@@ -833,7 +833,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         return Err(VsmError::InvalidInputAddress);
     }
 
-    if patch_pa_1.is_null()
+    let heki_patch = if patch_pa_1.is_null()
         || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
     {
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPatch>(patch_pa_0) }
@@ -853,11 +853,13 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
                 return Err(VsmError::Vtl0CopyFailed);
             }
         }
-        if heki_patch.is_valid() {
-            Ok(heki_patch)
-        } else {
-            Err(VsmError::InvalidInputAddress)
-        }
+        Ok(heki_patch)
+    }?;
+
+    if heki_patch.is_valid() {
+        Ok(heki_patch)
+    } else {
+        Err(VsmError::InvalidInputAddress)
     }
 }
 
@@ -1107,19 +1109,23 @@ impl Vtl0KernelInfo {
         self.system_certs.get().map(|b| &**b)
     }
 
-    // This function finds the precomputed patch data corresponding to the input patch data.
-    // We need this because each step of `mshv_vsm_patch_data`/`text_poke_bp_batch` only
-    // provides a part of the patch data and addresses (`patch[0]` or `patch[1..patch_size-1]`).
+    /// This function finds the precomputed patch data corresponding to the input patch data.
+    ///
+    /// Each step of `text_poke_bp_batch` only exposes a portion of the target's address range,
+    /// so we look up in the precomputed map by two keys derived from `patch_data.pa[0]`:
+    /// - `pa[0]` matches step 1 or 3 (target's first byte) and, for a precomputed patch that
+    ///   straddles at offset 1, step 2.
+    /// - `pa[0] - 1` matches step 2 where `patch.pa[0] == precomputed.pa[0] + 1`.
+    ///
+    /// No legitimate step requires looking up by `patch.pa[1]`.
     pub fn find_precomputed_patch(&self, patch_data: &HekiPatch) -> Option<HekiPatch> {
         // `HekiPatch::is_valid` already validated both physical addresses.
         let patch_pa_0 = PhysAddr::new(patch_data.pa[0]);
         let patch_pa_0_prev = patch_data.pa[0].checked_sub(1).map(PhysAddr::new);
-        let patch_pa_1 = PhysAddr::new(patch_data.pa[1]);
 
         self.precomputed_patches
             .get(patch_pa_0)
             .or_else(|| patch_pa_0_prev.and_then(|pa| self.precomputed_patches.get(pa)))
-            .or_else(|| self.precomputed_patches.get(patch_pa_1))
             .or(None)
     }
 }
