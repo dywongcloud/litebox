@@ -314,7 +314,7 @@ impl LinuxUserland {
         // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
-        let path = "/proc/self/maps";
+        let path = c"/proc/self/maps";
         let fd = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::open,
@@ -344,6 +344,7 @@ impl LinuxUserland {
             total_read += n;
         }
         assert!(total_read < buf.len(), "buffer too small");
+        unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
 
         let mut reserved_pages = alloc::vec::Vec::new();
         let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
