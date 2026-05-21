@@ -1492,6 +1492,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_common_windows"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror",
+]
+
+[[package]]
 name = "litebox_packager"
 version = "0.1.0"
 dependencies = [
@@ -1690,6 +1698,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_windows_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_multiplex",
+ "litebox_platform_windows_userland",
+ "litebox_shim_windows",
+ "litebox_util_log",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "litebox_shim_linux"
 version = "0.1.0"
 dependencies = [
@@ -1732,6 +1755,18 @@ dependencies = [
  "spin 0.10.0",
  "thiserror",
  "zerocopy",
+]
+
+[[package]]
+name = "litebox_shim_windows"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_windows",
+ "litebox_platform_multiplex",
+ "litebox_util_log",
+ "thiserror",
 ]
 
 [[package]]
