@@ -9,9 +9,10 @@
 //! compatibility with POSIX semantics.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
@@ -276,7 +277,7 @@ pub struct FileSystem<
     /// 9P client for protocol operations
     client: client::Client<Platform, T>,
     /// Root (attached to the root of the remote filesystem)
-    root: (fcall::Qid, fcall::Fid, String),
+    root: (fcall::Qid, client::Fid<Platform>, String),
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
     /// Whether `unlinkat` is supported by the server
@@ -339,22 +340,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 
     /// Walk to a path and return the fid
-    fn walk_to(&self, path: &str) -> Result<fcall::Fid, Error> {
+    fn walk_to(&self, path: &str) -> Result<client::Fid<Platform>, Error> {
         let components: Vec<&str> = path
             .normalized_components()
             .map_err(|_| Error::InvalidPathname)?
             .collect();
         if components.is_empty() {
             // Clone the root fid
-            self.client.clone_fid(self.root.1)
+            self.client.clone_fid(&self.root.1)
         } else {
-            let (_, fid) = self.client.walk(self.root.1, &components)?;
+            let (_, fid) = self.client.walk(&self.root.1, &components)?;
             Ok(fid)
         }
     }
 
     /// Walk to the parent of a path and return the parent fid and the name of the final component
-    fn walk_to_parent<'a>(&self, path: &'a str) -> Result<(fcall::Fid, &'a str), Error> {
+    fn walk_to_parent<'a>(&self, path: &'a str) -> Result<(client::Fid<Platform>, &'a str), Error> {
         let components: Vec<&str> = path
             .normalized_components()
             .map_err(|_| Error::InvalidPathname)?
@@ -367,10 +368,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let parent_components = &components[..components.len() - 1];
 
         if parent_components.is_empty() {
-            let parent_fid = self.client.clone_fid(self.root.1)?;
+            let parent_fid = self.client.clone_fid(&self.root.1)?;
             Ok((parent_fid, name))
         } else {
-            let (_, parent_fid) = self.client.walk(self.root.1, parent_components)?;
+            let (_, parent_fid) = self.client.walk(&self.root.1, parent_components)?;
             Ok((parent_fid, name))
         }
     }
@@ -511,8 +512,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
             let result =
                 self.client
-                    .unlinkat(parent_fid, name, if is_file { 0 } else { AT_REMOVEDIR });
-            let _ = self.client.clunk(parent_fid);
+                    .unlinkat(&parent_fid, name, if is_file { 0 } else { AT_REMOVEDIR });
+            self.client.clunk(parent_fid);
             if let Err(Error::Remote(ENOSYS | EOPNOTSUPP)) = &result {
                 self.unlinkat_supported.store(false, Ordering::SeqCst);
                 // fall back to `remove`
@@ -522,9 +523,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
 
         let fid = self.walk_to(&path)?;
-        let result = self.client.remove(fid);
-        self.client.free_fid(fid);
-        result
+        self.client.remove(fid)
     }
 }
 
@@ -532,7 +531,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     for FileSystem<Platform, T>
 {
     fn drop(&mut self) {
-        let _ = self.client.clunk(self.root.1);
+        self.client.clunk(self.root.1.clone());
     }
 }
 
@@ -576,18 +575,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let (new_qid, new_fid) = if needs_create {
             let (_, dfid) = self
                 .client
-                .walk(self.root.1, &components[..components.len() - 1])?;
+                .walk(&self.root.1, &components[..components.len() - 1])?;
             self.client
                 .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)?
         } else {
-            let (_, new_fid) = self.client.walk(self.root.1, &components)?;
-            let qid = self.client.open(new_fid, lflags)?;
+            let (_, new_fid) = self.client.walk(&self.root.1, &components)?;
+            let qid = match self.client.open(&new_fid, lflags) {
+                Ok(qid) => qid,
+                Err(err) => {
+                    self.client.clunk(new_fid);
+                    return Err(err.into());
+                }
+            };
             (qid, new_fid)
         };
 
         let descriptor = Descriptor {
             fid: new_fid,
-            offset: AtomicUsize::new(0),
+            offset: Arc::new(sync::Mutex::new(0)),
             qid: new_qid,
         };
 
@@ -598,7 +603,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn close(&self, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
         let entry = self.litebox.descriptor_table_mut().remove(fd);
         if let Some(entry) = entry {
-            let _ = self.client.clunk(entry.entry.fid);
+            self.client.clunk(entry.entry.fid);
         }
         Ok(())
     }
@@ -609,30 +614,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
-        // Extract fid and current offset, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, current_offset) = self
+        // Clone the fid and offset lock out of the descriptor and release the
+        // table lock before issuing the potentially blocking 9P call. The fid
+        // keeps the pool slot reserved while the offset lock serializes
+        // implicit-offset I/O on this descriptor.
+        let (fid, descriptor_offset) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
             })
             .ok_or(super::errors::ReadError::ClosedFd)?;
 
-        let read_offset = match offset {
-            Some(o) => o,
-            None => current_offset,
-        };
-
-        let bytes_read = self.client.read(fid, read_offset as u64, buf)?;
-
-        // Update offset if not using explicit offset
-        if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.fetch_add(bytes_read, Ordering::SeqCst);
-            });
+        if let Some(read_offset) = offset {
+            return Ok(self.client.read(&fid, read_offset as u64, buf)?);
         }
 
+        let mut current_offset = descriptor_offset.lock();
+        let bytes_read = self.client.read(&fid, *current_offset as u64, buf)?;
+        *current_offset = current_offset
+            .checked_add(bytes_read)
+            .ok_or(super::errors::ReadError::Io)?;
         Ok(bytes_read)
     }
 
@@ -642,30 +644,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
-        // Extract fid and current offset, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, current_offset) = self
+        let (fid, descriptor_offset) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
             })
             .ok_or(super::errors::WriteError::ClosedFd)?;
 
-        let write_offset = match offset {
-            Some(o) => o,
-            None => current_offset,
-        };
-
-        let bytes_written = self.client.write(fid, write_offset as u64, buf)?;
-
-        // Update offset if not using explicit offset
-        if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.fetch_add(bytes_written, Ordering::SeqCst);
-            });
+        if let Some(write_offset) = offset {
+            return Ok(self.client.write(&fid, write_offset as u64, buf)?);
         }
 
+        let mut current_offset = descriptor_offset.lock();
+        let bytes_written = self.client.write(&fid, *current_offset as u64, buf)?;
+        *current_offset = current_offset
+            .checked_add(bytes_written)
+            .ok_or(super::errors::WriteError::Io)?;
         Ok(bytes_written)
     }
 
@@ -675,31 +670,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
-        // Extract fid and current offset, releasing the descriptor table lock
-        // before performing potentially blocking I/O (getattr for SeekWhence::RelativeToEnd).
-        let (fid, current_offset) = self
+        let (fid, descriptor_offset) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
+                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
             })
             .ok_or(SeekError::ClosedFd)?;
 
-        let base = match whence {
+        let new_offset = match whence {
             super::SeekWhence::RelativeToBeginning => 0,
-            super::SeekWhence::RelativeToCurrentOffset => current_offset,
+            super::SeekWhence::RelativeToCurrentOffset => {
+                let mut current_offset = descriptor_offset.lock();
+                let new_offset = current_offset
+                    .checked_add_signed(offset)
+                    .ok_or(SeekError::InvalidOffset)?;
+                *current_offset = new_offset;
+                return Ok(new_offset);
+            }
             super::SeekWhence::RelativeToEnd => {
-                let attr = self.client.getattr(fid, fcall::GetattrMask::SIZE)?;
+                let attr = self.client.getattr(&fid, fcall::GetattrMask::SIZE)?;
                 usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
             }
-        };
-        let new_offset = base
-            .checked_add_signed(offset)
-            .ok_or(SeekError::InvalidOffset)?;
+        }
+        .checked_add_signed(offset)
+        .ok_or(SeekError::InvalidOffset)?;
 
-        self.litebox.descriptor_table().with_entry(fd, |desc| {
-            desc.entry.offset.store(new_offset, Ordering::SeqCst);
-        });
+        *descriptor_offset.lock() = new_offset;
         Ok(new_offset)
     }
 
@@ -709,12 +706,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         length: usize,
         reset_offset: bool,
     ) -> Result<(), super::errors::TruncateError> {
-        // Extract fid and qid, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, qid) = self
+        let (fid, qid, descriptor_offset) = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
+            .with_entry(fd, |desc| {
+                (
+                    desc.entry.fid.clone(),
+                    desc.entry.qid,
+                    Arc::clone(&desc.entry.offset),
+                )
+            })
             .ok_or(super::errors::TruncateError::ClosedFd)?;
 
         if qid.typ.contains(fcall::QidType::DIR) {
@@ -729,12 +730,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             ..Default::default()
         };
 
-        self.client.setattr(fid, fcall::SetattrMask::SIZE, stat)?;
+        self.client.setattr(&fid, fcall::SetattrMask::SIZE, stat)?;
 
         if reset_offset {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.store(0, Ordering::SeqCst);
-            });
+            *descriptor_offset.lock() = 0;
         }
 
         Ok(())
@@ -753,8 +752,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             ..Default::default()
         };
 
-        let result = self.client.setattr(fid, fcall::SetattrMask::MODE, stat);
-        let _ = self.client.clunk(fid);
+        let result = self.client.setattr(&fid, fcall::SetattrMask::MODE, stat);
+        self.client.clunk(fid);
 
         result.map_err(ChmodError::from)
     }
@@ -789,8 +788,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             ..Default::default()
         };
 
-        let result = self.client.setattr(fid, valid, stat);
-        let _ = self.client.clunk(fid);
+        let result = self.client.setattr(&fid, valid, stat);
+        self.client.clunk(fid);
 
         result.map_err(ChownError::from)
     }
@@ -805,8 +804,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         let (parent_fid, name) = self.walk_to_parent(&path)?;
 
-        let result = self.client.mkdir(parent_fid, name, mode.bits(), 0);
-        let _ = self.client.clunk(parent_fid);
+        let result = self.client.mkdir(&parent_fid, name, mode.bits(), 0);
+        self.client.clunk(parent_fid);
 
         result.map(|_| ()).map_err(MkdirError::from)
     }
@@ -820,20 +819,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         &self,
         fd: &FileFd<Platform, T>,
     ) -> Result<Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
-        // Extract fid and qid, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
         let (fid, qid) = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
+            .with_entry(fd, |desc| (desc.entry.fid.clone(), desc.entry.qid))
             .ok_or(super::errors::ReadDirError::ClosedFd)?;
 
         if !qid.typ.contains(fcall::QidType::DIR) {
             return Err(super::errors::ReadDirError::NotADirectory);
         }
 
-        // Perform blocking I/O without holding any locks.
-        let entries = self.client.readdir_all(fid)?;
+        let entries = self.client.readdir_all(&fid)?;
 
         let dir_entries: Vec<super::DirEntry> = entries
             .into_iter()
@@ -866,8 +862,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let path = self.absolute_path(path)?;
         let fid = self.walk_to(&path)?;
 
-        let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
-        let _ = self.client.clunk(fid);
+        let result = self.client.getattr(&fid, fcall::GetattrMask::ALL);
+        self.client.clunk(fid);
 
         result
             .and_then(|attr| Self::rgetattr_to_file_status(&attr))
@@ -878,28 +874,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         &self,
         fd: &FileFd<Platform, T>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        // Extract fid, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
         let fid = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| desc.entry.fid)
+            .with_entry(fd, |desc| desc.entry.fid.clone())
             .ok_or(super::errors::FileStatusError::ClosedFd)?;
 
-        // Perform blocking I/O without holding any locks.
-        let attr = self.client.getattr(fid, fcall::GetattrMask::ALL)?;
+        let attr = self.client.getattr(&fid, fcall::GetattrMask::ALL)?;
 
         Ok(Self::rgetattr_to_file_status(&attr)?)
     }
 }
 
 /// Internal descriptor state for a 9P file descriptor
-#[derive(Debug)]
-struct Descriptor {
-    /// The 9P fid for this file
-    fid: fcall::Fid,
+struct Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
+    /// The 9P fid for this file. Refcounted so concurrent in-flight
+    /// operations keep the pool slot reserved across `close`.
+    fid: client::Fid<Platform>,
     /// Current file offset (9P doesn't track this server-side)
-    offset: AtomicUsize,
+    offset: Arc<sync::Mutex<Platform, usize>>,
     /// The qid of the file (contains type and unique ID)
     qid: fcall::Qid,
 }
@@ -907,6 +900,7 @@ struct Descriptor {
 crate::fd::enable_fds_for_subsystem! {
     @Platform: { sync::RawSyncPrimitivesProvider }, T: { transport::Read + transport::Write };
     FileSystem<Platform, T>;
-    Descriptor;
+    @Platform: { sync::RawSyncPrimitivesProvider };
+    Descriptor<Platform>;
     -> FileFd<Platform, T>;
 }

@@ -329,10 +329,17 @@ impl<'a> DirEntryData<'a> {
     }
 
     fn decode_from(d: &mut FcallDecoder<'a>) -> Result<Self, super::Error> {
-        let end_len = d.buf.len() - d.decode_le::<u32>()? as usize;
+        let len = d.decode_le::<u32>()? as usize;
+        if len > d.buf.len() {
+            return Err(super::Error::InvalidResponse);
+        }
+        let end_len = d.buf.len() - len;
         let mut v = Vec::new();
         while d.buf.len() > end_len {
             v.push(DirEntry::decode_from(d)?);
+        }
+        if d.buf.len() != end_len {
+            return Err(super::Error::InvalidResponse);
         }
         Ok(DirEntryData { data: v })
     }
@@ -1179,6 +1186,10 @@ impl<'a> TaggedFcall<'a> {
         if buf.len() < 7 {
             return Err(super::Error::InvalidResponse);
         }
+        let sz = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        if sz != buf.len() {
+            return Err(super::Error::InvalidResponse);
+        }
 
         let mut decoder = FcallDecoder { buf: &buf[4..] };
         decoder.decode_message()
@@ -1304,6 +1315,9 @@ impl<'b> FcallDecoder<'b> {
 
     fn decode_vec_qid(&mut self) -> Result<Vec<Qid>, super::Error> {
         let len = self.decode_le::<u16>()?;
+        if usize::from(len) > MAXWELEM {
+            return Err(super::Error::InvalidResponse);
+        }
         let mut v = Vec::new();
         for _ in 0..len {
             v.push(Qid::decode_from(self)?);
@@ -1313,6 +1327,9 @@ impl<'b> FcallDecoder<'b> {
 
     fn decode_vec_str(&mut self) -> Result<Vec<FcallStr<'b>>, super::Error> {
         let len = self.decode_le::<u16>()?;
+        if usize::from(len) > MAXWELEM {
+            return Err(super::Error::InvalidResponse);
+        }
         let mut v = Vec::new();
         for _ in 0..len {
             v.push(self.decode_str()?);
