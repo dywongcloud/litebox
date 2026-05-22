@@ -8,6 +8,7 @@
 use alloc::vec::Vec;
 use core::cmp;
 use core::mem::size_of;
+use zerocopy::{FromBytes, IntoBytes};
 
 use object::endian::LittleEndian as LE;
 use object::pe;
@@ -26,9 +27,10 @@ pub struct PeParsedFile {
     /// Basic image metadata from the PE optional and COFF headers.
     pub image: PeImageInfo,
     /// Raw PE section headers in file order.
-    pub sections: Vec<pe::ImageSectionHeader>,
+    sections: Vec<pe::ImageSectionHeader>,
     /// Data directory entries indexed by `IMAGE_DIRECTORY_ENTRY_*`.
     pub data_directories: Vec<PeDataDirectory>,
+    trampoline: Option<PeTrampolineInfo>,
 }
 
 /// Basic PE image metadata needed by the Windows shim loader.
@@ -56,6 +58,25 @@ pub struct MappingInfo {
     pub entry_point: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeTrampolineInfo {
+    rva: usize,
+    size: usize,
+    file_offset: u64,
+    syscall_entry_point: usize,
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
+struct TrampolineHeader64 {
+    magic: [u8; 8],
+    file_offset: u64,
+    rva: u64,
+    trampoline_size: u64,
+}
+
+const TRAMPOLINE_MAGIC: [u8; 8] = *b"LITEBOX0";
+
 /// A PE data directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeDataDirectory {
@@ -72,6 +93,12 @@ pub enum PeParseError<E> {
     /// The file is not a supported Windows executable image.
     #[error("unsupported PE image")]
     UnsupportedImage,
+    /// The LiteBox trampoline footer is malformed.
+    #[error("bad LiteBox trampoline")]
+    BadTrampoline,
+    /// The LiteBox trampoline footer has an unsupported version.
+    #[error("invalid LiteBox trampoline version")]
+    BadTrampolineVersion,
     /// A PE field overflowed the host representation used by this parser.
     #[error("PE field overflow")]
     Overflow,
@@ -136,7 +163,14 @@ impl PeParsedFile {
             image,
             sections,
             data_directories,
+            trampoline: None,
         })
+    }
+
+    /// Returns whether the image has a parsed LiteBox syscall trampoline.
+    #[must_use]
+    pub fn has_trampoline(&self) -> bool {
+        self.trampoline.is_some()
     }
 
     /// Load the PE image into memory.
@@ -150,6 +184,18 @@ impl PeParsedFile {
         mapper: &mut M,
         mem: &mut impl AccessMemory,
     ) -> Result<MappingInfo, PeLoadError<M::Error>> {
+        self.load_with_writable_sections(mapper, mem, &[])
+    }
+
+    /// Load the PE image into memory, keeping selected sections writable.
+    ///
+    /// This is intended for target-specific loader data such as ntdll's `.mrdata`.
+    pub fn load_with_writable_sections<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        writable_section_names: &[&[u8]],
+    ) -> Result<MappingInfo, PeLoadError<M::Error>> {
         let preferred_base = self.image.image_base;
         let image_size = checked_next_multiple_of!(
             self.image.size_of_image,
@@ -159,13 +205,15 @@ impl PeParsedFile {
         if image_size == 0 {
             return Err(PeLoadError::InvalidImage);
         }
+        let mapping_size = self.mapping_size::<M::Error>(image_size)?;
 
         let base_addr = mapper
-            .reserve(preferred_base, image_size, PAGE_SIZE)
+            .reserve(preferred_base, mapping_size, PAGE_SIZE)
             .map_err(PeLoadError::Map)?;
         let image_end = checked_add_invalid!(base_addr, image_size)?;
 
         let headers_size = self.image.size_of_headers;
+
         if headers_size > image_size {
             return Err(PeLoadError::InvalidImage);
         }
@@ -241,9 +289,13 @@ impl PeParsedFile {
                 .protect(
                     protect_start,
                     protect_end - protect_start,
-                    &Protection::from_section_characteristics(section.characteristics.get(LE)),
+                    &Protection::from_section(section, writable_section_names),
                 )
                 .map_err(PeLoadError::Map)?;
+        }
+
+        if self.trampoline.is_some() {
+            self.load_trampoline(mapper, mem, base_addr)?;
         }
 
         let entry_point = checked_add!(
@@ -254,9 +306,129 @@ impl PeParsedFile {
 
         Ok(MappingInfo {
             base_addr,
-            image_size,
+            image_size: mapping_size,
             entry_point,
         })
+    }
+
+    /// Parse the LiteBox PE trampoline footer, if present.
+    ///
+    /// The trampoline RVA is relative to the image base. The first pointer-sized
+    /// word of the mapped trampoline is patched with `syscall_entry_point` when
+    /// the image is loaded.
+    pub fn parse_trampoline<F: ReadAt>(
+        &mut self,
+        file: &mut F,
+        syscall_entry_point: usize,
+    ) -> Result<(), PeParseError<F::Error>> {
+        if syscall_entry_point == 0 {
+            return Ok(());
+        }
+
+        let file_size = file.size().map_err(PeParseError::Io)?;
+        let header_size = size_of::<TrampolineHeader64>();
+        if file_size < header_size as u64 {
+            return Ok(());
+        }
+
+        let header_offset = file_size - header_size as u64;
+        let mut header_buf = [0u8; size_of::<TrampolineHeader64>()];
+        file.read_at(header_offset, &mut header_buf)
+            .map_err(PeParseError::Io)?;
+        let header = TrampolineHeader64::read_from_bytes(&header_buf)
+            .map_err(|_| PeParseError::BadTrampoline)?;
+        let magic = header.magic;
+        if magic != TRAMPOLINE_MAGIC {
+            if &magic[0..7] == b"LITEBOX" {
+                return Err(PeParseError::BadTrampolineVersion);
+            }
+            return Ok(());
+        }
+
+        let file_offset = header.file_offset;
+        let rva = usize_from_u64(header.rva)?;
+        let trampoline_size = usize_from_u64(header.trampoline_size)?;
+        let image_size = checked_next_multiple_of!(
+            self.image.size_of_image,
+            PAGE_SIZE,
+            PeParseError::BadTrampoline
+        )?;
+
+        if trampoline_size == 0
+            || !file_offset.is_multiple_of(PAGE_SIZE as u64)
+            || !rva.is_multiple_of(PAGE_SIZE)
+            || rva < image_size
+            || file_offset
+                .checked_add(trampoline_size as u64)
+                .ok_or(PeParseError::BadTrampoline)?
+                != header_offset
+        {
+            return Err(PeParseError::BadTrampoline);
+        }
+
+        self.trampoline = Some(PeTrampolineInfo {
+            rva,
+            size: trampoline_size,
+            file_offset,
+            syscall_entry_point,
+        });
+        Ok(())
+    }
+
+    fn mapping_size<E>(&self, image_size: usize) -> Result<usize, PeLoadError<E>> {
+        let Some(trampoline) = &self.trampoline else {
+            return Ok(image_size);
+        };
+
+        trampoline
+            .rva
+            .checked_add(trampoline.size)
+            .and_then(|trampoline_end| trampoline_end.checked_next_multiple_of(PAGE_SIZE))
+            .map(|trampoline_end| image_size.max(trampoline_end))
+            .ok_or(PeLoadError::InvalidImage)
+    }
+
+    fn load_trampoline<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        base_addr: usize,
+    ) -> Result<(), PeLoadError<M::Error>> {
+        let trampoline = self.trampoline.as_ref().unwrap();
+        let trampoline_start = base_addr
+            .checked_add(trampoline.rva)
+            .ok_or(PeLoadError::InvalidImage)?;
+        let trampoline_size =
+            checked_next_multiple_of!(trampoline.size, PAGE_SIZE, PeLoadError::InvalidImage)?;
+        mapper
+            .map_file(
+                trampoline_start,
+                trampoline_size,
+                trampoline.file_offset,
+                &Protection {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+            )
+            .map_err(PeLoadError::Map)?;
+
+        mem.write(
+            trampoline_start,
+            &trampoline.syscall_entry_point.to_ne_bytes(),
+        )?;
+
+        mapper
+            .protect(
+                trampoline_start,
+                trampoline_size,
+                &Protection {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            )
+            .map_err(PeLoadError::Map)
     }
 
     fn apply_base_relocations<E>(
@@ -464,12 +636,6 @@ fn parse_headers<F: ReadAt>(
             }
         })
         .collect();
-    for dir in &data_directories {
-        let end = checked_add!(dir.virtual_address, dir.size, PeParseError::Overflow)?;
-        if (end as usize) > image.size_of_image {
-            return Err(PeParseError::UnsupportedImage);
-        }
-    }
 
     // Section headers sit at `nt_offset + 4 (signature) + size_of::<ImageFileHeader>() + size_of_optional_header`.
     let num_sections = nt.file_header.number_of_sections.get(LE) as usize;
@@ -610,8 +776,10 @@ pub trait MapMemory {
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].
 pub trait AccessMemory {
+    /// Read from memory.
     fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<(), Fault>;
 
+    /// Write to memory.
     fn write(&mut self, address: usize, data: &[u8]) -> Result<(), Fault>;
 }
 
@@ -642,11 +810,29 @@ impl Protection {
         execute: false,
     };
 
-    fn from_section_characteristics(characteristics: u32) -> Self {
-        Self {
-            read: characteristics & pe::IMAGE_SCN_MEM_READ != 0,
-            write: characteristics & pe::IMAGE_SCN_MEM_WRITE != 0,
-            execute: characteristics & pe::IMAGE_SCN_MEM_EXECUTE != 0,
+    fn from_section(section: &pe::ImageSectionHeader, writable_section_names: &[&[u8]]) -> Self {
+        let characteristics = section.characteristics.get(LE);
+        let mut protection = Self {
+            read: characteristics & object::pe::IMAGE_SCN_MEM_READ != 0,
+            write: characteristics & object::pe::IMAGE_SCN_MEM_WRITE != 0,
+            execute: characteristics & object::pe::IMAGE_SCN_MEM_EXECUTE != 0,
+        };
+        if writable_section_names
+            .iter()
+            .any(|name| section_name_eq(section, name))
+        {
+            protection.write = true;
         }
+
+        protection
     }
+}
+
+fn section_name_eq(section: &pe::ImageSectionHeader, name: &[u8]) -> bool {
+    let end = section
+        .name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(section.name.len());
+    &section.name[..end] == name
 }
