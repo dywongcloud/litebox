@@ -17,12 +17,13 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType,
+    IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno, signal::Signal,
 };
 use litebox_platform_multiplex::Platform;
+use thiserror::Error;
 
-use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
+use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task, syscalls::signal};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Task state shared by `CLONE_FS`.
@@ -166,8 +167,11 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Resolve a path against the current working directory.
-    fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
+    pub(crate) fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
+        if path_str.is_empty() {
+            return Err(Errno::ENOENT);
+        }
         if path_str.starts_with('/') {
             CString::new(path_str.to_string()).map_err(|_| Errno::EINVAL)
         } else {
@@ -177,26 +181,48 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Handle syscall `umask`
-    pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
-        let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
-        let old_mask = self
-            .fs
-            .borrow()
-            .umask
-            .swap(new_mask.bits(), Ordering::Relaxed);
-        Mode::from_bits_retain(old_mask)
+    /// Resolve a path relative to a dirfd.
+    ///
+    /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
+    fn resolve_path_at(&self, dirfd: i32, pathname: impl path::Arg) -> Result<CString, Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        match fs_path {
+            FsPath::Absolute { path } => Ok(path),
+            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { fd: _, path: _ } => {
+                log_unsupported!("path resolution with FsPath::FdRelative");
+                Err(Errno::EINVAL)
+            }
+        }
     }
 
-    /// Handle syscall `open`
-    pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
-        let path = self.resolve_path(path)?;
+    pub(crate) fn do_open(
+        &self,
+        path: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<FS>, Errno> {
         let mode = mode & !self.get_umask();
-        let file = self
-            .files
+        self.files
             .borrow()
             .fs
-            .open(path, flags - OFlags::CLOEXEC, mode)?;
+            .open(path, flags - OFlags::CLOEXEC, mode)
+            .map_err(Errno::from)
+    }
+
+    fn do_openat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<FS>, Errno> {
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        self.do_open(path, flags, mode)
+    }
+
+    fn insert_raw_file_fd(&self, file: TypedFd<FS>, flags: OFlags) -> Result<u32, Errno> {
         if flags.contains(OFlags::CLOEXEC) {
             let None = self
                 .global
@@ -215,6 +241,24 @@ impl<FS: ShimFS> Task<FS> {
         Ok(u32::try_from(raw_fd).unwrap())
     }
 
+    /// Handle syscall `umask`
+    pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
+        let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
+        let old_mask = self
+            .fs
+            .borrow()
+            .umask
+            .swap(new_mask.bits(), Ordering::Relaxed);
+        Mode::from_bits_retain(old_mask)
+    }
+
+    /// Handle syscall `open`
+    pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+        let path = self.resolve_path(path)?;
+        let file = self.do_open(path, flags, mode)?;
+        self.insert_raw_file_fd(file, flags)
+    }
+
     /// Handle syscall `openat`
     pub fn sys_openat(
         &self,
@@ -223,20 +267,8 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         mode: Mode,
     ) -> Result<u32, Errno> {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => self.sys_open(path, flags, mode),
-            FsPath::Cwd => self.sys_open(get_cwd(), flags, mode),
-            FsPath::Fd(_fd) => {
-                log_unsupported!("openat with FsPath::Fd");
-                Err(Errno::EINVAL)
-            }
-            FsPath::FdRelative { fd: _, path: _ } => {
-                log_unsupported!("openat with FsPath::FdRelative");
-                Err(Errno::EINVAL)
-            }
-        }
+        let file = self.do_openat(dirfd, pathname, flags, mode)?;
+        self.insert_raw_file_fd(file, flags)
     }
 
     /// Handle syscall `ftruncate`
@@ -258,6 +290,46 @@ impl<FS: ShimFS> Task<FS> {
             .flatten()
     }
 
+    /// Handle syscall `mknodat` — create a filesystem node.
+    pub(crate) fn sys_mknodat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode_and_type: u32,
+        _dev: u32,
+    ) -> Result<(), Errno> {
+        const FILE_TYPE_MASK: u32 = 0o170000;
+
+        let file_type = mode_and_type & FILE_TYPE_MASK;
+        let file_type = if file_type == 0 {
+            // zero translates to S_IFREG
+            InodeType::File
+        } else {
+            InodeType::try_from(file_type).map_err(|_| Errno::EINVAL)?
+        };
+        match file_type {
+            InodeType::File => {
+                let mode = Mode::from_bits_truncate(mode_and_type & !FILE_TYPE_MASK);
+                let file = self.do_openat(
+                    dirfd,
+                    pathname,
+                    OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                    mode,
+                )?;
+                let files = self.files.borrow();
+                let _ = files.fs.close(&file);
+            }
+            // TODO: Named pipe, socket, block and char files are not supported
+            InodeType::NamedPipe
+            | InodeType::Socket
+            | InodeType::BlockDevice
+            | InodeType::CharDevice
+            | InodeType::Dir => return Err(Errno::EPERM),
+            InodeType::SymLink => return Err(Errno::EINVAL),
+        }
+        Ok(())
+    }
+
     /// Handle syscall `unlinkat`
     pub(crate) fn sys_unlinkat(
         &self,
@@ -269,18 +341,11 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => {
-                if flags.contains(AtFlags::AT_REMOVEDIR) {
-                    self.files.borrow().fs.rmdir(path).map_err(Errno::from)
-                } else {
-                    self.files.borrow().fs.unlink(path).map_err(Errno::from)
-                }
-            }
-            FsPath::Cwd => Err(Errno::EINVAL),
-            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        if flags.contains(AtFlags::AT_REMOVEDIR) {
+            self.files.borrow().fs.rmdir(path).map_err(Errno::from)
+        } else {
+            self.files.borrow().fs.unlink(path).map_err(Errno::from)
         }
     }
 
@@ -304,7 +369,7 @@ impl<FS: ShimFS> Task<FS> {
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-        files
+        let n = files
             .run_on_raw_fd(
                 fd as usize,
                 |fd| {
@@ -367,7 +432,11 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 },
             )
-            .flatten()
+            .flatten()?;
+        // For datagrams, the returned size represents the actual size of the message,
+        // which may be larger than the buffer size.
+        let capped_size = n.min(buf.borrow().len());
+        Ok(capped_size)
     }
 
     /// Handle syscall `write`
@@ -436,7 +505,7 @@ impl<FS: ShimFS> Task<FS> {
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
     }
@@ -530,64 +599,115 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
+        self.do_close_and_replace::<FS>(raw_fd, None)
+    }
+
+    /// Close the file at `raw_fd` and optionally place a new file in the same slot.
+    ///
+    /// This function ensure `close` and `insert` are done atomically.
+    fn do_close_and_replace<S: FdEnabledSubsystem>(
+        &self,
+        raw_fd: usize,
+        replace: Option<TypedFd<S>>,
+    ) -> Result<(), Errno> {
+        enum ConsumedFd<FS: ShimFS> {
+            Fs(alloc::sync::Arc<TypedFd<FS>>),
+            Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
+            Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
+            Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
+            Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<FS>>>),
+            Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<FS>>>),
+        }
+
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
-        match rds.fd_consume_raw_integer(raw_fd) {
-            Ok(fd) => {
-                drop(rds);
-                return files.fs.close(&fd).map_err(Errno::from);
-            }
+        let consumed: ConsumedFd<FS> = match rds.fd_consume_raw_integer::<FS>(raw_fd) {
+            Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
+                if let Some(new_fd) = replace {
+                    let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
+                    assert!(success, "raw_fd slot is empty, so insert must succeed");
+                }
                 return Err(Errno::EBADF);
             }
             Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                // fallthrough
+                if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(raw_fd)
+                {
+                    ConsumedFd::Network(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
+                {
+                    ConsumedFd::Pipes(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                {
+                    ConsumedFd::Eventfd(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+                {
+                    ConsumedFd::Epoll(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                {
+                    ConsumedFd::Unix(fd)
+                } else {
+                    unreachable!("all subsystems covered")
+                }
+            }
+        };
+
+        // Insert the replacement into the now-vacated slot while still holding the lock.
+        if let Some(new_fd) = replace {
+            let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
+            assert!(
+                success,
+                "we just consumed this raw_fd, so it must be available"
+            );
+        }
+        drop(rds);
+
+        match consumed {
+            ConsumedFd::Fs(fd) => {
+                if let Ok(raw_fd) = i32::try_from(raw_fd) {
+                    self.finalize_elf_patch(raw_fd);
+                }
+                files.fs.close(&fd).map_err(Errno::from)
+            }
+            ConsumedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
+            ConsumedFd::Pipes(fd) => self.global.pipes.close(&fd).map_err(Errno::from),
+            ConsumedFd::Eventfd(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
+            ConsumedFd::Epoll(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
+            ConsumedFd::Unix(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
             }
         }
-        if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
-            drop(rds);
-            return self.global.close_socket(&self.wait_cx(), fd);
-        }
-        if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
-            drop(rds);
-            return self.global.pipes.close(&fd).map_err(Errno::from);
-        }
-        if let Ok(fd) = rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd) {
-            drop(rds);
-            let entry = {
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                dt.remove(&fd)
-            };
-            drop(entry);
-            return Ok(());
-        }
-        if let Ok(fd) = rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd) {
-            drop(rds);
-            let entry = {
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                dt.remove(&fd)
-            };
-            drop(entry);
-            return Ok(());
-        }
-        if let Ok(fd) = rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd) {
-            drop(rds);
-            let entry = {
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                dt.remove(&fd)
-            };
-            drop(entry);
-            return Ok(());
-        }
-        // All the above cases should cover all the known subsystems, and we've already
-        // early-handled the "raw FD not found" case.
-        unreachable!()
     }
 
     /// Handle syscall `close`
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
-        self.finalize_elf_patch(fd);
-
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -654,22 +774,36 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-fn write_to_iovec<F>(iovs: &[IoWriteVec<ConstPtr<u8>>], write_fn: F) -> Result<usize, Errno>
+pub(super) fn write_to_iovec<P, I, F>(iovs: I, write_fn: F) -> Result<usize, Errno>
 where
+    P: RawConstPointer<u8>,
+    I: IntoIterator<Item = (P, usize)>,
     F: Fn(&[u8]) -> Result<usize, Errno>,
 {
     let mut total_written = 0;
-    for iov in iovs {
-        if iov.iov_len == 0 {
+    for (iov_base, iov_len) in iovs {
+        if iov_len == 0 {
             continue;
         }
-        let slice = iov
-            .iov_base
-            .to_owned_slice(iov.iov_len)
-            .ok_or(Errno::EFAULT)?;
-        let size = write_fn(&slice)?;
+        let Some(slice) = iov_base.to_owned_slice(iov_len) else {
+            return if total_written > 0 {
+                Ok(total_written)
+            } else {
+                Err(Errno::EFAULT)
+            };
+        };
+        let size = match write_fn(&slice) {
+            Ok(size) => size,
+            Err(err) => {
+                return if total_written > 0 {
+                    Ok(total_written)
+                } else {
+                    Err(err)
+                };
+            }
+        };
         total_written += size;
-        if size < iov.iov_len {
+        if size < iov_len {
             // Okay to transfer fewer bytes than requested
             break;
         }
@@ -698,12 +832,12 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
-                    write_to_iovec(iovs, |buf: &[u8]| {
+                    write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
                         files.fs.write(fd, buf, None).map_err(Errno::from)
                     })
                 },
                 |fd| {
-                    write_to_iovec(iovs, |buf| {
+                    write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
                         self.global.sendto(
                             &self.wait_cx(),
                             fd,
@@ -720,7 +854,7 @@ impl<FS: ShimFS> Task<FS> {
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            unimplemented!("send SIGPIPE to the current task");
+            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
     }
@@ -789,18 +923,8 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fspath = FsPath::new(dirfd, pathname, get_cwd)?;
-        let path = match fspath {
-            FsPath::Absolute { path } => {
-                self.do_readlink(path.to_str().map_err(|_| Errno::EINVAL)?)
-            }
-            FsPath::Cwd => {
-                let cwd = self.fs.borrow().cwd.read().clone();
-                self.do_readlink(&cwd)
-            }
-            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
-        }?;
+        let pathname = self.resolve_path_at(dirfd, pathname)?;
+        let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?)?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
         buf[..min_len].copy_from_slice(&bytes[..min_len]);
@@ -808,114 +932,54 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
-    let fstat = task
-        .files
-        .borrow()
+fn descriptor_stat<FS: ShimFS, T>(raw_fd: usize, task: &Task<FS>) -> Result<T, Errno>
+where
+    T: From<litebox::fs::FileStatus> + From<FileStat>,
+{
+    // TODO: give correct values for the synthesized branches.
+    let synthetic = |mode_bits: u32, blksize: usize| FileStat {
+        st_dev: 0,
+        st_ino: 0,
+        st_nlink: 1,
+        st_mode: mode_bits.trunc(),
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        st_size: 0,
+        st_blksize: blksize,
+        st_blocks: 0,
+        ..Default::default()
+    };
+    let socket_mode = litebox_common_linux::InodeType::Socket as u32
+        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
+    let rw_user_mode = (Mode::RUSR | Mode::WUSR).bits();
+    let files = task.files.borrow();
+    files
         .run_on_raw_fd(
             raw_fd,
             |fd| {
-                task.files
-                    .borrow()
+                files
                     .fs
                     .fd_file_status(fd)
-                    .map(FileStat::from)
+                    .map(T::from)
                     .map_err(Errno::from)
             },
-            |_fd| {
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (litebox_common_linux::InodeType::Socket as u32
-                        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                    .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 4096,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
-            },
+            |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
                 let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
                 let read_write_mode = match half_pipe_type {
                     litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
                     litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
                 };
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (read_write_mode.bits()
-                        | litebox_common_linux::InodeType::NamedPipe as u32)
-                        .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 4096,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
+                let pipe_mode =
+                    read_write_mode.bits() | litebox_common_linux::InodeType::NamedPipe as u32;
+                Ok(T::from(synthetic(pipe_mode, 4096)))
             },
-            |_fd| {
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 4096,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
-            },
-            |_fd| {
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 0,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
-            },
-            |_fd| {
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (litebox_common_linux::InodeType::Socket as u32
-                        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                    .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 4096,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
-            },
+            |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
+            |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
+            |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
         )
-        .flatten()?;
-    Ok(fstat)
+        .flatten()
 }
 
 pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
@@ -979,7 +1043,11 @@ impl<FS: ShimFS> Task<FS> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
-    fn do_stat(&self, pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
+    fn do_stat<T: From<litebox::fs::FileStatus>>(
+        &self,
+        pathname: impl path::Arg,
+        follow_symlink: bool,
+    ) -> Result<T, Errno> {
         let normalized_path = pathname.normalized()?;
         let path = if follow_symlink {
             self.do_readlink(normalized_path.as_str())
@@ -988,7 +1056,7 @@ impl<FS: ShimFS> Task<FS> {
             normalized_path
         };
         let status = self.files.borrow().fs.file_status(path)?;
-        Ok(FileStat::from(status))
+        Ok(T::from(status))
     }
 
     /// Handle syscall `stat`
@@ -1015,35 +1083,83 @@ impl<FS: ShimFS> Task<FS> {
         descriptor_stat(raw_fd, self)
     }
 
+    fn do_fstatat<T>(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+    ) -> Result<T, Errno>
+    where
+        T: From<litebox::fs::FileStatus> + From<FileStat>,
+    {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        match fs_path {
+            FsPath::Absolute { path } => {
+                self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
+            }
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                Ok(T::from(self.files.borrow().fs.file_status(get_cwd())?))
+            }
+            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                descriptor_stat(fd as usize, self)
+            }
+            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { .. } => {
+                log_unsupported!("relative fstatat with AT_EMPTY_PATH unset is not supported yet");
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+
     /// Handle syscall `newfstatat`
-    pub fn sys_newfstatat(
+    pub(crate) fn sys_newfstatat(
         &self,
         dirfd: i32,
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
         let current_support_flags = AtFlags::AT_EMPTY_PATH;
-        if flags.contains(current_support_flags.complement()) {
-            todo!("unsupported flags");
+        if flags.intersects(current_support_flags.complement()) {
+            log_unsupported!("unsupported flags: {flags:?}");
+            return Err(Errno::EINVAL);
         }
 
-        let files = self.files.borrow();
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        let fstat: FileStat = match fs_path {
-            FsPath::Absolute { path } => {
-                self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
-            }
-            FsPath::Cwd => files.fs.file_status(get_cwd())?.into(),
-            FsPath::Fd(fd) => {
-                let Ok(raw_fd) = usize::try_from(fd) else {
-                    return Err(Errno::EBADF);
-                };
-                descriptor_stat(raw_fd, self)?
-            }
-            FsPath::FdRelative { .. } => todo!(),
-        };
-        Ok(fstat)
+        self.do_fstatat(dirfd, pathname, flags)
+    }
+
+    /// Handle syscall `statx`
+    pub(crate) fn sys_statx(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+        mask: StatxMask,
+    ) -> Result<Statx, Errno> {
+        if mask.contains(StatxMask::STATX__RESERVED) {
+            return Err(Errno::EINVAL);
+        }
+        // `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync
+        // hints are accepted as no-ops since LiteBox filesystems
+        // do not automount or sync to a remote.
+        let allowed = AtFlags::AT_EMPTY_PATH
+            | AtFlags::AT_NO_AUTOMOUNT
+            | AtFlags::AT_SYMLINK_NOFOLLOW
+            | AtFlags::AT_STATX_FORCE_SYNC
+            | AtFlags::AT_STATX_DONT_SYNC;
+        if flags.intersects(allowed.complement()) {
+            log_unsupported!("unsupported statx flags: {flags:?}");
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(AtFlags::AT_STATX_FORCE_SYNC | AtFlags::AT_STATX_DONT_SYNC) {
+            return Err(Errno::EINVAL);
+        }
+
+        // `mask` is informational past this point: the underlying FS doesn't
+        // support field selection, so we always fill the basic stats and
+        // report the actual filled set via `Statx::stx_mask`. Matches Linux's
+        // documented behavior of returning more than what was asked.
+        self.do_fstatat(dirfd, pathname, flags)
     }
 
     pub(crate) fn sys_fcntl(
@@ -1244,22 +1360,21 @@ impl<FS: ShimFS> Task<FS> {
                     .flatten()
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
-                let max_fd = self
-                    .process()
-                    .limits
-                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
-                if min_fd as usize >= max_fd {
-                    return Err(Errno::EINVAL);
-                }
-                let new_file = self.do_dup_inner(
-                    desc,
-                    if cloexec {
-                        OFlags::CLOEXEC
-                    } else {
-                        OFlags::empty()
-                    },
-                    DupFdRequest::LowestAtOrAbove(min_fd as usize),
-                )?;
+                let new_file = self
+                    .do_dup_inner(
+                        desc,
+                        if cloexec {
+                            OFlags::CLOEXEC
+                        } else {
+                            OFlags::empty()
+                        },
+                        DupFdRequest::LowestAtOrAbove(min_fd as usize),
+                    )
+                    .map_err(|e| match e {
+                        DupFdError::BadFd => Errno::EBADF,
+                        DupFdError::TooManyFiles => Errno::EMFILE,
+                        DupFdError::TargetFdExceedsLimit => Errno::EINVAL,
+                    })?;
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
@@ -1329,7 +1444,8 @@ impl<FS: ShimFS> Task<FS> {
         let (pipe_flags, cloexec) = {
             use litebox::pipes::Flags;
             let mut f = Flags::empty();
-            if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
+            if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement())
+            {
                 return Err(Errno::EINVAL);
             }
             f.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
@@ -1391,7 +1507,7 @@ impl<FS: ShimFS> Task<FS> {
 
     pub fn sys_eventfd2(&self, initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
         if flags
-            .contains((EfdFlags::SEMAPHORE | EfdFlags::CLOEXEC | EfdFlags::NONBLOCK).complement())
+            .intersects((EfdFlags::SEMAPHORE | EfdFlags::CLOEXEC | EfdFlags::NONBLOCK).complement())
         {
             return Err(Errno::EINVAL);
         }
@@ -1622,7 +1738,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `epoll_create` and `epoll_create1`
     pub fn sys_epoll_create(&self, flags: EpollCreateFlags) -> Result<u32, Errno> {
-        if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
+        if flags.intersects(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
             return Err(Errno::EINVAL);
         }
 
@@ -1809,7 +1925,7 @@ impl<FS: ShimFS> Task<FS> {
             let revents_ptr = crate::MutPtr::<i16>::from_usize(
                 fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
             );
-            let revents: u16 = revents.bits().truncate();
+            let revents: u16 = revents.bits().trunc();
             revents_ptr
                 .write_at_offset(0, revents.reinterpret_as_signed())
                 .ok_or(Errno::EFAULT)?;
@@ -1960,7 +2076,7 @@ impl<FS: ShimFS> Task<FS> {
         Ok(count)
     }
 
-    fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, Errno> {
+    fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, DupFdError> {
         self.do_dup_inner(file, flags, DupFdRequest::LowestAvailable)
     }
 
@@ -1969,30 +2085,47 @@ impl<FS: ShimFS> Task<FS> {
         file: usize,
         flags: OFlags,
         target: DupFdRequest,
-    ) -> Result<usize, Errno> {
+    ) -> Result<usize, DupFdError> {
         fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
-            global: &GlobalState<FS>,
+            task: &Task<FS>,
             files: &FilesState<FS>,
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: DupFdRequest,
-        ) -> Result<usize, Errno> {
-            let mut dt = global.litebox.descriptor_table_mut();
-            let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+        ) -> Result<usize, DupFdError> {
+            let max_fd = task
+                .process()
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
+            match target {
+                DupFdRequest::Exact(target) if target >= max_fd => {
+                    return Err(DupFdError::TargetFdExceedsLimit);
+                }
+                DupFdRequest::LowestAtOrAbove(min_fd) if min_fd >= max_fd => {
+                    return Err(DupFdError::TargetFdExceedsLimit);
+                }
+                _ => {}
+            }
+
+            let mut dt = task.global.litebox.descriptor_table_mut();
+            let fd: TypedFd<_> = dt.duplicate(fd).ok_or(DupFdError::BadFd)?;
             if close_on_exec {
                 let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                 assert!(old.is_none());
             }
-            let mut rds = files.raw_descriptor_store.write();
-            match target {
+            drop(dt);
+
+            let new_fd = match target {
                 DupFdRequest::Exact(target) => {
-                    if !rds.fd_into_specific_raw_integer(fd, target) {
-                        return Err(Errno::EBADF);
-                    }
-                    Ok(target)
+                    let _ = task.do_close_and_replace(target, Some(fd));
+                    target
                 }
-                DupFdRequest::LowestAvailable => Ok(rds.fd_into_raw_integer(fd)),
+                DupFdRequest::LowestAvailable => {
+                    let rds = &mut *files.raw_descriptor_store.write();
+                    rds.fd_into_raw_integer(fd)
+                }
                 DupFdRequest::LowestAtOrAbove(min_fd) => {
+                    let rds = &mut *files.raw_descriptor_store.write();
                     let mut raw_fd = min_fd;
                     for occupied_raw_fd in rds.iter_alive().skip_while(|&fd| fd < min_fd) {
                         if occupied_raw_fd != raw_fd {
@@ -2002,35 +2135,29 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
                     assert!(success);
-                    Ok(raw_fd)
+                    raw_fd
                 }
+            };
+            if new_fd >= max_fd {
+                let _ = task.do_close(new_fd);
+                return Err(DupFdError::TooManyFiles);
             }
+            Ok(new_fd)
         }
+
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
-        let new_fd = files.run_on_raw_fd(
-            file,
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-        )??;
-        if matches!(
-            target,
-            DupFdRequest::LowestAvailable | DupFdRequest::LowestAtOrAbove(_)
-        ) {
-            let max_fd = self
-                .process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
-            if new_fd >= max_fd {
-                self.do_close(new_fd)?;
-                return Err(Errno::EMFILE);
-            }
-        }
-        Ok(new_fd)
+        files
+            .run_on_raw_fd(
+                file,
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+            )
+            .map_err(|_| DupFdError::BadFd)?
     }
 
     /// Handle syscall `dup/dup2/dup3`
@@ -2073,26 +2200,21 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(oldfd)
                 };
             }
-            // Close whatever is at newfd before duping into it.
-            // Finalize any in-progress ELF patching for the target fd first,
-            // since dup2/dup3 implicitly closes it without going through
-            // sys_close.
             let newfd_usize = usize::try_from(newfd).or(Err(Errno::EBADF))?;
-            if let Ok(fd) = i32::try_from(newfd) {
-                self.finalize_elf_patch(fd);
-            }
-            let _ = self.do_close(newfd_usize);
             self.do_dup_inner(
                 oldfd_usize,
                 flags.unwrap_or(OFlags::empty()),
                 DupFdRequest::Exact(newfd_usize),
-            )?;
-            Ok(newfd)
+            )
         } else {
             // dup
-            let new_file = self.do_dup(oldfd_usize, flags.unwrap_or(OFlags::empty()))?;
-            Ok(u32::try_from(new_file).unwrap())
+            self.do_dup(oldfd_usize, flags.unwrap_or(OFlags::empty()))
         }
+        .map_err(|e| match e {
+            DupFdError::BadFd | DupFdError::TargetFdExceedsLimit => Errno::EBADF,
+            DupFdError::TooManyFiles => Errno::EMFILE,
+        })
+        .map(|new_fd| u32::try_from(new_fd).unwrap())
     }
 }
 
@@ -2100,7 +2222,18 @@ impl<FS: ShimFS> Task<FS> {
 enum DupFdRequest {
     LowestAvailable,
     LowestAtOrAbove(usize),
+    /// Duplicate to the specified fd, closing it first if it's open.
     Exact(usize),
+}
+
+#[derive(Error, Debug)]
+enum DupFdError {
+    #[error("Bad file descriptor")]
+    BadFd,
+    #[error("Too many open files")]
+    TooManyFiles,
+    #[error("Target fd exceeds process limit")]
+    TargetFdExceedsLimit,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2151,7 +2284,7 @@ impl<FS: ShimFS> Task<FS> {
                     let dirent64 = litebox_common_linux::LinuxDirent64 {
                         ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
                         off: dir_off as u64,
-                        len: len.truncate(),
+                        len: len.trunc(),
                         typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
                         __name: [0; 0],
                     };
@@ -2194,9 +2327,42 @@ impl<FS: ShimFS> Task<FS> {
 mod tests {
     use super::*;
     use alloc::string::String;
+    use core::cell::Cell;
     use litebox::fs::Mode;
 
     extern crate std;
+
+    #[test]
+    fn write_to_iovec_returns_partial_after_later_error() {
+        let first = b"first";
+        let second = b"second";
+        let iovs = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(first.as_ptr().expose_provenance()),
+                iov_len: first.len(),
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(second.as_ptr().expose_provenance()),
+                iov_len: second.len(),
+            },
+        ];
+        let calls = Cell::new(0);
+
+        let result = write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                assert_eq!(buf, first);
+                Ok(buf.len())
+            } else {
+                assert_eq!(buf, second);
+                Err(Errno::EPIPE)
+            }
+        });
+
+        assert_eq!(result, Ok(first.len()));
+        assert_eq!(calls.get(), 2);
+    }
 
     #[test]
     fn fspath_new() {
@@ -2304,6 +2470,75 @@ mod tests {
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
         assert_eq!(cwd, "/rel_parent/");
+    }
+
+    #[test]
+    fn mknodat_regular_file_does_not_consume_fd_limit() {
+        use litebox_common_linux::{Rlimit, RlimitResource};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let old_limit = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+        task.do_prlimit(
+            RlimitResource::NOFILE,
+            Some(Rlimit {
+                rlim_cur: 3,
+                rlim_max: old_limit.rlim_max,
+            }),
+        )
+        .unwrap();
+        let path = "/mknodat_at_fd_limit";
+
+        let result = task.sys_mknodat(
+            litebox_common_linux::AT_FDCWD,
+            path,
+            InodeType::File as u32 | (Mode::RUSR | Mode::WUSR).bits(),
+            0,
+        );
+
+        assert!(
+            task.sys_stat(path).is_ok(),
+            "mknodat created the file before returning {result:?}"
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn empty_pathnames_return_enoent() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(
+            task.sys_open("", OFlags::RDONLY, Mode::empty())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            task.sys_open("", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(task.sys_stat("").unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            task.sys_unlinkat(litebox_common_linux::AT_FDCWD, "", AtFlags::empty())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(task.sys_mkdir("", 0o755).unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            task.sys_mknodat(
+                litebox_common_linux::AT_FDCWD,
+                "",
+                InodeType::File as u32 | Mode::RWXU.bits(),
+                0,
+            )
+            .unwrap_err(),
+            Errno::ENOENT
+        );
+        let mut buffer = [0u8; 16];
+        assert_eq!(
+            task.sys_readlinkat(litebox_common_linux::AT_FDCWD, "", &mut buffer)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     /// Verify every path-taking syscall resolves relative paths after `chdir`.

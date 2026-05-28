@@ -97,7 +97,7 @@ impl<'a, FS: ShimFS> PeLoader<'a, FS> {
         }
 
         let header = KiUserInvertedFunctionTableHeader {
-            current_size: entries.len().truncate(),
+            current_size: entries.len().trunc(),
             maximum_size: MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE,
             epoch: 0,
             overflow: 0,

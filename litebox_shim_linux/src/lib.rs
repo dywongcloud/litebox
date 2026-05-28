@@ -339,9 +339,11 @@ fn default_fs(
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
+#[derive(Clone)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
 /// Status flags for pipes
+#[derive(Clone)]
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
@@ -581,7 +583,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
-                syscalls::file::try_into_whence(whence.truncate())
+                syscalls::file::try_into_whence(whence.trunc())
                     .map_err(|_| Errno::EINVAL)
                     .and_then(|seekwhence| self.sys_lseek(fd, offset, seekwhence))
             }
@@ -698,6 +700,8 @@ impl<FS: ShimFS> Task<FS> {
                 addr,
                 addrlen,
             } => self.sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
+            SyscallRequest::Recvmsg { sockfd, msg, flags } => self.sys_recvmsg(sockfd, msg, flags),
+            SyscallRequest::Shutdown { sockfd, how } => syscall!(sys_shutdown(sockfd, how)),
             SyscallRequest::Bind {
                 sockfd,
                 sockaddr,
@@ -847,6 +851,14 @@ impl<FS: ShimFS> Task<FS> {
                 syscall!(sys_openat(dirfd, path, flags, mode))
             }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
+            SyscallRequest::Mknodat {
+                dirfd,
+                pathname,
+                mode_and_type,
+                dev,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_mknodat(dirfd, path, mode_and_type, dev))
+            }),
             SyscallRequest::Unlinkat {
                 dirfd,
                 pathname,
@@ -890,6 +902,30 @@ impl<FS: ShimFS> Task<FS> {
                         .map(|()| 0)
                 })
             }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                statxbuf,
+            } => {
+                let (path, flags) = match pathname {
+                    // Linux 6.11+ treats a NULL statx path as a request to stat dirfd.
+                    None => (
+                        Ok(c"".into()),
+                        flags | litebox_common_linux::AtFlags::AT_EMPTY_PATH,
+                    ),
+                    Some(p) => (p.to_cstring().ok_or(Errno::EFAULT), flags),
+                };
+                path.and_then(|path| {
+                    self.sys_statx(dirfd, path, flags, mask).and_then(|sx| {
+                        statxbuf
+                            .write_at_offset(0, sx)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                })
+            }
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
@@ -984,6 +1020,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
+            SyscallRequest::Pause => syscall!(sys_pause()),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)

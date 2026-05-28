@@ -163,7 +163,7 @@ impl PerCpuVariables {
     pub fn vp_index(&self) -> u32 {
         let idx = self.vp_index.get();
         if idx == u32::MAX {
-            let vp_index: u32 = rdmsr(HV_REGISTER_VP_INDEX).truncate();
+            let vp_index: u32 = rdmsr(HV_REGISTER_VP_INDEX).trunc();
             assert!(
                 vp_index < u32::try_from(MAX_CORES).unwrap(),
                 "VP index {vp_index} exceeds the configured processor mask"
@@ -261,6 +261,8 @@ pub struct PerCpuVariablesAsm {
     vtl_return_addr: Cell<usize>,
     /// Scratch pad
     scratch: Cell<usize>,
+    /// User-mode RFLAGS captured at `syscall` entry
+    user_rflags: Cell<usize>,
     /// Top address of VTL0 VtlState
     vtl0_state_top_addr: Cell<usize>,
     /// Current kernel stack pointer
@@ -357,6 +359,9 @@ impl PerCpuVariablesAsm {
     }
     pub const fn scratch_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, scratch)
+    }
+    pub const fn user_rflags_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, user_rflags)
     }
     pub const fn vtl0_state_top_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl0_state_top_addr)
@@ -488,7 +493,7 @@ pub fn allocate_per_cpu_variables() {
     let pcv = Box::leak(per_cpu_variables);
     let addr = &raw const *pcv as u64;
     unsafe {
-        wrgsbase(addr.truncate());
+        wrgsbase(addr.trunc());
     }
 }
 
@@ -514,12 +519,12 @@ pub fn allocate_xsave_area() {
 pub fn init_per_cpu_variables() {
     const STACK_ALIGNMENT: usize = 16;
     with_per_cpu_variables(|per_cpu_variables| {
-        let kernel_sp = TruncateExt::<usize>::truncate(per_cpu_variables.kernel_stack_top())
+        let kernel_sp = TruncateExt::<usize>::trunc(per_cpu_variables.kernel_stack_top())
             & !(STACK_ALIGNMENT - 1);
         let double_fault_sp =
-            TruncateExt::<usize>::truncate(per_cpu_variables.double_fault_stack_top())
+            TruncateExt::<usize>::trunc(per_cpu_variables.double_fault_stack_top())
                 & !(STACK_ALIGNMENT - 1);
-        let exception_sp = TruncateExt::<usize>::truncate(per_cpu_variables.exception_stack_top())
+        let exception_sp = TruncateExt::<usize>::trunc(per_cpu_variables.exception_stack_top())
             & !(STACK_ALIGNMENT - 1);
         // `Cell<VtlState>` is `#[repr(transparent)]`, so its address equals
         // the inner `VtlState`'s address. Assembly code (`SAVE_VTL_STATE_ASM`
@@ -528,7 +533,7 @@ pub fn init_per_cpu_variables() {
         // Rust reference scope and the Cell is only accessed in Rust between
         // the save and load points (i.e., while VTL1 is executing).
         let vtl0_state_top_addr =
-            TruncateExt::<usize>::truncate(&raw const per_cpu_variables.vtl0_state as u64)
+            TruncateExt::<usize>::trunc(&raw const per_cpu_variables.vtl0_state as u64)
                 + core::mem::size_of::<VtlState>();
         per_cpu_variables.asm.set_kernel_stack_ptr(kernel_sp);
         per_cpu_variables

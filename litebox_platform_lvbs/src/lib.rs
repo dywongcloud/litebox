@@ -150,6 +150,18 @@ const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
 /// <https://cateee.net/lkddb/web-lkddb/LSM_MMAP_MIN_ADDR.html>
 const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
 
+#[inline]
+fn is_valid_user_addr(addr: usize) -> bool {
+    (USER_ADDR_MIN..USER_ADDR_MAX).contains(&addr)
+}
+
+/// Checks whether a user context is valid for switching to user mode, i.e.,
+/// both `rsp` and `rip` are within the user-space address range.
+#[inline]
+fn is_valid_user_ctx(ctx: &litebox_common_linux::PtRegs) -> bool {
+    is_valid_user_addr(ctx.rsp) && is_valid_user_addr(ctx.rip)
+}
+
 /// Manages base and task page tables.
 ///
 /// This struct maintains:
@@ -211,7 +223,7 @@ impl PageTableManager {
             return &self.base_page_table;
         }
 
-        let cr3_id: usize = cr3_frame.start_address().as_u64().truncate();
+        let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
         let task_pts = self.task_page_tables.lock();
         if let Some(pt) = task_pts.get(&cr3_id) {
             // SAFETY: Three invariants guarantee this reference remains valid:
@@ -251,7 +263,7 @@ impl PageTableManager {
         }
 
         // The task page table ID is the start address of the P4 frame.
-        cr3_frame.start_address().as_u64().truncate()
+        cr3_frame.start_address().as_u64().trunc()
     }
 
     /// Returns `true` if the base page table is currently active.
@@ -321,7 +333,7 @@ impl PageTableManager {
         pt.copy_pml4_entries_from(&self.base_page_table);
 
         let pt = alloc::boxed::Box::new(pt);
-        let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().truncate();
+        let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().trunc();
 
         let mut task_pts = self.task_page_tables.lock();
         task_pts.insert(task_pt_id, pt);
@@ -360,7 +372,7 @@ impl PageTableManager {
 
         // Check CR3 under the same lock to avoid TOCTOU with the removal below.
         let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
-        let cr3_id: usize = cr3_frame.start_address().as_u64().truncate();
+        let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
         if cr3_id == task_pt_id {
             return Err(Errno::EBUSY);
         }
@@ -695,8 +707,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         unsafe {
             self.page_table_manager.current_page_table().unmap_pages(
                 PageRange::<PAGE_SIZE>::new(
-                    page_addr.as_u64().truncate(),
-                    end.align_up(Size4KiB::SIZE).as_u64().truncate(),
+                    page_addr.as_u64().trunc(),
+                    end.align_up(Size4KiB::SIZE).as_u64().trunc(),
                 )
                 .ok_or(DeallocationError::Unaligned)?,
                 false,
@@ -719,13 +731,13 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             .and_then(|end| x86_64::PhysAddr::try_new(end).ok())?;
         let (page_addr, page_aligned_length) =
             self.map_vtl0_phys_range(phys_addr, phys_end, flags).ok()?;
-        let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
+        let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).trunc();
         Some(Vtl0MappedGuard {
             owner: self,
             page_addr,
             page_aligned_length,
             ptr: page_addr.wrapping_add(page_offset),
-            size: size.truncate(),
+            size: size.trunc(),
         })
     }
 
@@ -1058,7 +1070,7 @@ impl<Host: HostInterface> RawMutex<Host> {
                     return Ok(UnblockedOrTimedOut::TimedOut);
                 }
                 Err(e) => {
-                    panic!("Error: {:?}", e);
+                    panic!("Error: {e:?}");
                 }
             }
         }
@@ -1278,7 +1290,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
         let new_range = PageRange::new(new_range.start, new_range.end)
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
-        if old_range.start.max(new_range.start) <= old_range.end.min(new_range.end) {
+        if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
         unsafe {
@@ -1765,6 +1777,7 @@ macro_rules! XRSTOR_VTL1_ASM {
 ///
 /// Prerequisite:
 /// - Store user `rsp` in `r11` before calling this macro.
+/// - Store user `rflags` in `gs:[user_rflags]` before calling this macro.
 /// - Store the userspace return address in `rcx` (`syscall` does this automatically).
 #[cfg(target_arch = "x86_64")]
 macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
@@ -1772,7 +1785,7 @@ macro_rules! SAVE_SYSCALL_USER_CONTEXT_ASM {
         "
         push 0x2b       // pt_regs->ss = __USER_DS
         push r11        // pt_regs->rsp
-        pushfq          // pt_regs->eflags
+        push qword ptr gs:[{user_rflags_off}] // pt_regs->eflags
         push 0x33       // pt_regs->cs = __USER_CS
         push rcx        // pt_regs->rip
         push rax        // pt_regs->orig_rax
@@ -1926,6 +1939,7 @@ unsafe extern "C" fn run_thread_arch(
         ".globl syscall_callback",
         "syscall_callback:",
         "swapgs",
+        "mov gs:[{user_rflags_off}], r11", // store user `rflags`.
         "mov r11, rsp", // store user `rsp` in `r11`
         "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_SYSCALL_USER_CONTEXT_ASM!(),
@@ -1945,6 +1959,8 @@ unsafe extern "C" fn run_thread_arch(
         // - GS = user (swapgs has NOT happened yet)
         ".globl exception_callback",
         "exception_callback:",
+        "cld",
+        "clac",
         "swapgs",
         "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
         "mov al, [rsp]",
@@ -2038,6 +2054,7 @@ unsafe extern "C" fn run_thread_arch(
         vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
         scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
+        user_rflags_off = const { PerCpuVariablesAsm::user_rflags_offset() },
         exception_trapno_off = const { PerCpuVariablesAsm::exception_trapno_offset() },
         is_in_user_off = const { PerCpuVariablesAsm::is_in_user_offset() },
         init_handler = sym init_handler,
@@ -2050,22 +2067,32 @@ unsafe extern "C" fn run_thread_arch(
 
 unsafe extern "C" fn init_handler(thread_ctx: &mut ThreadContext) {
     match thread_ctx.call_shim(|shim, ctx| shim.init(ctx)) {
-        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
-        ContinueOperation::Terminate => {}
+        ContinueOperation::Resume if is_valid_user_ctx(thread_ctx.ctx) => unsafe {
+            switch_to_user(thread_ctx.ctx)
+        },
+        ContinueOperation::Terminate | ContinueOperation::Resume => {}
     }
 }
 
 unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
     match thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx)) {
-        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
-        ContinueOperation::Terminate => {}
+        ContinueOperation::Resume if is_valid_user_ctx(thread_ctx.ctx) => unsafe {
+            switch_to_user(thread_ctx.ctx)
+        },
+        ContinueOperation::Terminate | ContinueOperation::Resume => {}
     }
 }
 
 unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    if !is_valid_user_ctx(thread_ctx.ctx) {
+        return;
+    }
+
     match thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx)) {
-        ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
-        ContinueOperation::Terminate => {}
+        ContinueOperation::Resume if is_valid_user_ctx(thread_ctx.ctx) => unsafe {
+            switch_to_user(thread_ctx.ctx)
+        },
+        ContinueOperation::Terminate | ContinueOperation::Resume => {}
     }
 }
 
@@ -2084,10 +2111,9 @@ unsafe extern "C" fn kernel_exception_handler_no_ctx(
     litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(|| {
         panic!(
             "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
-             Accessed Address: {:#x}\n\
-             Error Code: {:#x}\n\
-             Faulting RIP: {:#x}",
-            cr2, error_code, faulting_rip,
+             Accessed Address: {cr2:#x}\n\
+             Error Code: {error_code:#x}\n\
+             Faulting RIP: {faulting_rip:#x}",
         )
     })
 }
@@ -2115,7 +2141,7 @@ unsafe extern "C" fn exception_handler(
         use litebox::utils::TruncateExt as _;
         litebox::shim::ExceptionInfo {
             exception: litebox::shim::Exception::PAGE_FAULT,
-            error_code: error_code.truncate(),
+            error_code: error_code.trunc(),
             cr2,
             kernel_mode: true,
         }
@@ -2124,7 +2150,7 @@ unsafe extern "C" fn exception_handler(
         use litebox::utils::TruncateExt as _;
         litebox::shim::ExceptionInfo {
             exception: with_per_cpu_variables(|pcv| pcv.asm.get_exception()),
-            error_code: thread_ctx.ctx.orig_rax.truncate(),
+            error_code: thread_ctx.ctx.orig_rax.trunc(),
             cr2,
             kernel_mode: false,
         }
@@ -2136,7 +2162,11 @@ unsafe extern "C" fn exception_handler(
                 0
             } else {
                 // User-mode exception handled; resume user execution.
-                unsafe { switch_to_user(thread_ctx.ctx) }
+                if is_valid_user_ctx(thread_ctx.ctx) {
+                    unsafe { switch_to_user(thread_ctx.ctx) }
+                } else {
+                    0
+                }
             }
         }
         ContinueOperation::Terminate => {

@@ -57,7 +57,7 @@ pub fn seed_initial_heap() {
     let vtl1_start = Platform::va_to_pa(x86_64::VirtAddr::new(vtl1_base_va));
 
     let mem_fill_start =
-        TruncateExt::<usize>::truncate(vtl1_base_va) + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE;
+        TruncateExt::<usize>::trunc(vtl1_base_va) + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE;
     unsafe {
         Platform::mem_fill_pages(mem_fill_start, VTL1_INIT_HEAP_SIZE);
     }
@@ -71,9 +71,9 @@ pub fn seed_initial_heap() {
 
     // Add pre-populated region (_heap_start .. end of Phase 1 mapping).
     let heap_va = get_heap_start_address();
-    let mem_fill_start: usize = heap_va.truncate();
+    let mem_fill_start: usize = heap_va.trunc();
     let heap_phys = Platform::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
-    let heap_offset: usize = TruncateExt::<usize>::truncate(heap_phys - vtl1_start.as_u64());
+    let heap_offset: usize = TruncateExt::<usize>::trunc(heap_phys - vtl1_start.as_u64());
     let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE - heap_offset;
     unsafe {
         Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
@@ -115,9 +115,9 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
         // Re-compute the pre-populated region bounds needed for the
         // remaining-memory add after `Platform::new()` below.
         let heap_va = get_heap_start_address();
-        let mem_fill_start: usize = heap_va.truncate();
+        let mem_fill_start: usize = heap_va.trunc();
         let heap_phys = Platform::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
-        let heap_offset: usize = TruncateExt::<usize>::truncate(heap_phys - start);
+        let heap_offset: usize = TruncateExt::<usize>::trunc(heap_phys - start);
         let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE - heap_offset;
 
         // Text section boundaries. These are used by the platform to mark
@@ -132,9 +132,9 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
         // After two-phase relocation, `get_rela_start/end_address()` return
         // high-canonical VAs. Use directly for the allocator.
         let rela_va = get_rela_start_address();
-        let rela_size: usize = (get_rela_end_address() - rela_va).truncate();
+        let rela_size: usize = (get_rela_end_address() - rela_va).trunc();
         if rela_size > 0 {
-            let rela_virt: usize = rela_va.truncate();
+            let rela_virt: usize = rela_va.trunc();
             unsafe {
                 Platform::mem_fill_pages(rela_virt, rela_size);
             }
@@ -155,7 +155,7 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
             // Reclaim pages 2–12 (PML4, PDPT, PDE, 8 PTE pages)
             let early_pt_pa = vtl1_start + (VTL1_PML4E_PAGE * PAGE_SIZE) as u64;
             let early_pt_start: usize =
-                TruncateExt::<usize>::truncate(Platform::pa_to_va(early_pt_pa).as_u64());
+                TruncateExt::<usize>::trunc(Platform::pa_to_va(early_pt_pa).as_u64());
             let early_pt_size: usize =
                 (VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT - VTL1_PML4E_PAGE) * PAGE_SIZE;
             // Safety: the early page table frames are no longer referenced
@@ -178,7 +178,7 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
             // Reclaim Phase 1 PDPT and PDE pages
             let remap_pt_pa = vtl1_start + (VTL1_REMAP_PDPT_PAGE * PAGE_SIZE) as u64;
             let remap_pt_start: usize =
-                TruncateExt::<usize>::truncate(Platform::pa_to_va(remap_pt_pa).as_u64());
+                TruncateExt::<usize>::trunc(Platform::pa_to_va(remap_pt_pa).as_u64());
             let remap_pt_size: usize = (VTL1_REMAP_PDE_PAGE - VTL1_REMAP_PDPT_PAGE + 1) * PAGE_SIZE;
             unsafe {
                 Platform::mem_fill_pages(remap_pt_start, remap_pt_size);
@@ -195,7 +195,7 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
         // Add the rest of the VTL1 memory to the global allocator once they are mapped to the base page table.
         let mem_fill_start = mem_fill_start + mem_fill_size;
         let vtl1_base_va = Platform::pa_to_va(vtl1_start).as_u64();
-        let mem_fill_size = TruncateExt::<usize>::truncate(
+        let mem_fill_size = TruncateExt::<usize>::trunc(
             size.checked_sub((mem_fill_start as u64) - vtl1_base_va)
                 .expect("remaining VTL1 memory size underflow in init()"),
         );
@@ -248,7 +248,7 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
 /// VTL call is Hyper-V specific. However, in general, there is no fundamental difference
 /// between VTL call and TrustZone SMC call, TDX TDCALL, etc.
 fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
-    let func_id: u32 = params[0].truncate();
+    let func_id: u32 = params[0].trunc();
     let Ok(func_id) = VsmFunction::try_from(func_id) else {
         return Errno::EINVAL.as_neg().into();
     };
@@ -272,7 +272,7 @@ fn optee_smc_handler_entry(smc_args_pfn: u64) -> i64 {
 fn optee_smc_handler_entry_inner(
     smc_args_pfn: u64,
 ) -> Result<i64, litebox_common_linux::errno::Errno> {
-    let smc_args_pfn: usize = smc_args_pfn.truncate();
+    let smc_args_pfn: usize = smc_args_pfn.trunc();
     let smc_args_addr = smc_args_pfn
         .checked_mul(1usize << litebox_platform_lvbs::mshv::vtl1_mem_layout::PAGE_SHIFT)
         .ok_or(litebox_common_linux::errno::Errno::EINVAL)?;
@@ -483,7 +483,7 @@ fn optee_smc_handler(smc_args_addr: usize) -> OpteeSmcArgs {
 /// On success, the session is registered and msg_args is updated with the session ID.
 /// On failure (including TA returning error), msg_args is updated with the error code
 /// and appropriate cleanup is performed (page table teardown for new instances,
-/// instance cleanup for TARGET_DEAD on single-instance TAs with no other sessions).
+/// instance cleanup for TARGET_DEAD on single-instance TAs).
 fn handle_open_session(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
@@ -504,23 +504,12 @@ fn handle_open_session(
         .get_known_flags(&ta_uuid)
         .is_none_or(|f| f.is_single_instance());
 
-    if is_single_instance {
-        // Fast path: Reuse a cached single-instance TA if one exists.
-        if let Some(existing) = session_manager().get_single_instance(&ta_uuid) {
-            return open_session_single_instance(
-                msg_args,
-                msg_args_phys_addr,
-                existing,
-                params,
-                ta_uuid,
-                &ta_req_info,
-            );
-        }
-    }
-
-    // Create a new TA instance. For single-instance TAs, this also re-checks the cache
-    // under the lock and prevents concurrent instance creation of the same UUID.
-    // For multi-instance TAs, only the global capacity limit is enforced.
+    // Resolve or create the TA instance.
+    // For single-instance TAs, `with_creation_slot` re-checks the cache
+    // under its lock and serializes instance creation per UUID.
+    // If a cache hit returns a zombie (an instance torn down by a
+    // concurrent close/panic), evict the dead entry and ask the Linux driver
+    // to retry so it can create a fresh TA instance.
     match session_manager().with_creation_slot(&ta_uuid, is_single_instance, || {
         open_session_new_instance(
             msg_args,
@@ -531,24 +520,46 @@ fn handle_open_session(
             &ta_req_info,
         )
     })? {
-        CreationReservation::ExistingSingleInstance(existing) => open_session_single_instance(
-            msg_args,
-            msg_args_phys_addr,
-            existing,
-            params,
-            ta_uuid,
-            &ta_req_info,
-        ),
+        CreationReservation::ExistingSingleInstance(existing) => {
+            match open_session_single_instance(
+                msg_args,
+                msg_args_phys_addr,
+                existing.clone(),
+                params,
+                ta_uuid,
+                &ta_req_info,
+            )? {
+                OpenSessionOutcome::Handled => Ok(()),
+                OpenSessionOutcome::InstanceDestroyed => {
+                    // Evict the zombie. Analog of OP-TEE's `maybe_release_ta_ctx`
+                    // removing the dead ctx from `tee_ctxes`.
+                    let _ = session_manager().remove_single_instance_if_same(&ta_uuid, &existing);
+                    Err(OpteeSmcReturnCode::EThreadLimit)
+                }
+            }
+        }
         CreationReservation::SlotReserved => Ok(()),
     }
+}
+
+/// Outcome of [`open_session_single_instance`].
+enum OpenSessionOutcome {
+    /// Session was successfully opened, TA returned a non-fatal error, or TA panicked
+    /// and the instance was destroyed inline. No extra cleanup effort is needed.
+    Handled,
+    /// The cached `TaInstance` is `closed` and must not be entered.
+    InstanceDestroyed,
 }
 
 /// Open a new session on an existing single-instance TA.
 ///
 /// Returns `Err(OpteeSmcReturnCode::EThreadLimit)` if the TA instance is currently in use.
 /// The Linux driver will wait and retry automatically.
+/// Returns [`OpenSessionOutcome::InstanceDestroyed`] if the cached TA is closed.
 ///
 /// If the TA's OpenSession entry point returns an error, the session is not registered.
+/// On TARGET_DEAD the cached instance is destroyed unconditionally; any sibling sessions
+/// become orphans that fail-fast on next access via the `instance.closed` check.
 /// For cleanup semantics, see OP-TEE OS `tee_ta_open_session()` in `tee_ta_manager.c`.
 #[allow(clippy::type_complexity)]
 fn open_session_single_instance(
@@ -558,12 +569,18 @@ fn open_session_single_instance(
     params: &[litebox_common_optee::UteeParamOwned],
     ta_uuid: litebox_common_optee::TeeUuid,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
-) -> Result<(), OpteeSmcReturnCode> {
+) -> Result<OpenSessionOutcome, OpteeSmcReturnCode> {
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
-    let instance = instance_arc
+    let mut instance = instance_arc
         .try_lock()
         .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
+
+    // `closed == true` means the instance is terminal and must not be entered.
+    if instance.closed {
+        return Ok(OpenSessionOutcome::InstanceDestroyed);
+    }
+    let task_pt_id = instance.task_page_table_id;
 
     // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID.
     // Use SessionIdGuard to ensure the ID is recycled on any error path
@@ -576,11 +593,10 @@ fn open_session_single_instance(
     debug_serial_println!(
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
         ta_uuid,
-        instance.task_page_table_id,
+        task_pt_id,
         runner_session_id
     );
 
-    let task_pt_id = instance.task_page_table_id;
     let ta_flags = instance.loaded_program.ta_flags;
 
     // Switch to the existing TA's page table
@@ -619,7 +635,7 @@ fn open_session_single_instance(
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
     // Check the return code from the TA's OpenSession entry point
-    let return_code: u32 = ctx.rax.truncate();
+    let return_code: u32 = ctx.rax.trunc();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
     // Per OP-TEE OS: if OpenSession fails, don't register the session
@@ -630,84 +646,92 @@ fn open_session_single_instance(
             return_code
         );
 
-        // For single-instance TAs, only clean up on TARGET_DEAD (panic).
-        // Regular errors (access denied, bad params, etc.) don't mean the TA is dead -
-        // it can still serve future OpenSession requests from other clients.
-        if return_code == TeeResult::TargetDead {
-            // Check if any other sessions are using this instance by counting sessions
-            // in the session map that reference this TA instance.
-            let session_count = session_manager()
-                .sessions()
-                .count_sessions_for_instance(&instance_arc);
-
-            if session_count == 0 {
-                debug_serial_println!(
-                    "Single-instance TA panicked with no other sessions, cleaning up"
-                );
-
-                // Write error response BEFORE switching page tables (accesses user memory)
-                write_msg_args_to_normal_world(
-                    msg_args,
-                    msg_args_phys_addr,
-                    return_code,
-                    None, // No session ID on failure
-                    Some(&ta_params),
-                    Some(ta_req_info),
-                )?;
-
-                session_manager().remove_single_instance(&ta_uuid);
-
-                // Safety: We are about to tear down this TA instance;
-                // no references to user-space memory will be held afterwards.
-                unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
-
-                drop(instance);
-
-                // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
-                // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
-                // cleaning it up. Currently we always clean up on panic.
-
-                return Ok(());
-            }
-        }
-
-        drop(instance);
-
-        // Write error response back to normal world
-        write_msg_args_to_normal_world(
+        // Write error response BEFORE switching page tables (accesses user memory).
+        // Keep the instance lock held until this completes so another core cannot
+        // tear down the active page table while this core is copying TA outputs.
+        let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
             return_code,
             None, // No session ID on failure
             Some(&ta_params),
             Some(ta_req_info),
-        )?;
+        );
 
-        return Ok(());
+        // For single-instance TAs, only clean up on TARGET_DEAD (panic).
+        // Regular errors (access denied, bad params, etc.) don't mean the TA is dead -
+        // it can still serve future OpenSession requests from other clients.
+        if return_code == TeeResult::TargetDead {
+            debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
+
+            let _ = session_manager().remove_single_instance_if_same(&ta_uuid, &instance_arc);
+            instance.closed = true;
+
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
+
+            // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
+            // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
+            // cleaning it up. Currently we always clean up on panic.
+        }
+
+        drop(instance);
+        write_result?;
+        return Ok(OpenSessionOutcome::Handled);
     }
 
-    drop(instance);
-
-    // Success: register session and disarm the guard (ownership transfers to session map)
-    // Safe to unwrap: guard has not been disarmed yet.
-    let runner_session_id = session_id_guard.disarm().unwrap();
-    session_manager().register_session(runner_session_id, instance_arc.clone(), ta_uuid, ta_flags);
-
-    write_msg_args_to_normal_world(
+    // Treat write-back failure as OpenSession failure: do not publish the session.
+    let runner_session_id = session_id_guard.id().unwrap();
+    let write_result = write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
         return_code,
         Some(runner_session_id),
         Some(&ta_params),
         Some(ta_req_info),
-    )?;
+    );
+
+    // Write-back failure: OpenSession succeeded inside the TA, but we cannot
+    // deliver the session id to the normal world, so it will never issue a
+    // matching CloseSession. For a non-keep-alive instance with no siblings
+    // we tear the whole instance down, reclaiming the TA-side state, and the
+    // session id can be recycled normally. For keep-alive or shared
+    // instances the TA still holds session-local state tagged with this id,
+    // so we forget the id (disarm the guard) to prevent a future OpenSession
+    // from reusing it and colliding with the orphaned TA-side bookkeeping.
+    if let Err(e) = write_result {
+        if !ta_flags.is_keep_alive()
+            && session_manager()
+                .sessions()
+                .count_sessions_for_instance(&instance_arc)
+                == 0
+        {
+            let _ = session_manager().remove_single_instance_if_same(&ta_uuid, &instance_arc);
+            instance.closed = true;
+
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
+        } else {
+            let _ = session_id_guard.disarm();
+        }
+        drop(instance);
+        return Err(e);
+    }
+
+    // Success: register session and disarm the guard (ownership transfers to session map)
+    session_manager().register_session(runner_session_id, instance_arc.clone(), ta_uuid, ta_flags);
+    session_id_guard.disarm();
+
+    drop(instance);
 
     debug_serial_println!(
         "OpenSession complete on single-instance TA: session_id={}",
         runner_session_id
     );
 
-    Ok(())
+    Ok(OpenSessionOutcome::Handled)
 }
 
 /// Create a new TA instance for a session.
@@ -788,7 +812,7 @@ fn open_session_new_instance(
     }
 
     // Check ldelf return code (TA_CreateEntryPoint result)
-    let ldelf_return_code: u32 = ldelf_ctx.rax.truncate();
+    let ldelf_return_code: u32 = ldelf_ctx.rax.trunc();
     let ldelf_return_code =
         TeeResult::try_from(ldelf_return_code).unwrap_or(TeeResult::GenericError);
     if ldelf_return_code != TeeResult::Success {
@@ -796,20 +820,22 @@ fn open_session_new_instance(
             "ldelf/TA_CreateEntryPoint failed: return_code={:?}",
             ldelf_return_code
         );
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         // Write error response back to normal world
-        write_msg_args_to_normal_world(
+        let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
             ldelf_return_code,
             None, // No session ID on failure
             None,
             Some(ta_req_info),
-        )?;
+        );
 
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+
+        write_result?;
         return Ok(());
     }
 
@@ -863,7 +889,7 @@ fn open_session_new_instance(
         })?;
 
     // Check the return code from the TA's OpenSession entry point
-    let return_code: u32 = ctx.rax.truncate();
+    let return_code: u32 = ctx.rax.trunc();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
     // Per OP-TEE OS: if OpenSession fails, tear down the instance
@@ -875,40 +901,28 @@ fn open_session_new_instance(
         );
 
         // Write error response back to normal world
-        write_msg_args_to_normal_world(
+        let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
             return_code,
             None, // No session ID on failure
             Some(&ta_params),
             Some(ta_req_info),
-        )?;
+        );
 
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
+        write_result?;
         return Ok(());
     }
 
-    // Success: create TA instance - loaded_program is already boxed, no move happens
-    let instance = Arc::new(SpinMutex::new(TaInstance {
-        shim,
-        loaded_program,
-        task_page_table_id: task_pt_id,
-    }));
-
-    // Cache single-instance TAs for future sessions
-    if ta_flags.is_single_instance() {
-        session_manager().cache_single_instance(ta_uuid, instance.clone());
-    }
-
-    // Disarm the guard: ownership transfers to session manager via register_session.
+    // Write back BEFORE publishing the instance. If the write fails, the
+    // session is neither registered nor cached, so we just tear down the
+    // local resources and let `session_id_guard` recycle the ID on drop.
     // Safe to unwrap: guard has not been disarmed yet.
-    let runner_session_id = session_id_guard.disarm().unwrap();
-    session_manager().register_session(runner_session_id, instance.clone(), ta_uuid, ta_flags);
-
-    // Write success response back to normal world
+    let runner_session_id = session_id_guard.id().unwrap();
     write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
@@ -916,7 +930,29 @@ fn open_session_new_instance(
         Some(runner_session_id),
         Some(&ta_params),
         Some(ta_req_info),
-    )?;
+    )
+    .inspect_err(|_| {
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+    })?;
+
+    // Success: create TA instance - loaded_program is already boxed, no move happens
+    let instance = Arc::new(SpinMutex::new(TaInstance {
+        shim,
+        loaded_program,
+        task_page_table_id: task_pt_id,
+        closed: false,
+    }));
+
+    // Success: register session and disarm the guard (ownership transfers to session map)
+    session_manager().register_session(runner_session_id, instance.clone(), ta_uuid, ta_flags);
+    session_id_guard.disarm();
+
+    // Cache single-instance TAs only after the opening session owns the instance.
+    if ta_flags.is_single_instance() {
+        session_manager().cache_single_instance(ta_uuid, instance.clone());
+    }
 
     debug_serial_println!(
         "OpenSession complete: session_id={}, single_instance={}",
@@ -932,8 +968,7 @@ fn open_session_new_instance(
 /// Looks up the session by ID, switches to its page table, and runs the command.
 ///
 /// Per OP-TEE OS semantics: if the TA panics (returns TARGET_DEAD), the session
-/// should be cleaned up. For single-instance TAs with no other sessions, the
-/// entire instance is destroyed.
+/// should be cleaned up. For single-instance TAs, the entire instance is destroyed.
 fn handle_invoke_command(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
@@ -952,10 +987,23 @@ fn handle_invoke_command(
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
-    let Some(instance) = session_entry.instance.try_lock() else {
+    let Some(mut instance) = session_entry.instance.try_lock() else {
         return Err(OpteeSmcReturnCode::EThreadLimit);
     };
-
+    // `closed == true` means the TA instance is terminal and must not be entered.
+    // The session is orphaned. Report TARGET_DEAD to the client.
+    if instance.closed {
+        drop(instance);
+        session_manager().unregister_session(session_id);
+        msg_args.ret = TeeResult::TargetDead;
+        msg_args.ret_origin = TeeOrigin::Tee;
+        write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
+        debug_serial_println!(
+            "InvokeCommand: session_id={} on closed TA instance",
+            session_id
+        );
+        return Ok(());
+    }
     let task_pt_id = instance.task_page_table_id;
 
     // Switch to the TA instance's page table
@@ -997,11 +1045,24 @@ fn handle_invoke_command(
         .read_at_offset(0)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
-    let return_code: u32 = ctx.rax.truncate();
+    let return_code: u32 = ctx.rax.trunc();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
-    // Per OP-TEE OS: if TA panics (TARGET_DEAD), clean up the session/instance
-    // Reference: tee_ta_invoke_command() in tee_ta_manager.c
+    // Write response BEFORE switching page tables (accesses user memory).
+    // Keep the instance lock held until this completes so another core cannot
+    // tear down the active page table while this core is copying TA outputs.
+    let write_result = write_msg_args_to_normal_world(
+        msg_args,
+        msg_args_phys_addr,
+        return_code,
+        None,
+        Some(&ta_params),
+        Some(&ta_req_info),
+    );
+
+    // Per OP-TEE OS: if TA panics (TARGET_DEAD), the TA context is
+    // unrecoverable; all sessions on the same single-instance TA are
+    // implicitly dead (Ref: tee_ta_invoke_command() in tee_ta_manager.c).
     if return_code == TeeResult::TargetDead {
         debug_serial_println!(
             "InvokeCommand: TA panicked (TARGET_DEAD), session_id={}",
@@ -1010,66 +1071,39 @@ fn handle_invoke_command(
 
         let ta_uuid = session_entry.ta_uuid;
         let ta_flags = session_entry.ta_flags;
-        let instance_arc = session_entry.instance.clone();
 
-        // Remove the session from the map
+        // Remove this session from the map. Sibling sessions on the same
+        // single-instance TA will be cleaned up lazily on their next
+        // invoke/close via the `instance.closed` check.
         session_manager().unregister_session(session_id);
 
-        // Check if this was the last session using the TA instance by counting
-        // remaining sessions that reference this instance.
-        let remaining_sessions = session_manager()
-            .sessions()
-            .count_sessions_for_instance(&instance_arc);
-        let is_last_session = remaining_sessions == 0;
-
-        // Write response BEFORE switching page tables (accesses user memory)
-        write_msg_args_to_normal_world(
-            msg_args,
-            msg_args_phys_addr,
-            return_code,
-            None,
-            Some(&ta_params),
-            Some(&ta_req_info),
-        )?;
-
-        if is_last_session {
-            // Clear single-instance cache if applicable
-            if ta_flags.is_single_instance() {
-                session_manager().remove_single_instance(&ta_uuid);
-            }
-
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            // The lock is held, so no other core can enter the TA.
-            unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
-
-            drop(instance);
-
-            debug_serial_println!(
-                "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
-                task_pt_id
-            );
-
-            // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
-            // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
-            // cleaning it up. Currently we always clean up on panic.
-        } else {
-            drop(instance);
+        // Clear single-instance cache so new OpenSessions for this UUID
+        // create a fresh instance instead of hitting the zombie one.
+        if ta_flags.is_single_instance() {
+            let _ =
+                session_manager().remove_single_instance_if_same(&ta_uuid, &session_entry.instance);
         }
 
-        return Ok(());
+        instance.closed = true;
+
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        // The lock is held, so no other core can enter the TA.
+        unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
+
+        drop(instance);
+
+        debug_serial_println!(
+            "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
+            task_pt_id
+        );
+
+        // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
+        // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
+        // cleaning it up. Currently we always clean up on panic.
     }
 
-    write_msg_args_to_normal_world(
-        msg_args,
-        msg_args_phys_addr,
-        return_code,
-        None,
-        Some(&ta_params),
-        Some(&ta_req_info),
-    )?;
-
-    Ok(())
+    write_result
 }
 
 /// Handle CloseSession command.
@@ -1095,10 +1129,24 @@ fn handle_close_session(
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
-    let Some(instance) = session_entry.instance.try_lock() else {
+    let Some(mut instance) = session_entry.instance.try_lock() else {
         return Err(OpteeSmcReturnCode::EThreadLimit);
     };
-
+    // `closed == true` means the TA instance is terminal and must not be entered.
+    // From the client's perspective the session no longer exists, so
+    // CloseSession is trivially successful.
+    if instance.closed {
+        drop(instance);
+        session_manager().unregister_session(session_id);
+        msg_args.ret = TeeResult::Success;
+        msg_args.ret_origin = TeeOrigin::Tee;
+        write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
+        debug_serial_println!(
+            "CloseSession complete: session_id={}, TA instance closed",
+            session_id
+        );
+        return Ok(());
+    }
     let task_pt_id = instance.task_page_table_id;
 
     // Switch to the TA instance's page table
@@ -1128,14 +1176,14 @@ fn handle_close_session(
     }
 
     // CloseSession always succeeds (TA_CloseSessionEntryPoint returns void)
-    write_msg_args_to_normal_world(
+    let write_result = write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
         TeeResult::Success,
         None,
         None,
         None,
-    )?;
+    );
 
     // Clone the instance Arc before dropping the lock for later cleanup check
     let instance_arc = session_entry.instance.clone();
@@ -1160,13 +1208,15 @@ fn handle_close_session(
                     "CloseSession complete: session_id={}, TA kept alive (INSTANCE_KEEP_ALIVE flag)",
                     session_id
                 );
-                return Ok(());
+                return write_result;
             }
 
             // Clear single-instance cache if this was a single-instance TA
             if entry.ta_flags.is_single_instance() {
-                session_manager().remove_single_instance(&entry.ta_uuid);
+                let _ =
+                    session_manager().remove_single_instance_if_same(&entry.ta_uuid, &instance_arc);
             }
+            instance.closed = true;
 
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
@@ -1175,7 +1225,6 @@ fn handle_close_session(
 
             // Drop the instance to release shim/loaded_program resources
             drop(instance);
-            drop(entry);
 
             debug_serial_println!(
                 "CloseSession complete: deleted task_pt_id={} (last session)",
@@ -1190,7 +1239,7 @@ fn handle_close_session(
         );
     }
 
-    Ok(())
+    write_result
 }
 
 /// Update msg_args with return values and write back to normal world memory.
@@ -1249,7 +1298,7 @@ fn write_msg_args_to_normal_world(
     msg_args.serialize(&mut blob)?;
 
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-        msg_args_phys_addr.truncate(),
+        msg_args_phys_addr.trunc(),
         msg_args_size,
     )?;
     // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
@@ -1275,7 +1324,7 @@ fn write_non_ta_msg_args_to_normal_world(
     msg_args.serialize(&mut blob)?;
 
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-        msg_args_phys_addr.truncate(),
+        msg_args_phys_addr.trunc(),
         msg_args_size,
     )?;
     // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
@@ -1303,7 +1352,7 @@ fn write_rpc_args_to_normal_world(
     let mut blob = vec![0u8; rpc_args_size];
     rpc_args.serialize(&mut blob)?;
 
-    let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::truncate(msg_args_phys_addr)
+    let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::trunc(msg_args_phys_addr)
         .checked_add(msg_args_size)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?; // RPC args are placed right after the main msg_args blob
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(rpc_pa, rpc_args_size)?;

@@ -11,7 +11,7 @@ use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
     platform::{RawConstPointer, RawMutPointer},
-    utils::{ReinterpretSignedExt as _, TruncateExt},
+    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use syscalls::Sysno;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -219,6 +219,7 @@ bitflags::bitflags! {
 }
 
 #[repr(u32)]
+#[derive(IntEnum)]
 pub enum InodeType {
     /// FIFO (named pipe)
     NamedPipe = 0o010000,
@@ -358,7 +359,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
             st_nlink: 1,
-            st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
+            st_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             st_uid: <_>::from(user),
             st_gid: <_>::from(group),
             st_rdev: rdev
@@ -368,6 +369,172 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_size: size,
             st_blksize: blksize,
             st_blocks: 0,
+            ..Default::default()
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Field-selection mask for [`statx`].
+    ///
+    /// Each bit asks the kernel to fill the corresponding field in [`Statx`].
+    /// `STATX__RESERVED` (0x8000_0000) is rejected with `EINVAL` by Linux and
+    /// must not appear in user input.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct StatxMask: u32 {
+        const STATX_TYPE = 0x0000_0001;
+        const STATX_MODE = 0x0000_0002;
+        const STATX_NLINK = 0x0000_0004;
+        const STATX_UID = 0x0000_0008;
+        const STATX_GID = 0x0000_0010;
+        const STATX_ATIME = 0x0000_0020;
+        const STATX_MTIME = 0x0000_0040;
+        const STATX_CTIME = 0x0000_0080;
+        const STATX_INO = 0x0000_0100;
+        const STATX_SIZE = 0x0000_0200;
+        const STATX_BLOCKS = 0x0000_0400;
+        const STATX_BASIC_STATS = Self::STATX_TYPE.bits()
+            | Self::STATX_MODE.bits()
+            | Self::STATX_NLINK.bits()
+            | Self::STATX_UID.bits()
+            | Self::STATX_GID.bits()
+            | Self::STATX_ATIME.bits()
+            | Self::STATX_MTIME.bits()
+            | Self::STATX_CTIME.bits()
+            | Self::STATX_INO.bits()
+            | Self::STATX_SIZE.bits()
+            | Self::STATX_BLOCKS.bits();
+        /// The basic-stats fields LiteBox actually fills. Excludes the
+        /// time bits because `FileStatus` doesn't carry timestamps.
+        const STATX_BASIC_FILLED = Self::STATX_BASIC_STATS.bits()
+            & !(Self::STATX_ATIME.bits() | Self::STATX_MTIME.bits() | Self::STATX_CTIME.bits());
+        const STATX_BTIME = 0x0000_0800;
+        const STATX_MNT_ID = 0x0000_1000;
+        const STATX_DIOALIGN = 0x0000_2000;
+        const STATX_MNT_ID_UNIQUE = 0x0000_4000;
+        const STATX_SUBVOL = 0x0000_8000;
+        const STATX_WRITE_ATOMIC = 0x0001_0000;
+        const STATX_DIO_READ_ALIGN = 0x0002_0000;
+
+        /// Named constant so callers can spell out the EINVAL check explicitly.
+        const STATX__RESERVED = 0x8000_0000;
+
+        /// Accept unknown future bits without truncating; the kernel silently
+        /// ignores them and reports the actual filled set via [`Statx::stx_mask`].
+        const _ = !0;
+    }
+}
+
+/// Linux's `struct statx_timestamp` (16 bytes, `linux/stat.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __reserved: i32,
+}
+
+/// Linux's `struct statx` (256 bytes, `linux/stat.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __spare0: [u16; 1],
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __spare3: [u64; 12],
+}
+
+/// Extract the major component from a Linux `dev_t` (matches `major(3)` from glibc).
+fn dev_major(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)).trunc()
+}
+/// Extract the minor component from a Linux `dev_t` (matches `minor(3)`).
+fn dev_minor(dev: u64) -> u32 {
+    ((dev & 0xff) | ((dev >> 12) & !0xff)).trunc()
+}
+
+impl From<litebox::fs::FileStatus> for Statx {
+    fn from(value: litebox::fs::FileStatus) -> Self {
+        let litebox::fs::FileStatus {
+            file_type,
+            mode,
+            size,
+            owner: litebox::fs::UserInfo { user, group },
+            node_info: litebox::fs::NodeInfo { dev, ino, rdev },
+            blksize,
+            ..
+        } = value;
+        let dev = dev as u64;
+        let rdev = rdev.map_or(0u64, |r| r.get() as u64);
+        Self {
+            stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
+            stx_blksize: blksize.trunc(),
+            stx_nlink: 1,
+            stx_uid: u32::from(user),
+            stx_gid: u32::from(group),
+            stx_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
+            stx_ino: ino as u64,
+            stx_size: size as u64,
+            stx_blocks: 0,
+            stx_rdev_major: dev_major(rdev),
+            stx_rdev_minor: dev_minor(rdev),
+            stx_dev_major: dev_major(dev),
+            stx_dev_minor: dev_minor(dev),
+            ..Default::default()
+        }
+    }
+}
+
+fn statx_timestamp(seconds: i64, nanoseconds: i64) -> StatxTimestamp {
+    StatxTimestamp {
+        tv_sec: seconds,
+        tv_nsec: u32::try_from(nanoseconds).unwrap_or(u32::MAX),
+        ..Default::default()
+    }
+}
+
+impl From<FileStat> for Statx {
+    fn from(value: FileStat) -> Self {
+        Self {
+            stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
+            stx_blksize: value.st_blksize.trunc(),
+            stx_nlink: value.st_nlink.trunc(),
+            stx_uid: value.st_uid,
+            stx_gid: value.st_gid,
+            stx_mode: value.st_mode.trunc(),
+            stx_ino: value.st_ino,
+            stx_size: value.st_size as u64,
+            stx_blocks: value.st_blocks.reinterpret_as_unsigned(),
+            stx_atime: statx_timestamp(value.st_atime, value.st_atime_nsec),
+            stx_ctime: statx_timestamp(value.st_ctime, value.st_ctime_nsec),
+            stx_mtime: statx_timestamp(value.st_mtime, value.st_mtime_nsec),
+            stx_rdev_major: dev_major(value.st_rdev),
+            stx_rdev_minor: dev_minor(value.st_rdev),
+            stx_dev_major: dev_major(value.st_dev),
+            stx_dev_minor: dev_minor(value.st_dev),
             ..Default::default()
         }
     }
@@ -451,19 +618,19 @@ impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
     pub fn try_from(cmd: i32, arg: usize) -> Option<Self> {
         Some(match cmd {
             F_GETFD => Self::GETFD,
-            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.truncate())),
+            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.trunc())),
             F_GETFL => Self::GETFL,
-            F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.truncate())),
+            F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.trunc())),
             F_GETLK => Self::GETLK(Platform::RawMutPointer::from_usize(arg)),
             F_SETLK => Self::SETLK(Platform::RawConstPointer::from_usize(arg)),
             F_SETLKW => Self::SETLKW(Platform::RawConstPointer::from_usize(arg)),
             F_DUPFD => Self::DUPFD {
                 cloexec: false,
-                min_fd: arg.truncate(),
+                min_fd: arg.trunc(),
             },
             F_DUPFD_CLOEXEC => Self::DUPFD {
                 cloexec: true,
-                min_fd: arg.truncate(),
+                min_fd: arg.trunc(),
             },
             _ => return None,
         })
@@ -712,13 +879,13 @@ impl TryFrom<Timespec> for Duration {
     fn try_from(value: Timespec) -> Result<Self, Self::Error> {
         // On 32-bit architectures, `tv_nsec` may be defined in user mode as
         // pointer sized. Ignore any high padding bits.
-        let nsec: usize = value.tv_nsec.truncate();
+        let nsec: usize = value.tv_nsec.trunc();
         if nsec >= 1_000_000_000 {
             return Err(errno::Errno::EINVAL);
         }
         Ok(Duration::new(
             u64::try_from(value.tv_sec).map_err(|_| errno::Errno::EINVAL)?,
-            nsec.truncate(),
+            nsec.trunc(),
         ))
     }
 }
@@ -760,7 +927,7 @@ impl From<Duration> for Timespec32 {
     fn from(value: Duration) -> Self {
         Timespec32 {
             // Silently truncate if needed, just like Linux would do.
-            tv_sec: value.as_secs().reinterpret_as_signed().truncate(),
+            tv_sec: value.as_secs().reinterpret_as_signed().trunc(),
             tv_nsec: value.subsec_nanos(),
         }
     }
@@ -785,7 +952,7 @@ impl TryFrom<TimeVal> for Duration {
     type Error = errno::Errno;
 
     fn try_from(value: TimeVal) -> Result<Self, Self::Error> {
-        let usec: u32 = value.tv_usec.truncate();
+        let usec: u32 = value.tv_usec.trunc();
         if usec >= 1_000_000 {
             return Err(errno::Errno::EINVAL);
         }
@@ -800,7 +967,7 @@ impl From<Duration> for TimeVal {
     fn from(value: Duration) -> Self {
         TimeVal {
             // Silently truncate if needed, just like Linux would do.
-            tv_sec: value.as_secs().reinterpret_as_signed().truncate(),
+            tv_sec: value.as_secs().reinterpret_as_signed().trunc(),
             #[cfg_attr(target_pointer_width = "32", expect(clippy::useless_conversion))]
             tv_usec: value.subsec_micros().into(),
         }
@@ -1136,12 +1303,12 @@ pub fn rlimit64_to_rlimit(rlim: Rlimit64) -> Rlimit {
         rlim_cur: if rlim.rlim_cur >= rlim_t::MAX as u64 {
             rlim_t::MAX
         } else {
-            rlim.rlim_cur.truncate()
+            rlim.rlim_cur.trunc()
         },
         rlim_max: if rlim.rlim_max >= rlim_t::MAX as u64 {
             rlim_t::MAX
         } else {
-            rlim.rlim_max.truncate()
+            rlim.rlim_max.trunc()
         },
     }
 }
@@ -1658,7 +1825,7 @@ pub struct SigSetPack {
 #[repr(C, packed)]
 pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// ptr to socket address structure
-    pub msg_name: Platform::RawConstPointer<u8>,
+    pub msg_name: Platform::RawMutPointer<u8>,
     /// size of socket address structure
     pub msg_namelen: u32,
     /// Explicit padding to match the 4-byte gap that Linux's naturally-aligned
@@ -1674,7 +1841,7 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// number of bytes of ancillary data
     pub msg_controllen: usize,
     /// flags on received message
-    pub msg_flags: SendFlags,
+    pub msg_flags: ReceiveFlags,
     /// Explicit trailing padding to match the 4-byte gap after `msg_flags` in
     /// Linux's naturally-aligned `struct user_msghdr` on 64-bit (total size 56).
     #[cfg(target_pointer_width = "64")]
@@ -1722,6 +1889,31 @@ pub enum SocketcallType {
     Accept4 = 18,
     Recvmmsg = 19,
     Sendmmsg = 20,
+}
+
+/// `how` argument to the `shutdown(2)` syscall.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, IntEnum)]
+pub enum ShutdownHow {
+    /// `SHUT_RD`.
+    Read = 0,
+    /// `SHUT_WR`.
+    Write = 1,
+    /// `SHUT_RDWR`.
+    Both = 2,
+}
+
+impl ShutdownHow {
+    /// Returns `true` when this `how` disables the receive side (`SHUT_RD` or `SHUT_RDWR`).
+    #[must_use]
+    pub fn is_shutdown_read(self) -> bool {
+        matches!(self, Self::Read | Self::Both)
+    }
+    /// Returns `true` when this `how` disables the send side (`SHUT_WR` or `SHUT_RDWR`).
+    #[must_use]
+    pub fn is_shutdown_write(self) -> bool {
+        matches!(self, Self::Write | Self::Both)
+    }
 }
 
 /// Request to syscall handler
@@ -1911,6 +2103,15 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         addr: Option<Platform::RawMutPointer<u8>>,
         addrlen: Platform::RawMutPointer<u32>,
     },
+    Recvmsg {
+        sockfd: i32,
+        msg: Platform::RawMutPointer<UserMsgHdr<Platform>>,
+        flags: ReceiveFlags,
+    },
+    Shutdown {
+        sockfd: i32,
+        how: i32,
+    },
     Bind {
         sockfd: i32,
         sockaddr: Platform::RawConstPointer<u8>,
@@ -2011,6 +2212,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Ftruncate {
         fd: i32,
         length: usize,
+    },
+    Mknodat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode_and_type: u32,
+        dev: u32,
     },
     Unlinkat {
         dirfd: i32,
@@ -2141,10 +2348,18 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Alarm {
         seconds: u32,
     },
+    Pause,
     SetITimer {
         which: IntervalTimer,
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
+    },
+    Statx {
+        dirfd: i32,
+        pathname: Option<Platform::RawConstPointer<i8>>,
+        flags: AtFlags,
+        mask: StatxMask,
+        statxbuf: Platform::RawMutPointer<Statx>,
     },
 }
 
@@ -2352,6 +2567,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::sendto => sys_req!(Sendto { sockfd, buf:*, len, flags, addr:*, addrlen }),
             Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
+            Sysno::recvmsg => sys_req!(Recvmsg { sockfd, msg:*, flags }),
+            Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
             Sysno::setsockopt => sys_req!(Setsockopt {
@@ -2507,6 +2724,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     mode: ctx.sys_req_arg(2),
                 }
             }
+            Sysno::mknodat => sys_req!(Mknodat { dirfd,pathname:*,mode_and_type,dev }),
+            Sysno::mknod => SyscallRequest::Mknodat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode_and_type: ctx.sys_req_arg(1),
+                dev: ctx.sys_req_arg(2),
+            },
             Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
             Sysno::unlink => {
                 // unlink is equivalent to unlinkat with dirfd AT_FDCWD and flags 0
@@ -2602,9 +2826,17 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
+            Sysno::pause => SyscallRequest::Pause,
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::statx => sys_req!(Statx {
+                dirfd,
+                pathname:*,
+                flags,
+                mask,
+                statxbuf:*,
+            }),
             // Noisy unsupported syscalls.
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {
@@ -2830,7 +3062,7 @@ impl PtRegs {
             3 => self.r10,
             4 => self.r8,
             5 => self.r9,
-            _ => panic!("Invalid syscall argument index: {}", idx),
+            _ => panic!("Invalid syscall argument index: {idx}"),
         }
     }
 
@@ -2888,14 +3120,14 @@ macro_rules! reinterpret_truncated_from_usize_for {
         $(
             impl ReinterpretTruncatedFromUsize for $uty {
                 fn reinterpret_truncated_from_usize(v: usize) -> Self {
-                    v.truncate()
+                    v.trunc()
                 }
             }
         )*
         $(
             impl ReinterpretTruncatedFromUsize for $sty {
                 fn reinterpret_truncated_from_usize(v: usize) -> Self {
-                    v.reinterpret_as_signed().truncate()
+                    v.reinterpret_as_signed().trunc()
                 }
             }
         )*
@@ -2928,6 +3160,7 @@ reinterpret_truncated_from_usize_for! {
         EfdFlags,
         RngFlags,
         TimerFlags,
+        StatxMask,
     ],
 }
 

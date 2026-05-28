@@ -124,6 +124,22 @@ impl TaStack {
         Some(())
     }
 
+    /// Zero the unused stack region before a new session writes its parameters,
+    /// to avoid leaking leftover data from a prior session whose stack region was recycled.
+    /// The trailing `UteeParams` slot is left untouched here because
+    /// `set_utee_params` overwrites it in full.
+    fn scrub(&mut self) -> Option<()> {
+        use litebox::mm::linux::PAGE_SIZE;
+        const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+
+        for offset in (0..self.pos).step_by(ZERO_CHUNK.len()) {
+            let len = ZERO_CHUNK.len().min(self.pos - offset);
+            self.stack_top.copy_from_slice(offset, &ZERO_CHUNK[..len])?;
+        }
+
+        Some(())
+    }
+
     /// Push a parameter whose type is `TeeParamType::None` to the stack.
     fn push_param_none(&mut self) -> Option<()> {
         if self.num_params >= UteeParams::TEE_NUM_PARAMS {
@@ -214,6 +230,9 @@ impl TaStack {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
             return None;
         }
+
+        self.scrub()?;
+
         for param in params {
             match param {
                 UteeParamOwned::ValueInput { value_a, value_b } => {
