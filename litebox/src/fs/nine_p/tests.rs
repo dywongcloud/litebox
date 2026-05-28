@@ -3,6 +3,7 @@
 
 extern crate std;
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -448,8 +449,6 @@ fn test_nine_p_host_files_visible() {
 // ---------------------------------------------------------------------------
 // Broken-connection transport: wraps TcpTransport and breaks after N writes
 // ---------------------------------------------------------------------------
-
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A transport wrapper that allows a fixed number of write-message calls to
 /// succeed, then fails all subsequent I/O. This simulates a connection that

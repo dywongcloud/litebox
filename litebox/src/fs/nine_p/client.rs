@@ -5,8 +5,9 @@
 //!
 //! This module provides a high-level client for the 9P2000.L protocol.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
@@ -15,33 +16,70 @@ use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::transport::{self, Read, Write};
 
-/// Fid generator with thread-safe access
-struct FidGenerator<Platform: RawSyncPrimitivesProvider> {
+/// Pool of 9P Fid values
+struct FidPool<Platform: RawSyncPrimitivesProvider> {
     inner: Mutex<Platform, IdPool>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Default for FidGenerator<Platform> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider> FidGenerator<Platform> {
-    /// Create a new fid generator
+impl<Platform: RawSyncPrimitivesProvider> FidPool<Platform> {
     fn new() -> Self {
-        FidGenerator {
+        Self {
             inner: Mutex::new(IdPool::new()),
         }
     }
 
-    /// Allocate a new fid
-    fn next(&self) -> Result<u32, Error> {
-        self.inner.lock().allocate().ok_or(Error::Io)
+    /// Allocate a new fid wrapped in a refcounted handle. The pool slot is
+    /// recycled when the [`Fid`] is dropped.
+    fn allocate(self: &Arc<Self>) -> Result<Fid<Platform>, Error> {
+        let id = self.inner.lock().allocate().ok_or(Error::Io)?;
+        Ok(Fid {
+            inner: Arc::new(FidInner {
+                id,
+                pool: Arc::clone(self),
+            }),
+        })
     }
 
-    /// Release a fid for reuse
-    fn free(&self, id: u32) {
+    /// Return a fid value to the pool.
+    fn recycle(&self, id: fcall::Fid) {
         self.inner.lock().recycle(id);
+    }
+}
+
+/// Refcounted handle to a 9P fid value.
+pub(super) struct Fid<Platform: RawSyncPrimitivesProvider> {
+    inner: Arc<FidInner<Platform>>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Clone for Fid<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Fid<Platform> {
+    /// The wire-level u32 fid for encoding into 9P messages.
+    fn id(&self) -> fcall::Fid {
+        self.inner.id
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> core::fmt::Debug for Fid<Platform> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Fid({})", self.inner.id)
+    }
+}
+
+struct FidInner<Platform: RawSyncPrimitivesProvider> {
+    id: fcall::Fid,
+    pool: Arc<FidPool<Platform>>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Drop for FidInner<Platform> {
+    fn drop(&mut self) {
+        self.pool.recycle(self.id);
     }
 }
 
@@ -64,13 +102,19 @@ pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
     write_state: Mutex<Platform, ClientWriteState<T>>,
     /// Read buffer for responses
     rbuf: Mutex<Platform, Vec<u8>>,
-    /// Fid generator
-    fids: FidGenerator<Platform>,
+    /// Pool of fid values, shared with every live [`Fid`] handle.
+    fids: Arc<FidPool<Platform>>,
     /// Next tag for synchronous operations
     next_tag: AtomicU16,
+    /// Whether the transport state is no longer safe to use.
+    transport_failed: AtomicBool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
+    /// Cap on the number of entries `readdir_all` will accumulate from an
+    /// untrusted server before bailing with `InvalidResponse`.
+    const MAX_READDIR_ENTRIES: usize = 1_000_000;
+
     /// Create a new 9P client and perform version negotiation
     ///
     /// # Arguments
@@ -97,7 +141,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
         .map_err(|_| Error::Io)?;
 
-        let response = transport::read_message(&mut transport, &mut rbuf)?;
+        let response = transport::read_message(&mut transport, &mut rbuf, bufsize as usize)?;
 
         let msize = match response {
             TaggedFcall {
@@ -123,8 +167,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             msize,
             write_state: Mutex::new(ClientWriteState { transport, wbuf }),
             rbuf: Mutex::new(rbuf),
-            fids: FidGenerator::new(),
+            fids: Arc::new(FidPool::new()),
             next_tag: AtomicU16::new(1),
+            transport_failed: AtomicBool::new(false),
         })
     }
 
@@ -133,26 +178,52 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
     {
-        let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
-        if tag == fcall::NOTAG {
-            todo!("tag wraparound");
+        if self.transport_failed.load(Ordering::Acquire) {
+            return Err(Error::Io);
         }
+
+        let tag = self.next_tag();
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        transport::write_message(transport, wbuf, TaggedFcall { tag, fcall })
-            .map_err(|_| Error::Io)?;
+        if transport::write_message(transport, wbuf, TaggedFcall { tag, fcall }).is_err() {
+            self.transport_failed.store(true, Ordering::Release);
+            return Err(Error::Io);
+        }
 
         let mut rbuf = self.rbuf.lock();
-
         // Loop until we get a response with matching tag (in case of stale responses)
         // TODO: support concurrent requests by allowing out-of-order responses and matching tags accordingly
         loop {
-            let response = transport::read_message(transport, &mut rbuf)?;
+            let response = match transport::read_message(transport, &mut rbuf, self.msize as usize)
+            {
+                Ok(response) => response,
+                Err(Error::Io) => {
+                    self.transport_failed.store(true, Ordering::Release);
+                    return Err(Error::Io);
+                }
+                Err(err) => return Err(err),
+            };
             if response.tag == tag {
                 return f(response.fcall);
             }
         }
+    }
+
+    fn next_tag(&self) -> u16 {
+        // NOTAG is reserved for Tversion/Rversion, so cycle through 1..NOTAG.
+        // `fetch_update` returns the value before the update, which is the tag
+        // we want to use for this fcall.
+        self.next_tag
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                debug_assert!(current != fcall::NOTAG);
+                Some(if current == fcall::NOTAG - 1 {
+                    1
+                } else {
+                    current + 1
+                })
+            })
+            .unwrap()
     }
 
     /// Attach to a remote filesystem
@@ -160,58 +231,78 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         &self,
         uname: &str,
         aname: &str,
-    ) -> Result<(fcall::Qid, fcall::Fid), Error> {
-        let fid = self.fids.next()?;
-        let res = self.fcall(
+    ) -> Result<(fcall::Qid, Fid<Platform>), Error> {
+        let fid = self.fids.allocate()?;
+        let id = fid.id();
+        let result = self.fcall(
             Fcall::Tattach(fcall::Tattach {
                 afid: fcall::NOFID,
-                fid,
+                fid: id,
                 n_uname: fcall::NONUNAME,
                 uname: fcall::FcallStr::Borrowed(uname.as_bytes()),
                 aname: fcall::FcallStr::Borrowed(aname.as_bytes()),
             }),
             |response| match response {
-                Fcall::Rattach(fcall::Rattach { qid }) => Ok((qid, fid)),
+                Fcall::Rattach(fcall::Rattach { qid }) => Ok(qid),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
         );
-        if res.is_err() {
-            self.fids.free(fid);
+        match result {
+            Ok(qid) => Ok((qid, fid)),
+            Err(err) => {
+                if !matches!(err, Error::Remote(_)) {
+                    self.clunk(fid);
+                }
+                Err(err)
+            }
         }
-        res
     }
 
     /// Walks the path from the given fid.
     ///
     /// The given wnames should not exceed the maximum number of elements (fcall::MAXWELEM),
     /// which is checked at the beginning of the function. This is an internal function that
-    /// is used by [`walk_chunked`](Client::walk_chunked), which handles the case where the number of elements exceeds the limit.
+    /// is used by [`walk_chunked`](Client::walk_chunked), which handles the case where the
+    /// number of elements exceeds the limit.
     fn walk_once(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         wnames: &[FcallStr],
-    ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
+    ) -> Result<(Vec<fcall::Qid>, Fid<Platform>), Error> {
         if wnames.len() > fcall::MAXWELEM {
             return Err(Error::InvalidPathname);
         }
-        let new_fid = self.fids.next()?;
-        let ret = self.fcall(
+        let new_fid = self.fids.allocate()?;
+        let wnames_len = wnames.len();
+        let result = self.fcall(
             Fcall::Twalk(fcall::Twalk {
-                fid,
-                new_fid,
+                fid: fid.id(),
+                new_fid: new_fid.id(),
                 wnames: wnames.to_vec(),
             }),
             |response| match response {
-                Fcall::Rwalk(fcall::Rwalk { wqids }) => Ok((wqids, new_fid)),
+                Fcall::Rwalk(fcall::Rwalk { wqids }) => {
+                    // A server returning more qids than we requested is a
+                    // protocol violation; reject rather than silently accept.
+                    if wqids.len() > wnames_len {
+                        return Err(Error::InvalidResponse);
+                    }
+                    Ok(wqids)
+                }
                 Fcall::Rlerror(err) => Err(Error::from(err)),
                 _ => Err(Error::InvalidResponse),
             },
         );
-        if ret.is_err() {
-            self.fids.free(new_fid);
+        match result {
+            Ok(wqids) => Ok((wqids, new_fid)),
+            Err(err) => {
+                if !matches!(err, Error::Remote(_)) {
+                    self.clunk(new_fid);
+                }
+                Err(err)
+            }
         }
-        ret
     }
 
     /// Walks the path from the given fid, handling paths longer than fcall::MAXWELEM by walking in chunks.
@@ -219,46 +310,48 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Returns the qids for each path component and a new fid for the final location on success.
     fn walk_chunked(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         wnames: &[FcallStr],
-    ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
+    ) -> Result<(Vec<fcall::Qid>, Fid<Platform>), Error> {
         if wnames.is_empty() {
             return self.walk_once(fid, wnames);
         }
         let mut wqids = Vec::with_capacity(fcall::MAXWELEM);
-        let mut f = fid;
-        for wnames in wnames.chunks(fcall::MAXWELEM) {
-            let (mut new_wqids, new_f) = self.walk_once(f, wnames)?;
+        let mut prev: Option<Fid<Platform>> = None;
+        for chunk in wnames.chunks(fcall::MAXWELEM) {
+            let from = prev.as_ref().unwrap_or(fid);
+            let (mut new_wqids, new_f) = match self.walk_once(from, chunk) {
+                Ok(v) => v,
+                Err(err) => {
+                    if let Some(p) = prev {
+                        self.clunk(p);
+                    }
+                    return Err(err);
+                }
+            };
             let new_len = new_wqids.len();
             wqids.append(&mut new_wqids);
-            // Clunk the old fid if it's not the original fid
-            if f != fid {
-                let _ = self.clunk(f);
+            if let Some(p) = prev.take() {
+                self.clunk(p);
             }
-            f = new_f;
             // It means that the walk failed at the nwqid-th element
-            if new_len < wnames.len() {
-                if wqids
-                    .last()
-                    .is_some_and(|e| e.typ == fcall::QidType::SYMLINK)
-                {
-                    todo!("symlink");
-                }
-                let _ = self.clunk(f);
+            if new_len < chunk.len() {
+                self.clunk(new_f);
                 return Err(Error::Remote(super::ENOENT));
             }
+            prev = Some(new_f);
         }
-        Ok((wqids, f))
+        Ok((wqids, prev.unwrap()))
     }
 
-    /// Walk to a path from a given fid
+    /// Walk to a path from a given fid.
     ///
-    /// Returns the qids for each path component and a new fid for the final location
+    /// Returns the qids for each path component and a new fid for the final location.
     pub(super) fn walk<S: AsRef<[u8]>>(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         wnames: &[S],
-    ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
+    ) -> Result<(Vec<fcall::Qid>, Fid<Platform>), Error> {
         let wnames: Vec<fcall::FcallStr<'_>> = wnames
             .iter()
             .map(|s| fcall::FcallStr::Borrowed(s.as_ref()))
@@ -269,11 +362,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Open a file
     pub(super) fn open(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         flags: fcall::LOpenFlags,
     ) -> Result<fcall::Qid, Error> {
         self.fcall(
-            Fcall::Tlopen(fcall::Tlopen { fid, flags }),
+            Fcall::Tlopen(fcall::Tlopen {
+                fid: fid.id(),
+                flags,
+            }),
             |response| match response {
                 Fcall::Rlopen(fcall::Rlopen { qid, .. }) => Ok(qid),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
@@ -284,48 +380,63 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Create a file with the given name and flags.
     ///
-    /// The input dfid initially represents the parent directory of the new file.
-    /// After the call it represents the new file.
+    /// The input `dfid` initially represents the parent directory of the new
+    /// file; on success the same fid value represents the new file server-side.
+    /// On error, we clunk it here.
     pub(super) fn create(
         &self,
-        dfid: fcall::Fid,
+        dfid: Fid<Platform>,
         name: &str,
         flags: fcall::LOpenFlags,
         mode: u32,
         gid: u32,
-    ) -> Result<(fcall::Qid, fcall::Fid), Error> {
-        self.fcall(
+    ) -> Result<(fcall::Qid, Fid<Platform>), Error> {
+        let res = self.fcall(
             Fcall::Tlcreate(fcall::Tlcreate {
-                fid: dfid,
+                fid: dfid.id(),
                 name: fcall::FcallStr::Borrowed(name.as_bytes()),
                 flags,
                 mode,
                 gid,
             }),
             |response| match response {
-                Fcall::Rlcreate(fcall::Rlcreate { qid, iounit: _ }) => Ok((qid, dfid)),
+                Fcall::Rlcreate(fcall::Rlcreate { qid, iounit: _ }) => Ok(qid),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
-        )
+        );
+        match res {
+            Ok(qid) => Ok((qid, dfid)),
+            Err(err) => {
+                self.clunk(dfid);
+                Err(err)
+            }
+        }
     }
 
     /// Read from a file
     pub(super) fn read(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
-        let count = buf.len().min((self.msize - fcall::IOHDRSZ) as usize);
+        let max_count = self
+            .msize
+            .checked_sub(fcall::IOHDRSZ)
+            .ok_or(Error::InvalidResponse)? as usize;
+        let count = buf.len().min(max_count);
         self.fcall(
             Fcall::Tread(fcall::Tread {
-                fid,
+                fid: fid.id(),
                 offset,
                 count: u32::try_from(count).map_err(|_| Error::InvalidResponse)?,
             }),
             |response| match response {
                 Fcall::Rread(fcall::Rread { data }) => {
+                    if data.len() > count {
+                        return Err(Error::InvalidResponse);
+                    }
                     buf[..data.len()].copy_from_slice(&data);
                     Ok(data.len())
                 }
@@ -336,16 +447,31 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Write to a file
-    pub(super) fn write(&self, fid: fcall::Fid, offset: u64, data: &[u8]) -> Result<usize, Error> {
-        let count = data.len().min((self.msize - fcall::IOHDRSZ) as usize);
+    pub(super) fn write(
+        &self,
+        fid: &Fid<Platform>,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, Error> {
+        let max_count = self
+            .msize
+            .checked_sub(fcall::IOHDRSZ)
+            .ok_or(Error::InvalidResponse)? as usize;
+        let count = data.len().min(max_count);
         self.fcall(
             Fcall::Twrite(fcall::Twrite {
-                fid,
+                fid: fid.id(),
                 offset,
                 data: alloc::borrow::Cow::Borrowed(&data[..count]),
             }),
             |response| match response {
-                Fcall::Rwrite(fcall::Rwrite { count }) => Ok(count as usize),
+                Fcall::Rwrite(fcall::Rwrite { count: written }) => {
+                    let written = written as usize;
+                    if written > count {
+                        return Err(Error::InvalidResponse);
+                    }
+                    Ok(written)
+                }
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
@@ -355,11 +481,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Get file attributes
     pub(super) fn getattr(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         req_mask: GetattrMask,
     ) -> Result<fcall::Rgetattr, Error> {
         self.fcall(
-            Fcall::Tgetattr(fcall::Tgetattr { fid, req_mask }),
+            Fcall::Tgetattr(fcall::Tgetattr {
+                fid: fid.id(),
+                req_mask,
+            }),
             |response| match response {
                 Fcall::Rgetattr(r) => Ok(r),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
@@ -371,12 +500,16 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Set file attributes
     pub(super) fn setattr(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         valid: fcall::SetattrMask,
         stat: fcall::SetAttr,
     ) -> Result<(), Error> {
         self.fcall(
-            Fcall::Tsetattr(fcall::Tsetattr { fid, valid, stat }),
+            Fcall::Tsetattr(fcall::Tsetattr {
+                fid: fid.id(),
+                valid,
+                stat,
+            }),
             |response| match response {
                 Fcall::Rsetattr(_) => Ok(()),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
@@ -392,12 +525,19 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Use [`readdir_all`](Client::readdir_all) to read all entries.
     pub(super) fn readdir(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         offset: u64,
     ) -> Result<Vec<fcall::DirEntry<'static>>, Error> {
-        let count = self.msize - fcall::READDIRHDRSZ;
+        let count = self
+            .msize
+            .checked_sub(fcall::READDIRHDRSZ)
+            .ok_or(Error::InvalidResponse)?;
         self.fcall(
-            Fcall::Treaddir(fcall::Treaddir { fid, offset, count }),
+            Fcall::Treaddir(fcall::Treaddir {
+                fid: fid.id(),
+                offset,
+                count,
+            }),
             |response| match response {
                 Fcall::Rreaddir(fcall::Rreaddir { data }) => Ok(data
                     .data
@@ -413,7 +553,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Read all directory entries
     pub(super) fn readdir_all(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
     ) -> Result<Vec<fcall::DirEntry<'static>>, Error> {
         let mut all_entries = Vec::new();
         let mut offset = 0u64;
@@ -422,7 +562,15 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             if entries.is_empty() {
                 break;
             }
-            offset = entries.last().unwrap().offset;
+            let next_offset = entries.last().unwrap().offset;
+            if all_entries
+                .len()
+                .checked_add(entries.len())
+                .is_none_or(|len| len > Self::MAX_READDIR_ENTRIES)
+            {
+                return Err(Error::InvalidResponse);
+            }
+            offset = next_offset;
             all_entries.extend(entries);
         }
         Ok(all_entries)
@@ -431,14 +579,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Create a directory
     pub(super) fn mkdir(
         &self,
-        dfid: fcall::Fid,
+        dfid: &Fid<Platform>,
         name: &str,
         mode: u32,
         gid: u32,
     ) -> Result<fcall::Qid, Error> {
         self.fcall(
             Fcall::Tmkdir(fcall::Tmkdir {
-                dfid,
+                dfid: dfid.id(),
                 name: fcall::FcallStr::Borrowed(name.as_bytes()),
                 mode,
                 gid,
@@ -451,23 +599,29 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
-    /// Remove the file represented by fid and clunk the fid, even if the remove fails
-    pub(super) fn remove(&self, fid: fcall::Fid) -> Result<(), Error> {
+    /// Remove the file represented by fid and clunk the fid, even if the remove fails.
+    pub(super) fn remove(&self, fid: Fid<Platform>) -> Result<(), Error> {
         self.fcall(
-            Fcall::Tremove(fcall::Tremove { fid }),
+            Fcall::Tremove(fcall::Tremove { fid: fid.id() }),
             |response| match response {
                 Fcall::Rremove(_) => Ok(()),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
         )
+        // `fid` drops here regardless of result
     }
 
     /// Remove (unlink) a file or directory
-    pub(super) fn unlinkat(&self, dfid: fcall::Fid, name: &str, flags: u32) -> Result<(), Error> {
+    pub(super) fn unlinkat(
+        &self,
+        dfid: &Fid<Platform>,
+        name: &str,
+        flags: u32,
+    ) -> Result<(), Error> {
         self.fcall(
             Fcall::Tunlinkat(fcall::Tunlinkat {
-                dfid,
+                dfid: dfid.id(),
                 name: fcall::FcallStr::Borrowed(name.as_bytes()),
                 flags,
             }),
@@ -483,14 +637,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     #[expect(dead_code)]
     pub(super) fn rename(
         &self,
-        fid: fcall::Fid,
-        dfid: fcall::Fid,
+        fid: &Fid<Platform>,
+        dfid: &Fid<Platform>,
         name: &str,
     ) -> Result<(), Error> {
         self.fcall(
             Fcall::Trename(fcall::Trename {
-                fid,
-                dfid,
+                fid: fid.id(),
+                dfid: dfid.id(),
                 name: fcall::FcallStr::Borrowed(name.as_bytes()),
             }),
             |response| match response {
@@ -503,10 +657,10 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Fsync a file
     #[expect(dead_code)]
-    pub(super) fn fsync(&self, fid: fcall::Fid, datasync: bool) -> Result<(), Error> {
+    pub(super) fn fsync(&self, fid: &Fid<Platform>, datasync: bool) -> Result<(), Error> {
         self.fcall(
             Fcall::Tfsync(fcall::Tfsync {
-                fid,
+                fid: fid.id(),
                 datasync: u32::from(datasync),
             }),
             |response| match response {
@@ -517,31 +671,23 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
-    /// Clunk (close) a fid
-    pub(super) fn clunk(&self, fid: fcall::Fid) -> Result<(), Error> {
-        let result = self.fcall(
-            Fcall::Tclunk(fcall::Tclunk { fid }),
+    /// Clunk (close) a fid.
+    pub(super) fn clunk(&self, fid: Fid<Platform>) {
+        let _ = self.fcall(
+            Fcall::Tclunk(fcall::Tclunk { fid: fid.id() }),
             |response| match response {
                 Fcall::Rclunk(_) => Ok(()),
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
         );
-        self.fids.free(fid);
-        result
+        // Per 9P2000.L semantics, the server-side fid is destroyed even if clunk fails.
     }
 
     /// Clone a fid (walk with empty path)
-    pub(super) fn clone_fid(&self, fid: fcall::Fid) -> Result<fcall::Fid, Error> {
+    pub(super) fn clone_fid(&self, fid: &Fid<Platform>) -> Result<Fid<Platform>, Error> {
         let empty: [&str; 0] = [];
         let (_, new_fid) = self.walk(fid, &empty)?;
         Ok(new_fid)
-    }
-
-    /// Release a fid back to the pool without clunking
-    ///
-    /// Use this when the fid has already been invalidated (e.g., after remove)
-    pub(super) fn free_fid(&self, fid: fcall::Fid) {
-        self.fids.free(fid);
     }
 }

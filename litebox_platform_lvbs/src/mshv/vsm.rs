@@ -47,7 +47,7 @@ use core::{
     ops::Range,
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
 };
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
 use spin::Once;
@@ -124,7 +124,7 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, VsmError> 
 pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Boot APs");
     let cpu_online_mask_page_addr = cpu_online_mask_pfn
-        .checked_shl(PAGE_SHIFT.truncate())
+        .checked_shl(PAGE_SHIFT.trunc())
         .and_then(|pa| PhysAddr::try_new(pa).ok())
         .ok_or(VsmError::InvalidPhysicalAddress)?;
 
@@ -147,7 +147,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64) -> Result<i64, VsmError> {
 
     // Initialize VTL for each online CPU and update its boot signal byte
     cpu_mask.for_each_cpu(|cpu_id| {
-        let cpu_id_u32: u32 = cpu_id.truncate();
+        let cpu_id_u32: u32 = cpu_id.trunc();
         if let Err(e) = init_vtl_ap(cpu_id_u32) {
             error = Some(e);
         }
@@ -347,6 +347,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
 
     let mut system_certs_mem = MemoryContainer::new();
     let mut kexec_trampoline_metadata = KexecMemoryMetadata::new();
+    let mut kexec_trampoline_insert_failed = false;
     let mut patch_info_mem = MemoryContainer::new();
     let mut kinfo_mem = MemoryContainer::new();
     let mut kdata_mem = MemoryContainer::new();
@@ -361,7 +362,12 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
                     .extend_range(heki_range)
                     .map_err(|_| VsmError::InvalidInputAddress)?,
                 HekiKdataType::KexecTrampoline => {
-                    kexec_trampoline_metadata.insert_heki_range(heki_range)?;
+                    if let Err(e) = kexec_trampoline_metadata.insert_heki_range(heki_range) {
+                        debug_serial_println!(
+                            "VSM: KexecTrampoline insert_heki_range failed ({e:?}); skipping kexec trampoline protection"
+                        );
+                        kexec_trampoline_insert_failed = true;
+                    }
                 }
                 HekiKdataType::PatchInfo => patch_info_mem
                     .extend_range(heki_range)
@@ -412,11 +418,17 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     vtl0_info.set_system_certificates(certs.clone());
     debug_serial_println!("VSM: Loaded {} system certificate(s)", certs.len());
 
-    for kexec_trampoline_range in &kexec_trampoline_metadata {
-        protect_physical_memory_range(
-            kexec_trampoline_range.phys_frame_range,
-            MemAttr::MEM_ATTR_READ,
-        )?;
+    // ToDo: Remove kexec_trampoline_insert_failed and protect kexec_trampoline_metadata
+    // once we have a better solution to handle the non-page-aligned kexec trampoline metadata.
+    // The current solution is to skip protecting kexec trampoline metadata if its insert_heki_range
+    // fails, letting kdata load proceed so that heki is not broken.
+    if !kexec_trampoline_insert_failed {
+        for kexec_trampoline_range in &kexec_trampoline_metadata {
+            protect_physical_memory_range(
+                kexec_trampoline_range.phys_frame_range,
+                MemAttr::MEM_ATTR_READ,
+            )?;
+        }
     }
 
     // pre-computed patch data for the kernel text
@@ -822,7 +834,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         core::cmp::min(PAGE_SIZE, core::mem::size_of::<HekiPatch>())
     } else {
         core::cmp::min(
-            (patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).truncate(),
+            (patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).trunc(),
             core::mem::size_of::<HekiPatch>(),
         )
     };
@@ -833,7 +845,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         return Err(VsmError::InvalidInputAddress);
     }
 
-    if patch_pa_1.is_null()
+    let heki_patch = if patch_pa_1.is_null()
         || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
     {
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPatch>(patch_pa_0) }
@@ -853,11 +865,13 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
                 return Err(VsmError::Vtl0CopyFailed);
             }
         }
-        if heki_patch.is_valid() {
-            Ok(heki_patch)
-        } else {
-            Err(VsmError::InvalidInputAddress)
-        }
+        Ok(heki_patch)
+    }?;
+
+    if heki_patch.is_valid() {
+        Ok(heki_patch)
+    } else {
+        Err(VsmError::InvalidInputAddress)
     }
 }
 
@@ -869,7 +883,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
     let heki_patch_pa_1 = PhysAddr::new(heki_patch.pa[1]);
 
     let patch_target_page_offset: usize =
-        (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).truncate();
+        (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc();
     let bytes_in_first_page = PAGE_SIZE - patch_target_page_offset;
 
     if heki_patch_pa_1.is_null()
@@ -959,7 +973,7 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
         VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[0], params[1], params[2]),
         VsmFunction::PatchText => mshv_vsm_patch_text(params[0], params[1]),
         VsmFunction::AllocateRingbufferMemory => {
-            let size: usize = params[1].truncate();
+            let size: usize = params[1].trunc();
             mshv_vsm_allocate_ringbuffer_memory(params[0], size)
         }
         VsmFunction::SetPlatformRootKey => mshv_vsm_set_platform_root_key(params[0]),
@@ -1107,19 +1121,23 @@ impl Vtl0KernelInfo {
         self.system_certs.get().map(|b| &**b)
     }
 
-    // This function finds the precomputed patch data corresponding to the input patch data.
-    // We need this because each step of `mshv_vsm_patch_data`/`text_poke_bp_batch` only
-    // provides a part of the patch data and addresses (`patch[0]` or `patch[1..patch_size-1]`).
+    /// This function finds the precomputed patch data corresponding to the input patch data.
+    ///
+    /// Each step of `text_poke_bp_batch` only exposes a portion of the target's address range,
+    /// so we look up in the precomputed map by two keys derived from `patch_data.pa[0]`:
+    /// - `pa[0]` matches step 1 or 3 (target's first byte) and, for a precomputed patch that
+    ///   straddles at offset 1, step 2.
+    /// - `pa[0] - 1` matches step 2 where `patch.pa[0] == precomputed.pa[0] + 1`.
+    ///
+    /// No legitimate step requires looking up by `patch.pa[1]`.
     pub fn find_precomputed_patch(&self, patch_data: &HekiPatch) -> Option<HekiPatch> {
         // `HekiPatch::is_valid` already validated both physical addresses.
         let patch_pa_0 = PhysAddr::new(patch_data.pa[0]);
         let patch_pa_0_prev = patch_data.pa[0].checked_sub(1).map(PhysAddr::new);
-        let patch_pa_1 = PhysAddr::new(patch_data.pa[1]);
 
         self.precomputed_patches
             .get(patch_pa_0)
             .or_else(|| patch_pa_0_prev.and_then(|pa| self.precomputed_patches.get(pa)))
-            .or_else(|| self.precomputed_patches.get(patch_pa_1))
             .or(None)
     }
 }
@@ -1346,43 +1364,85 @@ impl<'a> ModuleMemoryMetadataIters<'a> {
 /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
 /// `pa` and `nranges` specify the physical address range containing one or more than one `HekiPage` structures.
 fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
-    let mut next_pa = PhysAddr::try_new(pa).ok()?;
-    let mut heki_pages = Vec::with_capacity(nranges.truncate());
+    let mut heki_pages = Vec::with_capacity(nranges.trunc());
+    let mut visited_pages = HashSet::new();
     let mut range: u64 = 0;
 
+    let mut cur_pa = PhysAddr::try_new(pa).ok()?;
     while range < nranges {
-        let heki_page =
-            (unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(next_pa) })?;
+        if visited_pages.contains(&cur_pa.as_u64()) {
+            return None;
+        }
+        let heki_page = (unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(cur_pa) })?;
         if !heki_page.is_valid() {
             return None;
         }
+        visited_pages.insert(cur_pa.as_u64());
 
         range = range.checked_add(heki_page.nranges)?;
+        if range < nranges && (heki_page.next_pa == 0 || visited_pages.contains(&heki_page.next_pa))
+        {
+            return None;
+        }
         // `HekiPage::is_valid` already validated `next_pa`.
-        next_pa = PhysAddr::new(heki_page.next_pa);
+        cur_pa = PhysAddr::new(heki_page.next_pa);
         heki_pages.push(*heki_page);
     }
 
     Some(heki_pages)
 }
 
-/// This function protects a VTL0 physical memory range from potentially compromised VTL0 by
-/// restricting its access permissions using VTL protection mask (e.g., kernel code integrity).
-/// It is a safe wrapper for `hv_modify_vtl_protection_mask`. `phys_frame_range` specifies the
-/// physical frame range to protect (must belong to VTL0) `mem_attr` specifies the memory
-/// attributes (VTL0's allowed access) to be applied to the range
-#[inline]
+/// Protects a VTL0 physical memory range from potentially compromised VTL0 by restricting its
+/// access permissions using VTL protection mask (e.g., kernel code integrity).
+///
+/// If the requested range overlaps with VTL1 working memory, the VTL1 portion is silently
+/// skipped and only the remaining VTL0 portions are protected. If the range falls entirely
+/// within VTL1, this function returns `Ok(())` without issuing a hypercall.
+///
+/// `phys_frame_range` specifies the physical frame range to protect (must belong to VTL0).
+/// `mem_attr` specifies the memory attributes (VTL0's allowed access) to be applied.
 pub(crate) fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), VsmError> {
     let vtl1_range = crate::platform_low().vtl1_phys_frame_range();
-    if phys_frame_range.start < vtl1_range.end && vtl1_range.start < phys_frame_range.end {
-        return Err(VsmError::Vtl1MemoryOverlap);
+
+    // Fast path: no overlap with VTL1 — protect the entire range directly.
+    let overlaps_vtl1 =
+        phys_frame_range.start < vtl1_range.end && vtl1_range.start < phys_frame_range.end;
+
+    if !overlaps_vtl1 {
+        let pa = phys_frame_range.start.start_address().as_u64();
+        let num_pages = phys_frame_range.count() as u64;
+        hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
+            .map_err(VsmError::HypercallFailed)?;
+        return Ok(());
     }
-    let pa = phys_frame_range.start.start_address().as_u64();
-    let num_pages = phys_frame_range.count() as u64;
-    if num_pages > 0 {
+
+    // Range fully within VTL1 — nothing to protect for VTL0.
+    if phys_frame_range.start >= vtl1_range.start && phys_frame_range.end <= vtl1_range.end {
+        return Ok(());
+    }
+
+    // Partial overlap: split into the portions before and after VTL1, skipping VTL1 pages.
+    let sub_ranges: [PhysFrameRange<Size4KiB>; 2] = {
+        let before = PhysFrame::range(
+            phys_frame_range.start,
+            core::cmp::min(phys_frame_range.end, vtl1_range.start),
+        );
+        let after = PhysFrame::range(
+            core::cmp::max(phys_frame_range.start, vtl1_range.end),
+            phys_frame_range.end,
+        );
+        [before, after]
+    };
+
+    for sub_range in sub_ranges {
+        if sub_range.start >= sub_range.end {
+            continue;
+        }
+        let pa = sub_range.start.start_address().as_u64();
+        let num_pages = sub_range.count() as u64;
         hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
             .map_err(VsmError::HypercallFailed)?;
     }
@@ -1557,7 +1617,7 @@ impl MemoryContainer {
         let mut len: usize = 0;
         if self.buf.is_empty() {
             for range in &self.range {
-                let range_len: usize = range.len.truncate();
+                let range_len: usize = range.len.trunc();
                 len = len
                     .checked_add(range_len)
                     .ok_or(MemoryContainerError::Overflow)?;
@@ -1584,7 +1644,7 @@ impl MemoryContainer {
         phys_start: PhysAddr,
         phys_end: PhysAddr,
     ) -> Result<(), MemoryContainerError> {
-        let mut bytes_to_copy: usize = (phys_end - phys_start).truncate();
+        let mut bytes_to_copy: usize = (phys_end - phys_start).trunc();
         let mut phys_cur = phys_start;
 
         while phys_cur < phys_end {
@@ -1595,7 +1655,7 @@ impl MemoryContainer {
                 return Err(MemoryContainerError::CopyFromVtl0Failed);
             };
 
-            let src_offset: usize = (phys_cur - phys_aligned).truncate();
+            let src_offset: usize = (phys_cur - phys_aligned).trunc();
             let src_len = core::cmp::min(bytes_to_copy, PAGE_SIZE - src_offset);
             let src = &page.0[src_offset..src_offset + src_len];
 
@@ -1746,9 +1806,9 @@ impl KexecMemoryRange {
             virt_addr: VirtAddr::new(virt_addr),
             phys_frame_range: PhysFrame::range(
                 PhysFrame::from_start_address(phys_start)
-                    .expect("validated kexec memory start address is page-aligned"),
+                    .expect("kexec memory start address is not page-aligned"),
                 PhysFrame::from_start_address(phys_end)
-                    .expect("validated kexec memory end address is page-aligned"),
+                    .expect("kexec memory end address is not page-aligned"),
             ),
         }
     }
@@ -1838,7 +1898,7 @@ impl PatchDataMap {
                 break;
             };
 
-            let patch_index: usize = patch_info.patch_index.truncate();
+            let patch_index: usize = patch_info.patch_index.trunc();
             let total_patch_size = core::mem::size_of::<HekiPatch>()
                 .checked_mul(patch_index)
                 .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
@@ -2013,12 +2073,12 @@ impl SymbolTable {
             return Err(VsmError::SymbolTableOutOfRange);
         }
 
-        let kinfo_len: usize = (end - start).truncate();
+        let kinfo_len: usize = (end - start).trunc();
         if !kinfo_len.is_multiple_of(HekiKernelSymbol::KSYM_LEN) {
             return Err(VsmError::SymbolTableLengthInvalid);
         }
 
-        let mut kinfo_offset: usize = (start - range.start).truncate();
+        let mut kinfo_offset: usize = (start - range.start).trunc();
         let mut kinfo_addr = start;
         let ksym_count = kinfo_len / HekiKernelSymbol::KSYM_LEN;
         let mut inner = self.inner.write();

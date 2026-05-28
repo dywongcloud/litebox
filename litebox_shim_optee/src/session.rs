@@ -115,8 +115,15 @@ pub struct TaInstance {
     /// Boxed to keep it at a fixed heap address - the Task inside must not be moved
     /// after initialization because it contains internal state that may not survive moves.
     pub loaded_program: alloc::boxed::Box<LoadedProgram>,
-    /// The task page table ID associated with this TA instance.
+    /// The task page table ID associated with this TA instance. Valid only
+    /// while `closed == false`.
     pub task_page_table_id: usize,
+    /// Set when the TA is committed to teardown (panic or last session closed). Any lock
+    /// holders should check `closed` before touching `task_page_table_id` and bail if true.
+    ///
+    /// The per-instance lock must be held when setting `closed = true` and across
+    /// the subsequent `teardown_ta_page_table`.
+    pub closed: bool,
 }
 
 // SAFETY: TaInstance is protected by SpinMutex and try_lock (`SessionEntry`)
@@ -237,9 +244,16 @@ impl SingleInstanceCache {
         self.inner.lock().insert(uuid, instance);
     }
 
-    /// Remove a cached single-instance TA by UUID.
-    pub fn remove(&self, uuid: &TeeUuid) -> Option<Arc<SpinMutex<TaInstance>>> {
-        self.inner.lock().remove(uuid)
+    /// Remove a cached single-instance TA only if it is the expected instance.
+    fn remove_if_same(&self, uuid: &TeeUuid, expected: &Arc<SpinMutex<TaInstance>>) -> bool {
+        let mut guard = self.inner.lock();
+        match guard.get(uuid) {
+            Some(current) if Arc::ptr_eq(current, expected) => {
+                guard.remove(uuid);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Get the number of cached single-instance TAs.
@@ -381,11 +395,6 @@ impl SessionManager {
         &self.single_instance_cache
     }
 
-    /// Get a cached single-instance TA by UUID.
-    pub fn get_single_instance(&self, uuid: &TeeUuid) -> Option<Arc<SpinMutex<TaInstance>>> {
-        self.single_instance_cache.get(uuid)
-    }
-
     /// Cache a single-instance TA.
     pub fn cache_single_instance(&self, uuid: TeeUuid, instance: Arc<SpinMutex<TaInstance>>) {
         self.single_instance_cache.insert(uuid, instance);
@@ -431,9 +440,14 @@ impl SessionManager {
         entry
     }
 
-    /// Remove a single-instance TA from the cache.
-    pub fn remove_single_instance(&self, uuid: &TeeUuid) -> Option<Arc<SpinMutex<TaInstance>>> {
-        self.single_instance_cache.remove(uuid)
+    /// Remove a single-instance TA from the cache only if the currently
+    /// cached `Arc` is the same as `expected`.
+    pub fn remove_single_instance_if_same(
+        &self,
+        uuid: &TeeUuid,
+        expected: &Arc<SpinMutex<TaInstance>>,
+    ) -> bool {
+        self.single_instance_cache.remove_if_same(uuid, expected)
     }
 
     /// Get the total count of unique TA instances (for limit checking).
@@ -486,8 +500,9 @@ impl SessionManager {
             let mut state = self.creation_state.lock();
 
             if is_single_instance {
-                // Re-check single-instance cache under the creation lock to close
-                // the TOCTOU window between the caller's get_single_instance() and here.
+                // Check the single-instance cache under the creation lock. A
+                // hit means another core finished creating the instance for
+                // this UUID; reuse it instead of starting a new load.
                 if let Some(existing) = self.single_instance_cache.get(uuid) {
                     return Ok(CreationReservation::ExistingSingleInstance(existing));
                 }

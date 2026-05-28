@@ -66,21 +66,31 @@ pub fn validate_kernel_module_against_elf(
 
     for target_section_name in sections_to_validate() {
         // section loaded in memory (with VTL0's relocations and patches applied)
-        let section_memory_container = module_memory
-            .find_section_by_name(target_section_name)
-            .expect("Section not found in module memory");
-        if section_memory_container.is_empty() {
-            continue;
-        }
+        let Some(section_memory_container) =
+            module_memory.find_section_by_name(target_section_name)
+        else {
+            return Err(KernelElfError::SectionNotFound);
+        };
 
-        let Some(target_shdr) = shdrs.iter().find(|s| {
+        let header = shdrs.iter().find(|s| {
             s.sh_flags & u64::from(SHF_ALLOC) != 0
                 && s.sh_size > 0
                 && shdr_strtab
                     .get(s.sh_name as usize)
                     .is_ok_and(|n| n == target_section_name)
-        }) else {
-            return Err(KernelElfError::SectionNotFound);
+        });
+        let target_shdr = match (header, section_memory_container.is_empty()) {
+            // ELF has no matching section and memory section is also empty -> nothing to validate
+            (None, true) => continue,
+            // ELF has no matching section but memory section has bytes -> suspicious
+            (None, false) => return Err(KernelElfError::SectionNotFound),
+            // ELF has content but memory section is empty -> mismatch
+            (Some(_), true) => {
+                result = false;
+                continue;
+            }
+            // ELF has content and memory section has bytes -> do validation
+            (Some(shdr), false) => shdr,
         };
 
         let elf_params = ElfParams {
@@ -284,7 +294,7 @@ fn identify_indirect_relocations(
                         Err(elf::ParseError::IntegerOverflow)
                     }
                 })
-                .is_ok()
+                .is_ok_and(|belongs_to_target| belongs_to_target)
             {
                 let reloc_size: usize = match rela.r_type {
                     R_X86_64_64 => 8,
@@ -626,18 +636,37 @@ const JMP32_INSN_SIZE: u8 = 5;
 /// Refer [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/arch/x86/kernel/alternative.c#L2164)
 pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
     // step 1
-    if patch_data.size == 1 && patch_data.code[0] == INT3_INSN_OPCODE {
+    if patch_data.size == 1
+        && patch_data.code[0] == INT3_INSN_OPCODE
+        && patch_data.pa[0] == precomputed_patch.pa[0]
+    {
         return true;
     }
 
     let offset: usize = if patch_data.size == 1 && patch_data.pa[0] == precomputed_patch.pa[0] {
         0 // step 3
-    } else if patch_data.size == precomputed_patch.size - 1
-        && (patch_data.pa[0] == precomputed_patch.pa[0] + 1
-            || (patch_data.pa[0] == precomputed_patch.pa[1]
-                && (precomputed_patch.pa[0] + 1).is_multiple_of(Size4KiB::SIZE)))
-    {
-        1 // step 2
+    } else if patch_data.size == precomputed_patch.size - 1 {
+        let Some(precomputed_patch_second_byte_pa) = precomputed_patch.pa[0].checked_add(1) else {
+            return false;
+        };
+        let precomputed_patch_second_byte_pa_aligned =
+            precomputed_patch_second_byte_pa.is_multiple_of(Size4KiB::SIZE);
+
+        if patch_data.pa[0] != precomputed_patch_second_byte_pa
+            && !(patch_data.pa[0] == precomputed_patch.pa[1]
+                && precomputed_patch_second_byte_pa_aligned)
+        {
+            return false;
+        }
+
+        // step 2. `apply_vtl0_text_patch` uses `patch_data.pa[1]` only when
+        // `patch_data.pa[0]` leaves the remainder of the patch on the next page.
+        // For a legitimate step 2, that next page is the precomputed patch's pa[1].
+        if !precomputed_patch_second_byte_pa_aligned && patch_data.pa[1] != precomputed_patch.pa[1]
+        {
+            return false;
+        }
+        1
     } else {
         return false;
     };
@@ -664,6 +693,35 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
 pub fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
     validate_text_poke_bp_batch(patch_data, precomputed_patch)
     // TODO: support other patching methods
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn patch(pa: [u64; 2], code: &[u8]) -> HekiPatch {
+        let mut patch = HekiPatch::default();
+        patch.pa = pa;
+        patch.size = u8::try_from(code.len()).expect("test patch code is too length");
+        patch.code[..code.len()].copy_from_slice(code);
+        patch
+    }
+
+    #[test]
+    fn validate_text_poke_bp_batch_accepts_step_2_starting_on_second_page() {
+        let precomputed = patch([0x1fff, 0x2000], &[0xe9, 0x01, 0x02, 0x03, 0x04]);
+        let patch_data = patch([precomputed.pa[1], 0], &[0x01, 0x02, 0x03, 0x04]);
+
+        assert!(validate_text_poke_bp_batch(&patch_data, &precomputed));
+    }
+
+    #[test]
+    fn validate_text_poke_bp_batch_rejects_straddling_step_2_wrong_pa_1() {
+        let precomputed = patch([0x1ffe, 0x2000], &[0xe9, 0x01, 0x02]);
+        let patch_data = patch([precomputed.pa[0] + 1, 0x3000], &[0x01, 0x02]);
+
+        assert!(!validate_text_poke_bp_batch(&patch_data, &precomputed));
+    }
 }
 
 /// Errors for kernel ELF validation and relocation.

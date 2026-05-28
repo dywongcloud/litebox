@@ -595,3 +595,68 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+/// Regression test for a bug where readers can be permanently starved on
+/// platforms where `wake_one` does not report whether it actually woke a thread
+/// (e.g. Windows with `WakeByAddressSingle`).
+#[test]
+fn test_rwlock_readers_not_starved_after_writer_handoff() {
+    fn join_with_timeout<T>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: std::time::Duration,
+        thread_name: &str,
+    ) -> T {
+        let start = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                start.elapsed() < timeout,
+                "{thread_name} timed out after {timeout:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        handle.join().expect("{thread_name} panicked")
+    }
+
+    // Initialize the platform (reuses the global Once-based init).
+    let _task = init_platform(None);
+    let join_timeout = std::time::Duration::from_secs(5);
+
+    // We run the test many times to increase the probability of hitting the
+    // exact interleaving, since we rely on sleep-based synchronization.
+    for _ in 0..200 {
+        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<
+            litebox_platform_multiplex::Platform,
+            u32,
+        >::new(0));
+        // Step 1: W1 acquires the write lock on the main thread.
+        let mut w1_guard = lock.write();
+
+        // Step 2: Spawn a reader that will block (READERS_WAITING).
+        let lock_r = lock.clone();
+        let reader_handle = std::thread::spawn(move || {
+            let r = lock_r.read();
+            drop(r);
+        });
+
+        // Step 3: Spawn W2 that will block (WRITERS_WAITING + other_writers_waiting).
+        let lock_w2 = lock.clone();
+        let writer_handle = std::thread::spawn(move || {
+            let mut w = lock_w2.write();
+            *w += 1;
+            // Hold briefly so reader stays blocked during our unlock.
+            drop(w);
+        });
+
+        // Give both threads time to block and set their waiting bits.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Step 4: W1 unlocks. This triggers wake_writer_or_readers which
+        // should eventually lead to both W2 and R being served.
+        *w1_guard = 42;
+        drop(w1_guard);
+
+        join_with_timeout(writer_handle, join_timeout, "writer");
+        join_with_timeout(reader_handle, join_timeout, "reader");
+    }
+}

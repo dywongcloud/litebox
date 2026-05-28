@@ -224,9 +224,7 @@ impl LinuxUserland {
 
                 // By taking ownership, we are letting the drop handler automatically run `libc::close`
                 // when necessary.
-                unsafe {
-                    std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().truncate())
-                }
+                unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().trunc()) }
             })
             .into();
 
@@ -314,7 +312,7 @@ impl LinuxUserland {
         // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
-        let path = "/proc/self/maps";
+        let path = c"/proc/self/maps";
         let fd = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::open,
@@ -344,6 +342,7 @@ impl LinuxUserland {
             total_read += n;
         }
         assert!(total_read < buf.len(), "buffer too small");
+        unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
 
         let mut reserved_pages = alloc::vec::Vec::new();
         let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
@@ -411,6 +410,98 @@ impl LinuxUserland {
                 }),
             )
         };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "the seccomp filter rules are hardcoded and not expected to fail"
+    )]
+    pub fn enable_seccomp_filter() {
+        use seccompiler::{
+            BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+            SeccompFilter, SeccompRule,
+        };
+
+        let rules = vec![
+            // TUN and terminal
+            (libc::SYS_read, vec![]),
+            (libc::SYS_write, vec![]),
+            (libc::SYS_poll, vec![]),
+            // memory management
+            (libc::SYS_mmap, vec![]),
+            (libc::SYS_mprotect, vec![]),
+            (libc::SYS_munmap, vec![]),
+            (libc::SYS_mremap, vec![]),
+            // signal
+            (libc::SYS_rt_sigreturn, vec![]),
+            (libc::SYS_sigaltstack, vec![]),
+            (libc::SYS_tgkill, vec![]),
+            (libc::SYS_timer_create, vec![]),
+            (libc::SYS_timer_settime, vec![]),
+            (libc::SYS_timer_delete, vec![]),
+            // called by [pthread_create](https://codebrowser.dev/glibc/glibc/nptl/pthread_create.c.html#83) to set up signal handler
+            // to support setuid et.al. functions (which we probably don't need, but include them in debug mode to suppress the warnings
+            // about missing seccomp rules for these syscalls).
+            #[cfg(debug_assertions)]
+            (libc::SYS_rt_sigaction, vec![]),
+            // TODO: also called by `next_signal_handler`, but I'm not sure if it's really needed.
+            (libc::SYS_rt_sigprocmask, vec![]),
+            // thread management
+            (libc::SYS_exit, vec![]),
+            (libc::SYS_exit_group, vec![]),
+            (libc::SYS_clone3, vec![]),
+            // sync
+            (libc::SYS_futex, vec![]),
+            // misc
+            (libc::SYS_getrandom, vec![]),
+            // required by std spawn
+            (libc::SYS_rseq, vec![]),
+            (libc::SYS_set_robust_list, vec![]),
+            (libc::SYS_get_robust_list, vec![]),
+            (libc::SYS_sched_getaffinity, vec![]),
+            (libc::SYS_gettid, vec![]),
+            (libc::SYS_madvise, vec![]),
+            // required by libc allocator
+            (libc::SYS_brk, vec![]),
+            (libc::SYS_getpid, vec![]),
+            // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
+            (
+                libc::SYS_open,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(OFlags::RDONLY.bits()),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
+            (libc::SYS_close, vec![]),
+        ];
+        let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+            rules.into_iter().collect();
+        let filter = SeccompFilter::new(
+            rule_map,
+            // In debug builds, log violations instead of silently returning an error so that
+            // it won't fail silently during development (which may be hard to debug).
+            if cfg!(debug_assertions) {
+                SeccompAction::Trap
+            } else {
+                SeccompAction::Errno(libc::EINVAL.cast_unsigned())
+            },
+            SeccompAction::Allow,
+            seccompiler::TargetArch::x86_64,
+        )
+        .unwrap();
+        // TODO: bpf program can be compiled offline
+        let bpf_prog: BpfProgram = filter.try_into().unwrap();
+
+        seccompiler::apply_filter(&bpf_prog).unwrap();
     }
 }
 
@@ -968,7 +1059,7 @@ impl litebox::platform::TimerHandle for TimerHandle {
                 tv_nsec: 0,
             },
             it_value: libc::timespec {
-                tv_sec: duration.as_secs().cast_signed().truncate(),
+                tv_sec: duration.as_secs().cast_signed().trunc(),
                 tv_nsec: duration.subsec_nanos().cast_signed().into(),
             },
         };
@@ -1142,7 +1233,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
-                t.tv_nsec.reinterpret_as_unsigned().truncate(),
+                t.tv_nsec.reinterpret_as_unsigned().trunc(),
             ),
         }
     }
@@ -1155,7 +1246,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
-                t.tv_nsec.reinterpret_as_unsigned().truncate(),
+                t.tv_nsec.reinterpret_as_unsigned().trunc(),
             ),
         }
     }
@@ -1753,6 +1844,9 @@ fn register_exception_handlers() {
             libc::SIGFPE,
             libc::SIGILL,
             libc::SIGTRAP,
+            // We'd like to log forbidden syscalls in debug mode
+            #[cfg(debug_assertions)]
+            libc::SIGSYS,
         ];
         for &sig in exception_signals {
             unsafe {
@@ -1958,7 +2052,7 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     ] {
         *reg = context.uc_mcontext.gregs[sig_reg.reinterpret_as_unsigned() as usize]
             .reinterpret_as_unsigned()
-            .truncate();
+            .trunc();
     }
     *orig_rax = *rax;
 }
@@ -1987,6 +2081,37 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    // Return an error code for the syscall and log it in debug mode.
+    #[cfg(debug_assertions)]
+    if signum == libc::SIGSYS {
+        use core::fmt::Write as _;
+        #[cfg(target_arch = "x86_64")]
+        let eax_idx = libc::REG_RAX as usize;
+        let sysno = context.uc_mcontext.gregs[eax_idx];
+        context.uc_mcontext.gregs[eax_idx] = i64::from(-libc::EINVAL);
+        // Signal-safe: format on the stack via arrayvec (no heap allocation).
+        let mut buf = arrayvec::ArrayString::<320>::new();
+        if sysno == libc::SYS_openat {
+            #[cfg(target_arch = "x86_64")]
+            let rsi = context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const i8;
+            let c_path = unsafe { core::ffi::CStr::from_ptr(rsi) };
+            // libc may call `openat` for certain files that we can ignore, e.g., /proc/sys/vm/overcommit_memory.
+            // Log the paths in case we need to allow some of them in the future.
+            let _ = writeln!(buf, "INFO: openat with {c_path:?} is not allowed");
+        } else {
+            let _ = writeln!(buf, "WARNING: disallowed syscall invoked: {sysno}");
+        }
+        let _ = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::write,
+                libc::STDERR_FILENO as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+            )
+        };
+        return;
+    }
+
     let Some(regs) = signal_handler_exit_guest(context, false) else {
         return unsafe { next_signal_handler(signum, info, context) };
     };
@@ -1999,9 +2124,9 @@ unsafe extern "C" fn exception_signal_handler(
     let sigctx = &context.uc_mcontext;
     #[cfg(target_arch = "x86_64")]
     let (trapno, err, cr2) = (
-        sigctx.gregs[libc::REG_TRAPNO as usize].truncate(),
-        sigctx.gregs[libc::REG_ERR as usize].truncate(),
-        sigctx.gregs[libc::REG_CR2 as usize].truncate(),
+        sigctx.gregs[libc::REG_TRAPNO as usize].trunc(),
+        sigctx.gregs[libc::REG_ERR as usize].trunc(),
+        sigctx.gregs[libc::REG_CR2 as usize].trunc(),
     );
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
@@ -2018,7 +2143,7 @@ unsafe fn next_signal_handler(
             {
                 context.uc_mcontext.gregs[libc::REG_RIP as usize]
                     .reinterpret_as_unsigned()
-                    .truncate()
+                    .trunc()
             }
         };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
@@ -2179,7 +2304,7 @@ unsafe fn interrupt_signal_handler(
     #[cfg(target_arch = "x86_64")]
     let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize]
         .reinterpret_as_unsigned()
-        .truncate();
+        .trunc();
 
     // Case 1: at the beginning of the syscall handler.
     //
@@ -2277,7 +2402,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use litebox::platform::RawMutex;
+    use litebox::{fs::OFlags, platform::RawMutex};
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;
@@ -2315,5 +2440,36 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
+    }
+
+    #[test]
+    fn test_seccomp_filter() {
+        let _platform: &LinuxUserland = LinuxUserland::new(None);
+        LinuxUserland::enable_seccomp_filter();
+
+        let pathname = c"/tmp/test_seccomp";
+        let mkdir_res = unsafe {
+            syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
+        };
+        assert_eq!(
+            mkdir_res.unwrap_err(),
+            syscalls::Errno::EINVAL,
+            "mkdir should be blocked by seccomp filter"
+        );
+
+        let pathname =
+            std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let open_res = unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::open,
+                pathname.as_ptr() as usize,
+                OFlags::RDWR.bits() as usize,
+            )
+        };
+        assert_eq!(
+            open_res.unwrap_err(),
+            syscalls::Errno::EINVAL,
+            "open with RDWR should be blocked by seccomp filter"
+        );
     }
 }

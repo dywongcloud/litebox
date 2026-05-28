@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use arrayvec::ArrayVec;
 use core::ops::Range;
 use litebox::mm::linux::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use litebox::platform::page_mgmt;
@@ -153,6 +154,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// Set `clean_up_page_tables` to `true` to free intermediate page-table frames
     /// (P1/P2/P3) that become empty after unmapping. Skip this when the VA range
     /// will be reused soon, as the intermediate frames would just be re-allocated.
+    ///
+    /// # Safety
+    ///
+    /// calling this function with `dealloc_frames = true` and `flush_tlb = false` is
+    /// subject to cross-core use-after-unmap. The caller should ensure no remote core
+    /// actively uses the pages it attempts to unmap.
     pub(crate) unsafe fn unmap_pages(
         &self,
         range: PageRange<ALIGN>,
@@ -160,6 +167,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         flush_tlb: bool,
         clean_up_page_tables: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
+        // This is based on `TLB_SINGLE_PAGE_FLUSH_CEILING` which is governed by `HvCallFlushVirtualAddressList`.
+        const UNMAP_BATCH: usize = 32;
         if range.is_empty() {
             return Ok(());
         }
@@ -169,32 +178,86 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             .or(Err(page_mgmt::DeallocationError::Unaligned))?;
         let mut allocator = PageTableAllocator::<M>::new();
 
-        // Note: TLB entries are batch-flushed after all pages are unmapped, consistent
-        // with the Linux kernel's mmu_gather approach.
-        // Note this implementation is slow as each page requires a full page table walk.
-        // If we have N pages, it will be N times slower.
         let mut inner = self.inner.lock();
-        for page in Page::range(start, end) {
+
+        // Local helper: clear a single PTE, returning the freed frame.
+        // Note this implementation is slow as it requires a full page table walk.
+        let mut unmap_one = |page: Page<Size4KiB>| -> Option<PhysFrame<Size4KiB>> {
             match inner.unmap(page) {
-                Ok((frame, _)) => {
-                    if dealloc_frames {
+                Ok((frame, _)) => Some(frame),
+                Err(X64UnmapError::PageNotMapped) => None,
+                Err(X64UnmapError::ParentEntryHugePage) => {
+                    crate::debug_serial_println!("BUG: attempt to unmap a huge page");
+                    None
+                }
+                Err(X64UnmapError::InvalidFrameAddress(pa)) => {
+                    crate::debug_serial_println!(
+                        "BUG: attempt to unmap an invalid frame address: {:#x}",
+                        pa
+                    );
+                    None
+                }
+            }
+        };
+
+        match (dealloc_frames, flush_tlb) {
+            (false, false) => {
+                // Nothing to free, no TLB ordering to honor. Just clear the PTEs.
+                for page in Page::range(start, end) {
+                    let _ = unmap_one(page);
+                }
+            }
+            (false, true) => {
+                // Frames are managed elsewhere (e.g., VTL0 frames). Do a single batch TLB shootdown.
+                for page in Page::range(start, end) {
+                    let _ = unmap_one(page);
+                }
+                let count =
+                    ((end.start_address() - start.start_address()) / Size4KiB::SIZE).trunc();
+                flush_tlb_range(start, count);
+            }
+            (true, false) => {
+                // Page table is being torn down, so frames can be returned to the allocator immediately.
+                for page in Page::range(start, end) {
+                    if let Some(frame) = unmap_one(page) {
                         unsafe { allocator.deallocate_frame(frame) };
                     }
                 }
-                Err(X64UnmapError::PageNotMapped) => {}
-                Err(X64UnmapError::ParentEntryHugePage) => {
-                    unreachable!("we do not support huge pages");
+            }
+            (true, true) => {
+                // Batch TLB shootdowns and frame deallocations through a small
+                // on-stack buffer. Ordering invariant: TLB shootdown must complete
+                // before any frame is reused so remote cores cannot reference it.
+                let mut unmapped_frames: ArrayVec<PhysFrame<Size4KiB>, UNMAP_BATCH> =
+                    ArrayVec::new();
+                let mut flush_start = start;
+                for (i, page) in Page::range(start, end).enumerate() {
+                    if let Some(frame) = unmap_one(page) {
+                        unmapped_frames.push(frame);
+                    }
+                    if (i + 1) % UNMAP_BATCH == 0 {
+                        if !unmapped_frames.is_empty() {
+                            flush_tlb_range(flush_start, UNMAP_BATCH);
+                            for frame in unmapped_frames.drain(..) {
+                                unsafe { allocator.deallocate_frame(frame) };
+                            }
+                        }
+                        flush_start = page + 1;
+                    }
                 }
-                Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                    todo!("Invalid frame address: {:#x}", pa);
+
+                // Final partial batch: flush any pages cleared since the last
+                // batched flush, then return their frames.
+                if !unmapped_frames.is_empty() {
+                    let count = ((end.start_address() - flush_start.start_address())
+                        / Size4KiB::SIZE)
+                        .trunc();
+                    flush_tlb_range(flush_start, count);
+                    for frame in unmapped_frames.drain(..) {
+                        unsafe { allocator.deallocate_frame(frame) };
+                    }
                 }
             }
-        }
-
-        if flush_tlb {
-            let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE;
-            // Present → not-present: other cores may hold stale entries.
-            flush_tlb_range(start, page_count.truncate());
         }
 
         if clean_up_page_tables {
@@ -294,7 +357,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         // Flush old (unmapped) addresses — other cores may hold stale entries.
         let page_count = (end.start_address() - flush_start.start_address()) / Size4KiB::SIZE;
-        flush_tlb_range(flush_start, page_count.truncate());
+        flush_tlb_range(flush_start, page_count.trunc());
 
         Ok(UserMutPtr::from_ptr(new_range.start as *mut u8))
     }
@@ -354,7 +417,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
         // Permission change: other cores may hold stale (wider) permissions.
-        flush_tlb_range(start, page_count.truncate());
+        flush_tlb_range(start, page_count.trunc());
 
         Ok(())
     }
@@ -464,7 +527,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             Page::<Size4KiB>::containing_address(pa_to_va(frame_range.start.start_address()));
         let count =
             (frame_range.end.start_address() - frame_range.start.start_address()) / Size4KiB::SIZE;
-        flush_tlb_range(start_page, count.truncate());
+        flush_tlb_range(start_page, count.trunc());
 
         Ok(pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
@@ -570,7 +633,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let start = pages.start;
         let end = pages.end; // inclusive
         let count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
-        flush_tlb_range(start, count.truncate());
+        flush_tlb_range(start, count.trunc());
 
         // Safety: all leaf entries in `pages` have been unmapped above while
         // holding `self.inner`, so any P1/P2/P3 frames that became empty can

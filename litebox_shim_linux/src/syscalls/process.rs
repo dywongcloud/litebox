@@ -520,12 +520,12 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_exit(&self, status: i32) {
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
-        self.exit_thread(status.truncate());
+        self.exit_thread(status.trunc());
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Tear down occurs similarly to `sys_exit`.
-        self.exit_group(ExitStatus::Exit(status.truncate()));
+        self.exit_group(ExitStatus::Exit(status.trunc()));
     }
 }
 
@@ -653,7 +653,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
-            let addr = tls.truncate();
+            let addr = tls.trunc();
             #[cfg(target_arch = "x86_64")]
             let desc = MutPtr::from_usize(addr);
             Some(desc)
@@ -664,7 +664,7 @@ impl<FS: ShimFS> Task<FS> {
         let child_tid = if child_tid == 0 {
             None
         } else {
-            Some(MutPtr::from_usize(child_tid.truncate()))
+            Some(MutPtr::from_usize(child_tid.trunc()))
         };
         let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
             child_tid
@@ -677,7 +677,7 @@ impl<FS: ShimFS> Task<FS> {
             None
         };
         let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
-            Some(MutPtr::from_usize(parent_tid.truncate()))
+            Some(MutPtr::from_usize(parent_tid.trunc()))
         } else {
             None
         };
@@ -697,8 +697,8 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
         let sp = if stack != 0 {
-            let stack: usize = stack.truncate();
-            Some(stack.wrapping_add(stack_size.truncate()))
+            let stack: usize = stack.trunc();
+            Some(stack.wrapping_add(stack_size.trunc()))
         } else {
             None
         };
@@ -1174,6 +1174,14 @@ impl<FS: ShimFS> Task<FS> {
         Ok(remaining)
     }
 
+    /// Handle syscall `pause`.
+    pub(crate) fn sys_pause(&self) -> Result<(), Errno> {
+        match self.wait_cx().sleep() {
+            WaitError::Interrupted => Err(Errno::EINTR),
+            WaitError::TimedOut => unreachable!("pause sleep has no deadline"),
+        }
+    }
+
     /// Handle syscall `getpid`.
     pub(crate) fn sys_getpid(&self) -> i32 {
         self.pid
@@ -1350,20 +1358,22 @@ impl<FS: ShimFS> Task<FS> {
         mut argv: alloc::vec::Vec<alloc::ffi::CString>,
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
         for _ in 0..SHEBANG_MAX_RECURSION {
-            let fd = self.sys_open(
-                path.as_str(),
+            let full_path = self.resolve_path(&path)?;
+            let file = self.do_open(
+                full_path,
                 litebox::fs::OFlags::RDONLY,
                 litebox::fs::Mode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
-            let n = match self.do_read(fd, &mut header, Some(0)) {
+            let files = self.files.borrow();
+            let n = match files.fs.read(&file, &mut header, Some(0)) {
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = self.do_close(fd as usize);
-                    return Err(e);
+                    let _ = files.fs.close(&file);
+                    return Err(Errno::from(e));
                 }
             };
-            let _ = self.do_close(fd as usize);
+            let _ = files.fs.close(&file);
 
             match parse_shebang(&header[..n]) {
                 Some((interp, opt_arg)) => {
@@ -1838,6 +1848,54 @@ mod tests {
             assert!(
                 !task.has_pending_signals(),
                 "cancelled alarm should not produce SIGALRM"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pause_wakes_on_pending_signal() {
+        use litebox_common_linux::{
+            PtRegs,
+            errno::Errno,
+            signal::{SigSet, SigmaskHow, Signal},
+        };
+
+        let task = crate::syscalls::tests::init_platform(None);
+        <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let block_set = SigSet::empty().with(Signal::SIGUSR1);
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_BLOCK,
+                Some(crate::ConstPtr::from_ptr(&raw const block_set)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .expect("block SIGUSR1 failed");
+
+            assert_eq!(task.sys_alarm(1).unwrap(), 0);
+            task.sys_tkill(task.tid, Signal::SIGUSR1.as_i32())
+                .expect("tkill failed");
+            assert!(!task.has_pending_signals(), "blocked SIGUSR1 should not be deliverable");
+
+            let mut regs = PtRegs::default();
+            task.process_signals(&mut regs);
+            assert!(!task.has_pending_signals(), "blocked SIGUSR1 should remain undeliverable");
+
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_UNBLOCK,
+                Some(crate::ConstPtr::from_ptr(&raw const block_set)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .expect("unblock SIGUSR1 failed");
+
+            assert_eq!(task.sys_pause(), Err(Errno::EINTR));
+            task.sys_alarm(0).unwrap();
+
+            let pending = task.pending_signal_set();
+            assert!(pending.contains(Signal::SIGUSR1), "expected SIGUSR1 pending");
+            assert!(
+                !pending.contains(Signal::SIGALRM),
+                "SIGALRM must not be what woke pause()"
             );
         });
     }
