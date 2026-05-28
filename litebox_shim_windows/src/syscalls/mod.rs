@@ -198,7 +198,7 @@ impl ReinterpretTruncatedFromUsize for isize {
 
 impl ReinterpretTruncatedFromUsize for NtStatus {
     fn reinterpret_truncated_from_usize(value: usize) -> Self {
-        Self::from_raw(value.truncate())
+        Self::from_raw(value.trunc())
     }
 }
 
@@ -207,7 +207,7 @@ macro_rules! reinterpret_truncated_unsigned {
         $(
             impl ReinterpretTruncatedFromUsize for $ty {
                 fn reinterpret_truncated_from_usize(value: usize) -> Self {
-                    value.truncate()
+                    value.trunc()
                 }
             }
         )*
@@ -219,7 +219,7 @@ macro_rules! reinterpret_truncated_signed {
         $(
             impl ReinterpretTruncatedFromUsize for $sty {
                 fn reinterpret_truncated_from_usize(value: usize) -> Self {
-                    value.cast_signed().truncate()
+                    value.cast_signed().trunc()
                 }
             }
         )*
