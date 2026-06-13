@@ -6,7 +6,7 @@ pub(crate) mod file;
 pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod registry;
-pub(crate) mod sysinfo;
+mod sysinfo;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
@@ -192,6 +192,20 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         performance_counter: Platform::RawMutPointer<i64>,
         performance_frequency: Option<Platform::RawMutPointer<i64>>,
     },
+    NtQuerySystemInformation {
+        system_information_class: u32,
+        system_information: Platform::RawMutPointer<u8>,
+        system_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQuerySystemInformationEx {
+        system_information_class: u32,
+        input_buffer: Option<Platform::RawConstPointer<u8>>,
+        input_buffer_length: u32,
+        system_information: Platform::RawMutPointer<u8>,
+        system_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
         source: Platform::RawConstPointer<u64>,
@@ -371,6 +385,20 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryPerformanceCounter => Some(sys_req!(NtQueryPerformanceCounter {
                 performance_counter:*,
                 performance_frequency:*,
+            })),
+            NtSysno::NtQuerySystemInformation => Some(sys_req!(NtQuerySystemInformation {
+                system_information_class,
+                system_information:*,
+                system_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQuerySystemInformationEx => Some(sys_req!(NtQuerySystemInformationEx {
+                system_information_class,
+                input_buffer:*,
+                input_buffer_length,
+                system_information:*,
+                system_information_length,
+                return_length:*,
             })),
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
                 sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
