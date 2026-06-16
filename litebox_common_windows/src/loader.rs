@@ -54,6 +54,8 @@ pub struct PeImageInfo {
 pub struct MappingInfo {
     pub base_addr: usize,
     pub image_size: usize,
+    /// image_size + trampoline size
+    pub mapping_size: usize,
     pub entry_point: usize,
 }
 
@@ -112,6 +114,262 @@ pub struct KiUserInvertedFunctionTableEntry {
     pub image_base: usize,
     pub image_size: u32,
     pub size_of_table: u32,
+}
+
+pub const API_SET_NAMESPACE_VERSION: u32 = 6;
+pub const API_SET_NAMESPACE_HASH_FACTOR: u32 = 31;
+pub const MAX_API_SET_NAMESPACE_SIZE: usize = 16 * 1024 * 1024;
+const API_SET_NAMESPACE_ENTRY_FLAGS: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes)]
+pub struct ApiSetNamespace {
+    pub version: u32,
+    pub size: u32,
+    pub flags: u32,
+    pub count: u32,
+    pub entry_offset: u32,
+    pub hash_offset: u32,
+    pub hash_factor: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes)]
+pub struct ApiSetNamespaceEntry {
+    pub flags: u32,
+    pub name_offset: u32,
+    pub name_length: u32,
+    pub hashed_length: u32,
+    pub value_offset: u32,
+    pub value_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes)]
+pub struct ApiSetValueEntry {
+    pub flags: u32,
+    pub name_offset: u32,
+    pub name_length: u32,
+    pub value_offset: u32,
+    pub value_length: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes)]
+pub struct ApiSetHashEntry {
+    pub hash: u32,
+    pub index: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiSetMapping<'a> {
+    /// API-set contract name, such as `api-ms-win-core-file-l1-2-3`.
+    pub contract: &'a str,
+    /// Host DLL name used as the default namespace value for the contract.
+    pub host_dll: &'a str,
+    /// Optional exact contract prefix used when computing the namespace hash.
+    pub hashed_prefix: Option<&'a str>,
+}
+
+impl<'a> ApiSetMapping<'a> {
+    /// Creates a mapping whose hash prefix is derived by trimming the last dash suffix.
+    #[must_use]
+    pub const fn new(contract: &'a str, host_dll: &'a str) -> Self {
+        Self {
+            contract,
+            host_dll,
+            hashed_prefix: None,
+        }
+    }
+
+    /// Creates a mapping with an explicit hash prefix for contracts that do not follow the
+    /// usual version-suffix naming pattern.
+    #[must_use]
+    pub const fn with_hashed_prefix(
+        contract: &'a str,
+        host_dll: &'a str,
+        hashed_prefix: &'a str,
+    ) -> Self {
+        Self {
+            contract,
+            host_dll,
+            hashed_prefix: Some(hashed_prefix),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ApiSetNamespaceBuildError {
+    #[error("API-set namespace field overflow")]
+    Overflow,
+    #[error("API-set namespace is too large")]
+    TooLarge,
+    #[error("API-set namespace mapping has an invalid hashed prefix")]
+    InvalidHashedPrefix,
+}
+
+pub fn build_api_set_namespace(
+    mappings: &[(&str, &str)],
+) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
+    let mappings = mappings
+        .iter()
+        .map(|&(contract, host_dll)| ApiSetMapping::new(contract, host_dll))
+        .collect::<Vec<_>>();
+    build_api_set_namespace_from_mappings(&mappings)
+}
+
+/// Builds an API-set namespace from mappings that can carry explicit hash prefixes.
+pub fn build_api_set_namespace_from_mappings(
+    mappings: &[ApiSetMapping<'_>],
+) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
+    let mut mappings = mappings.to_vec();
+    mappings.sort_by(|left, right| left.contract.cmp(right.contract));
+
+    let count = mappings.len();
+    let entry_offset = size_of::<ApiSetNamespace>();
+    let value_offset = api_set_checked_add(
+        entry_offset,
+        api_set_checked_mul(count, size_of::<ApiSetNamespaceEntry>())?,
+    )?;
+    let strings_offset = api_set_checked_add(
+        value_offset,
+        api_set_checked_mul(count, size_of::<ApiSetValueEntry>())?,
+    )?;
+    let mut string_data = Vec::new();
+    let mut entries = Vec::with_capacity(count);
+    let mut values = Vec::with_capacity(count);
+    let mut hashes = Vec::with_capacity(count);
+
+    for (index, mapping) in mappings.iter().enumerate() {
+        let contract = mapping.contract;
+        let host_dll = mapping.host_dll;
+        let hashed_prefix = mapping
+            .hashed_prefix
+            .unwrap_or_else(|| &contract[..api_set_hashed_name_len(contract)]);
+        if !hashed_prefix.is_ascii() || !contract.starts_with(hashed_prefix) {
+            return Err(ApiSetNamespaceBuildError::InvalidHashedPrefix);
+        }
+
+        let name = utf16_bytes(contract)?;
+        let host = utf16_bytes(host_dll)?;
+        let name_offset = api_set_checked_add(strings_offset, string_data.len())?;
+        string_data.extend_from_slice(&name);
+        let host_offset = api_set_checked_add(strings_offset, string_data.len())?;
+        string_data.extend_from_slice(&host);
+        let value_entry_offset = api_set_checked_add(
+            value_offset,
+            api_set_checked_mul(index, size_of::<ApiSetValueEntry>())?,
+        )?;
+        entries.push(ApiSetNamespaceEntry {
+            flags: API_SET_NAMESPACE_ENTRY_FLAGS,
+            name_offset: api_set_to_u32(name_offset)?,
+            name_length: api_set_to_u32(name.len())?,
+            hashed_length: api_set_to_u32(utf16_byte_len(hashed_prefix)?)?,
+            value_offset: api_set_to_u32(value_entry_offset)?,
+            value_count: 1,
+        });
+        values.push(ApiSetValueEntry {
+            flags: 0,
+            name_offset: 0,
+            name_length: 0,
+            value_offset: api_set_to_u32(host_offset)?,
+            value_length: api_set_to_u32(host.len())?,
+        });
+        hashes.push(ApiSetHashEntry {
+            hash: api_set_hash_prefix(hashed_prefix),
+            index: api_set_to_u32(index)?,
+        });
+    }
+
+    let hash_offset =
+        api_set_checked_add(strings_offset, string_data.len())?.next_multiple_of(size_of::<u32>());
+    let size = api_set_checked_add(
+        hash_offset,
+        api_set_checked_mul(count, size_of::<ApiSetHashEntry>())?,
+    )?;
+    if size > MAX_API_SET_NAMESPACE_SIZE {
+        return Err(ApiSetNamespaceBuildError::TooLarge);
+    }
+    hashes.sort_by_key(|entry| (entry.hash, entry.index));
+
+    let namespace = ApiSetNamespace {
+        version: API_SET_NAMESPACE_VERSION,
+        size: api_set_to_u32(size)?,
+        flags: 0,
+        count: api_set_to_u32(count)?,
+        entry_offset: api_set_to_u32(entry_offset)?,
+        hash_offset: api_set_to_u32(hash_offset)?,
+        hash_factor: API_SET_NAMESPACE_HASH_FACTOR,
+    };
+
+    let mut bytes = Vec::with_capacity(size);
+    bytes.extend_from_slice(namespace.as_bytes());
+    for entry in &entries {
+        bytes.extend_from_slice(entry.as_bytes());
+    }
+    for value in &values {
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    bytes.extend_from_slice(&string_data);
+    bytes.resize(hash_offset, 0);
+    for hash in &hashes {
+        bytes.extend_from_slice(hash.as_bytes());
+    }
+    debug_assert_eq!(bytes.len(), size);
+    Ok(bytes)
+}
+
+#[must_use]
+pub fn api_set_hash(name: &str) -> u32 {
+    api_set_hash_prefix(&name[..api_set_hashed_name_len(name)])
+}
+
+/// Computes the API-set hash for an already selected contract prefix.
+#[must_use]
+pub fn api_set_hash_prefix(prefix: &str) -> u32 {
+    prefix.bytes().fold(0, |hash, byte| {
+        hash.wrapping_mul(API_SET_NAMESPACE_HASH_FACTOR)
+            .wrapping_add(u32::from(byte.to_ascii_lowercase()))
+    })
+}
+
+fn api_set_hashed_name_len(name: &str) -> usize {
+    name.rfind('-').unwrap_or(name.len())
+}
+
+fn utf16_bytes(value: &str) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
+    let mut bytes = Vec::with_capacity(
+        value
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or(ApiSetNamespaceBuildError::Overflow)?,
+    );
+    for unit in value.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+fn utf16_byte_len(value: &str) -> Result<usize, ApiSetNamespaceBuildError> {
+    value
+        .encode_utf16()
+        .count()
+        .checked_mul(size_of::<u16>())
+        .ok_or(ApiSetNamespaceBuildError::Overflow)
+}
+
+fn api_set_checked_add(left: usize, right: usize) -> Result<usize, ApiSetNamespaceBuildError> {
+    left.checked_add(right)
+        .ok_or(ApiSetNamespaceBuildError::Overflow)
+}
+
+fn api_set_checked_mul(left: usize, right: usize) -> Result<usize, ApiSetNamespaceBuildError> {
+    left.checked_mul(right)
+        .ok_or(ApiSetNamespaceBuildError::Overflow)
+}
+
+fn api_set_to_u32(value: usize) -> Result<u32, ApiSetNamespaceBuildError> {
+    u32::try_from(value).map_err(|_| ApiSetNamespaceBuildError::Overflow)
 }
 
 /// Errors that can occur when parsing a PE file.
@@ -217,6 +475,12 @@ impl PeParsedFile {
     #[must_use]
     pub fn image_size(&self) -> usize {
         self.image.size_of_image
+    }
+
+    /// Returns the PE entry-point RVA from the optional header.
+    #[must_use]
+    pub fn entry_point_rva(&self) -> usize {
+        self.image.entry_point_rva
     }
 
     /// Returns the preferred image base from the optional header.
@@ -375,8 +639,8 @@ impl PeParsedFile {
                 .map_err(PeLoadError::Map)?;
         }
 
-        if self.trampoline.is_some() {
-            self.load_trampoline(mapper, mem, base_addr)?;
+        if let Some(trampoline) = &self.trampoline {
+            Self::load_trampoline(mapper, mem, base_addr, trampoline)?;
         }
 
         let entry_point = checked_add!(
@@ -387,7 +651,8 @@ impl PeParsedFile {
 
         Ok(MappingInfo {
             base_addr,
-            image_size: mapping_size,
+            image_size,
+            mapping_size,
             entry_point,
         })
     }
@@ -589,12 +854,14 @@ impl PeParsedFile {
     }
 
     fn load_trampoline<M: MapMemory>(
-        &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
         base_addr: usize,
+        trampoline: &PeTrampolineInfo,
     ) -> Result<(), PeLoadError<M::Error>> {
-        let trampoline = self.trampoline.as_ref().unwrap();
+        if trampoline.size == 0 {
+            return Ok(());
+        }
         let trampoline_start = base_addr
             .checked_add(trampoline.rva)
             .ok_or(PeLoadError::InvalidImage)?;

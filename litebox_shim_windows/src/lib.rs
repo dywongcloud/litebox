@@ -116,6 +116,21 @@ where
     ptr.write_at_offset(0, value)
 }
 
+fn write_field_at_offset<Platform, Struct, Field>(
+    base: MutPtr<Platform, Struct>,
+    field_offset: usize,
+    value: Field,
+) -> Option<()>
+where
+    Platform: RawPointerProvider,
+    Struct: zerocopy::FromBytes + zerocopy::IntoBytes,
+    Field: zerocopy::FromBytes + zerocopy::IntoBytes,
+{
+    let address = base.as_usize().checked_add(field_offset)?;
+    let ptr = MutPtr::<Platform, Field>::from_usize(address);
+    ptr.write_at_offset(0, value)
+}
+
 fn write_slice<Platform, T>(address: usize, values: &[T]) -> Option<()>
 where
     Platform: RawPointerProvider,
@@ -298,17 +313,15 @@ pub struct WindowsShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platf
 
 impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
     /// Loads the program at `path` as the shim's initial task.
-    ///
-    /// TODO: PEB/TEB setup and initial handle table state are not yet implemented.
     pub fn load_program(
         &self,
         fs: Arc<FS>,
         path: &str,
-        _argv: Vec<alloc::ffi::CString>,
-        _envp: Vec<alloc::ffi::CString>,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
-        let load_info =
-            loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager).load(path)?;
+        let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
+            .load(path, &argv, &envp)?;
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
             peb_address: load_info.environment.peb,
