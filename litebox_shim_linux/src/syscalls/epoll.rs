@@ -635,7 +635,10 @@ mod test {
     #[test]
     fn test_epoll_with_eventfd() {
         let (task, epoll) = setup_epoll();
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd = task
+            .global
+            .create_linux_eventfd(0, EfdFlags::CLOEXEC)
+            .unwrap();
         let typed = task
             .global
             .litebox
@@ -658,8 +661,7 @@ mod test {
             )
             .unwrap();
 
-        // spawn a thread to write to the eventfd
-        {
+        let writer = {
             let global = task.global.clone();
             let files = Arc::clone(&files);
             std::thread::spawn(move || {
@@ -674,11 +676,12 @@ mod test {
                     .with_entry(&typed, |entry| {
                         entry.write(&WaitState::new(platform()).context(), 1)
                     });
-            });
-        }
+            })
+        };
         epoll
             .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
+        writer.join().unwrap();
     }
 
     #[test]
@@ -730,7 +733,10 @@ mod test {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
+        let eventfd = task
+            .global
+            .create_linux_eventfd(0, EfdFlags::empty())
+            .unwrap();
 
         let typed = task
             .global

@@ -9,6 +9,8 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
+mod broker;
+
 extern crate alloc;
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
@@ -77,6 +79,15 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Connect to an already-running broker Unix socket and verify the control path.
+    #[arg(
+        long = "broker-socket",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_socket: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -201,7 +212,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let broker_connection = broker::connect(cli_args.broker_socket.as_deref())?;
+
+    let shim_builder = if let Some(broker_connection) = broker_connection {
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(
+            litebox::LiteBox::new_with_broker_local(
+                litebox_platform_multiplex::platform(),
+                broker_connection.into_local(),
+            ),
+        )
+    } else {
+        litebox_shim_linux::LinuxShimBuilder::new()
+    };
     let litebox = shim_builder.litebox();
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) }

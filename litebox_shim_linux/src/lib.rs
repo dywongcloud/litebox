@@ -14,10 +14,10 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
@@ -165,10 +165,13 @@ impl LinuxShimBuilder {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
-        Self {
-            platform,
-            litebox: LiteBox::new(platform),
-        }
+        Self::new_with_litebox(LiteBox::new(platform))
+    }
+
+    /// Returns a new shim builder using an already-created LiteBox instance.
+    pub fn new_with_litebox(litebox: LiteBox<Platform>) -> Self {
+        let platform = litebox_platform_multiplex::platform();
+        Self { platform, litebox }
     }
 
     /// Returns the litebox object for the shim.

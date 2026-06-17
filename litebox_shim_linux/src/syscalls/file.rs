@@ -1734,7 +1734,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags);
+        let eventfd = self.global.create_linux_eventfd(initval, flags)?;
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
         if flags.contains(EfdFlags::CLOEXEC) {

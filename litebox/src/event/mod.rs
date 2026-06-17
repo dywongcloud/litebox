@@ -3,6 +3,7 @@
 
 //! Events related functionality
 
+pub mod counter;
 pub mod observer;
 pub mod polling;
 pub mod wait;

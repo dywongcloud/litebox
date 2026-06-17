@@ -536,6 +536,20 @@ where
     }
 }
 
+impl From<litebox::event::counter::EventCounterError> for Errno {
+    fn from(value: litebox::event::counter::EventCounterError) -> Self {
+        match value {
+            litebox::event::counter::EventCounterError::InvalidInput => Errno::EINVAL,
+            litebox::event::counter::EventCounterError::WouldBlock
+            | litebox::event::counter::EventCounterError::ResourceExhausted => Errno::EAGAIN,
+            litebox::event::counter::EventCounterError::Io
+            | litebox::event::counter::EventCounterError::UnexpectedResponse
+            | litebox::event::counter::EventCounterError::Unavailable => Errno::EIO,
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
         match value {

@@ -5,7 +5,11 @@
 
 use alloc::sync::Arc;
 
+use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::LocalControlChannel;
+
 use crate::{
+    broker::{self, BrokerControl, BrokerState},
     fd::Descriptors,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -30,6 +34,35 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// If the `enforce_singleton_litebox_instance` compilation feature has been enabled, and more
     /// than one instance is made, will panic.
     pub fn new(platform: &'static Platform) -> Self {
+        Self::new_inner(platform, None)
+    }
+
+    /// Create a new [`LiteBox`] instance with broker control installed.
+    pub fn new_with_broker_control(
+        platform: &'static Platform,
+        broker_control: Arc<dyn BrokerControl>,
+    ) -> Self {
+        Self::new_inner(platform, Some(broker_control))
+    }
+
+    /// Create a new [`LiteBox`] instance with a negotiated broker-local control adapter installed.
+    pub fn new_with_broker_local<T>(
+        platform: &'static Platform,
+        broker_local: BrokerLocal<T>,
+    ) -> Self
+    where
+        T: LocalControlChannel + Send + 'static,
+    {
+        Self::new_inner(
+            platform,
+            Some(broker::control_from_local::<Platform, T>(broker_local)),
+        )
+    }
+
+    fn new_inner(
+        platform: &'static Platform,
+        broker_control: Option<Arc<dyn BrokerControl>>,
+    ) -> Self {
         // This check ensures that there is exactly one `LiteBox` instance in the process.
         //
         // LiteBox itself supports having multiple instances (and subsystems correctly make any
@@ -65,6 +98,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         crate::sync::lock_tracing::LockTracker::init(platform);
 
         let descriptors = RwLock::new(Descriptors::new_from_litebox_creation());
+        let broker = BrokerState::new(broker_control);
 
         litebox_util_log::trace!("LiteBox instance initialized");
 
@@ -72,6 +106,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 platform,
                 descriptors,
+                broker,
             }),
         }
     }
@@ -106,10 +141,15 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
     }
+
+    pub(crate) fn broker_control(&self) -> Option<Arc<dyn BrokerControl>> {
+        self.x.broker.control()
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
+    broker: BrokerState<Platform>,
 }
