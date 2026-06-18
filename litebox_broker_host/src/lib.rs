@@ -234,7 +234,6 @@ fn to_protocol_error(error: BrokerError) -> ErrorCode {
     match error {
         BrokerError::PolicyDenied => ErrorCode::PolicyDenied,
         BrokerError::UnknownObject => ErrorCode::UnknownObject,
-        BrokerError::StaleHandle => ErrorCode::StaleHandle,
         BrokerError::WrongObjectType => ErrorCode::WrongObjectType,
         BrokerError::InvalidRights => ErrorCode::InvalidRights,
         BrokerError::ResourceExhausted => ErrorCode::ResourceExhausted,
@@ -352,7 +351,7 @@ mod tests {
             }
             response => panic!("unexpected response: {response:?}"),
         };
-        assert_ne!(handle.reference_id.get(), 0);
+        assert_ne!(handle.0, 0);
     }
 
     fn serve_connection_closes_after_protocol_violation(core: &mut BrokerCore) {

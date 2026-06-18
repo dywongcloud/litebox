@@ -16,7 +16,6 @@ pub mod channel;
 pub mod error;
 pub mod event;
 pub mod message;
-pub mod object;
 pub mod wire;
 
 pub use channel::{
@@ -32,7 +31,11 @@ pub use event::{
 pub use message::{
     BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,
 };
-pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
+
+/// Opaque broker object reference handle.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectHandle(pub u64);
 
 /// Major/minor broker protocol version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

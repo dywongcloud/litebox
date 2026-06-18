@@ -6,7 +6,7 @@ use core::ops::BitOr;
 use crate::event::EventObject;
 use crate::identity::{BrokerAssociation, ProcessId};
 use crate::{BrokerCore, BrokerError, PolicyDecision, PolicyOperation, Result, allocate_id};
-use litebox_broker_protocol::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
+use litebox_broker_protocol::ObjectHandle;
 
 /// Broker object type known to the authority core and policy engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,40 +54,24 @@ impl BitOr for ObjectRights {
     }
 }
 
-/// Broker-owned object identifier.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ObjectId(u64);
-
-impl ObjectId {
-    /// Creates an object identifier from its raw value.
-    const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
+slotmap::new_key_type! {
+    /// Broker-owned object identifier.
+    pub(crate) struct ObjectId;
 }
-
-const FIRST_REFERENCE_GENERATION: ObjectReferenceGeneration = ObjectReferenceGeneration::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ObjectReference {
     pub(crate) object_id: ObjectId,
-    pub(crate) reference_generation: ObjectReferenceGeneration,
     pub(crate) owner: ProcessId,
-    pub(crate) object_type: ObjectType,
     pub(crate) rights: ObjectRights,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ObjectEntry {
-    pub(crate) kind: ObjectKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ObjectKind {
+pub(crate) enum ObjectEntry {
     Event(EventObject),
 }
 
-impl ObjectKind {
+impl ObjectEntry {
     pub(crate) const fn object_type(self) -> ObjectType {
         match self {
             Self::Event(_) => ObjectType::Event,
@@ -97,16 +81,10 @@ impl ObjectKind {
 
 impl BrokerCore {
     /// Inserts a broker object and mints its first owned reference.
-    ///
-    /// The current POC never reuses reference slots, so the reference
-    /// generation starts at the authority-owned first generation. Any future
-    /// reference-slot reuse path must bump the generation before reissuing a
-    /// slot so stale handles cannot validate against a recycled reference.
     pub(crate) fn insert_object_with_reference(
         &mut self,
         association: &BrokerAssociation,
-        kind: ObjectKind,
-        object_type: ObjectType,
+        object: ObjectEntry,
         rights: ObjectRights,
     ) -> Result<ObjectHandle> {
         if self.objects.len() >= self.limits.max_objects
@@ -115,23 +93,19 @@ impl BrokerCore {
             return Err(BrokerError::ResourceExhausted);
         }
 
-        let object_id = self.allocate_object_id()?;
-        let reference_id = self.allocate_reference_id()?;
-        let reference_generation = FIRST_REFERENCE_GENERATION;
-
-        self.objects.insert(object_id, ObjectEntry { kind });
-        self.references.insert(
-            reference_id,
+        let handle = ObjectHandle(allocate_id(&mut self.next_reference_handle)?);
+        let object_id = self.objects.insert(object);
+        let old_reference = self.references.insert(
+            handle,
             ObjectReference {
                 object_id,
-                reference_generation,
                 owner: association.process_id(),
-                object_type,
                 rights,
             },
         );
+        debug_assert!(old_reference.is_none());
 
-        Ok(ObjectHandle::new(reference_id, reference_generation))
+        Ok(handle)
     }
 
     pub(crate) fn authorize_create_object(
@@ -173,13 +147,13 @@ impl BrokerCore {
 
     pub(crate) fn object(&self, object_id: ObjectId) -> Result<&ObjectEntry> {
         self.objects
-            .get(&object_id)
+            .get(object_id)
             .ok_or(BrokerError::UnknownObject)
     }
 
     pub(crate) fn object_mut(&mut self, object_id: ObjectId) -> Result<&mut ObjectEntry> {
         self.objects
-            .get_mut(&object_id)
+            .get_mut(object_id)
             .ok_or(BrokerError::UnknownObject)
     }
 
@@ -191,30 +165,19 @@ impl BrokerCore {
         required_rights: ObjectRights,
     ) -> Result<ObjectReference> {
         let reference = self.reference_for_handle(association, handle)?;
-        if reference.object_type != expected_type {
-            return Err(BrokerError::WrongObjectType);
-        }
         if !reference.rights.contains(required_rights) {
             return Err(BrokerError::InvalidRights);
         }
 
         let object = self
             .objects
-            .get(&reference.object_id)
+            .get(reference.object_id)
             .ok_or(BrokerError::UnknownObject)?;
-        if object.kind.object_type() != expected_type {
+        if object.object_type() != expected_type {
             return Err(BrokerError::WrongObjectType);
         }
 
         Ok(*reference)
-    }
-
-    fn allocate_object_id(&mut self) -> Result<ObjectId> {
-        allocate_id(&mut self.next_object_id).map(ObjectId::new)
-    }
-
-    fn allocate_reference_id(&mut self) -> Result<ObjectReferenceId> {
-        allocate_id(&mut self.next_reference_id).map(ObjectReferenceId::new)
     }
 }
 
@@ -228,11 +191,11 @@ impl BrokerCore {
         handle: ObjectHandle,
     ) -> Result<()> {
         let object_id = self.reference_for_handle(association, handle)?.object_id;
-        if !self.objects.contains_key(&object_id) {
+        if !self.objects.contains_key(object_id) {
             return Err(BrokerError::UnknownObject);
         }
 
-        self.references.remove(&handle.reference_id);
+        self.references.remove(&handle);
         self.drop_object_if_unreferenced(object_id);
         Ok(())
     }
@@ -246,7 +209,7 @@ impl BrokerCore {
         self.objects.retain(|object_id, _| {
             references
                 .values()
-                .any(|reference| reference.object_id == *object_id)
+                .any(|reference| reference.object_id == object_id)
         });
     }
 
@@ -257,13 +220,10 @@ impl BrokerCore {
     ) -> Result<&ObjectReference> {
         let reference = self
             .references
-            .get(&handle.reference_id)
+            .get(&handle)
             .ok_or(BrokerError::UnknownObject)?;
         if reference.owner != association.process_id() {
             return Err(BrokerError::UnknownObject);
-        }
-        if reference.reference_generation != handle.reference_generation {
-            return Err(BrokerError::StaleHandle);
         }
         Ok(reference)
     }
@@ -274,7 +234,7 @@ impl BrokerCore {
             .values()
             .any(|reference| reference.object_id == object_id)
         {
-            self.objects.remove(&object_id);
+            self.objects.remove(object_id);
         }
     }
 }
@@ -288,19 +248,34 @@ pub(crate) struct AuthorizedObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerError, CallerCredential, PolicyEngine};
-    use litebox_broker_protocol::WaitOutcome;
+    use crate::{BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, allocate_id};
+    use litebox_broker_protocol::{ObjectHandle, WaitOutcome};
 
     #[test]
-    fn allocator_issues_max_id_then_exhausts() {
+    fn allocator_exhausts_before_id_overflow() {
         let mut next_id = u64::MAX;
 
-        assert_eq!(allocate_id(&mut next_id), Ok(u64::MAX));
-        assert_eq!(next_id, 0);
         assert_eq!(
             allocate_id(&mut next_id),
             Err(BrokerError::ResourceExhausted)
         );
+        assert_eq!(
+            allocate_id(&mut next_id),
+            Err(BrokerError::ResourceExhausted)
+        );
+    }
+
+    #[test]
+    fn oversized_object_slotmap_limits_are_rejected_before_core_construction() {
+        let too_many_entries = u32::MAX as usize;
+
+        assert!(matches!(
+            BrokerCore::new_with_limits(
+                PolicyEngine::event_only(),
+                BrokerCoreLimits::new(too_many_entries, 1)
+            ),
+            Err(BrokerError::ResourceExhausted)
+        ));
     }
 
     #[test]
@@ -313,20 +288,19 @@ mod tests {
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = core.create_event(&owner).unwrap();
+        let unknown_handle = ObjectHandle(handle.0 + 1);
+
+        assert_ne!(unknown_handle, handle);
+        assert_eq!(
+            core.wait_event(&owner, unknown_handle),
+            Err(BrokerError::UnknownObject)
+        );
 
         assert_eq!(
             core.close_object_reference(&other, handle),
             Err(BrokerError::UnknownObject)
         );
 
-        let stale = ObjectHandle::new(
-            handle.reference_id,
-            ObjectReferenceGeneration::new(handle.reference_generation.get() + 1),
-        );
-        assert_eq!(
-            core.close_object_reference(&owner, stale),
-            Err(BrokerError::StaleHandle)
-        );
         assert!(matches!(
             core.wait_event(&owner, handle),
             Ok(WaitOutcome::WouldBlock(_))
@@ -349,6 +323,17 @@ mod tests {
 
         core.close_association(association);
 
+        assert!(core.references.is_empty());
+        assert!(core.objects.is_empty());
+
+        let association = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        core.next_reference_handle = u64::MAX;
+        assert_eq!(
+            core.create_event(&association),
+            Err(BrokerError::ResourceExhausted)
+        );
         assert!(core.references.is_empty());
         assert!(core.objects.is_empty());
     }
