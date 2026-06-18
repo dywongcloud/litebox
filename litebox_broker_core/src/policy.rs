@@ -1,72 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{BrokerError, CallerCredential, ObjectRights, ObjectType};
-
-/// Broker operation submitted to the policy engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PolicyOperation {
-    /// Perform an operation on a broker-owned object type.
-    Object {
-        /// Broker-entry-authenticated credential for the caller.
-        caller_credential: CallerCredential,
-        /// Object type targeted by the operation.
-        object_type: ObjectType,
-        /// Operation requested for the object type.
-        operation: ObjectOperation,
-    },
-}
-
-/// Generic object operation submitted to the policy engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ObjectOperation {
-    /// Create a new broker-owned object.
-    Create,
-    /// Use an existing object handle with the requested rights.
-    Use { rights: ObjectRights },
-}
-
-/// Policy decision returned after authorizing a broker operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PolicyDecision {
-    /// Operation is authorized and does not grant new authority material.
-    Authorized,
-    /// Object creation is authorized with rights for the initial object reference.
-    GrantObjectReference {
-        /// Rights to attach to the newly minted object reference.
-        rights: ObjectRights,
-    },
-}
-
-impl PolicyOperation {
-    /// Creates a policy operation for creating a broker-owned object type.
-    pub const fn create_object(
-        caller_credential: CallerCredential,
-        object_type: ObjectType,
-    ) -> Self {
-        Self::Object {
-            caller_credential,
-            object_type,
-            operation: ObjectOperation::Create,
-        }
-    }
-
-    /// Creates a policy operation for using a broker-owned object with rights.
-    pub const fn use_object(
-        caller_credential: CallerCredential,
-        object_type: ObjectType,
-        rights: ObjectRights,
-    ) -> Self {
-        Self::Object {
-            caller_credential,
-            object_type,
-            operation: ObjectOperation::Use { rights },
-        }
-    }
-}
+use crate::{BrokerError, CallerCredential, ObjectRights};
 
 /// Configured broker policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,7 +37,7 @@ impl PolicyEngine {
 
     /// Creates a policy engine that allows only the current event-object surface.
     pub const fn event_only() -> Self {
-        Self::event_only_with_reference_rights(EVENT_REFERENCE_RIGHTS)
+        Self::event_only_with_reference_rights(DEFAULT_EVENT_RIGHTS)
     }
 
     /// Creates an event-only policy engine with explicit initial reference rights.
@@ -112,21 +47,44 @@ impl PolicyEngine {
     pub const fn event_only_with_reference_rights(event_reference_rights: ObjectRights) -> Self {
         Self::new(PolicyProfile::EventOnly {
             event_reference_rights,
-            event_use_rights: EVENT_REFERENCE_RIGHTS,
+            event_use_rights: DEFAULT_EVENT_RIGHTS,
         })
     }
 
-    /// Authorizes or denies a broker operation.
-    pub(crate) fn authorize(
-        &mut self,
-        operation: PolicyOperation,
-    ) -> Result<PolicyDecision, BrokerError> {
+    pub(crate) fn authorize_create_event(
+        &self,
+        caller_credential: CallerCredential,
+    ) -> Result<ObjectRights, BrokerError> {
         match self.profile {
-            PolicyProfile::DefaultDeny => Err(BrokerError::PolicyDenied),
             PolicyProfile::EventOnly {
                 event_reference_rights,
-                event_use_rights,
-            } => authorize_event_only(event_reference_rights, event_use_rights, operation),
+                ..
+            } if caller_credential == CallerCredential::Unauthenticated => {
+                Ok(event_reference_rights)
+            }
+            PolicyProfile::DefaultDeny | PolicyProfile::EventOnly { .. } => {
+                Err(BrokerError::PolicyDenied)
+            }
+        }
+    }
+
+    pub(crate) fn authorize_use_event(
+        &self,
+        caller_credential: CallerCredential,
+        rights: ObjectRights,
+    ) -> Result<(), BrokerError> {
+        match self.profile {
+            PolicyProfile::EventOnly {
+                event_use_rights, ..
+            } if caller_credential == CallerCredential::Unauthenticated
+                && !rights.is_empty()
+                && event_use_rights.contains(rights) =>
+            {
+                Ok(())
+            }
+            PolicyProfile::DefaultDeny | PolicyProfile::EventOnly { .. } => {
+                Err(BrokerError::PolicyDenied)
+            }
         }
     }
 }
@@ -142,34 +100,7 @@ impl Default for PolicyEngine {
 /// The default event create operation grants `WAIT | WRITE` on the initial
 /// reference. Use requests may ask for any non-empty subset of configured event
 /// use rights; BrokerCore separately enforces each reference's actual rights.
-const EVENT_REFERENCE_RIGHTS: ObjectRights = ObjectRights::WAIT.union(ObjectRights::WRITE);
-
-fn authorize_event_only(
-    event_reference_rights: ObjectRights,
-    event_use_rights: ObjectRights,
-    operation: PolicyOperation,
-) -> Result<PolicyDecision, BrokerError> {
-    match operation {
-        PolicyOperation::Object {
-            caller_credential: CallerCredential::Unauthenticated,
-            object_type: ObjectType::Event,
-            operation: ObjectOperation::Create,
-        } => Ok(PolicyDecision::GrantObjectReference {
-            rights: event_reference_rights,
-        }),
-        PolicyOperation::Object {
-            caller_credential: CallerCredential::Unauthenticated,
-            object_type: ObjectType::Event,
-            operation: ObjectOperation::Use { rights },
-        } if !rights.is_empty() && event_use_rights.contains(rights) => {
-            Ok(PolicyDecision::Authorized)
-        }
-        PolicyOperation::Object {
-            object_type: ObjectType::Event,
-            ..
-        } => Err(BrokerError::PolicyDenied),
-    }
-}
+const DEFAULT_EVENT_RIGHTS: ObjectRights = ObjectRights::WAIT.union(ObjectRights::WRITE);
 
 #[cfg(test)]
 mod tests {
@@ -177,71 +108,44 @@ mod tests {
 
     #[test]
     fn event_only_policy_allows_only_current_event_surface() {
-        let mut policy = PolicyEngine::event_only();
+        let policy = PolicyEngine::event_only();
 
         assert_eq!(
-            policy.authorize(PolicyOperation::create_object(
-                CallerCredential::Unauthenticated,
-                ObjectType::Event
-            )),
-            Ok(PolicyDecision::GrantObjectReference {
-                rights: ObjectRights::WAIT | ObjectRights::WRITE
-            })
+            policy.authorize_create_event(CallerCredential::Unauthenticated),
+            Ok(ObjectRights::WAIT | ObjectRights::WRITE)
         );
         assert_eq!(
-            policy.authorize(PolicyOperation::use_object(
-                CallerCredential::Unauthenticated,
-                ObjectType::Event,
-                ObjectRights::WAIT
-            )),
-            Ok(PolicyDecision::Authorized)
+            policy.authorize_use_event(CallerCredential::Unauthenticated, ObjectRights::WAIT),
+            Ok(())
         );
         assert_eq!(
-            policy.authorize(PolicyOperation::use_object(
-                CallerCredential::Unauthenticated,
-                ObjectType::Event,
-                ObjectRights::WRITE
-            )),
-            Ok(PolicyDecision::Authorized)
+            policy.authorize_use_event(CallerCredential::Unauthenticated, ObjectRights::WRITE),
+            Ok(())
         );
         assert_eq!(
-            policy.authorize(PolicyOperation::use_object(
+            policy.authorize_use_event(
                 CallerCredential::Unauthenticated,
-                ObjectType::Event,
                 ObjectRights::WAIT | ObjectRights::WRITE
-            )),
-            Ok(PolicyDecision::Authorized)
+            ),
+            Ok(())
         );
         assert_eq!(
-            policy.authorize(PolicyOperation::use_object(
-                CallerCredential::Unauthenticated,
-                ObjectType::Event,
-                ObjectRights::empty()
-            )),
+            policy.authorize_use_event(CallerCredential::Unauthenticated, ObjectRights::empty()),
             Err(BrokerError::PolicyDenied)
         );
     }
 
     #[test]
     fn explicit_event_reference_rights_do_not_narrow_event_use_policy() {
-        let mut policy = PolicyEngine::event_only_with_reference_rights(ObjectRights::WAIT);
+        let policy = PolicyEngine::event_only_with_reference_rights(ObjectRights::WAIT);
 
         assert_eq!(
-            policy.authorize(PolicyOperation::create_object(
-                CallerCredential::Unauthenticated,
-                ObjectType::Event
-            )),
-            Ok(PolicyDecision::GrantObjectReference {
-                rights: ObjectRights::WAIT
-            })
+            policy.authorize_create_event(CallerCredential::Unauthenticated),
+            Ok(ObjectRights::WAIT)
         );
         assert_eq!(
-            policy.authorize(PolicyOperation::use_object(
-                CallerCredential::Unauthenticated,
-                ObjectType::Event,
-                ObjectRights::WRITE
-            )),
-            Ok(PolicyDecision::Authorized)
+            policy.authorize_use_event(CallerCredential::Unauthenticated, ObjectRights::WRITE),
+            Ok(())
         );
     }
 }
