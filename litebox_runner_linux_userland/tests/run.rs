@@ -312,7 +312,7 @@ fn spawn_test_broker(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let listener = std::os::unix::net::UnixListener::bind(&server_socket_path)
                 .expect("failed to bind broker test socket");
-            let mut core =
+            let broker =
                 litebox_broker_core::BrokerCore::new(policy).expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
 
@@ -329,7 +329,7 @@ fn spawn_test_broker(
                 let mut channel = CountingHostControlChannel::new(
                     litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream),
                 );
-                let termination = litebox_broker_host::serve_connection(&mut core, &mut channel)
+                let termination = litebox_broker_host::serve_connection(&broker, &mut channel)
                     .expect("broker host failed");
                 assert_eq!(
                     termination,
@@ -422,7 +422,9 @@ fn test_runner_broker_integration_with_rewriter() {
     let socket_path = unique_test_socket_path("runner-broker");
     let broker_thread = spawn_test_broker(
         &socket_path,
-        litebox_broker_core::PolicyEngine::event_only(),
+        litebox_broker_core::PolicyEngine::with_unauthenticated_rights(
+            litebox_broker_core::PrincipalRights::all(),
+        ),
         2,
     );
 
