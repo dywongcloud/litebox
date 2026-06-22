@@ -9,9 +9,10 @@ use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use litebox_broker_host::HOST_PROTOCOL_VERSION;
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{ReadinessState, WaitOutcome};
+use litebox_broker_protocol::{
+    BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, ReadinessState, WaitOutcome,
+};
 use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 #[test]
@@ -24,7 +25,16 @@ fn separate_process_broker_serves_event_object_requests() {
         .unwrap();
     let mut local = BrokerLocal::new(channel);
 
-    assert_eq!(local.negotiate().unwrap(), HOST_PROTOCOL_VERSION);
+    assert_eq!(
+        local
+            .request(BrokerRequest::Negotiate {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            })
+            .unwrap(),
+        BrokerResponse::Negotiated {
+            broker_protocol_version: BROKER_PROTOCOL_VERSION
+        }
+    );
 
     let handle = local.create_event().unwrap();
     assert_eq!(

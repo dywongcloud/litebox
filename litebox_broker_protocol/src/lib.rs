@@ -37,30 +37,17 @@ pub use message::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectHandle(pub u64);
 
-/// Major/minor broker protocol version.
+/// Broker protocol version.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProtocolVersion {
-    /// Incompatible protocol version.
-    pub major: u16,
-    /// Backward-compatible protocol revision within a major version.
-    pub minor: u16,
-}
+pub struct ProtocolVersion(pub u16);
 
 impl ProtocolVersion {
     /// Creates a protocol version.
-    pub const fn new(major: u16, minor: u16) -> Self {
-        Self { major, minor }
-    }
-
-    /// Returns whether this requested version is supported by `supported`.
-    ///
-    /// Minor revisions are backward-compatible within a major version, so a
-    /// broker can serve a peer requesting the same major version and a minor
-    /// version no newer than the broker supports.
-    pub const fn is_supported_by(self, supported: Self) -> bool {
-        self.major == supported.major && self.minor <= supported.minor
+    pub const fn new(version: u16) -> Self {
+        Self(version)
     }
 }
 
-/// Initial broker protocol version implemented by the split-broker POC.
-pub const INITIAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
+/// Current broker protocol version.
+pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1);
