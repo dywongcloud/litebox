@@ -36,25 +36,24 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Raw error values are part of the broker wire ABI; do not renumber
-    /// assigned values.
+    /// Raw error values are part of the broker wire ABI.
     ///
-    /// Values `0`, `1`, `6`, and `7` remain unassigned so null/default-looking
-    /// values never represent concrete broker errors and retired values are not reused.
+    /// Value `0` is unassigned so null/default-looking values never represent
+    /// concrete broker errors.
     ///
     /// Converts a raw protocol error code to an error category.
     pub const fn from_raw(raw: u16) -> Self {
         match raw {
-            2 => Self::UnsupportedVersion,
-            3 => Self::MalformedRequest,
-            10 => Self::ProtocolState,
-            11 => Self::UnsupportedOperation,
-            12 => Self::Internal,
-            4 => Self::PolicyDenied,
-            5 => Self::UnknownObject,
+            1 => Self::UnsupportedVersion,
+            2 => Self::MalformedRequest,
+            3 => Self::ProtocolState,
+            4 => Self::UnsupportedOperation,
+            5 => Self::Internal,
+            6 => Self::PolicyDenied,
+            7 => Self::UnknownObject,
             8 => Self::InvalidRights,
             9 => Self::ResourceExhausted,
-            13 => Self::WouldBlock,
+            10 => Self::WouldBlock,
             raw => Self::Unknown(raw),
         }
     }
@@ -62,16 +61,16 @@ impl ErrorCode {
     /// Returns the raw protocol error code.
     pub const fn as_raw(self) -> u16 {
         match self {
-            Self::UnsupportedVersion => 2,
-            Self::MalformedRequest => 3,
-            Self::ProtocolState => 10,
-            Self::UnsupportedOperation => 11,
-            Self::Internal => 12,
-            Self::PolicyDenied => 4,
-            Self::UnknownObject => 5,
+            Self::UnsupportedVersion => 1,
+            Self::MalformedRequest => 2,
+            Self::ProtocolState => 3,
+            Self::UnsupportedOperation => 4,
+            Self::Internal => 5,
+            Self::PolicyDenied => 6,
+            Self::UnknownObject => 7,
             Self::InvalidRights => 8,
             Self::ResourceExhausted => 9,
-            Self::WouldBlock => 13,
+            Self::WouldBlock => 10,
             Self::Unknown(raw) => raw,
         }
     }
