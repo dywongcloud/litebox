@@ -12,16 +12,6 @@ pub struct ReadinessState {
     pub write_ready: bool,
 }
 
-impl ReadinessState {
-    /// Creates a readiness state.
-    pub const fn new(read_ready: bool, write_ready: bool) -> Self {
-        Self {
-            read_ready,
-            write_ready,
-        }
-    }
-}
-
 /// Result of checking whether a broker event read wait would complete now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -49,25 +39,11 @@ pub struct CreateEventRequest {
     pub initial_count: u64,
 }
 
-impl CreateEventRequest {
-    /// Creates an event create request.
-    pub const fn new(initial_count: u64) -> Self {
-        Self { initial_count }
-    }
-}
-
 /// Response to an event create request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateEventResponse {
     /// Created event handle.
     pub handle: ObjectHandle,
-}
-
-impl CreateEventResponse {
-    /// Creates an event create response.
-    pub const fn new(handle: ObjectHandle) -> Self {
-        Self { handle }
-    }
 }
 
 /// Request to check whether an event wait would complete now.
@@ -77,25 +53,11 @@ pub struct WaitEventRequest {
     pub handle: ObjectHandle,
 }
 
-impl WaitEventRequest {
-    /// Creates an event wait request.
-    pub const fn new(handle: ObjectHandle) -> Self {
-        Self { handle }
-    }
-}
-
 /// Response to an event wait request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WaitEventResponse {
     /// Current wait outcome.
     pub outcome: WaitOutcome,
-}
-
-impl WaitEventResponse {
-    /// Creates an event wait response.
-    pub const fn new(outcome: WaitOutcome) -> Self {
-        Self { outcome }
-    }
 }
 
 /// Request to add readiness credits to an event.
@@ -107,25 +69,11 @@ pub struct AddEventRequest {
     pub value: u64,
 }
 
-impl AddEventRequest {
-    /// Creates an event add request.
-    pub const fn new(handle: ObjectHandle, value: u64) -> Self {
-        Self { handle, value }
-    }
-}
-
 /// Response to an event add request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddEventResponse {
     /// Readiness state after adding credits.
     pub readiness: ReadinessState,
-}
-
-impl AddEventResponse {
-    /// Creates an event add response.
-    pub const fn new(readiness: ReadinessState) -> Self {
-        Self { readiness }
-    }
 }
 
 /// Request to consume readiness credits from an event.
@@ -137,13 +85,6 @@ pub struct ConsumeEventRequest {
     pub mode: EventConsumeMode,
 }
 
-impl ConsumeEventRequest {
-    /// Creates an event consume request.
-    pub const fn new(handle: ObjectHandle, mode: EventConsumeMode) -> Self {
-        Self { handle, mode }
-    }
-}
-
 /// Result of consuming readiness credits from a broker-owned event object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EventConsumption {
@@ -151,13 +92,6 @@ pub struct EventConsumption {
     pub value: u64,
     /// Readiness state after consuming credits.
     pub readiness: ReadinessState,
-}
-
-impl EventConsumption {
-    /// Creates an event consumption result.
-    pub const fn new(value: u64, readiness: ReadinessState) -> Self {
-        Self { value, readiness }
-    }
 }
 
 /// Response to an event consume request.
