@@ -359,13 +359,15 @@ fn spawn_test_broker(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-struct CountingHostControlChannel<Channel: litebox_broker_protocol::HostControlChannel> {
+struct CountingHostControlChannel<Channel: litebox_broker_protocol::channel::HostControlChannel> {
     inner: Channel,
     event_request_count: usize,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<Channel: litebox_broker_protocol::HostControlChannel> CountingHostControlChannel<Channel> {
+impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
+    CountingHostControlChannel<Channel>
+{
     const fn new(inner: Channel) -> Self {
         Self {
             inner,
@@ -379,23 +381,25 @@ impl<Channel: litebox_broker_protocol::HostControlChannel> CountingHostControlCh
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<Channel: litebox_broker_protocol::HostControlChannel>
-    litebox_broker_protocol::HostControlChannel for CountingHostControlChannel<Channel>
+impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
+    litebox_broker_protocol::channel::HostControlChannel for CountingHostControlChannel<Channel>
 {
     type Error = Channel::Error;
 
-    fn peer_credential(&self) -> Result<litebox_broker_protocol::PeerCredential, Self::Error> {
+    fn peer_credential(
+        &self,
+    ) -> Result<litebox_broker_protocol::channel::PeerCredential, Self::Error> {
         self.inner.peer_credential()
     }
 
     fn recv_request(
         &mut self,
-    ) -> Result<Option<litebox_broker_protocol::BrokerRequest>, Self::Error> {
+    ) -> Result<Option<litebox_broker_protocol::message::BrokerRequest>, Self::Error> {
         let request = self.inner.recv_request()?;
         if matches!(
             request,
-            Some(litebox_broker_protocol::BrokerRequest::Core(
-                litebox_broker_protocol::CoreRequest::Event(_)
+            Some(litebox_broker_protocol::message::BrokerRequest::Core(
+                litebox_broker_protocol::message::CoreRequest::Event(_)
             ))
         ) {
             self.event_request_count += 1;
@@ -405,7 +409,7 @@ impl<Channel: litebox_broker_protocol::HostControlChannel>
 
     fn send_response(
         &mut self,
-        response: &litebox_broker_protocol::BrokerResponse,
+        response: &litebox_broker_protocol::message::BrokerResponse,
     ) -> Result<(), Self::Error> {
         self.inner.send_response(response)
     }
