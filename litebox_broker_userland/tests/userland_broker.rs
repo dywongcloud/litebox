@@ -2,22 +2,77 @@
 // Licensed under the MIT license.
 
 use std::env;
-use std::fs;
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
+use std::process::{Child, Command};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ReadinessState;
 use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
-#[test]
-fn separate_process_broker_serves_event_object_requests() {
-    let socket_path = SocketPathGuard::new(unique_socket_path());
-    let mut child = ChildGuard::new(spawn_broker(socket_path.path()));
-    let mut channel = connect_with_retry(socket_path.path()).unwrap();
+const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
+
+fn main() {
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|arg| arg == OsStr::new("--unstable"))
+    {
+        run_fake_runner(&args);
+    } else {
+        run_parent_test();
+    }
+}
+
+fn run_parent_test() {
+    // This custom-harness integration test uses its own executable as the broker's
+    // runner. Cargo starts this executable without broker args, so it runs the
+    // parent path here. The broker then starts the same executable with the real
+    // runner argv (`--unstable --broker-socket <path>`), which runs `run_fake_runner`.
+    // After the fake runner finishes its broker requests, it terminates the broker
+    // parent process; this lets the test exercise the long-running broker without a
+    // test-only shutdown path.
+    let mut broker = ChildGuard {
+        child: Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
+            .arg("--runner")
+            .arg(env::current_exe().unwrap())
+            .arg(RUNNER_ARGUMENT)
+            .spawn()
+            .unwrap(),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Some(status) = broker.child.try_wait().unwrap() {
+            assert_eq!(status.signal(), Some(libc::SIGTERM));
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for broker to stop");
+}
+
+fn run_fake_runner(args: &[OsString]) {
+    assert_eq!(
+        args.first().map(OsString::as_os_str),
+        Some(OsStr::new("--unstable"))
+    );
+    assert_eq!(
+        args.get(1).map(OsString::as_os_str),
+        Some(OsStr::new("--broker-socket"))
+    );
+    assert_eq!(
+        args.get(3).map(OsString::as_os_str),
+        Some(OsStr::new(RUNNER_ARGUMENT))
+    );
+    assert_eq!(args.len(), 4, "unexpected runner arguments: {args:?}");
+
+    let socket_path = args.get(2).unwrap();
+    let mut channel = connect_with_retry(Path::new(socket_path)).unwrap();
     channel
         .set_io_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -48,70 +103,29 @@ fn separate_process_broker_serves_event_object_requests() {
         }
     );
     drop(local);
-    assert!(child.wait().unwrap().success());
-}
 
-fn spawn_broker(socket_path: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"))
-        .arg("--socket")
-        .arg(socket_path)
-        .spawn()
-        .unwrap()
+    // SAFETY: `getppid` takes no pointer arguments and has no Rust-side aliasing requirements.
+    let broker_pid = unsafe { libc::getppid() };
+    // SAFETY: `broker_pid` is the runner's parent process and `SIGTERM` is a valid signal number.
+    let kill_result = unsafe { libc::kill(broker_pid, libc::SIGTERM) };
+    assert_eq!(
+        kill_result,
+        0,
+        "failed to stop broker: {}",
+        io::Error::last_os_error()
+    );
 }
 
 struct ChildGuard {
-    child: Option<Child>,
-}
-
-impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child.as_mut().expect("child process missing").wait();
-        if status.is_ok() {
-            self.child = None;
-        }
-        status
-    }
+    child: Child,
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            match child.try_wait() {
-                Ok(Some(_status)) => {}
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(_error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
+        if !matches!(self.child.try_wait(), Ok(Some(_status))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-    }
-}
-
-struct SocketPathGuard {
-    path: PathBuf,
-}
-
-impl SocketPathGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for SocketPathGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -131,15 +145,4 @@ fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamLocalControlCh
             Err(error) => return Err(error),
         }
     }
-}
-
-fn unique_socket_path() -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    env::temp_dir().join(format!(
-        "litebox-broker-userland-{}-{now}.sock",
-        std::process::id()
-    ))
 }
