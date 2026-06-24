@@ -14,7 +14,7 @@ extern crate std;
 
 use core::fmt;
 
-use litebox_broker_core::{BrokerCore, BrokerError, BrokerSession, CallerCredential, event};
+use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential, event};
 use litebox_broker_protocol::{
     AddEventResponse, BROKER_PROTOCOL_VERSION, BrokerRequest, BrokerResponse, CoreRequest,
     CoreResponse, CreateEventResponse, ErrorCode, EventRequest, EventResponse, HostControlChannel,
@@ -36,11 +36,11 @@ where
     let peer_credential = channel
         .peer_credential()
         .map_err(BrokerHostError::Channel)?;
-    let caller_credential = caller_credential_from_peer(peer_credential)
-        .map_err(|()| BrokerHostError::AssociationSetup)?;
-    let session = core
-        .create_session(caller_credential)
-        .map_err(|_error| BrokerHostError::AssociationSetup)?;
+    let caller_credential = match peer_credential {
+        PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
+        _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
+    };
+    let session = core.create_session(caller_credential)?;
 
     serve_request_loop(channel, &session)
 }
@@ -68,16 +68,6 @@ where
     }
 
     Ok(ConnectionTermination::PeerClosed)
-}
-
-fn caller_credential_from_peer(
-    peer_credential: PeerCredential,
-) -> core::result::Result<CallerCredential, ()> {
-    if peer_credential == PeerCredential::Unauthenticated {
-        Ok(CallerCredential::Unauthenticated)
-    } else {
-        Err(())
-    }
 }
 
 fn handle_request(
@@ -165,19 +155,7 @@ fn handle_core_result<T>(
 ) -> BrokerResponse {
     match result {
         Ok(value) => into_response(value),
-        Err(error) => BrokerResponse::Error(to_protocol_error(error)),
-    }
-}
-
-fn to_protocol_error(error: BrokerError) -> ErrorCode {
-    match error {
-        BrokerError::PolicyDenied => ErrorCode::PolicyDenied,
-        BrokerError::UnknownObject => ErrorCode::UnknownObject,
-        BrokerError::InvalidRights => ErrorCode::InvalidRights,
-        BrokerError::ResourceExhausted => ErrorCode::ResourceExhausted,
-        BrokerError::WouldBlock => ErrorCode::WouldBlock,
-        BrokerError::UnsupportedOperation => ErrorCode::UnsupportedOperation,
-        _ => ErrorCode::Internal,
+        Err(error) => BrokerResponse::Error(error.into()),
     }
 }
 
