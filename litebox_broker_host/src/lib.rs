@@ -99,7 +99,7 @@ fn handle_request(
                     })
                 }
             }
-            _ => BrokerDispatch::close_after(
+            BrokerRequest::Core(_) => BrokerDispatch::close_after(
                 BrokerResponse::Error(ErrorCode::ProtocolState),
                 CloseReason::ProtocolViolation,
             ),
@@ -117,14 +117,12 @@ fn handle_active_request(session: &BrokerSession, request: BrokerRequest) -> Bro
         BrokerRequest::Core(request) => {
             BrokerDispatch::continue_after(handle_core_request(session, request))
         }
-        _ => BrokerDispatch::continue_after(BrokerResponse::Error(ErrorCode::UnsupportedOperation)),
     }
 }
 
 fn handle_core_request(session: &BrokerSession, request: CoreRequest) -> BrokerResponse {
     match request {
         CoreRequest::Event(request) => handle_event_request(session, request),
-        _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
     }
 }
 
@@ -138,9 +136,9 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
             })
         }
         EventRequest::Wait(request) => {
-            handle_core_result(event::wait(session, request.handle), |outcome| {
+            handle_core_result(event::wait(session, request.handle), |readiness| {
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
-                    WaitEventResponse { outcome },
+                    WaitEventResponse { readiness },
                 )))
             })
         }
@@ -158,7 +156,6 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
                 BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(consumption)))
             },
         ),
-        _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
     }
 }
 

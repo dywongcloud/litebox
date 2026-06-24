@@ -7,7 +7,7 @@ pub use litebox_broker_protocol::EventConsumeMode as EventCounterReadMode;
 use litebox_broker_protocol::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CoreRequest, CoreResponse,
     CreateEventRequest, EventRequest, EventResponse, ObjectHandle, ReadinessState,
-    WaitEventRequest, WaitOutcome,
+    WaitEventRequest,
 };
 use thiserror::Error;
 
@@ -64,7 +64,7 @@ where
                 CreateEventRequest { initial_count },
             )))
             .map_err(BrokerObjectError::from)
-            .and_then(event_response_from_core)
+            .map(event_response_from_core)
             .map_err(EventCounterError::from)?;
         let EventResponse::Create(response) = response else {
             return Err(BrokerObjectError::UnexpectedResponse.into());
@@ -140,7 +140,7 @@ where
         self.broker
             .request(CoreRequest::Event(request))
             .map_err(BrokerObjectError::from)
-            .and_then(event_response_from_core)
+            .map(event_response_from_core)
     }
 }
 
@@ -161,10 +161,7 @@ where
         let EventResponse::Wait(response) = response else {
             return Events::empty();
         };
-        let (WaitOutcome::Ready(readiness) | WaitOutcome::WouldBlock(readiness)) = response.outcome
-        else {
-            return Events::empty();
-        };
+        let readiness = response.readiness;
         let mut events = Events::empty();
         if readiness.read_ready {
             events |= Events::IN;
@@ -176,9 +173,8 @@ where
     }
 }
 
-fn event_response_from_core(response: CoreResponse) -> Result<EventResponse, BrokerObjectError> {
+fn event_response_from_core(response: CoreResponse) -> EventResponse {
     match response {
-        CoreResponse::Event(response) => Ok(response),
-        _ => Err(BrokerObjectError::UnexpectedResponse),
+        CoreResponse::Event(response) => response,
     }
 }
