@@ -14,8 +14,6 @@ pub(crate) enum BrokerControlError {
     Transport,
     #[error("broker returned operation error: {0}")]
     Broker(#[source] ErrorCode),
-    #[error("broker returned unexpected response")]
-    UnexpectedResponse,
 }
 
 /// Internal normalized error for broker-backed object adapters.
@@ -32,10 +30,8 @@ pub(crate) enum BrokerObjectError {
     WouldBlock,
     #[error("broker object resource exhausted")]
     ResourceExhausted,
-    #[error("broker returned unexpected response")]
-    UnexpectedResponse,
-    #[error("internal broker object error")]
-    Internal,
+    #[error("broker object permission denied")]
+    PermissionDenied,
 }
 
 impl From<BrokerControlError> for BrokerObjectError {
@@ -43,7 +39,6 @@ impl From<BrokerControlError> for BrokerObjectError {
         match error {
             BrokerControlError::Transport => Self::Control,
             BrokerControlError::Broker(error) => error.into(),
-            BrokerControlError::UnexpectedResponse => Self::UnexpectedResponse,
         }
     }
 }
@@ -54,7 +49,13 @@ impl From<ErrorCode> for BrokerObjectError {
             ErrorCode::InvalidRights | ErrorCode::UnknownObject => Self::InvalidObject,
             ErrorCode::WouldBlock => Self::WouldBlock,
             ErrorCode::ResourceExhausted => Self::ResourceExhausted,
-            _ => Self::Internal,
+            ErrorCode::PolicyDenied => Self::PermissionDenied,
+            ErrorCode::UnsupportedVersion
+            | ErrorCode::MalformedRequest
+            | ErrorCode::ProtocolState
+            | ErrorCode::UnsupportedOperation
+            | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
+            _ => panic!("broker returned unsupported error: {error}"),
         }
     }
 }
@@ -64,7 +65,6 @@ impl<E> From<BrokerLocalError<E>> for BrokerControlError {
         match error {
             BrokerLocalError::Channel(_) | BrokerLocalError::ChannelClosed => Self::Transport,
             BrokerLocalError::Broker(error) => Self::Broker(error),
-            BrokerLocalError::UnexpectedResponse(_) => Self::UnexpectedResponse,
         }
     }
 }
@@ -83,10 +83,8 @@ impl From<BrokerObjectError> for EventCounterError {
         match error {
             BrokerObjectError::WouldBlock => Self::WouldBlock,
             BrokerObjectError::ResourceExhausted => Self::ResourceExhausted,
-            BrokerObjectError::UnexpectedResponse => Self::UnexpectedResponse,
-            BrokerObjectError::Control
-            | BrokerObjectError::InvalidObject
-            | BrokerObjectError::Internal => Self::Io,
+            BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            BrokerObjectError::Control | BrokerObjectError::InvalidObject => Self::Io,
         }
     }
 }

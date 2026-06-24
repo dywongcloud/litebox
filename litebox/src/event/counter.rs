@@ -32,10 +32,10 @@ pub enum EventCounterError {
     WouldBlock,
     #[error("event counter resource exhausted")]
     ResourceExhausted,
+    #[error("event counter permission denied")]
+    PermissionDenied,
     #[error("event counter I/O failed")]
     Io,
-    #[error("event counter received unexpected response")]
-    UnexpectedResponse,
     #[error("event counter backing authority unavailable")]
     Unavailable,
 }
@@ -52,6 +52,11 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     /// Creates a local-core event counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match the issued event request.
     pub fn new(litebox: &LiteBox<Platform>, initial_count: u64) -> Result<Self, EventCounterError> {
         let Some(broker) = litebox.broker_control() else {
             return Err(EventCounterError::Unavailable);
@@ -64,7 +69,7 @@ where
             .map_err(EventCounterError::from)?;
         let CoreResponse::Event(response) = response;
         let EventResponse::Create(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse.into());
+            panic!("broker returned unexpected event response: {response:?}");
         };
         Ok(Self {
             broker,
@@ -117,7 +122,7 @@ where
             mode,
         }))?;
         let EventResponse::Consume(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
+            panic!("broker returned unexpected event response: {response:?}");
         };
         Ok(response)
     }
@@ -128,7 +133,7 @@ where
             value,
         }))?;
         let EventResponse::Add(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
+            panic!("broker returned unexpected event response: {response:?}");
         };
         Ok(response.readiness)
     }
@@ -157,7 +162,7 @@ where
             return Events::empty();
         };
         let EventResponse::Wait(response) = response else {
-            return Events::empty();
+            panic!("broker returned unexpected event response: {response:?}");
         };
         let readiness = response.readiness;
         let mut events = Events::empty();
