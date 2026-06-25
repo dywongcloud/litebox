@@ -7,16 +7,13 @@ use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
     EventConsumeMode, ReadinessState, WaitEventRequest,
 };
-use litebox_broker_protocol::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
+use litebox_broker_protocol::message::{
+    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
+};
 
-use crate::{BrokerLocal, Result};
+use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
-    /// Creates a broker-owned event object.
-    pub fn create_event(&mut self) -> Result<ObjectHandle, Channel::Error> {
-        self.create_event_with_count(0)
-    }
-
     /// Creates a broker-owned event object with initial readiness credits.
     ///
     /// # Panics
@@ -87,7 +84,9 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     }
 
     fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
-        let CoreResponse::Event(response) = self.request(CoreRequest::Event(request))?;
-        Ok(response)
+        match self.request(BrokerRequest::Event(request))? {
+            BrokerResponse::Event(response) => Ok(response),
+            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
+        }
     }
 }

@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::message::{BrokerRequest, BrokerResponse};
+use crate::message::{
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+};
 
 /// Peer identity information supplied by the channel or host layer.
 ///
@@ -20,15 +22,38 @@ pub enum PeerCredential {
     Unauthenticated,
 }
 
+/// Host-side receive outcome for peer-to-broker control messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostReceive<T> {
+    /// The peer sent a well-formed message for the current protocol phase.
+    Message(T),
+    /// The peer sent a well-formed message for a different protocol phase.
+    ProtocolViolation,
+    /// The peer closed the channel cleanly before starting another frame.
+    PeerClosed,
+}
+
 /// Local-side control channel for broker authority calls.
 pub trait LocalControlChannel {
     /// Channel-specific error type.
     type Error;
 
-    /// Sends one broker request.
+    /// Sends one broker handshake request.
+    fn send_handshake_request(
+        &mut self,
+        request: &BrokerHandshakeRequest,
+    ) -> Result<(), Self::Error>;
+
+    /// Receives one broker handshake response.
+    ///
+    /// Returns `Ok(None)` when the broker closed the channel cleanly before
+    /// starting another response frame.
+    fn recv_handshake_response(&mut self) -> Result<Option<BrokerHandshakeResponse>, Self::Error>;
+
+    /// Sends one active broker request.
     fn send_request(&mut self, request: &BrokerRequest) -> Result<(), Self::Error>;
 
-    /// Receives one broker response.
+    /// Receives one active broker response.
     ///
     /// Returns `Ok(None)` when the broker closed the channel cleanly before
     /// starting another response frame.
@@ -43,12 +68,20 @@ pub trait HostControlChannel {
     /// Returns the peer credential authenticated for this channel endpoint.
     fn peer_credential(&self) -> Result<PeerCredential, Self::Error>;
 
-    /// Receives one broker request.
-    ///
-    /// Returns `Ok(None)` when the peer closed the channel cleanly before
-    /// starting another request frame.
-    fn recv_request(&mut self) -> Result<Option<BrokerRequest>, Self::Error>;
+    /// Receives one broker handshake request.
+    fn recv_handshake_request(
+        &mut self,
+    ) -> Result<HostReceive<BrokerHandshakeRequest>, Self::Error>;
 
-    /// Sends one broker response.
+    /// Sends one broker handshake response.
+    fn send_handshake_response(
+        &mut self,
+        response: &BrokerHandshakeResponse,
+    ) -> Result<(), Self::Error>;
+
+    /// Receives one active broker request.
+    fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
+
+    /// Sends one active broker response.
     fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
 }

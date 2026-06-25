@@ -6,33 +6,33 @@
 //! The wire codec mirrors the protocol DTO hierarchy:
 //! - this module owns public encode/decode entry points and top-level broker
 //!   envelope tags;
-//! - `core_message` owns `CoreRequest`/`CoreResponse` family tags;
 //! - object-family modules such as `event` own their operation and nested value
 //!   tags;
 //! - `primitive` owns shared scalar/value encoders.
 //!
-//! New object families should add a core family tag and a private family codec
-//! module instead of adding flat helpers here. Existing payloads are positional;
-//! changing fields is an ABI change, so prefer a new operation tag or explicit
-//! negotiated-version gate for payload evolution.
+//! New object families should add a top-level broker message tag and a private
+//! family codec module instead of adding flat helpers here. Existing payloads
+//! are positional; changing fields is an ABI change, so prefer a new operation
+//! tag or explicit negotiated-version gate for payload evolution.
 
 use alloc::vec::Vec;
 use thiserror::Error;
 
 use crate::error::ErrorCode;
-use crate::message::{BrokerRequest, BrokerResponse};
+use crate::message::{
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+};
 
 use primitive::{Decoder, Encoder};
 
-mod core_message;
 mod event;
 mod primitive;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
-const REQUEST_TAG_CORE: u8 = 1;
+const REQUEST_TAG_EVENT: u8 = 1;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
-const RESPONSE_TAG_CORE: u8 = 1;
+const RESPONSE_TAG_EVENT: u8 = 1;
 const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 
@@ -48,8 +48,36 @@ pub enum WireError {
     InvalidBoolean,
     #[error("invalid broker wire tag")]
     InvalidTag,
+    #[error("broker wire message is not valid in this protocol phase")]
+    WrongMessagePhase,
     #[error("broker wire offset overflow")]
     OffsetOverflow,
+}
+
+/// Encodes a broker handshake request body.
+///
+/// Successful encodings are always non-empty because the first byte is the
+/// message tag.
+pub fn encode_handshake_request(request: BrokerHandshakeRequest) -> Vec<u8> {
+    let mut encoder = Encoder::default();
+    encoder.u8(REQUEST_TAG_NEGOTIATE);
+    encoder.protocol_version(request.protocol_version);
+    encoder.finish()
+}
+
+/// Decodes a broker handshake request body.
+pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, WireError> {
+    let mut decoder = Decoder::new(frame);
+    let tag = decoder.u8()?;
+    let request = match tag {
+        REQUEST_TAG_NEGOTIATE => BrokerHandshakeRequest {
+            protocol_version: decoder.protocol_version()?,
+        },
+        REQUEST_TAG_EVENT => return Err(WireError::WrongMessagePhase),
+        _ => return Err(WireError::InvalidTag),
+    };
+    decoder.finish()?;
+    Ok(request)
 }
 
 /// Encodes a broker request body.
@@ -59,13 +87,9 @@ pub enum WireError {
 pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
     let mut encoder = Encoder::default();
     match request {
-        BrokerRequest::Negotiate { protocol_version } => {
-            encoder.u8(REQUEST_TAG_NEGOTIATE);
-            encoder.protocol_version(protocol_version);
-        }
-        BrokerRequest::Core(request) => {
-            encoder.u8(REQUEST_TAG_CORE);
-            core_message::encode_core_request(&mut encoder, request);
+        BrokerRequest::Event(request) => {
+            encoder.u8(REQUEST_TAG_EVENT);
+            event::encode_event_request(&mut encoder, request);
         }
     }
     encoder.finish()
@@ -76,14 +100,61 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let request = match tag {
-        REQUEST_TAG_NEGOTIATE => BrokerRequest::Negotiate {
-            protocol_version: decoder.protocol_version()?,
-        },
-        REQUEST_TAG_CORE => BrokerRequest::Core(core_message::decode_core_request(&mut decoder)?),
+        REQUEST_TAG_NEGOTIATE => return Err(WireError::WrongMessagePhase),
+        REQUEST_TAG_EVENT => BrokerRequest::Event(event::decode_event_request(&mut decoder)?),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
     Ok(request)
+}
+
+/// Encodes a broker handshake response body.
+///
+/// Successful encodings are always non-empty because the first byte is the
+/// message tag.
+pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
+    let mut encoder = Encoder::default();
+    match response {
+        BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version,
+        } => {
+            encoder.u8(RESPONSE_TAG_NEGOTIATED);
+            encoder.protocol_version(broker_protocol_version);
+        }
+        BrokerHandshakeResponse::VersionMismatch {
+            broker_protocol_version,
+        } => {
+            encoder.u8(RESPONSE_TAG_VERSION_MISMATCH);
+            encoder.protocol_version(broker_protocol_version);
+        }
+        BrokerHandshakeResponse::Error(error) => {
+            encoder.u8(RESPONSE_TAG_ERROR);
+            encoder.u16(error.as_raw());
+        }
+    }
+    encoder.finish()
+}
+
+/// Decodes a broker handshake response body.
+pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse, WireError> {
+    let mut decoder = Decoder::new(frame);
+    let tag = decoder.u8()?;
+    let response = match tag {
+        RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: decoder.protocol_version()?,
+        },
+        RESPONSE_TAG_EVENT => return Err(WireError::WrongMessagePhase),
+        RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
+            broker_protocol_version: decoder.protocol_version()?,
+        },
+        RESPONSE_TAG_ERROR => {
+            let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
+            BrokerHandshakeResponse::Error(error)
+        }
+        _ => return Err(WireError::InvalidTag),
+    };
+    decoder.finish()?;
+    Ok(response)
 }
 
 /// Encodes a broker response body.
@@ -93,21 +164,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
 pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
     let mut encoder = Encoder::default();
     match response {
-        BrokerResponse::Negotiated {
-            broker_protocol_version,
-        } => {
-            encoder.u8(RESPONSE_TAG_NEGOTIATED);
-            encoder.protocol_version(broker_protocol_version);
-        }
-        BrokerResponse::VersionMismatch {
-            broker_protocol_version,
-        } => {
-            encoder.u8(RESPONSE_TAG_VERSION_MISMATCH);
-            encoder.protocol_version(broker_protocol_version);
-        }
-        BrokerResponse::Core(response) => {
-            encoder.u8(RESPONSE_TAG_CORE);
-            core_message::encode_core_response(&mut encoder, response);
+        BrokerResponse::Event(response) => {
+            encoder.u8(RESPONSE_TAG_EVENT);
+            event::encode_event_response(&mut encoder, response);
         }
         BrokerResponse::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
@@ -122,15 +181,10 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let response = match tag {
-        RESPONSE_TAG_NEGOTIATED => BrokerResponse::Negotiated {
-            broker_protocol_version: decoder.protocol_version()?,
-        },
-        RESPONSE_TAG_VERSION_MISMATCH => BrokerResponse::VersionMismatch {
-            broker_protocol_version: decoder.protocol_version()?,
-        },
-        RESPONSE_TAG_CORE => {
-            BrokerResponse::Core(core_message::decode_core_response(&mut decoder)?)
+        RESPONSE_TAG_NEGOTIATED | RESPONSE_TAG_VERSION_MISMATCH => {
+            return Err(WireError::WrongMessagePhase);
         }
+        RESPONSE_TAG_EVENT => BrokerResponse::Event(event::decode_event_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResponse::Error(error)
@@ -149,29 +203,40 @@ mod tests {
         CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState, WaitEventRequest,
         WaitEventResponse,
     };
-    use crate::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
+    use crate::message::{EventRequest, EventResponse};
     use crate::{ObjectHandle, ProtocolVersion};
 
     #[test]
+    fn handshake_request_codec_round_trips_all_variants() {
+        let requests = [BrokerHandshakeRequest {
+            protocol_version: ProtocolVersion(1),
+        }];
+
+        for request in requests {
+            assert_eq!(
+                decode_handshake_request(&encode_handshake_request(request.clone())).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
     fn request_codec_round_trips_all_variants() {
-        let handle = sample_handle();
+        let handle = ObjectHandle(13);
         let requests = [
-            BrokerRequest::Negotiate {
-                protocol_version: ProtocolVersion(1),
-            },
-            event_request(EventRequest::Create(CreateEventRequest {
+            BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
             })),
-            event_request(EventRequest::Create(CreateEventRequest {
+            BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 7,
             })),
-            event_request(EventRequest::Wait(WaitEventRequest { handle })),
-            event_request(EventRequest::Add(AddEventRequest { handle, value: 3 })),
-            event_request(EventRequest::Consume(ConsumeEventRequest {
+            BrokerRequest::Event(EventRequest::Wait(WaitEventRequest { handle })),
+            BrokerRequest::Event(EventRequest::Add(AddEventRequest { handle, value: 3 })),
+            BrokerRequest::Event(EventRequest::Consume(ConsumeEventRequest {
                 handle,
                 mode: EventConsumeMode::All,
             })),
-            event_request(EventRequest::Consume(ConsumeEventRequest {
+            BrokerRequest::Event(EventRequest::Consume(ConsumeEventRequest {
                 handle,
                 mode: EventConsumeMode::One,
             })),
@@ -186,35 +251,50 @@ mod tests {
     }
 
     #[test]
-    fn response_codec_round_trips_all_variants() {
-        let handle = sample_handle();
+    fn handshake_response_codec_round_trips_all_variants() {
         let responses = [
-            BrokerResponse::Negotiated {
+            BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
             },
-            BrokerResponse::VersionMismatch {
+            BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),
             },
-            event_response(EventResponse::Create(CreateEventResponse { handle })),
-            event_response(EventResponse::Wait(WaitEventResponse {
+            BrokerHandshakeResponse::Error(ErrorCode::PolicyDenied),
+            BrokerHandshakeResponse::Error(ErrorCode::Internal),
+        ];
+
+        for response in responses {
+            assert_eq!(
+                decode_handshake_response(&encode_handshake_response(response.clone())).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn response_codec_round_trips_all_variants() {
+        let handle = ObjectHandle(13);
+        let responses = [
+            BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle })),
+            BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
                 readiness: ReadinessState {
                     read_ready: true,
                     write_ready: false,
                 },
             })),
-            event_response(EventResponse::Wait(WaitEventResponse {
+            BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
                 readiness: ReadinessState {
                     read_ready: false,
                     write_ready: true,
                 },
             })),
-            event_response(EventResponse::Add(AddEventResponse {
+            BrokerResponse::Event(EventResponse::Add(AddEventResponse {
                 readiness: ReadinessState {
                     read_ready: true,
                     write_ready: true,
                 },
             })),
-            event_response(EventResponse::Consume(EventConsumption {
+            BrokerResponse::Event(EventResponse::Consume(EventConsumption {
                 value: 3,
                 readiness: ReadinessState {
                     read_ready: false,
@@ -235,24 +315,89 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_malformed_handshake_request_frames() {
+        assert_eq!(
+            decode_handshake_request(&[0xff, 1, 2, 3]),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_handshake_request(&[0, 1]),
+            Err(WireError::TruncatedFrame)
+        );
+        assert_eq!(
+            decode_handshake_request(&encode_request(BrokerRequest::Event(EventRequest::Create(
+                CreateEventRequest { initial_count: 0 },
+            )))),
+            Err(WireError::WrongMessagePhase)
+        );
+        let mut frame = encode_handshake_request(BrokerHandshakeRequest {
+            protocol_version: ProtocolVersion(1),
+        });
+        frame.push(0xff);
+        assert_eq!(
+            decode_handshake_request(&frame),
+            Err(WireError::TrailingBytes)
+        );
+    }
+
+    #[test]
     fn decode_rejects_malformed_request_frames() {
         assert_eq!(decode_request(&[0xff, 1, 2, 3]), Err(WireError::InvalidTag));
-        let mut unknown_consume_mode =
-            encode_request(event_request(EventRequest::Consume(ConsumeEventRequest {
-                handle: sample_handle(),
+        assert_eq!(
+            decode_request(&encode_handshake_request(BrokerHandshakeRequest {
+                protocol_version: ProtocolVersion(1),
+            })),
+            Err(WireError::WrongMessagePhase)
+        );
+        let mut unknown_consume_mode = encode_request(BrokerRequest::Event(EventRequest::Consume(
+            ConsumeEventRequest {
+                handle: ObjectHandle(13),
                 mode: EventConsumeMode::All,
-            })));
+            },
+        )));
         *unknown_consume_mode.last_mut().unwrap() = 0xff;
         assert_eq!(
             decode_request(&unknown_consume_mode),
             Err(WireError::InvalidTag)
         );
-        assert_eq!(decode_request(&[0, 1]), Err(WireError::TruncatedFrame));
-        let mut frame = encode_request(event_request(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        })));
+        let mut frame = encode_request(BrokerRequest::Event(EventRequest::Create(
+            CreateEventRequest { initial_count: 0 },
+        )));
         frame.push(0xff);
         assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
+    }
+
+    #[test]
+    fn decode_rejects_malformed_handshake_response_frames() {
+        assert_eq!(
+            decode_handshake_response(&[0xff, 1, 2, 3]),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_handshake_response(&[0, 1]),
+            Err(WireError::TruncatedFrame)
+        );
+        assert_eq!(
+            decode_handshake_response(&[2, 0xff, 0xff]),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_handshake_response(&encode_response(BrokerResponse::Event(
+                EventResponse::Create(CreateEventResponse {
+                    handle: ObjectHandle(13),
+                }),
+            ))),
+            Err(WireError::WrongMessagePhase)
+        );
+
+        let mut frame = encode_handshake_response(BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: ProtocolVersion(1),
+        });
+        frame.push(0xff);
+        assert_eq!(
+            decode_handshake_response(&frame),
+            Err(WireError::TrailingBytes)
+        );
     }
 
     #[test]
@@ -262,7 +407,15 @@ mod tests {
             Err(WireError::InvalidTag)
         );
         assert_eq!(
-            decode_response(&[1, 0, 1, 0xff]),
+            decode_response(&encode_handshake_response(
+                BrokerHandshakeResponse::Negotiated {
+                    broker_protocol_version: ProtocolVersion(1),
+                },
+            )),
+            Err(WireError::WrongMessagePhase)
+        );
+        assert_eq!(
+            decode_response(&[1, 1, 0xff]),
             Err(WireError::InvalidBoolean)
         );
         assert_eq!(
@@ -270,14 +423,14 @@ mod tests {
             Err(WireError::InvalidTag)
         );
 
-        let mut invalid_bool = [1, 0, 2, 2, 0];
+        let mut invalid_bool = [1, 2, 2, 0];
         assert_eq!(
             decode_response(&invalid_bool),
             Err(WireError::InvalidBoolean)
         );
 
+        invalid_bool[2] = 1;
         invalid_bool[3] = 1;
-        invalid_bool[4] = 1;
         let mut frame = invalid_bool.to_vec();
         frame.push(0xff);
         assert_eq!(decode_response(&frame), Err(WireError::TrailingBytes));
@@ -286,25 +439,15 @@ mod tests {
     #[test]
     fn event_add_response_wire_shape_is_pinned() {
         assert_eq!(
-            encode_response(event_response(EventResponse::Add(AddEventResponse {
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: false,
-                },
-            }))),
-            [1, 0, 2, 1, 0]
+            encode_response(BrokerResponse::Event(EventResponse::Add(
+                AddEventResponse {
+                    readiness: ReadinessState {
+                        read_ready: true,
+                        write_ready: false,
+                    },
+                }
+            ))),
+            [1, 2, 1, 0]
         );
-    }
-
-    const fn sample_handle() -> ObjectHandle {
-        ObjectHandle(13)
-    }
-
-    const fn event_request(request: EventRequest) -> BrokerRequest {
-        BrokerRequest::Core(CoreRequest::Event(request))
-    }
-
-    const fn event_response(response: EventResponse) -> BrokerResponse {
-        BrokerResponse::Core(CoreResponse::Event(response))
     }
 }

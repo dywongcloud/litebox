@@ -9,7 +9,9 @@ use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest, ReadinessState,
     WaitEventRequest,
 };
-use litebox_broker_protocol::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
+use litebox_broker_protocol::message::{
+    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
+};
 use thiserror::Error;
 
 use crate::{
@@ -63,13 +65,12 @@ where
             return Err(EventCounterError::Unavailable);
         };
         let response = broker
-            .request(CoreRequest::Event(EventRequest::Create(
+            .request(BrokerRequest::Event(EventRequest::Create(
                 CreateEventRequest { initial_count },
             )))
             .map_err(BrokerObjectError::from)
             .map_err(EventCounterError::from)?;
-        let CoreResponse::Event(response) = response;
-        let EventResponse::Create(response) = response else {
+        let BrokerResponse::Event(EventResponse::Create(response)) = response else {
             panic!("broker returned unexpected event response: {response:?}");
         };
         Ok(Self {
@@ -140,11 +141,14 @@ where
     }
 
     fn request_event(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
-        let CoreResponse::Event(response) = self
+        match self
             .broker
-            .request(CoreRequest::Event(request))
-            .map_err(BrokerObjectError::from)?;
-        Ok(response)
+            .request(BrokerRequest::Event(request))
+            .map_err(BrokerObjectError::from)?
+        {
+            BrokerResponse::Event(response) => Ok(response),
+            BrokerResponse::Error(error) => Err(error.into()),
+        }
     }
 }
 

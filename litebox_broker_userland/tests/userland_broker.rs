@@ -76,7 +76,7 @@ fn run_fake_runner(args: &[OsString]) {
         .unwrap();
     let mut local = BrokerLocal::negotiate(channel).unwrap();
 
-    let handle = local.create_event().unwrap();
+    let handle = local.create_event_with_count(0).unwrap();
     assert_eq!(
         local.wait_event(handle).unwrap(),
         ReadinessState {

@@ -3,7 +3,7 @@
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::channel::LocalControlChannel;
-use litebox_broker_protocol::message::{CoreRequest, CoreResponse};
+use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
@@ -16,11 +16,11 @@ use error::BrokerControlError;
 /// requests. Deployment code owns endpoint selection and supplies the connected
 /// transport behind this protocol-level boundary.
 pub(crate) trait BrokerControl: Send + Sync {
-    /// Sends one active BrokerCore request and returns its response.
+    /// Sends one active broker request and returns its response.
     fn request(
         &self,
-        request: CoreRequest,
-    ) -> core::result::Result<CoreResponse, BrokerControlError>;
+        request: BrokerRequest,
+    ) -> core::result::Result<BrokerResponse, BrokerControlError>;
 }
 
 pub(crate) struct BrokerLocalControl<
@@ -49,8 +49,8 @@ where
 {
     fn request(
         &self,
-        request: CoreRequest,
-    ) -> core::result::Result<CoreResponse, BrokerControlError> {
+        request: BrokerRequest,
+    ) -> core::result::Result<BrokerResponse, BrokerControlError> {
         Ok(self.local.lock().request(request)?)
     }
 }

@@ -12,10 +12,16 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use litebox_broker_protocol::channel::{HostControlChannel, LocalControlChannel, PeerCredential};
-use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
+use litebox_broker_protocol::channel::{
+    HostControlChannel, HostReceive, LocalControlChannel, PeerCredential,
+};
+use litebox_broker_protocol::message::{
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+};
 use litebox_broker_protocol::wire::{
-    WireError, decode_request, decode_response, encode_request, encode_response,
+    WireError, decode_handshake_request, decode_handshake_response, decode_request,
+    decode_response, encode_handshake_request, encode_handshake_response, encode_request,
+    encode_response,
 };
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
@@ -115,6 +121,30 @@ impl UnixStreamHostControlChannel {
 impl LocalControlChannel for UnixStreamLocalControlChannel {
     type Error = Error;
 
+    fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
+        let frame = encode_handshake_request(request.clone());
+        let deadline = self.current_deadline()?;
+        let result = write_frame_with_deadline(&mut self.stream, &frame, deadline);
+        if result.is_err() {
+            self.active_request_deadline = None;
+        }
+        result
+    }
+
+    fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
+        let deadline = self.current_deadline()?;
+        let frame = read_frame_with_deadline(&mut self.stream, deadline);
+        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
+            self.set_stream_io_timeout(self.io_timeout)?;
+        }
+        match frame? {
+            Some(frame) => decode_handshake_response(&frame)
+                .map(Some)
+                .map_err(wire_error),
+            None => Ok(None),
+        }
+    }
+
     fn send_request(&mut self, request: &BrokerRequest) -> IoResult<()> {
         let frame = encode_request(request.clone());
         let deadline = self.current_deadline()?;
@@ -127,14 +157,14 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
 
     fn recv_response(&mut self) -> IoResult<Option<BrokerResponse>> {
         let deadline = self.current_deadline()?;
-        let result = match read_frame_with_deadline(&mut self.stream, deadline)? {
-            Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
-            None => Ok(None),
-        };
+        let frame = read_frame_with_deadline(&mut self.stream, deadline);
         if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
             self.set_stream_io_timeout(self.io_timeout)?;
         }
-        result
+        match frame? {
+            Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
+            None => Ok(None),
+        }
     }
 }
 
@@ -147,11 +177,34 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         Ok(PeerCredential::Unauthenticated)
     }
 
-    fn recv_request(&mut self) -> IoResult<Option<BrokerRequest>> {
+    fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
         let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
-            return Ok(None);
+            return Ok(HostReceive::PeerClosed);
         };
-        decode_request(&frame).map(Some).map_err(wire_error)
+        match decode_handshake_request(&frame) {
+            Ok(request) => Ok(HostReceive::Message(request)),
+            Err(WireError::WrongMessagePhase) => Ok(HostReceive::ProtocolViolation),
+            Err(error) => Err(wire_error(error)),
+        }
+    }
+
+    fn send_handshake_response(&mut self, response: &BrokerHandshakeResponse) -> IoResult<()> {
+        write_frame_with_deadline(
+            &mut self.stream,
+            &encode_handshake_response(response.clone()),
+            self.io_deadline,
+        )
+    }
+
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
+            return Ok(HostReceive::PeerClosed);
+        };
+        match decode_request(&frame) {
+            Ok(request) => Ok(HostReceive::Message(request)),
+            Err(WireError::WrongMessagePhase) => Ok(HostReceive::ProtocolViolation),
+            Err(error) => Err(wire_error(error)),
+        }
     }
 
     fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
@@ -362,6 +415,41 @@ mod tests {
         assert!(
             matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
             "unexpected timeout error kind: {error:?}"
+        );
+    }
+
+    #[test]
+    fn host_reports_wrong_phase_request_frames_as_protocol_violations() {
+        let (mut peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        write_frame_with_deadline(
+            &mut peer_stream,
+            &encode_request(BrokerRequest::Event(
+                litebox_broker_protocol::message::EventRequest::Create(
+                    litebox_broker_protocol::event::CreateEventRequest { initial_count: 0 },
+                ),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            channel.recv_handshake_request().unwrap(),
+            HostReceive::ProtocolViolation
+        );
+
+        let (mut peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        write_frame_with_deadline(
+            &mut peer_stream,
+            &encode_handshake_request(BrokerHandshakeRequest {
+                protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            channel.recv_request().unwrap(),
+            HostReceive::ProtocolViolation
         );
     }
 }

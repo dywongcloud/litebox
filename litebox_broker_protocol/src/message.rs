@@ -8,49 +8,23 @@ use crate::event::{
     CreateEventRequest, CreateEventResponse, WaitEventRequest, WaitEventResponse,
 };
 
-/// Broker request sent over the control channel.
-///
-/// The outer broker request is intentionally small. Object-family and
-/// domain-specific operations are grouped below it so new object families do not
-/// accumulate as unrelated top-level broker variants.
+/// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerRequest {
-    /// Protocol negotiation request.
-    Negotiate {
-        /// Required protocol version.
-        protocol_version: ProtocolVersion,
-    },
-    /// BrokerCore authority request.
-    Core(CoreRequest),
+pub struct BrokerHandshakeRequest {
+    /// Required protocol version.
+    pub protocol_version: ProtocolVersion,
 }
 
-/// Request adapted by the broker host into a BrokerCore domain call.
+/// Broker request sent over an active control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CoreRequest {
+pub enum BrokerRequest {
     /// Event object request family.
     Event(EventRequest),
 }
 
-/// Broker-owned event object request.
+/// Broker handshake response sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EventRequest {
-    /// Create a broker-owned event object.
-    Create(CreateEventRequest),
-    /// Check whether an event wait would complete now.
-    Wait(WaitEventRequest),
-    /// Add readiness credits to an event.
-    Add(AddEventRequest),
-    /// Consume readiness credits from an event.
-    Consume(ConsumeEventRequest),
-}
-
-/// Broker response sent over the control channel.
-///
-/// Common connection/protocol outcomes stay at this layer. Domain payloads are
-/// grouped under [`CoreResponse`] so future object families can evolve without
-/// turning the broker envelope into a flat operation/result list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerResponse {
+pub enum BrokerHandshakeResponse {
     /// Negotiation result.
     Negotiated {
         /// Broker protocol version supported by this endpoint.
@@ -68,17 +42,30 @@ pub enum BrokerResponse {
         /// Broker protocol version supported by this endpoint.
         broker_protocol_version: ProtocolVersion,
     },
-    /// BrokerCore authority response.
-    Core(CoreResponse),
-    /// Operation failed with an ABI-neutral broker error.
+    /// Handshake failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
 
-/// Response returned by a BrokerCore domain request.
+/// Broker-owned event object request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CoreResponse {
+pub enum EventRequest {
+    /// Create a broker-owned event object.
+    Create(CreateEventRequest),
+    /// Check whether an event wait would complete now.
+    Wait(WaitEventRequest),
+    /// Add readiness credits to an event.
+    Add(AddEventRequest),
+    /// Consume readiness credits from an event.
+    Consume(ConsumeEventRequest),
+}
+
+/// Broker response sent over an active control channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrokerResponse {
     /// Event object response family.
     Event(EventResponse),
+    /// Operation failed with an ABI-neutral broker error.
+    Error(ErrorCode),
 }
 
 /// Broker-owned event object response.

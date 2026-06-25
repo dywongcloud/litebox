@@ -326,9 +326,10 @@ fn spawn_test_broker(
                 stream
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test write timeout");
-                let mut channel = CountingHostControlChannel::new(
-                    litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream),
-                );
+                let mut channel = CountingHostControlChannel {
+                    inner: litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream),
+                    event_request_count: 0,
+                };
                 let termination = litebox_broker_host::serve_connection(&broker, &mut channel)
                     .expect("broker host failed");
                 assert_eq!(
@@ -336,7 +337,7 @@ fn spawn_test_broker(
                     litebox_broker_host::ConnectionTermination::PeerClosed
                 );
                 event_request_count_tx
-                    .send(channel.event_request_count())
+                    .send(channel.event_request_count)
                     .expect("failed to report broker event request count");
             }
         }));
@@ -366,22 +367,6 @@ struct CountingHostControlChannel<Channel: litebox_broker_protocol::channel::Hos
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
-    CountingHostControlChannel<Channel>
-{
-    const fn new(inner: Channel) -> Self {
-        Self {
-            inner,
-            event_request_count: 0,
-        }
-    }
-
-    const fn event_request_count(&self) -> usize {
-        self.event_request_count
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
     litebox_broker_protocol::channel::HostControlChannel for CountingHostControlChannel<Channel>
 {
     type Error = Channel::Error;
@@ -392,15 +377,38 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
         self.inner.peer_credential()
     }
 
+    fn recv_handshake_request(
+        &mut self,
+    ) -> Result<
+        litebox_broker_protocol::channel::HostReceive<
+            litebox_broker_protocol::message::BrokerHandshakeRequest,
+        >,
+        Self::Error,
+    > {
+        self.inner.recv_handshake_request()
+    }
+
+    fn send_handshake_response(
+        &mut self,
+        response: &litebox_broker_protocol::message::BrokerHandshakeResponse,
+    ) -> Result<(), Self::Error> {
+        self.inner.send_handshake_response(response)
+    }
+
     fn recv_request(
         &mut self,
-    ) -> Result<Option<litebox_broker_protocol::message::BrokerRequest>, Self::Error> {
+    ) -> Result<
+        litebox_broker_protocol::channel::HostReceive<
+            litebox_broker_protocol::message::BrokerRequest,
+        >,
+        Self::Error,
+    > {
         let request = self.inner.recv_request()?;
         if matches!(
-            request,
-            Some(litebox_broker_protocol::message::BrokerRequest::Core(
-                litebox_broker_protocol::message::CoreRequest::Event(_)
-            ))
+            &request,
+            litebox_broker_protocol::channel::HostReceive::Message(
+                litebox_broker_protocol::message::BrokerRequest::Event(_)
+            )
         ) {
             self.event_request_count += 1;
         }
