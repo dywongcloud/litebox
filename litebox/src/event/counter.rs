@@ -144,10 +144,20 @@ where
         match self
             .broker
             .request(BrokerRequest::Event(request))
-            .map_err(BrokerObjectError::from)?
-        {
+            .map_err(BrokerObjectError::from)
+            .inspect_err(|&error| {
+                if error != BrokerObjectError::WouldBlock {
+                    self.pollee.notify_observers(Events::ERR);
+                }
+            })? {
             BrokerResponse::Event(response) => Ok(response),
-            BrokerResponse::Error(error) => Err(error.into()),
+            BrokerResponse::Error(error) => {
+                let error = error.into();
+                if error != BrokerObjectError::WouldBlock {
+                    self.pollee.notify_observers(Events::ERR);
+                }
+                Err(error)
+            }
         }
     }
 }
@@ -161,10 +171,12 @@ where
     }
 
     fn check_io_events(&self) -> Events {
-        let Ok(response) = self.request_event(EventRequest::Wait(WaitEventRequest {
+        let response = match self.request_event(EventRequest::Wait(WaitEventRequest {
             handle: self.handle,
-        })) else {
-            return Events::empty();
+        })) {
+            Ok(response) => response,
+            Err(BrokerObjectError::WouldBlock) => return Events::empty(),
+            Err(_) => return Events::ERR,
         };
         let EventResponse::Wait(response) = response else {
             panic!("broker returned unexpected event response: {response:?}");
