@@ -55,6 +55,14 @@ pub struct PerCpuVariables {
     /// via `rdmsr(HV_REGISTER_VP_INDEX)` and immutable thereafter.
     /// Uses `u32::MAX` as the "uninitialized" sentinel.
     vp_index: Cell<u32>,
+    /// Set once this CPU's preemption timer is configured (see `arch::timer`).
+    /// Zero-initialized to `false`.
+    pub(crate) preemption_timer_enabled: Cell<bool>,
+    /// True while the preemption timer is armed (see `arch::timer`).
+    /// Zero-initialized to `false`.
+    pub(crate) preemption_armed: Cell<bool>,
+    /// Set when a preemption timer killed user-mode code.
+    pub(crate) preemption_timeout_killed_user: Cell<bool>,
 }
 
 // These Hyper-V pages must be page-aligned.

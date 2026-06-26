@@ -1613,7 +1613,15 @@ fn run_thread_inner(
     // `thread_ctx` will be passed to `syscall_handler` later.
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
     // member variable offset calculation in assembly code).
-    unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter)) };
+    //
+    // Arm the preemption timer for this user-thread execution. This function is
+    // idempotent, so `reenter` does not change the timeout.
+    crate::arch::timer::arm_preemption();
+    // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
+    // the duration of the call, and `run_thread_arch` returns exactly once.
+    unsafe {
+        run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
+    }
 }
 
 /// Save callee-saved registers onto the stack.
@@ -2131,6 +2139,12 @@ unsafe extern "C" fn exception_handler(
             kernel_mode: false,
         }
     };
+    // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
+    // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
+    if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
+        crate::arch::timer::eoi();
+        crate::arch::timer::mark_user_timeout_kill();
+    }
     match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
         ContinueOperation::Resume => {
             if kernel_mode {
@@ -2194,6 +2208,7 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
     #[rustfmt::skip]
     core::arch::naked_asm!(
         "switch_to_user_start:",
+        "cli",
         // Flush TLB by reloading CR3
         "mov rax, cr3",
         "mov cr3, rax",
