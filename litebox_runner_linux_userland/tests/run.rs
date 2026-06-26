@@ -263,16 +263,16 @@ fn unique_test_socket_path(name: &str) -> PathBuf {
 struct TestBroker {
     thread: Option<std::thread::JoinHandle<()>>,
     done_rx: std::sync::mpsc::Receiver<()>,
-    event_request_count_rx: std::sync::mpsc::Receiver<usize>,
+    close_object_count_rx: std::sync::mpsc::Receiver<usize>,
     socket_path: PathBuf,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl TestBroker {
-    fn next_event_request_count(&self) -> usize {
-        self.event_request_count_rx
+    fn next_close_object_count(&self) -> usize {
+        self.close_object_count_rx
             .recv_timeout(BROKER_HELPER_TIMEOUT)
-            .expect("broker test host did not report event request count")
+            .expect("broker test host did not report close-object count")
     }
 
     fn join(mut self) {
@@ -305,7 +305,7 @@ fn spawn_test_broker(
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let (event_request_count_tx, event_request_count_rx) = std::sync::mpsc::channel();
+    let (close_object_count_tx, close_object_count_rx) = std::sync::mpsc::channel();
     let server_socket_path = socket_path.to_path_buf();
     let cleanup_socket_path = socket_path.to_path_buf();
     let broker_thread = std::thread::spawn(move || {
@@ -328,7 +328,7 @@ fn spawn_test_broker(
                     .expect("failed to configure broker test write timeout");
                 let mut channel = CountingHostControlChannel {
                     inner: litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream),
-                    event_request_count: 0,
+                    close_object_count: 0,
                 };
                 let termination = litebox_broker_host::serve_connection(&broker, &mut channel)
                     .expect("broker host failed");
@@ -336,9 +336,9 @@ fn spawn_test_broker(
                     termination,
                     litebox_broker_host::ConnectionTermination::PeerClosed
                 );
-                event_request_count_tx
-                    .send(channel.event_request_count)
-                    .expect("failed to report broker event request count");
+                close_object_count_tx
+                    .send(channel.close_object_count)
+                    .expect("failed to report broker close-object count");
             }
         }));
         let _ = std::fs::remove_file(&server_socket_path);
@@ -354,7 +354,7 @@ fn spawn_test_broker(
     TestBroker {
         thread: Some(broker_thread),
         done_rx,
-        event_request_count_rx,
+        close_object_count_rx,
         socket_path: cleanup_socket_path,
     }
 }
@@ -362,7 +362,7 @@ fn spawn_test_broker(
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct CountingHostControlChannel<Channel: litebox_broker_protocol::channel::HostControlChannel> {
     inner: Channel,
-    event_request_count: usize,
+    close_object_count: usize,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -407,10 +407,10 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
         if matches!(
             &request,
             litebox_broker_protocol::channel::HostReceive::Message(
-                litebox_broker_protocol::message::BrokerRequest::Event(_)
+                litebox_broker_protocol::message::BrokerRequest::CloseObject(_)
             )
         ) {
-            self.event_request_count += 1;
+            self.close_object_count += 1;
         }
         Ok(request)
     }
@@ -440,12 +440,13 @@ fn test_runner_broker_integration_with_rewriter() {
     Runner::new(&true_path, "broker_true_rewriter")
         .broker_socket(&socket_path)
         .run();
-    assert_eq!(broker_thread.next_event_request_count(), 0);
+    assert_eq!(broker_thread.next_close_object_count(), 0);
 
     Runner::new(&target, "broker_eventfd_rewriter")
         .broker_socket(&socket_path)
         .run();
-    assert!(broker_thread.next_event_request_count() > 0);
+    // eventfd.c creates eight eventfd objects; each should release one broker object.
+    assert_eq!(broker_thread.next_close_object_count(), 8);
 
     broker_thread.join();
 }
