@@ -12,10 +12,7 @@ use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    remove_raw_handle,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,26 +33,13 @@ bitflags::bitflags! {
 
 impl IoCompletionAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        let mut access = Self::from_bits_retain(desired_access);
-        if desired_access & AccessMask::GENERIC_READ.bits() != 0 {
-            access.insert(Self::READ);
-        }
-        if desired_access & AccessMask::GENERIC_WRITE.bits() != 0 {
-            access.insert(Self::WRITE);
-        }
-        if desired_access & AccessMask::GENERIC_EXECUTE.bits() != 0 {
-            access.insert(Self::EXECUTE);
-        }
-        if desired_access & AccessMask::GENERIC_ALL.bits() != 0 {
-            access.insert(Self::ALL_ACCESS);
-        }
-        access.remove(Self::from_bits_retain(
-            AccessMask::GENERIC_READ.bits()
-                | AccessMask::GENERIC_WRITE.bits()
-                | AccessMask::GENERIC_EXECUTE.bits()
-                | AccessMask::GENERIC_ALL.bits(),
-        ));
-        access
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::READ.bits(),
+            Self::WRITE.bits(),
+            Self::EXECUTE.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
     }
 
     pub(crate) fn require(self, required: Self) -> Result<(), NtStatus> {
@@ -123,29 +107,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         port: Arc<IoCompletionObject<Platform>>,
         granted_access: IoCompletionAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<IoCompletionSubsystem<Platform>>(IoCompletionHandleObject {
+        self.insert_typed_handle::<IoCompletionSubsystem<Platform>>(
+            IoCompletionHandleObject {
                 port,
                 granted_access,
-            });
-        insert_raw_handle::<Platform, IoCompletionSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
+            },
             drop,
         )
     }
 
     pub(crate) fn close_io_completion_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, IoCompletionSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<IoCompletionSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_io_completion(io_completion: IoCompletionHandleObject<Platform>) {

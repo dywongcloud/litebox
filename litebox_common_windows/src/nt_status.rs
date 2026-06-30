@@ -88,6 +88,7 @@ impl NtStatus {
             }
             0x00000102 => "STATUS_TIMEOUT: The given timeout interval expired",
             0x00000103 => "STATUS_PENDING: The operation that was requested is pending completion",
+            0x00000105 => "STATUS_MORE_ENTRIES: More entries are available",
             0x00010001 => "DBG_EXCEPTION_HANDLED: Exception handled by debugger",
             0x00010002 => "DBG_CONTINUE: Continue from exception",
             0x40000000 => "STATUS_OBJECT_NAME_EXISTS: The object name already exists",
@@ -96,6 +97,7 @@ impl NtStatus {
             0x80000003 => "STATUS_BREAKPOINT: Breakpoint encountered",
             0x80000004 => "STATUS_SINGLE_STEP: Single instruction executed",
             0x80000005 => "STATUS_BUFFER_OVERFLOW: Buffer overflow",
+            0x8000001A => "STATUS_NO_MORE_ENTRIES: No more entries are available",
             0xC0000001 => "STATUS_UNSUCCESSFUL: The operation completed with an error",
             0xC0000002 => "STATUS_NOT_IMPLEMENTED: The function is not implemented",
             0xC0000003 => "STATUS_INVALID_INFO_CLASS: Invalid information class",
@@ -143,6 +145,7 @@ impl NtStatus {
             0xC0000037 => "STATUS_PORT_DISCONNECTED: Port disconnected",
             0xC0000039 => "STATUS_OBJECT_PATH_INVALID: Object path invalid",
             0xC000003A => "STATUS_OBJECT_PATH_NOT_FOUND: Object path not found",
+            0xC000003B => "STATUS_OBJECT_PATH_SYNTAX_BAD: Object path syntax is invalid",
             0xC000003C => "STATUS_DATA_OVERRUN: Data overrun",
             0xC000003D => "STATUS_DATA_LATE_ERROR: Data late error",
             0xC000003E => "STATUS_DATA_ERROR: Data error",
@@ -230,6 +233,9 @@ impl NtStatus {
     /// STATUS_TIMEOUT
     pub const TIMEOUT: Self = Self::from_raw(0x00000102);
 
+    /// STATUS_MORE_ENTRIES
+    pub const MORE_ENTRIES: Self = Self::from_raw(0x00000105);
+
     /// DBG_EXCEPTION_HANDLED
     pub const EXCEPTION_HANDLED: Self = Self::from_raw(0x00010001);
 
@@ -253,6 +259,8 @@ impl NtStatus {
 
     /// STATUS_BUFFER_OVERFLOW
     pub const BUFFER_OVERFLOW: Self = Self::from_raw(0x80000005);
+    /// STATUS_NO_MORE_ENTRIES
+    pub const NO_MORE_ENTRIES: Self = Self::from_raw(0x8000001A);
 
     /// STATUS_UNSUCCESSFUL
     pub const UNSUCCESSFUL: Self = Self::from_raw(0xC0000001);
@@ -394,6 +402,8 @@ impl NtStatus {
 
     /// STATUS_OBJECT_PATH_NOT_FOUND
     pub const OBJECT_PATH_NOT_FOUND: Self = Self::from_raw(0xC000003A);
+    /// STATUS_OBJECT_PATH_SYNTAX_BAD
+    pub const OBJECT_PATH_SYNTAX_BAD: Self = Self::from_raw(0xC000003B);
 
     /// STATUS_DATA_OVERRUN
     pub const DATA_OVERRUN: Self = Self::from_raw(0xC000003C);

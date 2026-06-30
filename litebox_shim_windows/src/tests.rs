@@ -5,6 +5,7 @@ extern crate std;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, AtomicU32};
@@ -12,6 +13,7 @@ use litebox::LiteBox;
 use litebox::fd::RawDescriptorStorage;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
+use litebox::utils::TruncateExt as _;
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
@@ -50,7 +52,7 @@ pub(crate) fn null_mut_ptr<T: zerocopy::FromBytes + zerocopy::IntoBytes>() -> Mu
 }
 
 pub(crate) fn unicode_string(units: &[u16]) -> UnicodeString {
-    let byte_len = u16::try_from(core::mem::size_of_val(units)).expect("test name fits in USHORT");
+    let byte_len = core::mem::size_of_val(units).trunc();
     UnicodeString {
         length: byte_len,
         maximum_length: byte_len,
@@ -59,10 +61,13 @@ pub(crate) fn unicode_string(units: &[u16]) -> UnicodeString {
     }
 }
 
+pub(crate) fn utf16_units(value: &str) -> Vec<u16> {
+    value.encode_utf16().collect()
+}
+
 pub(crate) fn object_attributes(name: &UnicodeString, attributes: u32) -> ObjectAttributes {
     ObjectAttributes {
-        length: u32::try_from(size_of::<ObjectAttributes>())
-            .expect("OBJECT_ATTRIBUTES fits in ULONG"),
+        length: size_of::<ObjectAttributes>().trunc(),
         root_directory: Handle::default(),
         object_name: core::ptr::from_ref(name) as usize,
         attributes,
@@ -134,6 +139,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
     let tar_ro =
         litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
     let fs = Arc::new(crate::default_fs(&litebox, in_mem, tar_ro));
+    let directory_namespace = crate::syscalls::directory::seed_directory_namespace();
     Task {
         global: Arc::new(GlobalState {
             platform,
@@ -147,6 +153,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             ntdll_mapping: None,
             peb_address: 0,
             handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
+            directory_namespace,
             event_namespace: crate::WindowsEventNamespace::<TestPlatform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
             virtual_allocations: crate::WindowsVirtualAllocations::<TestPlatform>::new(

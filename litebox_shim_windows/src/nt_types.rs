@@ -161,6 +161,47 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Flags carried in `OBJECT_ATTRIBUTES.Attributes`.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct ObjectAttributesFlags: u32 {
+        const CASE_INSENSITIVE = 0x0000_0040;
+        const OPENIF = 0x0000_0080;
+        const OPENLINK = 0x0000_0100;
+
+        const _ = !0;
+    }
+}
+
+impl AccessMask {
+    pub(crate) fn expand_generic_access(
+        desired_access: u32,
+        generic_read: u32,
+        generic_write: u32,
+        generic_execute: u32,
+        generic_all: u32,
+    ) -> u32 {
+        let mut access = desired_access;
+        if desired_access & Self::GENERIC_READ.bits() != 0 {
+            access |= generic_read;
+        }
+        if desired_access & Self::GENERIC_WRITE.bits() != 0 {
+            access |= generic_write;
+        }
+        if desired_access & Self::GENERIC_EXECUTE.bits() != 0 {
+            access |= generic_execute;
+        }
+        if desired_access & Self::GENERIC_ALL.bits() != 0 {
+            access |= generic_all;
+        }
+        access
+            & !(Self::GENERIC_READ.bits()
+                | Self::GENERIC_WRITE.bits()
+                | Self::GENERIC_EXECUTE.bits()
+                | Self::GENERIC_ALL.bits())
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
 pub(crate) struct ObjectAttributes {
@@ -216,6 +257,9 @@ pub(crate) struct UnicodeString {
 impl UnicodeString {
     pub(crate) fn read_string<Platform: RawPointerProvider>(self) -> Result<String, NtStatus> {
         if !self.length.is_multiple_of(2) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if self.maximum_length < self.length {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         if self.length == 0 {

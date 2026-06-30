@@ -16,8 +16,7 @@ use crate::nt_types::{
 };
 use crate::syscalls::Handle;
 use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    raw_handle_entry, remove_raw_handle,
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
 };
 
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
@@ -85,10 +84,6 @@ bitflags::bitflags! {
         const WRITE_ATTRIBUTES = 0x0100;
         const DELETE = AccessMask::DELETE.bits();
         const SYNCHRONIZE = AccessMask::SYNCHRONIZE.bits();
-        const GENERIC_ALL = AccessMask::GENERIC_ALL.bits();
-        const GENERIC_EXECUTE = AccessMask::GENERIC_EXECUTE.bits();
-        const GENERIC_WRITE = AccessMask::GENERIC_WRITE.bits();
-        const GENERIC_READ = AccessMask::GENERIC_READ.bits();
 
         const GENERIC_READ_EXPANSION = AccessMask::STANDARD_RIGHTS_READ.bits()
             | Self::READ_DATA.bits()
@@ -145,24 +140,13 @@ bitflags::bitflags! {
 
 impl FileAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        let mut access = Self::from_bits_retain(desired_access);
-        if access.contains(Self::GENERIC_READ) {
-            access.remove(Self::GENERIC_READ);
-            access.insert(Self::GENERIC_READ_EXPANSION);
-        }
-        if access.contains(Self::GENERIC_WRITE) {
-            access.remove(Self::GENERIC_WRITE);
-            access.insert(Self::GENERIC_WRITE_EXPANSION);
-        }
-        if access.contains(Self::GENERIC_EXECUTE) {
-            access.remove(Self::GENERIC_EXECUTE);
-            access.insert(Self::GENERIC_EXECUTE_EXPANSION);
-        }
-        if access.contains(Self::GENERIC_ALL) {
-            access.remove(Self::GENERIC_ALL);
-            access.insert(Self::ALL_ACCESS);
-        }
-        access
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::GENERIC_READ_EXPANSION.bits(),
+            Self::GENERIC_WRITE_EXPANSION.bits(),
+            Self::GENERIC_EXECUTE_EXPANSION.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
     }
 
     fn open_flags(
@@ -323,26 +307,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn insert_file_handle(&self, file: FileObject<FS>) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<FileObjectSubsystem<FS>>(file);
-        insert_raw_handle::<Platform, FileObjectSubsystem<FS>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
-            |file| self.close_file(file),
-        )
+        self.insert_typed_handle::<FileObjectSubsystem<FS>>(file, |file| self.close_file(file))
     }
 
     pub(crate) fn close_file_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, FileObjectSubsystem<FS>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            |file| self.close_file(file),
-        );
+        self.close_typed_handle::<FileObjectSubsystem<FS>>(handle, |file| self.close_file(file));
     }
 
     pub(crate) fn close_file(&self, file: FileObject<FS>) {
@@ -755,6 +724,18 @@ fn create_directory_mode(file_attributes: u32) -> Mode {
     create_mode(file_attributes) | Mode::XUSR
 }
 
+/// Convert the NT file-name forms we currently support at the object-manager to
+/// filesystem seam.
+///
+/// Native NT reaches this seam by walking object-manager directories until it
+/// reaches a device object, then the device parse routine hands the remaining
+/// path to the filesystem driver. LiteBox intentionally uses the Wine-style
+/// shortcut here instead: known NT prefixes are recognized as strings and then
+/// mapped directly into the sandbox filesystem. Today that includes `\??\`,
+/// `\\?\`, any drive-letter prefix, both `\SystemRoot\` and `/SystemRoot/`,
+/// `\Device\HarddiskVolume1\`, and `\Device\ConDrv\`. A unified object-manager
+/// walk through device objects into the backing filesystem namespace remains
+/// outside this file-path mapper.
 fn absolute_nt_file_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
     let mut name = name;
     if let Some(rest) = strip_case_insensitive_prefix(name, "\\??\\") {
@@ -912,6 +893,7 @@ mod tests {
     use super::*;
     use crate::tests::{
         TestFS, TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, unicode_string,
+        utf16_units as utf16,
     };
     use litebox::fs::FileSystem as _;
 
@@ -936,10 +918,6 @@ mod tests {
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
         let _ = crate::tests::test_platform();
         <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(f)
-    }
-
-    fn utf16(value: &str) -> std::vec::Vec<u16> {
-        value.encode_utf16().collect()
     }
 
     fn open_object_attributes(

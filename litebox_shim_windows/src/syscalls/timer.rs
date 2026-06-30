@@ -13,8 +13,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
 use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    raw_handle_entry, remove_raw_handle,
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
 };
 
 const TIMER2_ATTRIBUTE_IR_TIMER: u32 = 0x0000_0002;
@@ -46,26 +45,13 @@ bitflags::bitflags! {
 
 impl TimerAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        let mut access = Self::from_bits_retain(desired_access);
-        if desired_access & AccessMask::GENERIC_READ.bits() != 0 {
-            access.insert(Self::READ);
-        }
-        if desired_access & AccessMask::GENERIC_WRITE.bits() != 0 {
-            access.insert(Self::WRITE);
-        }
-        if desired_access & AccessMask::GENERIC_EXECUTE.bits() != 0 {
-            access.insert(Self::EXECUTE);
-        }
-        if desired_access & AccessMask::GENERIC_ALL.bits() != 0 {
-            access.insert(Self::ALL_ACCESS);
-        }
-        access.remove(Self::from_bits_retain(
-            AccessMask::GENERIC_READ.bits()
-                | AccessMask::GENERIC_WRITE.bits()
-                | AccessMask::GENERIC_EXECUTE.bits()
-                | AccessMask::GENERIC_ALL.bits(),
-        ));
-        access
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::READ.bits(),
+            Self::WRITE.bits(),
+            Self::EXECUTE.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
     }
 }
 
@@ -162,29 +148,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         timer: Arc<TimerObject<Platform>>,
         granted_access: TimerAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<TimerSubsystem<Platform>>(TimerHandleObject {
+        self.insert_typed_handle::<TimerSubsystem<Platform>>(
+            TimerHandleObject {
                 _timer: timer,
                 granted_access,
-            });
-        insert_raw_handle::<Platform, TimerSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
+            },
             drop,
         )
     }
 
     pub(crate) fn close_timer_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, TimerSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<TimerSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_timer(timer: TimerHandleObject<Platform>) {

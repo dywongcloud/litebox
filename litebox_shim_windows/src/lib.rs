@@ -31,10 +31,14 @@ use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
+use crate::syscalls::directory::{
+    DirectoryHandleObject, DirectoryNamespace, DirectoryObjectSubsystem,
+};
 use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::wait_completion_packet::{
     WaitCompletionPacketAssociateParameters, WaitCompletionPacketHandleObject,
@@ -88,6 +92,7 @@ pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
 pub(crate) type WindowsEventNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Weak<EventObject<Platform>>>>;
+pub(crate) type WindowsDirectoryNamespace<Platform> = DirectoryNamespace<Platform>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
@@ -188,7 +193,7 @@ where
     true
 }
 
-pub(crate) fn insert_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
+fn insert_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
     typed: litebox::fd::TypedFd<Subsystem>,
@@ -230,7 +235,7 @@ where
     litebox.descriptor_table().entry_handle(&typed)
 }
 
-pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
+fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
     handle: syscalls::Handle,
@@ -245,7 +250,7 @@ pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsy
         remove_raw_handle_by_raw_fd::<Platform, Subsystem>(litebox, handles, raw_fd, cleanup_entry);
 }
 
-pub(crate) fn remove_raw_handle_by_raw_fd<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
+fn remove_raw_handle_by_raw_fd<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
     raw_fd: usize,
@@ -331,10 +336,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
     ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
+        let directory_namespace = syscalls::directory::seed_directory_namespace();
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
             peb_address: load_info.environment.peb,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
+            directory_namespace,
             event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
             virtual_allocations: load_info.virtual_allocations,
@@ -378,6 +385,7 @@ pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
+    directory_namespace: WindowsDirectoryNamespace<Platform>,
     event_namespace: WindowsEventNamespace<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
@@ -442,6 +450,69 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ContinueOperation::Resume
     }
 
+    fn typed_handle_entry<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        let Some(raw_fd) = handle.raw_fd() else {
+            return Err(NtStatus::INVALID_HANDLE);
+        };
+        let typed = {
+            let handles = self.process.handles.read();
+            match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
+                Ok(typed) => typed,
+                Err(litebox::fd::ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
+                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
+                    return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+                }
+            }
+        };
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&typed)
+            .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
+    fn insert_typed_handle<Subsystem>(
+        &self,
+        entry: Subsystem::Entry,
+        cleanup_entry: impl FnOnce(Subsystem::Entry),
+    ) -> Result<syscalls::Handle, NtStatus>
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<Subsystem>(entry);
+        insert_raw_handle::<Platform, Subsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            typed,
+            cleanup_entry,
+        )
+    }
+
+    fn close_typed_handle<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        cleanup_entry: impl FnOnce(Subsystem::Entry),
+    ) where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        remove_raw_handle::<Platform, Subsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+            cleanup_entry,
+        );
+    }
+
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             litebox_util_log::debug!(
@@ -472,6 +543,108 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     object_attributes,
                     event_type,
                     initial_state,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateDirectoryObject {
+                directory_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_create_directory_object(
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                    syscalls::Handle::default(),
+                    0,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateDirectoryObjectEx {
+                directory_handle,
+                desired_access,
+                object_attributes,
+                shadow_directory_handle,
+                flags,
+            } => {
+                let status = self.sys_nt_create_directory_object(
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                    shadow_directory_handle,
+                    flags,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenDirectoryObject {
+                directory_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_open_directory_object(
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryDirectoryObject {
+                directory_handle,
+                buffer,
+                buffer_length,
+                return_single_entry,
+                restart_scan,
+                context,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_directory_object(
+                    syscalls::directory::DirectoryQueryParameters {
+                        directory_handle,
+                        buffer,
+                        buffer_length,
+                        return_single_entry,
+                        restart_scan,
+                        context,
+                        return_length,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateSymbolicLinkObject {
+                link_handle,
+                desired_access,
+                object_attributes,
+                link_target,
+            } => {
+                let status = self.sys_nt_create_symbolic_link_object(
+                    link_handle,
+                    desired_access,
+                    object_attributes,
+                    link_target,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenSymbolicLinkObject {
+                link_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_open_symbolic_link_object(
+                    link_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQuerySymbolicLinkObject {
+                link_handle,
+                link_target,
+                returned_length,
+            } => {
+                let status = self.sys_nt_query_symbolic_link_object(
+                    link_handle,
+                    link_target,
+                    returned_length,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -1011,6 +1184,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, DirectoryObjectSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |directory| visitor.directory(directory),
+        ) {
+            return NtStatus::SUCCESS;
+        }
+        if remove_raw_handle_by_raw_fd::<Platform, SymbolicLinkSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |link| visitor.symbolic_link(link),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, IoCompletionSubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -1065,6 +1254,10 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn event(&self, event: EventHandleObject<Platform>);
 
+    fn directory(&self, directory: DirectoryHandleObject<Platform>);
+
+    fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>);
+
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
 
     fn timer(&self, timer: TimerHandleObject<Platform>);
@@ -1094,6 +1287,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn event(&self, event: EventHandleObject<Platform>) {
         Task::<Platform, FS>::close_event(event);
+    }
+
+    fn directory(&self, directory: DirectoryHandleObject<Platform>) {
+        Task::<Platform, FS>::close_directory(directory);
+    }
+
+    fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>) {
+        Task::<Platform, FS>::close_symbolic_link(link);
     }
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {

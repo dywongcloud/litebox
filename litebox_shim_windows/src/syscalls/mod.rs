@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub(crate) mod directory;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod iocp;
@@ -8,6 +9,7 @@ pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod process;
 pub(crate) mod registry;
+pub(crate) mod symlink;
 mod sysinfo;
 pub(crate) mod timer;
 pub(crate) mod wait_completion_packet;
@@ -104,6 +106,48 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         event_type: u32,
         initial_state: u8,
+    },
+    NtCreateDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtCreateDirectoryObjectEx {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        shadow_directory_handle: Handle,
+        flags: u32,
+    },
+    NtOpenDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQueryDirectoryObject {
+        directory_handle: Handle,
+        buffer: Platform::RawMutPointer<u8>,
+        buffer_length: u32,
+        return_single_entry: u8,
+        restart_scan: u8,
+        context: Platform::RawMutPointer<u32>,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtCreateSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        link_target: Platform::RawConstPointer<nt_types::UnicodeString>,
+    },
+    NtOpenSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQuerySymbolicLinkObject {
+        link_handle: Handle,
+        link_target: Platform::RawMutPointer<nt_types::UnicodeString>,
+        returned_length: Option<Platform::RawMutPointer<u32>>,
     },
     NtCreateIoCompletion {
         io_completion_handle: Platform::RawMutPointer<Handle>,
@@ -365,6 +409,48 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 object_attributes:*,
                 event_type,
                 initial_state,
+            })),
+            NtSysno::NtCreateDirectoryObject => Some(sys_req!(NtCreateDirectoryObject {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtCreateDirectoryObjectEx => Some(sys_req!(NtCreateDirectoryObjectEx {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+                shadow_directory_handle:{Handle::from_raw},
+                flags,
+            })),
+            NtSysno::NtOpenDirectoryObject => Some(sys_req!(NtOpenDirectoryObject {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQueryDirectoryObject => Some(sys_req!(NtQueryDirectoryObject {
+                directory_handle:{Handle::from_raw},
+                buffer:*,
+                buffer_length,
+                return_single_entry,
+                restart_scan,
+                context:*,
+                return_length:*,
+            })),
+            NtSysno::NtCreateSymbolicLinkObject => Some(sys_req!(NtCreateSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+                link_target:*,
+            })),
+            NtSysno::NtOpenSymbolicLinkObject => Some(sys_req!(NtOpenSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQuerySymbolicLinkObject => Some(sys_req!(NtQuerySymbolicLinkObject {
+                link_handle:{Handle::from_raw},
+                link_target:*,
+                returned_length:*,
             })),
             NtSysno::NtCreateIoCompletion => Some(sys_req!(NtCreateIoCompletion {
                 io_completion_handle:*,

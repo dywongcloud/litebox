@@ -16,16 +16,13 @@ use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
+use crate::nt_types::{
+    AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString, read_object_attributes,
+};
 use crate::syscalls::Handle;
 use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    raw_handle_entry, remove_raw_handle,
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
 };
-
-const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
-const OBJ_OPENIF: u32 = 0x0000_0080;
-const OBJ_OPENLINK: u32 = 0x0000_0100;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
@@ -66,26 +63,13 @@ bitflags::bitflags! {
 
 impl EventAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        let mut access = Self::from_bits_retain(desired_access);
-        if desired_access & AccessMask::GENERIC_READ.bits() != 0 {
-            access.insert(Self::READ);
-        }
-        if desired_access & AccessMask::GENERIC_WRITE.bits() != 0 {
-            access.insert(Self::WRITE);
-        }
-        if desired_access & AccessMask::GENERIC_EXECUTE.bits() != 0 {
-            access.insert(Self::EXECUTE);
-        }
-        if desired_access & AccessMask::GENERIC_ALL.bits() != 0 {
-            access.insert(Self::ALL_ACCESS);
-        }
-        access.remove(Self::from_bits_retain(
-            AccessMask::GENERIC_READ.bits()
-                | AccessMask::GENERIC_WRITE.bits()
-                | AccessMask::GENERIC_EXECUTE.bits()
-                | AccessMask::GENERIC_ALL.bits(),
-        ));
-        access
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::READ.bits(),
+            Self::WRITE.bits(),
+            Self::EXECUTE.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
     }
 
     fn require(self, required: Self) -> Result<(), NtStatus> {
@@ -233,7 +217,9 @@ fn read_event_name<Platform: RawPointerProvider>(
     if key.is_empty() {
         return Err(NtStatus::OBJECT_NAME_INVALID);
     }
-    if object_attributes.attributes & OBJ_CASE_INSENSITIVE != 0 {
+    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::CASE_INSENSITIVE)
+    {
         key = key.to_ascii_lowercase();
     }
     Ok(Some(EventName { key }))
@@ -250,7 +236,9 @@ fn read_event_object_attributes<Platform: RawPointerProvider>(
         return Ok((None, None));
     };
     let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
-    if object_attributes.attributes & OBJ_OPENLINK != 0 {
+    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::OPENLINK)
+    {
         return Err(NtStatus::INVALID_PARAMETER);
     }
     let event_name =
@@ -279,29 +267,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         event: Arc<EventObject<Platform>>,
         granted_access: EventAccess,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<EventSubsystem<Platform>>(EventHandleObject {
+        self.insert_typed_handle::<EventSubsystem<Platform>>(
+            EventHandleObject {
                 event,
                 granted_access,
-            });
-        insert_raw_handle::<Platform, EventSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
+            },
             drop,
         )
     }
 
     pub(crate) fn close_event_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, EventSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            drop,
-        );
+        self.close_typed_handle::<EventSubsystem<Platform>>(handle, drop);
     }
 
     pub(crate) fn close_event(event: EventHandleObject<Platform>) {
@@ -343,7 +319,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let Some(object_attributes) = object_attributes else {
                     return NtStatus::INVALID_PARAMETER;
                 };
-                if object_attributes.attributes & OBJ_OPENIF == 0 {
+                if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+                    .contains(ObjectAttributesFlags::OPENIF)
+                {
                     return NtStatus::OBJECT_NAME_COLLISION;
                 }
                 let Ok(handle) = self.insert_event_handle(event, granted_access) else {
@@ -553,26 +531,27 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
     use core::mem::size_of;
 
+    use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
-    use crate::nt_types::ObjectAttributes;
-    use crate::tests::{const_ptr, mut_ptr, object_attributes, test_task, unicode_string};
+    use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags};
+    use crate::tests::{
+        const_ptr, mut_ptr, object_attributes, test_task, unicode_string, utf16_units,
+    };
 
     const EVENT_QUERY_STATE: u32 = 0x0001;
     const EVENT_MODIFY_STATE: u32 = 0x0002;
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
 
     fn event_basic_information_size() -> u32 {
-        u32::try_from(size_of::<EventBasicInformation>())
-            .expect("EVENT_BASIC_INFORMATION fits in ULONG")
+        size_of::<EventBasicInformation>().trunc()
     }
 
     fn object_attributes_size() -> u32 {
-        u32::try_from(size_of::<ObjectAttributes>()).expect("OBJECT_ATTRIBUTES fits in ULONG")
+        size_of::<ObjectAttributes>().trunc()
     }
 
     #[test]
@@ -764,9 +743,9 @@ mod tests {
     #[test]
     fn named_event_open_shares_state() {
         let task = test_task();
-        let name_units: Vec<u16> = "\\BaseNamedObjects\\LiteBoxEvent".encode_utf16().collect();
+        let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxEvent");
         let name = unicode_string(&name_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
 
         let mut created = Handle::default();
         assert_eq!(
@@ -839,11 +818,12 @@ mod tests {
     #[test]
     fn create_openif_existing_named_event_returns_name_exists() {
         let task = test_task();
-        let name_units: Vec<u16> = "\\BaseNamedObjects\\LiteBoxOpenIf".encode_utf16().collect();
+        let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxOpenIf");
         let name = unicode_string(&name_units);
-        let attrs = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+        let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
         let openif_attrs = ObjectAttributes {
-            attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+            attributes: (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENIF)
+                .bits(),
             ..attrs
         };
 
@@ -1150,12 +1130,13 @@ mod tests {
         #[test]
         fn named_open_matches_host_state_sharing() {
             let unique = 0u8;
-            let name_units: Vec<u16> =
-                alloc::format!(r"\BaseNamedObjects\LiteBoxEventFidelity{:p}", &unique,)
-                    .encode_utf16()
-                    .collect();
+            let name_units = utf16_units(&alloc::format!(
+                r"\BaseNamedObjects\LiteBoxEventFidelity{:p}",
+                &unique,
+            ));
             let name = unicode_string(&name_units);
-            let attributes = object_attributes(&name, OBJ_CASE_INSENSITIVE);
+            let attributes =
+                object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
 
             let mut host_created = core::ptr::null_mut();
             let mut host_opened = core::ptr::null_mut();

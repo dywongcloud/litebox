@@ -44,9 +44,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, raw_handle_entry, remove_raw_handle,
-};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, raw_handle_entry};
 
 use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
 
@@ -364,26 +362,15 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         key: RegistryKeyObject<Platform>,
     ) -> Result<Handle, NtStatus> {
-        let typed = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .insert::<RegistryKeySubsystem<Platform>>(key);
-        insert_raw_handle::<Platform, RegistryKeySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
-            |key| self.close_registry_key(key),
-        )
+        self.insert_typed_handle::<RegistryKeySubsystem<Platform>>(key, |key| {
+            self.close_registry_key(key);
+        })
     }
 
     pub(crate) fn close_registry_key_handle(&self, handle: Handle) {
-        remove_raw_handle::<Platform, RegistryKeySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            handle,
-            |key| self.close_registry_key(key),
-        );
+        self.close_typed_handle::<RegistryKeySubsystem<Platform>>(handle, |key| {
+            self.close_registry_key(key);
+        });
     }
 
     pub(crate) fn close_registry_key(&self, key: RegistryKeyObject<Platform>) {
@@ -841,7 +828,7 @@ fn map_read_error(error: ReadError) -> NtStatus {
 mod tests {
     use crate::tests::{
         TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
-        unicode_string,
+        unicode_string, utf16_units as utf16,
     };
 
     use super::*;
@@ -908,10 +895,6 @@ mod tests {
         fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
     }
 
-    fn utf16(value: &str) -> std::vec::Vec<u16> {
-        value.encode_utf16().collect()
-    }
-
     fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
         let litebox = LiteBox::new(test_platform());
         let registry = RegistryStore::new(&litebox);
@@ -934,7 +917,7 @@ mod tests {
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     fn nul_terminated_utf16(value: &str) -> Vec<u16> {
-        let mut value: Vec<u16> = value.encode_utf16().collect();
+        let mut value = utf16(value);
         value.push(0);
         value
     }
@@ -1125,7 +1108,7 @@ mod tests {
                     value_name,
                     KeyValueInformationClass::Partial,
                     mut_byte_ptr(&mut information),
-                    u32::try_from(information.len()).unwrap(),
+                    information.len().trunc(),
                     mut_ptr(&mut result_length),
                 )
                 .is_ok()
@@ -1228,7 +1211,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .is_ok()
@@ -1241,7 +1224,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
@@ -1264,7 +1247,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .is_ok()
@@ -1279,10 +1262,7 @@ mod tests {
             KeyValuePartialInformation::read_from_prefix(information).unwrap();
         assert_eq!(information.title_index, 0);
         assert_eq!(information.value_type, RegistryValueType::Sz.into());
-        assert_eq!(
-            information.data_length,
-            u32::try_from(DEFAULT_ACP_VALUE.len()).unwrap()
-        );
+        assert_eq!(information.data_length, DEFAULT_ACP_VALUE.len().trunc());
         assert_eq!(data, DEFAULT_ACP_VALUE);
     }
 
@@ -1309,7 +1289,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
@@ -1333,7 +1313,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Basic,
                 mut_byte_ptr(&mut basic_information),
-                u32::try_from(basic_information.len()).unwrap(),
+                basic_information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .is_ok()
@@ -1357,7 +1337,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Full,
                 mut_byte_ptr(&mut full_information),
-                u32::try_from(full_information.len()).unwrap(),
+                full_information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .is_ok()
@@ -1365,7 +1345,7 @@ mod tests {
         let full_information = &full_information[..(result_length as usize)];
         let (full_header, full_tail) =
             KeyValueFullInformation::read_from_prefix(full_information).unwrap();
-        let data_offset = usize::try_from(full_header.data_offset).unwrap();
+        let data_offset = full_header.data_offset as usize;
         assert_eq!(full_header.title_index, 0);
         assert_eq!(full_header.value_type, RegistryValueType::Sz.into());
         assert_eq!(full_header.data_length as usize, DEFAULT_OEMCP_VALUE.len());
@@ -1395,7 +1375,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
@@ -1408,7 +1388,7 @@ mod tests {
                 missing_value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
@@ -1421,7 +1401,7 @@ mod tests {
                 const_ptr(&value_name),
                 0xffff,
                 mut_byte_ptr(&mut information),
-                u32::try_from(information.len()).unwrap(),
+                information.len().trunc(),
                 mut_ptr(&mut result_length),
             ),
             NtStatus::INVALID_INFO_CLASS
@@ -1433,7 +1413,7 @@ mod tests {
                 value_name,
                 KeyValueInformationClass::Partial,
                 mut_byte_ptr(&mut short_information),
-                u32::try_from(short_information.len()).unwrap(),
+                short_information.len().trunc(),
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
