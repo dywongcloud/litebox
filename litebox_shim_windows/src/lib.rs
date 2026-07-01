@@ -1067,6 +1067,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenThreadToken {
+                thread_handle,
+                desired_access,
+                open_as_self,
+                token_handle,
+            } => {
+                let status = Self::sys_nt_open_thread_token(
+                    thread_handle,
+                    desired_access,
+                    open_as_self,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenThreadTokenEx {
+                thread_handle,
+                desired_access,
+                open_as_self,
+                handle_attributes,
+                token_handle,
+            } => {
+                let status = Self::sys_nt_open_thread_token_ex(
+                    thread_handle,
+                    desired_access,
+                    open_as_self,
+                    handle_attributes,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
                 flag,
                 source,

@@ -7,8 +7,8 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable};
 
-use crate::syscalls::ThreadHandle;
-use crate::{ConstPtr, ShimFS, ShimPlatform, Task};
+use crate::syscalls::{Handle, ThreadHandle};
+use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -86,6 +86,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // The scheduler-shared-data handle is never valid in the sandbox, matching the host
         // current-thread path for the observed all-zero slot request.
         NtStatus::INVALID_HANDLE
+    }
+
+    pub(crate) fn sys_nt_open_thread_token(
+        thread_handle: ThreadHandle,
+        _desired_access: u32,
+        _open_as_self: u32,
+        token_handle: MutPtr<Platform, Handle>,
+    ) -> NtStatus {
+        Self::open_thread_token(thread_handle, token_handle)
+    }
+
+    pub(crate) fn sys_nt_open_thread_token_ex(
+        thread_handle: ThreadHandle,
+        _desired_access: u32,
+        _open_as_self: u32,
+        _handle_attributes: u32,
+        token_handle: MutPtr<Platform, Handle>,
+    ) -> NtStatus {
+        // TODO: HandleAttributes is outcome-independent while the sandbox has no impersonation
+        // token. Once a real token subsystem exists it must be validated; host 25H2 returns
+        // STATUS_INVALID_PARAMETER for attrs=0xffffffff after ImpersonateSelf.
+        Self::open_thread_token(thread_handle, token_handle)
+    }
+
+    fn open_thread_token(
+        thread_handle: ThreadHandle,
+        token_handle: MutPtr<Platform, Handle>,
+    ) -> NtStatus {
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(token_handle) {
+            return status;
+        }
+        if !thread_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        // A thread only has a token while it is actively impersonating (SetThreadToken /
+        // ImpersonateSelf). Sandbox threads never impersonate, so real host 25H2 returns
+        // STATUS_NO_TOKEN here as well: this is the host-faithful terminal answer, not a stub.
+        NtStatus::NO_TOKEN
     }
 }
 
