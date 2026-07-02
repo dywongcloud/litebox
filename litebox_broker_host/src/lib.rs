@@ -14,7 +14,9 @@ extern crate std;
 
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-use litebox_broker_protocol::channel::{HostControlChannel, HostReceive, PeerCredential};
+use litebox_broker_protocol::channel::{
+    HostControlChannel, HostNotificationChannel, HostReceive, PeerCredential,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse, WaitEventResponse};
 use litebox_broker_protocol::message::{
@@ -25,15 +27,24 @@ mod error;
 
 pub use error::{BrokerHostError, Result};
 
-/// Authenticates, negotiates, and serves one broker connection over the control channel.
-pub fn serve_connection<Channel>(
+/// Authenticates, negotiates, and serves one broker association over paired
+/// control and notification channels.
+///
+/// The deployment must bind both channels to the same authenticated peer
+/// association. Active requests and responses remain on the control channel;
+/// broker-initiated readiness wakeups are sent on the notification channel.
+/// Event mutations caused by control requests return readiness in their control
+/// response and do not also emit a duplicate notification.
+pub fn serve_connection<ControlChannel, NotificationChannel, ChannelError>(
     core: &BrokerCore,
-    channel: &mut Channel,
-) -> Result<ConnectionTermination, Channel::Error>
+    control_channel: &mut ControlChannel,
+    _notification_channel: &mut NotificationChannel,
+) -> Result<ConnectionTermination, ChannelError>
 where
-    Channel: HostControlChannel,
+    ControlChannel: HostControlChannel<Error = ChannelError>,
+    NotificationChannel: HostNotificationChannel<Error = ChannelError>,
 {
-    let peer_credential = channel
+    let peer_credential = control_channel
         .peer_credential()
         .map_err(BrokerHostError::Channel)?;
     let caller_credential = match peer_credential {
@@ -43,13 +54,13 @@ where
     let session = core.create_session(caller_credential)?;
 
     loop {
-        let request = match channel
+        let request = match control_channel
             .recv_handshake_request()
             .map_err(BrokerHostError::Channel)?
         {
             HostReceive::Message(request) => request,
             HostReceive::ProtocolViolation => {
-                channel
+                control_channel
                     .send_handshake_response(&BrokerHandshakeResponse::Error(
                         ErrorCode::ProtocolState,
                     ))
@@ -69,7 +80,7 @@ where
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }
         };
-        channel
+        control_channel
             .send_handshake_response(&response)
             .map_err(BrokerHostError::Channel)?;
         if negotiated {
@@ -77,21 +88,14 @@ where
         }
     }
 
-    serve_request_loop(channel, &session)
-}
-
-fn serve_request_loop<Channel>(
-    channel: &mut Channel,
-    session: &BrokerSession,
-) -> Result<ConnectionTermination, Channel::Error>
-where
-    Channel: HostControlChannel,
-{
     loop {
-        let request = match channel.recv_request().map_err(BrokerHostError::Channel)? {
+        let request = match control_channel
+            .recv_request()
+            .map_err(BrokerHostError::Channel)?
+        {
             HostReceive::Message(request) => request,
             HostReceive::ProtocolViolation => {
-                channel
+                control_channel
                     .send_response(&BrokerResponse::Error(ErrorCode::ProtocolState))
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(ConnectionTermination::ProtocolViolation);
@@ -99,8 +103,8 @@ where
             HostReceive::PeerClosed => break,
         };
 
-        let response = handle_request(session, request);
-        channel
+        let response = handle_request(&session, request);
+        control_channel
             .send_response(&response)
             .map_err(BrokerHostError::Channel)?;
     }
@@ -167,8 +171,11 @@ pub enum ConnectionTermination {
 mod tests {
     use super::*;
     use litebox_broker_core::{PolicyEngine, PrincipalRights};
-    use litebox_broker_protocol::event::{CreateEventRequest, WaitEventRequest};
-    use litebox_broker_protocol::message::BrokerHandshakeRequest;
+    use litebox_broker_protocol::event::{
+        AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
+        WaitEventRequest,
+    };
+    use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerNotification};
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion};
 
     #[test]
@@ -183,6 +190,7 @@ mod tests {
         serve_connection_rejects_active_request_before_negotiation(&broker);
         serve_connection_rejects_handshake_request_after_negotiation(&broker);
         serve_connection_returns_channel_error_when_response_send_fails(&broker);
+        serve_connection_returns_event_readiness_in_control_responses(&broker);
         active_request_closes_object_reference(&broker);
     }
 
@@ -198,9 +206,10 @@ mod tests {
                 Ok(HostReceive::PeerClosed),
             ]),
         );
+        let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection(broker, &mut channel).unwrap(),
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -228,9 +237,10 @@ mod tests {
             ]),
             std::vec::Vec::from([Ok(HostReceive::PeerClosed)]),
         );
+        let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection(broker, &mut channel).unwrap(),
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -251,9 +261,10 @@ mod tests {
             std::vec::Vec::from([Ok(HostReceive::ProtocolViolation)]),
             std::vec::Vec::new(),
         );
+        let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection(broker, &mut channel).unwrap(),
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::ProtocolViolation
         );
         assert_eq!(
@@ -270,9 +281,10 @@ mod tests {
             }))]),
             std::vec::Vec::from([Ok(HostReceive::ProtocolViolation)]),
         );
+        let mut notifications = FakeHostNotificationChannel::default();
 
         assert_eq!(
-            serve_connection(broker, &mut channel).unwrap(),
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
             ConnectionTermination::ProtocolViolation
         );
         assert_eq!(
@@ -295,12 +307,52 @@ mod tests {
             std::vec::Vec::new(),
         );
         channel.send_error = true;
+        let mut notifications = FakeHostNotificationChannel::default();
 
-        match serve_connection(broker, &mut channel) {
+        match serve_connection(broker, &mut channel, &mut notifications) {
             Err(BrokerHostError::Channel(())) => {}
             result => panic!("unexpected serve result: {result:?}"),
         }
         assert!(channel.handshake_responses.is_empty());
+    }
+
+    fn serve_connection_returns_event_readiness_in_control_responses(broker: &BrokerCore) {
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            }))]),
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerRequest::Event(
+                EventRequest::Create(CreateEventRequest { initial_count: 0 }),
+            )))]),
+        );
+        channel.enqueue_readiness_requests_after_create = true;
+        let mut notifications = FakeHostNotificationChannel::default();
+
+        assert_eq!(
+            serve_connection(broker, &mut channel, &mut notifications).unwrap(),
+            ConnectionTermination::PeerClosed
+        );
+        assert!(notifications.notifications.is_empty());
+        assert_eq!(
+            &channel.responses[1..],
+            [
+                BrokerResponse::Event(EventResponse::Add(AddEventResponse {
+                    readiness: litebox_broker_protocol::event::ReadinessState {
+                        read_ready: true,
+                        write_ready: true,
+                    },
+                })),
+                BrokerResponse::Event(EventResponse::Consume(
+                    litebox_broker_protocol::event::ConsumeEventResponse {
+                        value: 1,
+                        readiness: litebox_broker_protocol::event::ReadinessState {
+                            read_ready: false,
+                            write_ready: true,
+                        },
+                    }
+                )),
+            ]
+        );
     }
 
     fn active_request_closes_object_reference(broker: &BrokerCore) {
@@ -344,6 +396,7 @@ mod tests {
         requests: std::vec::Vec<core::result::Result<HostReceive<BrokerRequest>, ()>>,
         handshake_responses: std::vec::Vec<BrokerHandshakeResponse>,
         responses: std::vec::Vec<BrokerResponse>,
+        enqueue_readiness_requests_after_create: bool,
         send_error: bool,
     }
 
@@ -359,6 +412,7 @@ mod tests {
                 requests,
                 handshake_responses: std::vec::Vec::new(),
                 responses: std::vec::Vec::new(),
+                enqueue_readiness_requests_after_create: false,
                 send_error: false,
             }
         }
@@ -409,7 +463,43 @@ mod tests {
             if self.send_error {
                 return Err(());
             }
+            if self.enqueue_readiness_requests_after_create
+                && let BrokerResponse::Event(EventResponse::Create(response)) = response
+            {
+                self.requests
+                    .push(Ok(HostReceive::Message(BrokerRequest::Event(
+                        EventRequest::Add(AddEventRequest {
+                            handle: response.handle,
+                            value: 1,
+                        }),
+                    ))));
+                self.requests
+                    .push(Ok(HostReceive::Message(BrokerRequest::Event(
+                        EventRequest::Consume(ConsumeEventRequest {
+                            handle: response.handle,
+                            mode: EventConsumeMode::One,
+                        }),
+                    ))));
+                self.requests.push(Ok(HostReceive::PeerClosed));
+            }
             self.responses.push(response.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeHostNotificationChannel {
+        notifications: std::vec::Vec<BrokerNotification>,
+    }
+
+    impl HostNotificationChannel for FakeHostNotificationChannel {
+        type Error = ();
+
+        fn send_notification(
+            &mut self,
+            notification: &BrokerNotification,
+        ) -> core::result::Result<(), Self::Error> {
+            self.notifications.push(notification.clone());
             Ok(())
         }
     }
