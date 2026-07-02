@@ -314,7 +314,10 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         }
     }
 
-    fn resolve_directory(&self, path: &str) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+    pub(super) fn resolve_directory(
+        &self,
+        path: &str,
+    ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
         let tail = absolute_path_tail(path)?;
         let node = self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, false)?;
         if node.is_directory() {
@@ -322,6 +325,23 @@ impl<Platform: crate::ShimPlatform> DirectoryNamespace<Platform> {
         } else {
             Err(NtStatus::OBJECT_TYPE_MISMATCH)
         }
+    }
+
+    pub(super) fn resolve_object(&self, path: &str) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
+        let tail = absolute_path_tail(path)?;
+        self.resolve_tail(tail, NtStatus::OBJECT_NAME_NOT_FOUND, true)
+    }
+
+    pub(super) fn parent_directory_exists(&self, path: &str) -> bool {
+        let path = trim_trailing_directory_path(path);
+        if path == r"\" {
+            return false;
+        }
+        let Some(index) = path.rfind('\\') else {
+            return false;
+        };
+        let parent = if index == 0 { r"\" } else { &path[..index] };
+        self.resolve_directory(parent).is_ok()
     }
 
     fn create_directory(
@@ -1223,6 +1243,17 @@ mod tests {
         handle
     }
 
+    fn object_attributes_with_root(
+        name: &UnicodeString,
+        root_directory: Handle,
+        attributes: u32,
+    ) -> ObjectAttributes {
+        ObjectAttributes {
+            root_directory,
+            ..object_attributes(name, attributes)
+        }
+    }
+
     fn expected_record_size(name: &str, type_name: &str) -> usize {
         size_of::<ObjectDirectoryInformation>()
             + name.encode_utf16().count() * size_of::<u16>()
@@ -1323,6 +1354,104 @@ mod tests {
                 );
                 assert_eq!(handle, Handle::default());
             }
+        });
+    }
+
+    #[test]
+    fn open_section_rejects_empty_known_dlls_with_zeroed_output() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let known_dlls_units = utf16_units(r"\KnownDlls");
+            let known_dlls_name = unicode_string(&known_dlls_units);
+            let known_dlls_attrs = object_attributes(
+                &known_dlls_name,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            let mut known_dlls = Handle::default();
+            assert_eq!(
+                task.sys_nt_open_directory_object(
+                    mut_ptr(&mut known_dlls),
+                    DIRECTORY_QUERY | DIRECTORY_TRAVERSE,
+                    Some(const_ptr(&known_dlls_attrs)),
+                ),
+                NtStatus::SUCCESS
+            );
+            let kernel32_units = utf16_units("KERNEL32.DLL");
+            let kernel32 = unicode_string(&kernel32_units);
+            let attrs = object_attributes_with_root(
+                &kernel32,
+                known_dlls,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            let mut handle = Handle::from_raw(0x5555_5555);
+
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(handle, Handle::default());
+
+            let attrs = object_attributes_with_root(
+                &kernel32,
+                known_dlls,
+                (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENLINK).bits(),
+            );
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::OBJECT_NAME_NOT_FOUND
+            );
+            assert_eq!(handle, Handle::default());
+
+            let missing_parent_units = utf16_units(r"\MissingLiteBoxParent\KERNEL32.DLL");
+            let missing_parent = unicode_string(&missing_parent_units);
+            let attrs = object_attributes(
+                &missing_parent,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::OBJECT_PATH_NOT_FOUND
+            );
+            assert_eq!(handle, Handle::default());
+
+            let attrs = object_attributes(
+                &known_dlls_name,
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::OBJECT_TYPE_MISMATCH
+            );
+            assert_eq!(handle, Handle::default());
+
+            let attrs = object_attributes_with_root(
+                &kernel32,
+                Handle::from_raw(0x1234),
+                ObjectAttributesFlags::CASE_INSENSITIVE.bits(),
+            );
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::INVALID_HANDLE
+            );
+            assert_eq!(handle, Handle::default());
+
+            handle = Handle::from_raw(0x5555_5555);
+            assert_eq!(
+                task.sys_nt_open_section(mut_ptr(&mut handle), 0x0d, None),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(handle, Handle::default());
+
+            assert_eq!(
+                task.sys_nt_open_section(null_mut_ptr::<Handle>(), 0x0d, Some(const_ptr(&attrs))),
+                NtStatus::ACCESS_VIOLATION
+            );
+
+            assert_eq!(task.sys_nt_close(known_dlls), NtStatus::SUCCESS);
         });
     }
 
