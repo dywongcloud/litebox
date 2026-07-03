@@ -7,10 +7,12 @@ use alloc::sync::Arc;
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::channel::LocalControlChannel;
+use litebox_broker_protocol::message::BrokerNotification;
 
 use crate::{
     broker,
     fd::Descriptors,
+    platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -100,12 +102,11 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 platform,
                 descriptors,
                 broker: broker_control,
+                broker_handles: Arc::new(broker::BrokerHandleRegistry::new()),
             }),
         }
     }
-}
 
-impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// An explicitly-crate-internal clone method to prevent outside users from cloning the
     /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
     /// only create it via [`Self::new`].
@@ -138,6 +139,34 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     pub(crate) fn broker_control(&self) -> Option<Arc<dyn broker::BrokerControl>> {
         self.x.broker.clone()
     }
+
+    pub(crate) fn broker_handle_registry(&self) -> Arc<broker::BrokerHandleRegistry<Platform>> {
+        Arc::clone(&self.x.broker_handles)
+    }
+
+    /// Dispatches one broker notification to the matching local-core object.
+    pub fn dispatch_broker_notification(&self, notification: BrokerNotification)
+    where
+        Platform: TimeProvider,
+    {
+        match notification {
+            BrokerNotification::EventReadiness(notification) => self
+                .x
+                .broker_handles
+                .notify_readiness(notification.handle, notification.readiness),
+        }
+    }
+
+    /// Returns a narrow dispatcher for moving broker notification handling into deployment code.
+    pub fn broker_notification_dispatcher(&self) -> impl Fn(BrokerNotification) + Send + 'static
+    where
+        Platform: TimeProvider + 'static,
+    {
+        let litebox = self.clone();
+        move |notification| {
+            litebox.dispatch_broker_notification(notification);
+        }
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
@@ -145,4 +174,5 @@ pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
     broker: Option<Arc<dyn broker::BrokerControl>>,
+    broker_handles: Arc<broker::BrokerHandleRegistry<Platform>>,
 }

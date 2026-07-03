@@ -3,33 +3,26 @@
 
 use std::{
     path::Path,
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
+use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
-type Local = BrokerLocal<UnixStreamLocalControlChannel>;
-
-pub(crate) struct BrokerConnection {
-    local: Local,
-    #[expect(
-        dead_code,
-        reason = "keeps the notification receiver thread alive while the broker connection is installed"
-    )]
-    notification_receiver_thread: JoinHandle<()>,
-}
 
 pub(crate) fn connect(
     control_socket_path: &Path,
     notification_socket_path: &Path,
-) -> Result<BrokerConnection> {
+) -> Result<(
+    BrokerLocal<UnixStreamLocalControlChannel>,
+    BrokerNotifications<UnixStreamLocalNotificationChannel>,
+)> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let control_channel = connect_with_retry(
         control_socket_path,
@@ -56,13 +49,19 @@ pub(crate) fn connect(
         )
     })?;
     let local = BrokerLocal::negotiate(control_channel).context("broker negotiation failed")?;
-    let mut notifications = BrokerNotifications::new(notification_channel);
-    let notification_thread = std::thread::Builder::new()
+    Ok((local, BrokerNotifications::new(notification_channel)))
+}
+
+pub(crate) fn start_notification_receiver(
+    mut notifications: BrokerNotifications<UnixStreamLocalNotificationChannel>,
+    dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
+) -> Result<()> {
+    std::thread::Builder::new()
         .name("litebox-broker-notifications".to_owned())
         .spawn(move || {
             loop {
                 match notifications.recv_notification() {
-                    Ok(Some(_notification)) => {}
+                    Ok(Some(notification)) => dispatch_notification(notification),
                     Ok(None) => break,
                     Err(error) => {
                         eprintln!("failed to receive broker notification: {error}");
@@ -72,16 +71,7 @@ pub(crate) fn connect(
             }
         })
         .context("failed to start broker notification receiver")?;
-    Ok(BrokerConnection {
-        local,
-        notification_receiver_thread: notification_thread,
-    })
-}
-
-impl BrokerConnection {
-    pub(crate) fn into_local(self) -> Local {
-        self.local
-    }
+    Ok(())
 }
 
 fn connect_with_retry<Channel>(
