@@ -491,8 +491,28 @@ impl<FS: ShimFS> Task<FS> {
         // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
         if prot.contains(ProtFlags::PROT_EXEC) {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
-            if syscall_entry != 0 {
-                self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
+            let file_backed =
+                syscall_entry != 0 && self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
+            if !file_backed {
+                // No tracked file mapping accounts for this range, so it is
+                // anonymous (or otherwise untracked) memory becoming
+                // executable. Unlike file-backed segments, anonymous memory
+                // is guest-writable RAM the guest can fill with arbitrary
+                // bytes before this call — without this scan, `mmap(RW,
+                // ANON)` + write a raw `syscall` opcode + `mprotect(RX)`
+                // would make that opcode directly executable, bypassing
+                // syscall interception entirely (a full sandbox escape).
+                // Neutralize any embedded `syscall` instructions the same
+                // way an unpatchable file segment is handled.
+                //
+                // This does not defend memory that is simultaneously
+                // writable and executable (`PROT_READ_WRITE_EXEC`): bytes
+                // written after this scan are never re-scanned, since no
+                // further permission transition occurs to catch them. See
+                // `litebox::mm::PageManager::make_pages_rwx`'s safety
+                // documentation — that combination is inherently unsafe and
+                // is only retained for legitimate JIT use cases.
+                self.apply_trap_fallback(addr, len, false);
             }
         }
         self.sys_mprotect_raw(addr, len, prot)
@@ -551,12 +571,17 @@ impl<FS: ShimFS> Task<FS> {
     /// Check all tracked file mappings for unpatched regions that overlap the
     /// mprotect range. If found, run the runtime rewriter before the region
     /// becomes executable.
+    ///
+    /// Returns `true` if at least one tracked file mapping overlapped the
+    /// range (regardless of whether patching found any syscalls to rewrite),
+    /// so the caller knows whether any part of the range is *not* accounted
+    /// for by this fd-tracked path and must be handled separately.
     fn maybe_patch_on_mprotect_exec(
         &self,
         addr: crate::MutPtr<u8>,
         len: usize,
         syscall_entry: usize,
-    ) {
+    ) -> bool {
         let mprotect_start = addr.as_usize();
         let mprotect_end = mprotect_start.saturating_add(len);
 
@@ -596,6 +621,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
+        let found_any = !to_patch.is_empty();
         for (fd, seg_start, seg_len) in to_patch {
             // Clamp to the intersection of the tracked mapping and the
             // mprotect range — only patch the portion becoming executable.
@@ -611,6 +637,7 @@ impl<FS: ShimFS> Task<FS> {
             let mapped_addr = MutPtr::<u8>::from_usize(patch_start);
             self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None);
         }
+        found_any
     }
 
     /// Initialize ELF patch state for an fd on its first mmap.

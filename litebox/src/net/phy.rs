@@ -95,9 +95,13 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
     {
         let packet = &mut self.buffer[..len];
         let res = f(packet);
-        self.platform
-            .send_ip_packet(packet)
-            .expect("Sending IP packet failed");
+        // `WouldBlock` (e.g. a full transmit queue) is ordinary backpressure,
+        // not a fatal condition: drop the packet, exactly as a real network
+        // device driver would when its TX ring is full. Higher layers (TCP
+        // retransmission, etc.) are responsible for recovery.
+        match self.platform.send_ip_packet(packet) {
+            Ok(()) | Err(platform::SendError::WouldBlock) => {}
+        }
         res
     }
 }

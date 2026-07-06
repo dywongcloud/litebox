@@ -270,7 +270,15 @@ pub trait IPInterfaceProvider {
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
 #[derive(Error, Debug)]
 #[non_exhaustive]
-pub enum SendError {}
+pub enum SendError {
+    /// The send operation would block (e.g. the underlying device's transmit
+    /// queue is full). Ordinary network backpressure, not a fatal condition:
+    /// the caller should drop the packet and rely on higher-layer
+    /// retransmission, exactly as a real network device driver would when its
+    /// TX ring is full.
+    #[error("Send operation would block")]
+    WouldBlock,
+}
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::receive_ip_packet`].
 #[derive(Error, Debug)]
