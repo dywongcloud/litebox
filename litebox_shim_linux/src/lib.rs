@@ -530,6 +530,16 @@ impl<FS: ShimFS> Task<FS> {
         buf: ConstPtr<u8>,
         count: usize,
     ) -> Result<usize, Errno> {
+        // Splitting a single write into several `sys_write` calls would break
+        // message-boundary and `O_APPEND` atomicity (a datagram socket would
+        // fragment one message; concurrent appends could interleave). Chunking
+        // is only safe within one `sys_write`, i.e. up to the scratch buffer's
+        // cap, so larger writes fall back to a single owned copy and a single
+        // call — the same guard `sys_sendto` uses.
+        if count > MAX_KERNEL_BUF_SIZE {
+            let owned = buf.to_owned_slice(count).ok_or(Errno::EFAULT)?;
+            return self.sys_write(fd, &owned, None);
+        }
         self.with_scratch_buf(count, |kernel_buf| {
             // Once any bytes have been delivered, an error collapses to
             // `Ok(written_total)` so partial progress is reported to user space.
