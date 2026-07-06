@@ -110,7 +110,6 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
     /// completes and the entry is fully returned.
     ///
     /// If the entry is not currently inserted, this method does nothing.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn remove(self: Pin<&mut Self>) {
         if let Some(list) = self.list {
             list.remove_node(&self.node);
@@ -201,7 +200,12 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                     let _ = node.data.state.block(s.0);
                 }
                 EntryState::REMOVED_WAKING => {
-                    // Spin until the remover finishes waking us.
+                    // Spin until the remover finishes waking us. This wait is
+                    // bounded to the remover executing a single store after its
+                    // wake call returns (see `LoanedEntry::drop`), so spinning
+                    // is acceptable. Note that `block`ing here instead would be
+                    // unsound: the remover issues no further wake after its
+                    // final store to `REMOVED`.
                     core::hint::spin_loop();
                 }
                 state => panic!("invalid state waiting for entry removal: {state:?}"),

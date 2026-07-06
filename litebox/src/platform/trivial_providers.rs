@@ -85,6 +85,23 @@ impl<T: FromBytes> RawConstPointer<T> for TransparentConstPtr<T> {
         }
     }
 
+    fn copy_to_slice(self, start_offset: usize, buf: &mut [T]) -> Option<()> {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
+            return None;
+        }
+        // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
+        // on T guarantees that any byte pattern is valid for T.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ptr.wrapping_add(start_offset),
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
+        }
+        Some(())
+    }
+
     fn as_usize(&self) -> usize {
         self.inner
     }
@@ -159,6 +176,23 @@ impl<T: FromBytes> RawConstPointer<T> for TransparentMutPtr<T> {
             core::ptr::copy_nonoverlapping(ptr, boxed.as_mut_ptr().cast(), len);
             Some(boxed.assume_init())
         }
+    }
+
+    fn copy_to_slice(self, start_offset: usize, buf: &mut [T]) -> Option<()> {
+        let ptr = self.as_ptr();
+        if ptr.is_null() || !ptr.is_aligned() {
+            return None;
+        }
+        // SAFETY: We checked the pointer is non-null and aligned. The FromBytes bound
+        // on T guarantees that any byte pattern is valid for T.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                ptr.wrapping_add(start_offset).cast_const(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
+        }
+        Some(())
     }
 
     fn as_usize(&self) -> usize {

@@ -3,9 +3,12 @@
 
 //! File descriptors used in LiteBox
 
-#![expect(
-    dead_code,
-    reason = "still under development, remove before merging PR"
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "still under development, remove before merging PR"
+    )
 )]
 
 use alloc::sync::Arc;
@@ -22,9 +25,54 @@ use crate::utilities::anymap::AnyMap;
 #[cfg(test)]
 mod tests;
 
+/// A bitmap tracking which slots of a `Vec<Option<T>>`-style table are occupied, so that the
+/// lowest free slot (POSIX lowest-fd semantics) can be found via an O(n/64) word scan instead of
+/// an O(n) entry scan.
+///
+/// Invariant: bit `i` is set iff slot `i` is occupied. In particular, bits at indices at or beyond
+/// the table's length must be clear, so that [`Self::allocate`] never returns an index more than
+/// one past the table's current length.
+#[derive(Default)]
+struct FreeSlotBitmap {
+    words: Vec<u64>,
+}
+
+impl FreeSlotBitmap {
+    /// Returns the lowest free slot index, marking it as occupied.
+    fn allocate(&mut self) -> usize {
+        for (i, word) in self.words.iter_mut().enumerate() {
+            if *word != u64::MAX {
+                let bit = (!*word).trailing_zeros() as usize;
+                *word |= 1u64 << bit;
+                return i * 64 + bit;
+            }
+        }
+        self.words.push(1);
+        (self.words.len() - 1) * 64
+    }
+
+    /// Marks `idx` as occupied, growing the bitmap as needed.
+    fn set_used(&mut self, idx: usize) {
+        let word = idx / 64;
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1u64 << (idx % 64);
+    }
+
+    /// Marks `idx` as free.
+    ///
+    /// `idx` must have previously been marked occupied (which guarantees the backing word exists).
+    fn set_free(&mut self, idx: usize) {
+        self.words[idx / 64] &= !(1u64 << (idx % 64));
+    }
+}
+
 /// Storage of file descriptors and their entries.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
     entries: Vec<Option<IndividualEntry<Platform>>>,
+    /// Tracks which `entries` slots are occupied; see [`FreeSlotBitmap`].
+    free_slots: FreeSlotBitmap,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
@@ -33,7 +81,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// This is expected to be invoked only by [`crate::LiteBox`]'s creation method, and should not
     /// be invoked anywhere else in the codebase.
     pub(crate) fn new_from_litebox_creation() -> Self {
-        Self { entries: vec![] }
+        Self {
+            entries: vec![],
+            free_slots: FreeSlotBitmap::default(),
+        }
+    }
+
+    /// Allocate the lowest free slot in `entries`, extending the table if needed.
+    fn allocate_slot(&mut self) -> usize {
+        let idx = self.free_slots.allocate();
+        debug_assert!(idx <= self.entries.len());
+        if idx == self.entries.len() {
+            self.entries.push(None);
+        }
+        idx
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
@@ -50,15 +111,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             entry: alloc::boxed::Box::new(entry.into()),
             metadata: AnyMap::new(),
         };
-        let idx = self
-            .entries
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.entries.push(None);
-                self.entries.len() - 1
-            });
-        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(RwLock::new(entry))));
+        let idx = self.allocate_slot();
+        let old = self.entries[idx].replace(IndividualEntry::new::<Subsystem>(Arc::new(
+            RwLock::new(entry),
+        )));
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
@@ -84,17 +140,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<TypedFd<Subsystem>> {
-        let idx = self
-            .entries
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.entries.push(None);
-                self.entries.len() - 1
-            });
-        let new_ind_entry = IndividualEntry::new(Arc::clone(
+        let new_ind_entry = IndividualEntry::new::<Subsystem>(Arc::clone(
             &self.entries[fd.x.as_usize()?].as_ref().unwrap().x,
         ));
+        let idx = self.allocate_slot();
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
         Some(TypedFd {
@@ -113,9 +162,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
-        let Some(old) = self.entries[fd.x.as_usize()?].take() else {
+        let idx = fd.x.as_usize()?;
+        let Some(old) = self.entries[idx].take() else {
             unreachable!();
         };
+        self.free_slots.set_free(idx);
         fd.x.mark_as_closed();
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
@@ -143,6 +194,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         if Arc::strong_count(&old.x) == 1 {
             // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
+                self.free_slots.set_free(idx);
                 fd.x.mark_as_closed();
                 let entry = Arc::into_inner(old.x)
                     .map(RwLock::into_inner)
@@ -241,17 +293,16 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> impl Iterator<Item = (InternalFd, impl core::ops::Deref<Target = Subsystem::Entry>)> {
         self.entries.iter().enumerate().filter_map(|(i, entry)| {
             entry.as_ref().and_then(|e| {
-                let entry = e.read();
-                if entry.matches_subsystem::<Subsystem>() {
-                    Some((
-                        InternalFd {
-                            raw: i.try_into().unwrap(),
-                        },
-                        crate::sync::RwLockReadGuard::map(entry, |e| e.as_subsystem::<Subsystem>()),
-                    ))
-                } else {
-                    None
+                if !e.matches_subsystem::<Subsystem>() {
+                    return None;
                 }
+                let entry = e.read();
+                Some((
+                    InternalFd {
+                        raw: i.try_into().unwrap(),
+                    },
+                    crate::sync::RwLockReadGuard::map(entry, |e| e.as_subsystem::<Subsystem>()),
+                ))
             })
         })
     }
@@ -270,11 +321,10 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     > {
         self.entries.iter().enumerate().filter_map(|(i, entry)| {
             entry.as_ref().and_then(|e| {
-                if !e.read().matches_subsystem::<Subsystem>() {
+                if !e.matches_subsystem::<Subsystem>() {
                     return None;
                 }
                 let entry = e.write();
-                assert!(entry.matches_subsystem::<Subsystem>());
                 Some((
                     InternalFd {
                         raw: i.try_into().unwrap(),
@@ -356,12 +406,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&mut Subsystem::Entry) -> R,
     {
-        let mut entry = self.entries[usize::try_from(internal_fd.raw).unwrap()]
+        let ind_entry = self.entries[usize::try_from(internal_fd.raw).unwrap()]
             .as_ref()
-            .unwrap()
-            .write();
-        if entry.matches_subsystem::<Subsystem>() {
-            Some(f(entry.as_subsystem_mut::<Subsystem>()))
+            .unwrap();
+        if ind_entry.matches_subsystem::<Subsystem>() {
+            Some(f(ind_entry.write().as_subsystem_mut::<Subsystem>()))
         } else {
             None
         }
@@ -573,6 +622,8 @@ pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
 pub struct RawDescriptorStorage {
     /// Stored FDs are used to provide raw integer values in a safer way.
     stored_fds: Vec<Option<StoredFd>>,
+    /// Tracks which `stored_fds` slots are occupied; see [`FreeSlotBitmap`].
+    free_slots: FreeSlotBitmap,
 }
 
 struct StoredFd {
@@ -596,7 +647,10 @@ impl RawDescriptorStorage {
     #[expect(clippy::new_without_default)]
     /// Create a new raw descriptor store.
     pub fn new() -> Self {
-        Self { stored_fds: vec![] }
+        Self {
+            stored_fds: vec![],
+            free_slots: FreeSlotBitmap::default(),
+        }
     }
 
     /// Get the corresponding integer value of the provided `fd`.
@@ -610,11 +664,9 @@ impl RawDescriptorStorage {
         &mut self,
         fd: TypedFd<Subsystem>,
     ) -> usize {
-        let ret = self
-            .stored_fds
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(self.stored_fds.len());
+        // `allocate` already marks the slot as used; `fd_into_specific_raw_integer` marking it
+        // again is a harmless no-op.
+        let ret = self.free_slots.allocate();
         let success = self.fd_into_specific_raw_integer(fd, ret);
         assert!(success);
         ret
@@ -656,6 +708,7 @@ impl RawDescriptorStorage {
         }
         let old = self.stored_fds[raw_fd].replace(StoredFd::new(fd));
         assert!(old.is_none());
+        self.free_slots.set_used(raw_fd);
         true
     }
 
@@ -684,6 +737,7 @@ impl RawDescriptorStorage {
         let underlying = self.stored_fds[fd].take();
         debug_assert!(underlying.is_some());
         drop(underlying);
+        self.free_slots.set_free(fd);
         Ok(ret)
     }
 
@@ -807,6 +861,10 @@ pub enum MetadataError {
 struct IndividualEntry<Platform: RawSyncPrimitivesProvider> {
     x: Arc<RwLock<Platform, DescriptorEntry>>,
     metadata: AnyMap,
+    /// The `TypeId` of the subsystem's entry type, cached at insertion time so that subsystem
+    /// filtering (e.g., in [`Descriptors::iter`]) does not need to lock the entry. This is valid
+    /// because an entry's type can never change after insertion.
+    subsystem_entry_type_id: core::any::TypeId,
 }
 impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<Platform> {
     type Target = Arc<RwLock<Platform, DescriptorEntry>>;
@@ -815,11 +873,18 @@ impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<P
     }
 }
 impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
-    fn new(x: Arc<RwLock<Platform, DescriptorEntry>>) -> Self {
+    fn new<Subsystem: FdEnabledSubsystem>(x: Arc<RwLock<Platform, DescriptorEntry>>) -> Self {
         Self {
             x,
             metadata: AnyMap::new(),
+            subsystem_entry_type_id: core::any::TypeId::of::<Subsystem::Entry>(),
         }
+    }
+
+    /// Check if this entry matches the specified subsystem, without locking the entry.
+    #[must_use]
+    fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
+        self.subsystem_entry_type_id == core::any::TypeId::of::<Subsystem::Entry>()
     }
 }
 
@@ -830,12 +895,6 @@ pub(crate) struct DescriptorEntry {
 }
 
 impl DescriptorEntry {
-    /// Check if this entry matches the specified subsystem
-    #[must_use]
-    fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
-        core::any::TypeId::of::<Subsystem::Entry>() == core::any::Any::type_id(self.entry.as_ref())
-    }
-
     /// Obtains `self` as the subsystem's entry type.
     ///
     /// # Panics

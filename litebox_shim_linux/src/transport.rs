@@ -6,6 +6,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
+use litebox::event::polling::TryOpError;
+use litebox::event::wait::WaitState;
+use litebox::event::{Events, IOPollable as _};
 use litebox::fs::nine_p::transport;
 use litebox::net::socket_channel::{ChannelWriteError, NetworkProxy};
 use litebox::net::{ReceiveFlags, SendFlags};
@@ -13,6 +16,55 @@ use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
 use crate::{GlobalState, Platform, ShimFS};
+
+/// Non-blocking retries before parking the calling thread.
+const SPIN_LIMIT: usize = 128;
+
+/// Timeout safety net while parked, in case a pollee notification is missed.
+const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(1);
+
+/// Runs `try_op` until it succeeds: first with a short bounded spin, then by
+/// parking the thread until `events` fire on the proxy's pollee.
+///
+/// A pure `spin_loop()` wait is toxic when the network worker's vCPU is
+/// preempted (e.g., in a ring-3 PVM guest, spinning burns the whole scheduling
+/// quantum), so after [`SPIN_LIMIT`] retries this blocks via the platform's
+/// wait facilities, with a [`POLL_INTERVAL`] timeout as a safety net.
+fn spin_then_wait<R, E>(
+    wait_state: &WaitState<Platform>,
+    proxy: &NetworkProxy<Platform>,
+    events: Events,
+    mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+) -> Result<R, E> {
+    for _ in 0..SPIN_LIMIT {
+        match try_op() {
+            Ok(r) => return Ok(r),
+            Err(TryOpError::TryAgain) => core::hint::spin_loop(),
+            Err(TryOpError::Other(e)) => return Err(e),
+            Err(TryOpError::WaitError(_)) => unreachable!("try_op does not wait"),
+        }
+    }
+    loop {
+        match wait_state
+            .context()
+            .with_timeout(POLL_INTERVAL)
+            .wait_on_events(
+                false,
+                events,
+                |observer, filter| {
+                    proxy.register_observer(observer, filter);
+                    Ok(())
+                },
+                &mut try_op,
+            ) {
+            Ok(r) => return Ok(r),
+            // Timed out: retry in case a notification was missed.
+            Err(TryOpError::WaitError(_)) => {}
+            Err(TryOpError::Other(e)) => return Err(e),
+            Err(TryOpError::TryAgain) => unreachable!("blocking wait cannot return TryAgain"),
+        }
+    }
+}
 
 /// Handles socket cleanup on drop without exposing the `FS` generic.
 ///
@@ -38,19 +90,22 @@ impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
     }
 }
 
-/// A spin-polling TCP transport backed by a raw `SocketFd` and its [`NetworkProxy`].
+/// A TCP transport backed by a raw `SocketFd` and its [`NetworkProxy`].
 ///
 /// The socket lives in the litebox descriptor table (for metadata / proxy) but is
 /// **not** registered in the guest's file-descriptor table, keeping it invisible
 /// to the guest program.
 ///
 /// All I/O goes through the non-blocking [`NetworkProxy`] methods directly
-/// (`try_read` / `try_write`), with spin-polling when data is not yet available.
-/// This avoids the need for a `WaitState` or any association with a particular
-/// guest `Task`.
+/// (`try_read` / `try_write`), briefly spinning and then parking the calling
+/// thread (via a transport-private [`WaitState`], with no association with a
+/// particular guest `Task`) when data is not yet available.
 pub struct ShimTransport {
     drop_guard: Box<dyn DropGuard>,
     proxy: Arc<NetworkProxy<Platform>>,
+    /// Wait state used to park whichever thread is driving the transport.
+    /// I/O calls take `&mut self`, so it is never used concurrently.
+    wait_state: WaitState<Platform>,
 }
 
 impl ShimTransport {
@@ -61,7 +116,8 @@ impl ShimTransport {
     /// set up, but the socket is **not** assigned a guest fd number.
     ///
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
-    /// spin-polling when the operation cannot complete immediately.
+    /// spinning briefly and then parking when the operation cannot complete
+    /// immediately.
     pub(crate) fn connect<FS: ShimFS>(
         global: Arc<GlobalState<FS>>,
         addr: core::net::SocketAddr,
@@ -77,21 +133,29 @@ impl ShimTransport {
         let proxy = global.initialize_socket(&sockfd, SockType::Stream, SockFlags::empty());
 
         // 3. Initiate the TCP connection.
+        let wait_state = WaitState::new(global.platform);
         let mut check_progress = false;
-        loop {
-            match global.net.lock().connect(&sockfd, &addr, check_progress) {
-                Ok(()) => break,
+        spin_then_wait(
+            &wait_state,
+            &proxy,
+            Events::IN | Events::OUT,
+            || match global.net.lock().connect(&sockfd, &addr, check_progress) {
+                Ok(()) => Ok(()),
                 Err(litebox::net::errors::ConnectError::InProgress) => {
-                    core::hint::spin_loop();
                     check_progress = true;
+                    Err(TryOpError::TryAgain)
                 }
-                Err(e) => return Err(Errno::from(e)),
-            }
-        }
+                Err(e) => Err(TryOpError::Other(Errno::from(e))),
+            },
+        )?;
 
         let drop_guard = Box::new(SocketDropGuard { global, sockfd });
 
-        Ok(Self { drop_guard, proxy })
+        Ok(Self {
+            drop_guard,
+            proxy,
+            wait_state,
+        })
     }
 }
 
@@ -103,31 +167,27 @@ impl Drop for ShimTransport {
 
 impl transport::Read for ShimTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
-        loop {
+        spin_then_wait(&self.wait_state, &self.proxy, Events::IN, || {
             match self.proxy.try_read(buf, ReceiveFlags::empty(), None) {
-                Ok(0) => {
-                    // No data yet — spin until something arrives.
-                    core::hint::spin_loop();
-                }
-                Ok(n) => return Ok(n),
-                Err(_) => return Err(transport::ReadError),
+                // No data yet — wait until something arrives.
+                Ok(0) => Err(TryOpError::TryAgain),
+                Ok(n) => Ok(n),
+                Err(_) => Err(TryOpError::Other(transport::ReadError)),
             }
-        }
+        })
     }
 }
 
 impl transport::Write for ShimTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
-        loop {
+        spin_then_wait(&self.wait_state, &self.proxy, Events::OUT, || {
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
-                Ok(n) => return Ok(n),
-                Err(ChannelWriteError::BufferFull) => {
-                    // TX ring full — spin until space opens up.
-                    core::hint::spin_loop();
-                }
-                Err(_) => return Err(transport::WriteError),
+                Ok(n) => Ok(n),
+                // TX ring full — wait until space opens up.
+                Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
+                Err(_) => Err(TryOpError::Other(transport::WriteError)),
             }
-        }
+        })
     }
 }
 

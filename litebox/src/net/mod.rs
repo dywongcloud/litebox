@@ -80,6 +80,10 @@ where
     queued_for_closure: Vec<SocketFd<Platform>>,
     /// Sockets that are closing in the background
     closing_in_background: Vec<smoltcp::iface::SocketHandle>,
+    /// Whether any socket may be in the deferred-close state (`consider_closed`), allowing
+    /// [`Self::close_pending_sockets`] to skip its scan of the descriptor table. May be stale
+    /// towards `true` (a scan then finds nothing and resets it), but never towards `false`.
+    has_deferred_closes: bool,
 }
 
 impl<Platform> Network<Platform>
@@ -123,6 +127,7 @@ where
             platform_interaction: PlatformInteraction::Automatic,
             queued_for_closure: vec![],
             closing_in_background: vec![],
+            has_deferred_closes: false,
         }
     }
 }
@@ -518,6 +523,11 @@ where
 
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
     fn close_pending_sockets(&mut self) {
+        if !self.has_deferred_closes {
+            // fast path: no socket is in the deferred-close state
+            return;
+        }
+        let mut any_remaining = false;
         let table = self.litebox.descriptor_table();
         for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
@@ -526,6 +536,7 @@ where
                 if let Some(proxy) = &socket_handle.proxy
                     && proxy.has_pending_tx()
                 {
+                    any_remaining = true;
                     continue;
                 }
 
@@ -548,9 +559,13 @@ where
                 );
                 if closed {
                     socket_handle.consider_closed = false;
+                } else {
+                    any_remaining = true;
                 }
             }
         }
+        drop(table);
+        self.has_deferred_closes = any_remaining;
     }
 
     /// Drain all socket channel buffers
@@ -727,9 +742,13 @@ where
     /// [`set_socket_proxy`](Self::set_socket_proxy).
     pub fn socket(&mut self, protocol: Protocol) -> Result<SocketFd<Platform>, SocketError> {
         let handle = match protocol {
+            // TCP sockets start with zero-capacity buffers; the real (large) rx/tx rings are
+            // allocated lazily on `connect` (see `ensure_tcp_socket_buffers`). This avoids the
+            // allocation entirely for sockets that never carry data themselves--most notably
+            // listening sockets, whose data flows through the backlog sockets instead.
             Protocol::Tcp => self.socket_set.add(tcp::Socket::new(
-                smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
-                smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
+                smoltcp::storage::RingBuffer::new(vec![]),
+                smoltcp::storage::RingBuffer::new(vec![]),
             )),
             Protocol::Udp => self.socket_set.add(udp::Socket::new(
                 smoltcp::storage::PacketBuffer::new(
@@ -799,6 +818,33 @@ where
     /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
     fn new_socket_fd_for(&mut self, socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
         self.litebox.descriptor_table_mut().insert(socket_handle)
+    }
+
+    /// Lazily allocate the rx/tx buffers of a TCP socket that was created with zero-capacity
+    /// buffers (see [`Self::socket`]), before it is first connected.
+    ///
+    /// Since smoltcp provides no way to replace a socket's buffers in place, this swaps in a
+    /// freshly-buffered socket, carrying over any socket options that may have been set already.
+    fn ensure_tcp_socket_buffers(
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        socket_handle: &mut SocketHandle<Platform>,
+    ) {
+        let socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+        if socket.recv_capacity() != 0 || socket.send_capacity() != 0 {
+            return;
+        }
+        let mut new_socket = tcp::Socket::new(
+            smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
+            smoltcp::storage::RingBuffer::new(vec![0u8; SOCKET_BUFFER_SIZE]),
+        );
+        new_socket.set_nagle_enabled(socket.nagle_enabled());
+        new_socket.set_keep_alive(socket.keep_alive());
+        new_socket.set_timeout(socket.timeout());
+        new_socket.set_ack_delay(socket.ack_delay());
+        new_socket.set_hop_limit(socket.hop_limit());
+        new_socket.set_congestion_control(socket.congestion_control());
+        socket_set.remove(socket_handle.handle);
+        socket_handle.handle = socket_set.add(new_socket);
     }
 
     /// Set the network proxy for the socket at `fd`
@@ -880,6 +926,7 @@ where
                 else {
                     unreachable!()
                 };
+                self.has_deferred_closes = true;
                 return Err(CloseError::DataPending);
             }
         }
@@ -989,6 +1036,11 @@ where
                     }
                 };
 
+                if !check_progress {
+                    // The socket is about to be connected; make sure its rx/tx buffers have
+                    // been allocated.
+                    Self::ensure_tcp_socket_buffers(&mut self.socket_set, socket_handle);
+                }
                 let socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 if check_progress {
                     check_state(socket.state())

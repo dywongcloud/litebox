@@ -256,6 +256,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         #[cfg(debug_assertions)] absolute_components: &[&str],
         outcome: &WalkOutcome<WalkingDirHandle<'_>>,
     ) -> Result<(), PathError> {
+        // `idx` is only used when `debug_assertions` is enabled.
+        #[cfg_attr(not(debug_assertions), expect(unused_variables))]
         for (idx, walked) in outcome.components.iter().enumerate() {
             match &walked.permissions {
                 PermissionCheck::ByBackend => {}

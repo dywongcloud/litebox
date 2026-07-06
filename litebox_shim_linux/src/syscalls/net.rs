@@ -1369,8 +1369,18 @@ impl<FS: ShimFS> Task<FS> {
         let sockaddr = addr
             .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
             .transpose()?;
-        let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
-        self.do_sendto(fd, &buf, flags, sockaddr)
+        if len <= crate::MAX_KERNEL_BUF_SIZE {
+            self.with_scratch_buf(len, |kernel_buf| {
+                buf.copy_to_slice(0, kernel_buf).ok_or(Errno::EFAULT)?;
+                self.do_sendto(fd, kernel_buf, flags, sockaddr)
+            })
+        } else {
+            // Larger sends cannot be blindly chunked, as datagram sockets must
+            // preserve message boundaries; they are rare enough that a single
+            // owned copy is acceptable.
+            let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+            self.do_sendto(fd, &buf, flags, sockaddr)
+        }
     }
     fn do_sendto(
         &self,

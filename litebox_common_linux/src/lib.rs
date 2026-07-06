@@ -1680,6 +1680,8 @@ bitflags::bitflags! {
 pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
+    Requeue = 3,
+    CmpRequeue = 4,
     WaitBitset = 9,
 }
 
@@ -1718,6 +1720,25 @@ pub enum FutexArgs<Platform: litebox::platform::RawPointerProvider> {
         addr: Platform::RawMutPointer<u32>,
         flags: FutexFlags,
         count: u32,
+    },
+    /// `FUTEX_REQUEUE`: wake up to `wake_count` waiters on `addr`, then move
+    /// up to `requeue_count` of the remaining waiters to wait on `addr2`.
+    Requeue {
+        addr: Platform::RawMutPointer<u32>,
+        flags: FutexFlags,
+        wake_count: u32,
+        addr2: Platform::RawMutPointer<u32>,
+        requeue_count: u32,
+    },
+    /// `FUTEX_CMP_REQUEUE`: like [`FutexArgs::Requeue`], but fails with
+    /// `EAGAIN` unless `*addr == expected`.
+    CmpRequeue {
+        addr: Platform::RawMutPointer<u32>,
+        flags: FutexFlags,
+        wake_count: u32,
+        addr2: Platform::RawMutPointer<u32>,
+        requeue_count: u32,
+        expected: u32,
     },
 }
 
@@ -3020,6 +3041,24 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 addr,
                 flags,
                 count: val,
+            },
+            // For the requeue operations the timeout slot carries `val2`, the
+            // maximum number of waiters to requeue, and arg 4 is the second
+            // futex word.
+            FutexOperation::Requeue => FutexArgs::Requeue {
+                addr,
+                flags,
+                wake_count: val,
+                addr2: ctx.sys_req_ptr(4),
+                requeue_count: ctx.sys_req_arg(3),
+            },
+            FutexOperation::CmpRequeue => FutexArgs::CmpRequeue {
+                addr,
+                flags,
+                wake_count: val,
+                addr2: ctx.sys_req_ptr(4),
+                requeue_count: ctx.sys_req_arg(3),
+                expected: ctx.sys_req_arg(5),
             },
         };
         Ok(SyscallRequest::Futex { args })
