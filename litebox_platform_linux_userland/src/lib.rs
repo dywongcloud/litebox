@@ -112,10 +112,11 @@ impl core::fmt::Debug for LinuxUserland {
 }
 
 /// Information about a CoW-eligible memory region backed by a file.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CowRegionInfo {
-    /// The path to the backing file on the host filesystem.
-    file_path: PathBuf,
+    /// The backing file, opened read-only once at registration time so that
+    /// each CoW mapping is a single host `mmap` (no per-mapping open/close).
+    file: std::fs::File,
     /// Length of the backing file.
     file_length: usize,
 }
@@ -175,6 +176,10 @@ impl LinuxUserland {
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+        init_fsgsbase_mode();
+        // Probe the CPU count now, before the seccomp filter is installed, so
+        // the query never trips the sandbox (see `num_cpus`).
+        NUM_CPUS.get_or_init(|| std::thread::available_parallelism().ok());
         register_exception_handlers();
 
         let tun_socket_fd = tun_device_name
@@ -266,11 +271,20 @@ impl LinuxUserland {
     ///
     /// # Panics
     ///
+    /// Panics if the backing file cannot be opened read-only.
+    ///
     /// Panics if an overlapping region is already registered.
     pub fn register_cow_region(&self, data: &'static [u8], file_path: impl Into<PathBuf>) {
         let start = data.as_ptr() as usize;
+        let file_path = file_path.into();
+        let file = std::fs::File::open(&file_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to open CoW backing file {}: {err}",
+                file_path.display()
+            )
+        });
         let info = CowRegionInfo {
-            file_path: file_path.into(),
+            file,
             file_length: data.len(),
         };
 
@@ -285,9 +299,11 @@ impl LinuxUserland {
 
     /// Look up the file backing a static slice for CoW mapping.
     ///
-    /// Returns `Some((file_path, offset_in_file))` if the slice is backed by a registered
-    /// CoW region, `None` otherwise.
-    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(PathBuf, usize)> {
+    /// Returns `Some((fd, offset_in_file))` if the slice is backed by a registered
+    /// CoW region, `None` otherwise. The returned raw fd stays valid for the
+    /// process lifetime: regions are never unregistered and the platform is
+    /// leaked (`&'static`).
+    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(std::os::fd::RawFd, usize)> {
         let slice_start = source_data.as_ptr() as usize;
         let slice_len = source_data.len();
 
@@ -298,7 +314,7 @@ impl LinuxUserland {
             let slice_end = slice_start.checked_add(slice_len).unwrap();
 
             if slice_start >= region_start && slice_end <= region_end {
-                return Some((info.file_path.clone(), slice_start - region_start));
+                return Some((info.file.as_raw_fd(), slice_start - region_start));
             }
         }
         None
@@ -451,6 +467,17 @@ impl LinuxUserland {
             (libc::SYS_clone3, vec![]),
             // sync
             (libc::SYS_futex, vec![]),
+            // time: glibc normally services these via the vDSO, but it falls
+            // back to the real syscalls when the clocksource is not
+            // vDSO-capable (e.g. an unstable TSC in PVM guests), so they must
+            // be allowed. They are read-only and sandbox-safe.
+            (libc::SYS_clock_gettime, vec![]),
+            (libc::SYS_clock_getres, vec![]),
+            (libc::SYS_gettimeofday, vec![]),
+            // segment-base switching on hosts without user-mode FSGSBASE
+            // (see `init_fsgsbase_mode`); affects only the calling thread's
+            // fs/gs bases, so it is sandbox-neutral.
+            (libc::SYS_arch_prctl, vec![]),
             // misc
             (libc::SYS_getrandom, vec![]),
             // required by std spawn
@@ -463,7 +490,9 @@ impl LinuxUserland {
             // required by libc allocator
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
-            // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
+            // CoW backing files are pre-opened at registration time (see
+            // `register_cow_region`); this read-only rule remains for host
+            // libc internals.
             (
                 libc::SYS_open,
                 vec![
@@ -518,6 +547,20 @@ impl litebox::platform::SignalProvider for LinuxUserland {
 
 /// Atomically takes the per-thread pending host signal bitmask.
 fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
+    // Fast path: a plain load first. Only this thread consumes the mask
+    // (signal handlers merely OR bits in), so a zero read means there is
+    // nothing to take and the locked `xchg` can be skipped.
+    let pending: u32;
+    unsafe {
+        core::arch::asm!(
+            concat!("mov {tmp:e}, DWORD PTR ", tls!("pending_host_signals")),
+            tmp = out(reg) pending,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    if pending == 0 {
+        return litebox_common_linux::signal::SigSet::from_u64(0);
+    }
     // Atomically swap the per-thread pending signals with zero.
     // Only the low 32 bits are used (covers traditional signals 1-31).
     let lo: u32;
@@ -621,6 +664,8 @@ pending_host_signals:
 .globl wait_waker_addr
 wait_waker_addr:
     .quad 0
+host_fsbase:
+    .quad 0
     "
 );
 
@@ -685,10 +730,37 @@ unsafe extern "C-unwind" fn run_thread_arch(
     lea r8, [rsi + {GUEST_CONTEXT_SIZE}]
     mov fs:guest_context_top@tpoff, r8
 
-    // Save host fs base in gs base. This will stay set for the lifetime
+    // Save host fs base in gs base (and mirror it in the host_fsbase TLS
+    // slot for the no-FSGSBASE fallback). This will stay set for the lifetime
     // of this call stack.
+    cmp BYTE PTR [rip + {have_fsgsbase}], {FSGSBASE_NATIVE}
+    jne .Lrta_no_fsgsbase
     rdfsbase r8
     wrgsbase r8
+    jmp .Lrta_gs_done
+.Lrta_no_fsgsbase:
+    // arch_prctl(ARCH_GET_FS) then arch_prctl(ARCH_SET_GS). Raw syscalls
+    // clobber rax/rcx/r11 (dead here) plus the registers we load; rdx still
+    // holds the live `reenter` flag, so preserve it in r9.
+    mov r9, rdx
+    sub rsp, 8
+    mov edi, {ARCH_GET_FS}
+    mov rsi, rsp
+    mov eax, {SYS_arch_prctl}
+    syscall
+    pop r8              // host fs base
+    mov edi, {ARCH_SET_GS}
+    mov rsi, r8
+    mov eax, {SYS_arch_prctl}
+    syscall
+    mov rdx, r9
+.Lrta_gs_done:
+    mov fs:host_fsbase@tpoff, r8
+
+    // Reload the thread-context pointer (first handler argument): the
+    // no-FSGSBASE path above clobbers rdi/rsi with arch_prctl arguments.
+    // The pushed `rdi` (thread_ctx) is at the top of the stack.
+    mov rdi, [rsp]
 
     // Call init_handler or reenter_handler based on reenter flag (in dl).
     test dl, dl
@@ -711,15 +783,12 @@ syscall_callback:
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
 
-    // Restore host fs base.
-    rdfsbase r11
-    mov      gs:guest_fsbase@tpoff, r11
-    rdgsbase r11
-    wrfsbase r11
-
-    // Switch to the top of the guest context.
+    // Switch to the top of the guest context. The guest context is saved
+    // before the host fs base is restored so that the no-FSGSBASE fallback
+    // below may clobber registers and flags freely; until then only
+    // gs-relative TLS (host base) and flag-preserving instructions are used.
     mov     r11, rsp
-    mov     rsp, fs:guest_context_top@tpoff
+    mov     rsp, gs:guest_context_top@tpoff
 
     // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
@@ -745,6 +814,26 @@ syscall_callback:
     push    r13         // pt_regs->r13
     push    r14         // pt_regs->r14
     push    r15         // pt_regs->r15
+
+    // Restore host fs base, capturing the guest's current fs base first.
+    // The full guest register frame is saved at this point, so both paths
+    // may clobber caller-saved registers and flags.
+    cmp BYTE PTR [rip + {have_fsgsbase}], {FSGSBASE_NATIVE}
+    jne .Lsc_no_fsgsbase
+    rdfsbase r11
+    mov      gs:guest_fsbase@tpoff, r11
+    rdgsbase r11
+    wrfsbase r11
+    jmp .Lsc_fs_done
+.Lsc_no_fsgsbase:
+    // Without FSGSBASE the guest cannot have changed its fs base directly
+    // (wrfsbase would fault), so gs:guest_fsbase is already current; just
+    // restore the host fs base saved at entry via arch_prctl(ARCH_SET_FS).
+    mov rsi, gs:host_fsbase@tpoff
+    mov edi, {ARCH_SET_FS}
+    mov eax, {SYS_arch_prctl}
+    syscall
+.Lsc_fs_done:
 
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
@@ -793,6 +882,12 @@ interrupt_callback:
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
+    have_fsgsbase = sym HAVE_FSGSBASE,
+    FSGSBASE_NATIVE = const FSGSBASE_NATIVE,
+    ARCH_GET_FS = const ARCH_GET_FS,
+    ARCH_SET_GS = const ARCH_SET_GS,
+    ARCH_SET_FS = const ARCH_SET_FS,
+    SYS_arch_prctl = const libc::SYS_arch_prctl,
     );
 }
 
@@ -822,9 +917,20 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "jne interrupt_callback",
         // Restore guest context from ctx.
         "mov rsp, rdi",
-        // Switch to the guest fsbase
+        // Switch to the guest fsbase. Every register clobbered below (rax,
+        // rcx, rdx, rsi, rdi, r11, rflags) is restored from the guest context
+        // by the pops that follow.
+        "cmp BYTE PTR [rip + {have_fsgsbase}], {FSGSBASE_NATIVE}",
+        "jne .Lstg_no_fsgsbase",
         "mov rdx, fs:guest_fsbase@tpoff",
         "wrfsbase rdx",
+        "jmp .Lstg_fs_done",
+        ".Lstg_no_fsgsbase:",
+        "mov rsi, fs:guest_fsbase@tpoff",
+        "mov edi, {ARCH_SET_FS}",
+        "mov eax, {SYS_arch_prctl}",
+        "syscall",
+        ".Lstg_fs_done:",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -847,6 +953,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "pop rsp",
         "jmp gs:scratch@tpoff", // jump to the guest
         "switch_to_guest_end:",
+        have_fsgsbase = sym HAVE_FSGSBASE,
+        FSGSBASE_NATIVE = const FSGSBASE_NATIVE,
+        ARCH_SET_FS = const ARCH_SET_FS,
+        SYS_arch_prctl = const libc::SYS_arch_prctl,
     );
 }
 
@@ -980,19 +1090,31 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         thread.interrupt();
     }
 
+    fn num_cpus(&self) -> Option<core::num::NonZeroUsize> {
+        // Cache the CPU count: it does not change over the process lifetime,
+        // and `available_parallelism` probes the host (and may consult files
+        // the seccomp filter blocks). Seeded pre-seccomp in `new`; the
+        // `get_or_init` fallback here keeps it correct if queried first.
+        *NUM_CPUS.get_or_init(|| std::thread::available_parallelism().ok())
+    }
+
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
         // to mirror the TLS base used in guest context, so that test threads can use the
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!(
-                "rdfsbase {tmp}",
-                "wrgsbase {tmp}",
-                tmp = out(reg) _,
-                options(nostack, preserves_flags),
-            );
+        if have_fsgsbase() {
+            unsafe {
+                core::arch::asm!(
+                    "rdfsbase {tmp}",
+                    "wrgsbase {tmp}",
+                    tmp = out(reg) _,
+                    options(nostack, preserves_flags),
+                );
+            }
+        } else {
+            arch_prctl_set_gs(arch_prctl_get_fs());
         }
 
         ThreadHandle::run_with_handle(f)
@@ -1187,9 +1309,17 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 }
                 Ok(())
             }
-            Err(errno) => {
-                unimplemented!("unexpected error {errno}")
-            }
+            Err(errno) => match errno {
+                // The TUN fd is opened O_NONBLOCK, so under ordinary host-side
+                // backpressure (a full transmit queue) this is expected,
+                // not fatal — mirrors the EWOULDBLOCK/EAGAIN handling in
+                // `receive_ip_packet` below.
+                #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
+                syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
+                    Err(litebox::platform::SendError::WouldBlock)
+                }
+                _ => unimplemented!("unexpected error {errno}"),
+            },
         }
     }
 
@@ -1225,7 +1355,12 @@ impl litebox::platform::TimeProvider for LinuxUserland {
 
     fn now(&self) -> Self::Instant {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
+        assert!(
+            ret == 0,
+            "clock_gettime(CLOCK_MONOTONIC) failed: {}",
+            std::io::Error::last_os_error()
+        );
         let t = unsafe { t.assume_init() };
         Instant {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
@@ -1238,7 +1373,12 @@ impl litebox::platform::TimeProvider for LinuxUserland {
 
     fn current_time(&self) -> Self::SystemTime {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
+        assert!(
+            ret == 0,
+            "clock_gettime(CLOCK_REALTIME) failed: {}",
+            std::io::Error::last_os_error()
+        );
         let t = unsafe { t.assume_init() };
         SystemTime {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
@@ -1349,7 +1489,6 @@ enum FutexOperation {
 }
 
 /// Safer invocation of the Linux futex syscall, with the "timeout" variant of the arguments.
-#[expect(clippy::similar_names, reason = "sec/nsec are as needed by libc")]
 fn futex_timeout(
     uaddr: &AtomicU32,
     futex_op: FutexOperation,
@@ -1359,20 +1498,9 @@ fn futex_timeout(
 ) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = std::ptr::from_ref(uaddr);
     let futex_op: i32 = futex_op as _;
-    let timeout = timeout.map(|t| {
-        const TEN_POWER_NINE: u128 = 1_000_000_000;
-        let nanos: u128 = t.as_nanos();
-        let tv_sec = nanos
-            .checked_div(TEN_POWER_NINE)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let tv_nsec = nanos
-            .checked_rem(TEN_POWER_NINE)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        litebox_common_linux::Timespec { tv_sec, tv_nsec }
+    let timeout = timeout.map(|t| litebox_common_linux::Timespec {
+        tv_sec: t.as_secs().try_into().unwrap(),
+        tv_nsec: t.subsec_nanos().into(),
     });
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
@@ -1556,6 +1684,25 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(())
     }
 
+    unsafe fn discard_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::DiscardError> {
+        // A single host `madvise(MADV_DONTNEED)` resets anonymous private pages to
+        // zero-fill-on-demand without remapping. On failure, report `Unsupported` so
+        // that the caller falls back to re-creating the mapping.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::madvise,
+                range.start,
+                range.len(),
+                usize::try_from(libc::MADV_DONTNEED).unwrap(),
+            )
+        }
+        .map(|_| ())
+        .map_err(|_| litebox::platform::page_mgmt::DiscardError::Unsupported)
+    }
+
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
         self.reserved_pages.iter()
     }
@@ -1567,25 +1714,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
-        let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
+        let Some((fd, file_offset)) = self.lookup_cow_region(source_data) else {
             return Err(CowAllocationError::UnsupportedSourceRegion);
         };
         if !file_offset.is_multiple_of(ALIGN) {
             return Err(CowAllocationError::Unaligned);
         }
-
-        let file_path_cstr =
-            std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
-        // TODO(jb): We should likely be storing pre-opened FDs, right?
-        let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
-                file_path_cstr.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
-        let fd = fd.expect("file should remain unchanged on host");
 
         let mut flags = MapFlags::MAP_PRIVATE;
         match fixed_address_behavior {
@@ -1606,7 +1740,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 source_data.len(),
                 prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
                 flags.bits().reinterpret_as_unsigned() as usize,
-                fd,
+                usize::try_from(fd).unwrap(),
                 {
                     #[cfg(target_arch = "x86_64")]
                     {
@@ -1615,8 +1749,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 },
             )
         };
-
-        let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
 
         match result {
             Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
@@ -1754,7 +1886,20 @@ impl ThreadContext<'_> {
         }
         let op = f(self.shim, self.ctx);
         match op {
-            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Resume => {
+                // Guest-controlled paths (notably `rt_sigreturn`, which copies
+                // a guest-memory-supplied `rip`/`rsp`/`eflags` into `ctx`
+                // unchecked) could otherwise resume the guest at an arbitrary
+                // address with an arbitrary stack and privileged RFLAGS bits.
+                // Validate and normalize before every resume, exactly as the
+                // `lvbs`/`snp` platforms do (see
+                // `PtRegs::sanitize_for_user_return`'s doc comment); a thread
+                // that fails this check is terminated instead of resumed.
+                if self.ctx.sanitize_for_user_return() {
+                    unsafe { switch_to_guest(self.ctx) }
+                }
+                litebox_util_log::warn!("terminating thread with invalid user return context");
+            }
             ContinueOperation::Terminate => {}
         }
     }
@@ -1793,8 +1938,134 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     }
 }
 
+/// Whether user-mode FSGSBASE instructions are usable on this host.
+///
+/// Values: `0` = not yet detected, `1` = unavailable (use the `arch_prctl`
+/// fallback), `2` = available (use `rdfsbase`/`wrgsbase` etc. natively).
+///
+/// The guest/host transition assembly compares this byte against
+/// [`FSGSBASE_NATIVE`] and takes the fallback path otherwise, so the
+/// not-yet-detected state is safe on any hardware (merely slower).
+static HAVE_FSGSBASE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// [`HAVE_FSGSBASE`] value meaning FSGSBASE instructions may be used.
+const FSGSBASE_NATIVE: u8 = 2;
+
+/// `arch_prctl` operation codes from `asm/prctl.h` (not exposed by `libc`).
+const ARCH_SET_GS: usize = 0x1001;
+const ARCH_SET_FS: usize = 0x1002;
+const ARCH_GET_FS: usize = 0x1003;
+const ARCH_GET_GS: usize = 0x1004;
+
+/// Detects whether user-mode FSGSBASE instructions are available.
+///
+/// The guest/host transition code prefers `rdfsbase`/`wrgsbase` etc., which
+/// raise `#UD` (delivered as `SIGILL`) unless the kernel has set
+/// `CR4.FSGSBASE` (CPU too old, kernel older than 5.9, or booted with
+/// `nofsgsbase` — including PVM guests on such hosts). When unavailable, the
+/// transition code falls back to `arch_prctl` syscalls with the host FS base
+/// cached in the `host_fsbase` TLS slot.
+///
+/// Setting `LITEBOX_NO_FSGSBASE` in the environment forces the fallback even
+/// on capable hosts (primarily for testing the fallback path).
+fn init_fsgsbase_mode() {
+    /// `HWCAP2_FSGSBASE` from `asm/hwcap2.h` (not exposed by the `libc` crate).
+    const HWCAP2_FSGSBASE: libc::c_ulong = 1 << 1;
+    let hwcap2 = unsafe { libc::getauxval(libc::AT_HWCAP2) };
+    let native = hwcap2 & HWCAP2_FSGSBASE != 0 && std::env::var_os("LITEBOX_NO_FSGSBASE").is_none();
+    HAVE_FSGSBASE.store(
+        if native { FSGSBASE_NATIVE } else { 1 },
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Returns true if FSGSBASE instructions may be used, detecting on first use.
+///
+/// Signal-handler callers are safe: detection happens at platform creation
+/// (and this function is idempotent), and both `getauxval` and `env::var_os`
+/// here only run outside signal context via `LinuxUserland::new` or
+/// `run_test_thread`.
+fn have_fsgsbase() -> bool {
+    match HAVE_FSGSBASE.load(core::sync::atomic::Ordering::Acquire) {
+        0 => {
+            init_fsgsbase_mode();
+            HAVE_FSGSBASE.load(core::sync::atomic::Ordering::Acquire) == FSGSBASE_NATIVE
+        }
+        v => v == FSGSBASE_NATIVE,
+    }
+}
+
+/// Reads the current thread's GS base without FSGSBASE instructions.
+///
+/// Uses a raw `arch_prctl(ARCH_GET_GS)` syscall, which is async-signal-safe
+/// and does not touch `errno` (the caller may be running with the guest's FS
+/// base, where libc's TLS-based `errno` would corrupt guest memory).
+fn arch_prctl_get_gs() -> u64 {
+    let mut value = 0u64;
+    let r = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_GET_GS,
+            core::ptr::from_mut(&mut value) as usize,
+        )
+    };
+    assert!(r.is_ok(), "arch_prctl(ARCH_GET_GS) failed");
+    value
+}
+
+/// Sets the current thread's FS base without FSGSBASE instructions.
+///
+/// Async-signal-safe; see [`arch_prctl_get_gs`].
+fn arch_prctl_set_fs(value: u64) {
+    let r = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_SET_FS,
+            usize::try_from(value).unwrap(),
+        )
+    };
+    assert!(r.is_ok(), "arch_prctl(ARCH_SET_FS) failed");
+}
+
+/// Reads the current thread's FS base without FSGSBASE instructions.
+///
+/// Async-signal-safe; see [`arch_prctl_get_gs`].
+#[cfg(debug_assertions)]
+fn arch_prctl_get_fs() -> u64 {
+    let mut value = 0u64;
+    let r = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_GET_FS,
+            core::ptr::from_mut(&mut value) as usize,
+        )
+    };
+    assert!(r.is_ok(), "arch_prctl(ARCH_GET_FS) failed");
+    value
+}
+
+/// Sets the current thread's GS base without FSGSBASE instructions.
+///
+/// Async-signal-safe; see [`arch_prctl_get_gs`].
+#[cfg(debug_assertions)]
+fn arch_prctl_set_gs(value: u64) {
+    let r = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_SET_GS,
+            usize::try_from(value).unwrap(),
+        )
+    };
+    assert!(r.is_ok(), "arch_prctl(ARCH_SET_GS) failed");
+}
+
 static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
 static INTERRUPT_SIGNAL_NUMBER: AtomicI32 = AtomicI32::new(0);
+
+/// Cached host CPU count, seeded before the seccomp filter is installed so
+/// that querying it never trips the sandbox. See `LinuxUserland`'s
+/// `ThreadProvider::num_cpus` implementation.
+static NUM_CPUS: std::sync::OnceLock<Option<core::num::NonZeroUsize>> = std::sync::OnceLock::new();
 
 fn register_exception_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1888,41 +2159,53 @@ fn register_exception_handlers() {
     });
 }
 
+/// Free list of alternate signal stacks (base addresses of the guard page).
+///
+/// Stacks are uniform in size, so they can be reused by any thread. Reuse
+/// avoids an mmap/mprotect/munmap round trip per guest thread; the pool is
+/// never shrunk (stacks are reclaimed only at process exit).
+static ALT_STACK_POOL: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
 /// Runs `f` with an alternate signal stack set up.
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let alt_stack_size = libc::SIGSTKSZ * 2;
     let guard_page_size = 0x1000;
-    let stack_base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            guard_page_size + alt_stack_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    assert!(
-        stack_base != libc::MAP_FAILED,
-        "failed to allocate memory for alternate signal stack: {}",
-        std::io::Error::last_os_error()
-    );
-    let _unmap_guard = litebox::utils::defer(|| {
-        let r = unsafe { libc::munmap(stack_base, guard_page_size + alt_stack_size) };
-        assert!(
-            r == 0,
-            "failed to free memory for alternate signal stack: {}",
-            std::io::Error::last_os_error()
-        );
-    });
+    let pooled = ALT_STACK_POOL.lock().unwrap().pop();
+    let stack_base = pooled.map_or_else(
+        || {
+            let stack_base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    guard_page_size + alt_stack_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(
+                stack_base != libc::MAP_FAILED,
+                "failed to allocate memory for alternate signal stack: {}",
+                std::io::Error::last_os_error()
+            );
 
-    // Set up a guard page to catch stack overflows.
-    let r = unsafe { libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE) };
-    assert!(
-        r == 0,
-        "failed to set guard page for alternate signal stack: {}",
-        std::io::Error::last_os_error()
+            // Set up a guard page to catch stack overflows.
+            let r = unsafe { libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE) };
+            assert!(
+                r == 0,
+                "failed to set guard page for alternate signal stack: {}",
+                std::io::Error::last_os_error()
+            );
+            stack_base
+        },
+        |addr| addr as *mut libc::c_void,
     );
+    // Return the stack to the pool once we are no longer running on it. This
+    // runs after `_restore_guard` below (drop order is reverse declaration
+    // order), i.e. only after the original signal stack has been restored.
+    let _pool_guard = litebox::utils::defer(|| {
+        ALT_STACK_POOL.lock().unwrap().push(stack_base as usize);
+    });
 
     let alt_stack = libc::stack_t {
         ss_sp: stack_base.cast(),
@@ -1966,9 +2249,14 @@ fn signal_handler_exit_guest(
     set_interrupt: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
     unsafe {
-        let gsbase: u64;
-        core::arch::asm! {
-            "rdgsbase {}", out(reg) gsbase
+        let gsbase: u64 = if have_fsgsbase() {
+            let gsbase: u64;
+            core::arch::asm! {
+                "rdgsbase {}", out(reg) gsbase
+            };
+            gsbase
+        } else {
+            arch_prctl_get_gs()
         };
         let is_in_guest = if gsbase == 0 {
             false
@@ -1992,11 +2280,18 @@ fn signal_handler_exit_guest(
             return None;
         }
 
+        if have_fsgsbase() {
+            core::arch::asm! {
+                "wrfsbase {gsbase}",
+                gsbase = in(reg) gsbase,
+                options(nostack, preserves_flags)
+            };
+        } else {
+            arch_prctl_set_fs(gsbase);
+        }
         let guest_context_top: *mut litebox_common_linux::PtRegs;
         core::arch::asm! {
-            "wrfsbase {gsbase}",
             "mov {guest_context_top}, fs:guest_context_top@tpoff",
-            gsbase = in(reg) gsbase,
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
@@ -2272,8 +2567,13 @@ unsafe fn interrupt_signal_handler(
         let is_guest_thread;
         #[cfg(target_arch = "x86_64")]
         {
-            let gsbase: u64;
-            unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
+            let gsbase: u64 = if have_fsgsbase() {
+                let gsbase: u64;
+                unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
+                gsbase
+            } else {
+                arch_prctl_get_gs()
+            };
             is_guest_thread = gsbase != 0;
         }
 

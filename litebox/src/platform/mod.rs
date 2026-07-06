@@ -77,6 +77,15 @@ pub trait ThreadProvider: RawPointerProvider {
     /// [`EnterShim::interrupt`]: crate::shim::EnterShim::interrupt
     fn interrupt_thread(&self, thread: &Self::ThreadHandle);
 
+    /// Returns the number of logical CPUs available for running threads, if
+    /// the platform can determine it.
+    ///
+    /// The default implementation returns `None`, letting callers choose a
+    /// fallback. Platforms that can query the host should override this.
+    fn num_cpus(&self) -> Option<core::num::NonZeroUsize> {
+        None
+    }
+
     /// Runs `f` on the current thread after performing any platform-specific
     /// thread registration needed for [`current_thread`](Self::current_thread)
     /// and related functionality to work.
@@ -173,6 +182,15 @@ pub trait RawMutex: Send + Sync + 'static {
     /// value of zero.
     const INIT: Self;
 
+    /// The number of times lock acquisition spins on the lock word before
+    /// blocking when the lock is contended (see [`crate::sync::Mutex`]).
+    ///
+    /// Platforms where spinning is likely counterproductive—e.g.,
+    /// paravirtualized guests where the lock holder's vCPU may be preempted,
+    /// making even short critical sections appear arbitrarily long—should
+    /// override this with a small value (or zero, to block immediately).
+    const CONTENDED_LOCK_SPIN_COUNT: u32 = 100;
+
     /// Returns a reference to the underlying atomic value
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32;
 
@@ -252,7 +270,15 @@ pub trait IPInterfaceProvider {
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
 #[derive(Error, Debug)]
 #[non_exhaustive]
-pub enum SendError {}
+pub enum SendError {
+    /// The send operation would block (e.g. the underlying device's transmit
+    /// queue is full). Ordinary network backpressure, not a fatal condition:
+    /// the caller should drop the packet and rely on higher-layer
+    /// retransmission, exactly as a real network device driver would when its
+    /// TX ring is full.
+    #[error("Send operation would block")]
+    WouldBlock,
+}
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::receive_ip_packet`].
 #[derive(Error, Debug)]
@@ -350,6 +376,24 @@ where
     /// Returns `None` if the provided pointer is invalid, or such a slice is known (in advance) to
     /// be invalid.
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>>;
+
+    /// Copy `buf.len()` values, starting `start_offset` values past the pointer, into the provided
+    /// kernel buffer.
+    ///
+    /// Unlike [`Self::to_owned_slice`], this does not allocate, making it suitable for copying
+    /// through a reusable kernel buffer.
+    ///
+    /// Returns `None` if the provided pointer is invalid, or such a slice is known (in advance) to
+    /// be invalid; in that case there are no guarantees about how much of `buf` has been
+    /// overwritten.
+    #[must_use]
+    fn copy_to_slice(self, start_offset: usize, buf: &mut [T]) -> Option<()> {
+        let start: isize = start_offset.try_into().ok()?;
+        for (offset, slot) in (start..).zip(buf.iter_mut()) {
+            *slot = self.read_at_offset(offset)?;
+        }
+        Some(())
+    }
 
     /// Read the pointer as an owned C string.
     ///

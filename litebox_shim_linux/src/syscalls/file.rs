@@ -765,8 +765,13 @@ impl<FS: ShimFS> Task<FS> {
             Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 if let Some(new_fd) = replace {
-                    let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
-                    assert!(success, "raw_fd slot is empty, so insert must succeed");
+                    // The slot is confirmed empty, so a failure here means
+                    // `raw_fd` exceeds the backing store's growth allowance
+                    // (see `fd_into_specific_raw_integer`), not that it is
+                    // occupied.
+                    if !rds.fd_into_specific_raw_integer(new_fd, raw_fd) {
+                        return Err(Errno::ENOMEM);
+                    }
                 }
                 return Err(Errno::EBADF);
             }
@@ -799,11 +804,13 @@ impl<FS: ShimFS> Task<FS> {
 
         // Insert the replacement into the now-vacated slot while still holding the lock.
         if let Some(new_fd) = replace {
-            let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
-            assert!(
-                success,
-                "we just consumed this raw_fd, so it must be available"
-            );
+            // As above: we just consumed this raw_fd, so a failure here means
+            // it exceeds the backing store's growth allowance, not that it is
+            // occupied.
+            if !rds.fd_into_specific_raw_integer(new_fd, raw_fd) {
+                drop(rds);
+                return Err(Errno::ENOMEM);
+            }
         }
         drop(rds);
 
@@ -866,11 +873,15 @@ impl<FS: ShimFS> Task<FS> {
         self.check_raw_fd_exists(fd)?;
         check_iovcnt(iovcnt)?;
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
-        let mut kernel_buffer = vec![0u8; PAGE_SIZE];
-        read_from_iovec(iovs, &mut kernel_buffer, |buf, total| {
-            let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
-            self.sys_read(fd, buf, Some(cur_offset))
-        })
+        self.with_scratch_buf(
+            total_iov_len(iovs.iter().map(|iov| iov.iov_len)),
+            |kernel_buffer| {
+                read_from_iovec(iovs, kernel_buffer, |buf, total| {
+                    let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
+                    self.sys_read(fd, buf, Some(cur_offset))
+                })
+            },
+        )
     }
 
     /// Handle syscall `pwritev`
@@ -903,13 +914,17 @@ impl<FS: ShimFS> Task<FS> {
         self.check_raw_fd_exists(fd)?;
         check_iovcnt(iovcnt)?;
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
-        let mut kernel_buffer = vec![0u8; PAGE_SIZE];
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        read_from_iovec(iovs, &mut kernel_buffer, |buf, _total| {
-            self.sys_read(fd, buf, None)
-        })
+        self.with_scratch_buf(
+            total_iov_len(iovs.iter().map(|iov| iov.iov_len)),
+            |kernel_buffer| {
+                read_from_iovec(iovs, kernel_buffer, |buf, _total| {
+                    self.sys_read(fd, buf, None)
+                })
+            },
+        )
     }
 }
 
@@ -952,6 +967,12 @@ fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno
         }
     }
     Ok(())
+}
+
+/// Total byte count of a set of iovecs, saturated; used only to size kernel
+/// buffers (overlong totals are rejected separately by [`check_iov_lens`]).
+fn total_iov_len(iov_lens: impl IntoIterator<Item = usize>) -> usize {
+    iov_lens.into_iter().fold(0usize, usize::saturating_add)
 }
 
 /// Drain reads into a sequence of user iovecs.
@@ -1022,17 +1043,19 @@ where
             continue;
         }
         if kernel_buffer.is_empty() {
-            kernel_buffer.resize(PAGE_SIZE, 0);
+            kernel_buffer.resize(
+                total_iov_len(iovs.iter().map(|iov| iov.iov_len)).min(crate::MAX_KERNEL_BUF_SIZE),
+                0,
+            );
         }
         let mut iov_written = 0;
         while iov_written < iov_len {
             let to_write = (iov_len - iov_written).min(kernel_buffer.len());
-            let base_offset = isize::try_from(iov_written).unwrap();
-            for (byte_offset, byte) in (0_isize..).zip(kernel_buffer[..to_write].iter_mut()) {
-                let Some(value) = iov_base.read_at_offset(base_offset + byte_offset) else {
-                    return bail(total_written, Errno::EFAULT);
-                };
-                *byte = value;
+            if iov_base
+                .copy_to_slice(iov_written, &mut kernel_buffer[..to_write])
+                .is_none()
+            {
+                return bail(total_written, Errno::EFAULT);
             }
             let size = match write_fn(&kernel_buffer[..to_write], total_written) {
                 Ok(size) => size,
@@ -2348,7 +2371,19 @@ impl<FS: ShimFS> Task<FS> {
 
             let new_fd = match target {
                 DupFdRequest::Exact(target) => {
-                    let _ = task.do_close_and_replace(target, Some(fd));
+                    // `do_close_and_replace` returns `Err(EBADF)` whenever
+                    // `target` had nothing open to close — the common case
+                    // for dup2 to a fresh fd — even though it still performs
+                    // the replacement insert; that outcome is intentionally
+                    // ignored, matching `close()`'s own semantics. It can
+                    // separately fail with `Err(ENOMEM)` if `target` is far
+                    // beyond the descriptor store's current growth allowance
+                    // (see `fd_into_specific_raw_integer`), in which case the
+                    // replacement was NOT inserted and the dup must fail.
+                    match task.do_close_and_replace(target, Some(fd)) {
+                        Ok(()) | Err(Errno::EBADF) => {}
+                        Err(_) => return Err(DupFdError::TooManyFiles),
+                    }
                     target
                 }
                 DupFdRequest::LowestAvailable => {
@@ -2364,8 +2399,12 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         raw_fd += 1;
                     }
-                    let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
-                    assert!(success);
+                    // As in the `Exact` case: `raw_fd` (bounded only by
+                    // `RLIMIT_NOFILE` via the `max_fd` check above) can still
+                    // exceed the descriptor store's growth allowance.
+                    if !rds.fd_into_specific_raw_integer(fd, raw_fd) {
+                        return Err(DupFdError::TooManyFiles);
+                    }
                     raw_fd
                 }
             };

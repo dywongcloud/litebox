@@ -1150,15 +1150,21 @@ pub(crate) fn write_sockaddr_to_user(
                 }
                 UnixSocketAddr::Path(path) => {
                     let offset = offset_of!(CSockUnixAddr, path);
-                    let max_len = addrlen_val as usize - offset;
-                    let name = &path.as_bytes()[..path.len().min(max_len)];
-                    addr.write_slice_at_offset(isize::try_from(offset).unwrap(), name)
-                        .ok_or(Errno::EFAULT)?;
-                    let null_offset = offset + name.len();
-                    // write null terminator if there is space
-                    if addrlen_val as usize > null_offset {
-                        addr.write_at_offset(isize::try_from(null_offset).unwrap(), 0)
+                    // `addrlen_val` is guest-supplied (the caller's declared
+                    // buffer size); a value at or below `offset` means there
+                    // is no room for any path bytes at all, matching the
+                    // `Abstract` arm's guard above.
+                    if addrlen_val as usize > offset {
+                        let max_len = addrlen_val as usize - offset;
+                        let name = &path.as_bytes()[..path.len().min(max_len)];
+                        addr.write_slice_at_offset(isize::try_from(offset).unwrap(), name)
                             .ok_or(Errno::EFAULT)?;
+                        let null_offset = offset + name.len();
+                        // write null terminator if there is space
+                        if addrlen_val as usize > null_offset {
+                            addr.write_at_offset(isize::try_from(null_offset).unwrap(), 0)
+                                .ok_or(Errno::EFAULT)?;
+                        }
                     }
                     offset + path.len() + 1
                 }
@@ -1369,8 +1375,18 @@ impl<FS: ShimFS> Task<FS> {
         let sockaddr = addr
             .map(|addr| read_sockaddr_from_user(addr, addrlen as usize))
             .transpose()?;
-        let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
-        self.do_sendto(fd, &buf, flags, sockaddr)
+        if len <= crate::MAX_KERNEL_BUF_SIZE {
+            self.with_scratch_buf(len, |kernel_buf| {
+                buf.copy_to_slice(0, kernel_buf).ok_or(Errno::EFAULT)?;
+                self.do_sendto(fd, kernel_buf, flags, sockaddr)
+            })
+        } else {
+            // Larger sends cannot be blindly chunked, as datagram sockets must
+            // preserve message boundaries; they are rare enough that a single
+            // owned copy is acceptable.
+            let buf = buf.to_owned_slice(len).ok_or(Errno::EFAULT)?;
+            self.do_sendto(fd, &buf, flags, sockaddr)
+        }
     }
     fn do_sendto(
         &self,

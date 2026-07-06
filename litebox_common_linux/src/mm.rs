@@ -7,12 +7,43 @@ use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
-    platform::{RawConstPointer, page_mgmt::DeallocationError},
+    platform::{
+        RawConstPointer,
+        page_mgmt::{DeallocationError, MemoryRegionPermissions},
+    },
 };
 
 use crate::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
+
+/// Convert `mmap` flags into [`CreatePagesFlags`].
+fn create_pages_flags(flags: MapFlags, ensure_space_after: bool) -> CreatePagesFlags {
+    let mut create_flags = CreatePagesFlags::empty();
+    // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior (exact address, not a hint)
+    create_flags.set(
+        CreatePagesFlags::FIXED_ADDR,
+        flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+    );
+    create_flags.set(
+        CreatePagesFlags::NOREPLACE,
+        flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+    );
+    create_flags.set(
+        CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+        flags.contains(MapFlags::MAP_POPULATE),
+    );
+    create_flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
+    create_flags.set(
+        CreatePagesFlags::MAP_FILE,
+        !flags.contains(MapFlags::MAP_ANONYMOUS),
+    );
+    create_flags.set(
+        CreatePagesFlags::SHARED,
+        flags.contains(MapFlags::MAP_SHARED),
+    );
+    create_flags
+}
 
 pub fn do_mmap<
     Platform: litebox::platform::RawPointerProvider
@@ -27,32 +58,7 @@ pub fn do_mmap<
     ensure_space_after: bool,
     op: impl FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, litebox::mm::linux::MappingError>,
 ) -> Result<Platform::RawMutPointer<u8>, litebox::mm::linux::MappingError> {
-    let flags = {
-        let mut create_flags = CreatePagesFlags::empty();
-        // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior (exact address, not a hint)
-        create_flags.set(
-            CreatePagesFlags::FIXED_ADDR,
-            flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
-        );
-        create_flags.set(
-            CreatePagesFlags::NOREPLACE,
-            flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
-        );
-        create_flags.set(
-            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            flags.contains(MapFlags::MAP_POPULATE),
-        );
-        create_flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
-        create_flags.set(
-            CreatePagesFlags::MAP_FILE,
-            !flags.contains(MapFlags::MAP_ANONYMOUS),
-        );
-        create_flags.set(
-            CreatePagesFlags::SHARED,
-            flags.contains(MapFlags::MAP_SHARED),
-        );
-        create_flags
-    };
+    let flags = create_pages_flags(flags, ensure_space_after);
     let suggested_addr = match suggested_addr {
         Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
         None => None,
@@ -82,6 +88,48 @@ pub fn do_mmap<
             }
         }
     }
+}
+
+/// Like [`do_mmap`], but for mappings that need no initialization callback (e.g., anonymous
+/// mappings).
+///
+/// The pages are mapped directly with their final permissions, saving the platform permission
+/// update that [`do_mmap`] performs after running the initialization `op`.
+pub fn do_mmap_no_init<
+    Platform: litebox::platform::RawPointerProvider
+        + litebox::sync::RawSyncPrimitivesProvider
+        + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
+>(
+    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    suggested_addr: Option<usize>,
+    len: usize,
+    prot: ProtFlags,
+    flags: MapFlags,
+    ensure_space_after: bool,
+) -> Result<Platform::RawMutPointer<u8>, litebox::mm::linux::MappingError> {
+    let flags = create_pages_flags(flags, ensure_space_after);
+    let suggested_addr = match suggested_addr {
+        Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
+        None => None,
+    };
+    let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
+    let perms = match prot {
+        ProtFlags::PROT_READ_EXEC => MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+        ProtFlags::PROT_READ_WRITE => {
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
+        }
+        ProtFlags::PROT_READ => MemoryRegionPermissions::READ,
+        ProtFlags::PROT_NONE => MemoryRegionPermissions::empty(),
+        _ => {
+            #[cfg(debug_assertions)]
+            todo!("Unsupported prot flags {:?}", prot);
+            // TODO: create inaccessible pages for now. Creating mapping
+            // for both executable and writable might be needed for JIT.
+            #[cfg(not(debug_assertions))]
+            MemoryRegionPermissions::empty()
+        }
+    };
+    unsafe { pm.create_pages_no_init(suggested_addr, length, flags, perms) }
 }
 
 /// Handle syscall `munmap`

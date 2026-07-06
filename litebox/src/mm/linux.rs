@@ -237,7 +237,7 @@ impl<const ALIGN: usize> core::ops::Add<usize> for NonZeroPageSize<ALIGN> {
     type Output = Option<Self>;
 
     fn add(self, rhs: usize) -> Self::Output {
-        NonZeroPageSize::new(self.size + rhs)
+        NonZeroPageSize::new(self.size.checked_add(rhs)?)
     }
 }
 
@@ -387,8 +387,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
     /// returns `Err(VmemResetError::FileBacked)`.
     ///
-    /// The current implementation effectively re-inserts the mapping with the same
-    /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
+    /// The current implementation discards the pages in place when the platform supports it
+    /// (see [`PageManagementProvider::discard_pages`]); otherwise it re-inserts the mapping
+    /// with the same `VmArea` properties, which will cause the pages to be unmapped and
+    /// mapped again.
     ///
     /// # Panics
     ///
@@ -420,6 +422,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
+            // Fast path: discard the pages in place if the platform supports it. Anonymous
+            // guest mappings are backed by anonymous platform pages, so an in-place discard
+            // (e.g., host `madvise(MADV_DONTNEED)`) yields the same zero-fill semantics as
+            // re-creating the mapping, without any change to the mapping itself.
+            if unsafe { self.platform.discard_pages(start..end) }.is_ok() {
+                continue;
+            }
             let new_range = PageRange::new(start, end).unwrap();
             unsafe { self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Replace) }
                 .expect("failed to reset pages");
@@ -559,13 +568,16 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         vma: VmArea,
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+        // `length` is guest-controlled (e.g. `mmap`'s requested length,
+        // page-rounded); reject rather than silently wrap when it is too
+        // large to reserve space after, or to form a valid range at all.
         let total_length = (length
             + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
                 DEFAULT_RESERVED_SPACE_SIZE
             } else {
                 0
             })
-        .unwrap();
+        .ok_or(AllocationError::OutOfMemory)?;
         let new_addr = self
             .get_unmmaped_area(
                 suggested_address,
@@ -574,7 +586,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             )
             .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
-        let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
+        let new_range = PageRange::new(
+            new_addr,
+            new_addr
+                .checked_add(length.as_usize())
+                .ok_or(AllocationError::OutOfMemory)?,
+        )
+        .ok_or(AllocationError::OutOfMemory)?;
         unsafe {
             self.insert_mapping(
                 new_range,
@@ -618,7 +636,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .get_key_value(&range.start)
             .ok_or(VmemResizeError::NotExist(range.start))?;
 
-        let new_end = range.start + new_size.as_usize();
+        // `new_size` is guest-controlled (from `mremap`'s `new_size` argument,
+        // only rounded up to a page boundary — an already-page-aligned huge
+        // value passes through unchanged). A raw add here would wrap and let
+        // a guest pick `new_end` anywhere in the address space by choosing
+        // `new_size` relative to `range.start`, causing the shrink branch
+        // below to unmap an attacker-chosen range instead of a suffix of this
+        // mapping.
+        let new_end =
+            range
+                .start
+                .checked_add(new_size.as_usize())
+                .ok_or(VmemResizeError::InvalidAddr {
+                    range: range.clone(),
+                    addr: usize::MAX,
+                })?;
         match new_end.cmp(&range.end) {
             core::cmp::Ordering::Equal => {
                 // no change
@@ -755,37 +787,69 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             return Err(VmemProtectError::InvalidRange(range));
         }
 
+        // All intersections change to the same `permissions`, so coalesce adjacent areas into
+        // contiguous runs, each applied with a single (expensive) platform permission update.
+        let mut run: Vec<(usize, usize, VmArea)> = Vec::new();
         for (start, end, vma) in mappings_to_change {
             if vma.flags & VmFlags::VM_ACCESS_FLAGS == flags {
+                // Already has the target permissions; ends the current contiguous run.
+                unsafe { self.commit_protect_run(&mut run, &range, permissions, flags) }?;
                 continue;
             }
             // flags >> 4 shift VM_MAY% in place of VM_%
             // turning on VM_% requires VM_MAY%
             if (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits() != 0 {
+                // Areas preceding the failing one are still changed, as Linux does.
+                unsafe { self.commit_protect_run(&mut run, &range, permissions, flags) }?;
                 return Err(VmemProtectError::NoAccess {
                     old: vma.flags,
                     new: flags,
                 });
             }
+            if run
+                .last()
+                .is_some_and(|&(_, prev_end, _)| prev_end != start)
+            {
+                // Not adjacent to the pending run; apply the pending run first.
+                unsafe { self.commit_protect_run(&mut run, &range, permissions, flags) }?;
+            }
+            run.push((start, end, vma));
+        }
+        unsafe { self.commit_protect_run(&mut run, &range, permissions, flags) }?;
 
+        Ok(())
+    }
+
+    /// Apply a pending contiguous run of areas collected by [`Self::protect_mapping`]: issue one
+    /// platform permission update covering the whole run, then update the bookkeeping of each
+    /// affected area. Drains `run`; does nothing if it is empty.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::protect_mapping`].
+    unsafe fn commit_protect_run(
+        &mut self,
+        run: &mut Vec<(usize, usize, VmArea)>,
+        request: &Range<usize>,
+        permissions: MemoryRegionPermissions,
+        flags: VmFlags,
+    ) -> Result<(), VmemProtectError> {
+        let (Some(&(first_start, ..)), Some(&(_, last_end, _))) = (run.first(), run.last()) else {
+            return Ok(());
+        };
+        // The run's intersection with the request is page aligned.
+        let host_range = request.start.max(first_start)..request.end.min(last_end);
+        unsafe { self.platform.update_permissions(host_range, permissions) }
+            .map_err(VmemProtectError::ProtectError)?;
+
+        for (start, end, vma) in run.drain(..) {
             self.vmas.remove(start..end);
-            let intersection = range.start.max(start)..range.end.min(end);
-            // split r into three parts: before, intersection, and after
+            let intersection = request.start.max(start)..request.end.min(end);
+            // split the area into three parts: before, intersection, and after
             let before = start..intersection.start;
             let after = intersection.end..end;
 
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            // `intersection` is page aligned.
-            unsafe {
-                self.platform
-                    .update_permissions(intersection.clone(), permissions)
-            }
-            .map_err(|e| {
-                // restore the original mapping
-                self.vmas.insert(start..end, vma);
-                VmemProtectError::ProtectError(e)
-            })?;
-
             self.vmas.insert(
                 intersection,
                 VmArea {
@@ -800,7 +864,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 self.vmas.insert(after, vma);
             }
         }
-
         Ok(())
     }
 

@@ -57,7 +57,7 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
         Platform,
-        litebox::fs::resolver::Resolver<Platform, litebox::fs::devices::Devices<Platform>>,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
         litebox::fs::tar_ro::FileSystem<Platform>,
     >,
 >;
@@ -257,6 +257,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                scratch_buf: RefCell::new(Vec::new()),
             },
         };
 
@@ -336,7 +337,12 @@ fn default_fs(
 ) -> LinuxFS {
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
-        litebox::fs::devices::Devices::migration_helper_standalone_new(litebox),
+        litebox::fs::composer::Composer::builder()
+            .mount("/dev", |allocator| {
+                litebox::fs::devices::Devices::new(litebox, allocator)
+            })
+            .build()
+            .unwrap(),
     );
     litebox::fs::layered::FileSystem::new(
         litebox,
@@ -469,6 +475,26 @@ impl ToSyscallResult for Result<u32, Errno> {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Runs `f` with the per-task scratch buffer, sized to `len` (capped at
+    /// [`MAX_KERNEL_BUF_SIZE`]) bytes.
+    ///
+    /// This avoids a fresh (and zeroed) allocation on every I/O syscall. The
+    /// buffer contents are unspecified on entry; callers must only rely on
+    /// bytes they have written themselves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if used reentrantly (i.e., if `f` itself borrows the scratch
+    /// buffer).
+    pub(crate) fn with_scratch_buf<R>(&self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let len = len.min(MAX_KERNEL_BUF_SIZE);
+        let mut buf = self.scratch_buf.borrow_mut();
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        f(&mut buf[..len])
+    }
+
     /// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
     fn pread_with_user_buf(
         &self,
@@ -477,26 +503,72 @@ impl<FS: ShimFS> Task<FS> {
         count: usize,
         offset: i64,
     ) -> Result<usize, Errno> {
-        let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-        let mut read_total = 0;
-        while read_total < count {
-            let to_read = (count - read_total).min(kernel_buf.len());
-            match self.sys_pread64(
-                fd,
-                &mut kernel_buf[..to_read],
-                offset + (read_total.reinterpret_as_signed() as i64),
-            ) {
-                Ok(0) => break, // EOF
-                Ok(size) => {
-                    buf.copy_from_slice(read_total, &kernel_buf[..size])
-                        .ok_or(Errno::EFAULT)?;
-                    read_total += size;
+        self.with_scratch_buf(count, |kernel_buf| {
+            let mut read_total = 0;
+            while read_total < count {
+                let to_read = (count - read_total).min(kernel_buf.len());
+                match self.sys_pread64(
+                    fd,
+                    &mut kernel_buf[..to_read],
+                    offset + (read_total.reinterpret_as_signed() as i64),
+                ) {
+                    Ok(0) => break, // EOF
+                    Ok(size) => {
+                        buf.copy_from_slice(read_total, &kernel_buf[..size])
+                            .ok_or(Errno::EFAULT)?;
+                        read_total += size;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
+            assert!(read_total <= count);
+            Ok(read_total)
+        })
+    }
+
+    /// A wrapper around `sys_write` that copies the user buffer through the
+    /// bounded per-task scratch buffer in chunks, to avoid an unbounded
+    /// allocation for large writes.
+    fn write_with_user_buf(
+        &self,
+        fd: i32,
+        buf: ConstPtr<u8>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        // Splitting a single write into several `sys_write` calls would break
+        // message-boundary and `O_APPEND` atomicity (a datagram socket would
+        // fragment one message; concurrent appends could interleave). Chunking
+        // is only safe within one `sys_write`, i.e. up to the scratch buffer's
+        // cap, so larger writes fall back to a single owned copy and a single
+        // call — the same guard `sys_sendto` uses.
+        if count > MAX_KERNEL_BUF_SIZE {
+            let owned = buf.to_owned_slice(count).ok_or(Errno::EFAULT)?;
+            return self.sys_write(fd, &owned, None);
         }
-        assert!(read_total <= count);
-        Ok(read_total)
+        self.with_scratch_buf(count, |kernel_buf| {
+            // Once any bytes have been delivered, an error collapses to
+            // `Ok(written_total)` so partial progress is reported to user space.
+            let bail = |total: usize, e: Errno| if total > 0 { Ok(total) } else { Err(e) };
+            let mut written_total = 0;
+            loop {
+                let to_write = (count - written_total).min(kernel_buf.len());
+                if buf
+                    .copy_to_slice(written_total, &mut kernel_buf[..to_write])
+                    .is_none()
+                {
+                    return bail(written_total, Errno::EFAULT);
+                }
+                let size = match self.sys_write(fd, &kernel_buf[..to_write], None) {
+                    Ok(size) => size,
+                    Err(e) => return bail(written_total, e),
+                };
+                written_total += size;
+                if written_total >= count || size < to_write {
+                    // Okay to transfer fewer bytes than requested.
+                    return Ok(written_total);
+                }
+            }
+        })
     }
 
     /// Handle Linux syscalls and dispatch them to LiteBox implementations.
@@ -546,11 +618,12 @@ impl<FS: ShimFS> Task<FS> {
                 // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
                 // requested indicates EOF.
                 if count <= MAX_KERNEL_BUF_SIZE {
-                    let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
-                    self.sys_read(fd, &mut kernel_buf, None).and_then(|size| {
-                        buf.copy_from_slice(0, &kernel_buf[..size])
-                            .map(|()| size)
-                            .ok_or(Errno::EFAULT)
+                    self.with_scratch_buf(count, |kernel_buf| {
+                        self.sys_read(fd, kernel_buf, None).and_then(|size| {
+                            buf.copy_from_slice(0, &kernel_buf[..size])
+                                .map(|()| size)
+                                .ok_or(Errno::EFAULT)
+                        })
                     })
                 } else {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
@@ -585,10 +658,7 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 }
             }
-            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice(count) {
-                Some(buf) => self.sys_write(fd, &buf, None),
-                None => Err(Errno::EFAULT),
-            },
+            SyscallRequest::Write { fd, buf, count } => self.write_with_user_buf(fd, buf, count),
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
@@ -1134,6 +1204,8 @@ struct Task<FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState,
+    /// Reusable kernel-side I/O buffer (see [`Task::with_scratch_buf`]).
+    scratch_buf: RefCell<Vec<u8>>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1171,6 +1243,7 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                scratch_buf: RefCell::new(Vec::new()),
                 global: self,
             }
         }
@@ -1195,6 +1268,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
+                scratch_buf: RefCell::new(Vec::new()),
             };
             Some(task)
         }

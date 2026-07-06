@@ -36,7 +36,12 @@ fn ratchet_globals() -> Result<()> {
             ("dev_bench/", 1),
             ("litebox/", 9),
             ("litebox_platform_linux_kernel/", 6),
-            ("litebox_platform_linux_userland/", 5),
+            // `litebox_platform_linux_userland` includes the process-wide
+            // alternate-signal-stack pool (`ALT_STACK_POOL`), the
+            // `HAVE_FSGSBASE` capability flag read from the guest/host
+            // transition assembly, and the `NUM_CPUS` cache seeded before
+            // seccomp installation — all deliberate process-wide state.
+            ("litebox_platform_linux_userland/", 8),
             ("litebox_platform_lvbs/", 23),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),

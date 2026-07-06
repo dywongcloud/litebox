@@ -92,7 +92,7 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
     /// Returns the state of the raw lock as soon as it is in unlocked (0) or contended (2), or when
     /// it has spun for long enough.
     fn spin(&self) -> u32 {
-        let mut spin = 100;
+        let mut spin = <Platform::RawMutex as crate::platform::RawMutex>::CONTENDED_LOCK_SPIN_COUNT;
         loop {
             // We only use `load` (and not `swap` or `compare_exchange`)
             // while spinning, to be easier on the caches.

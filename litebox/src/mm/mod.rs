@@ -253,6 +253,35 @@ where
         }
     }
 
+    /// Create pages with the given permissions, without an initialization callback.
+    ///
+    /// Unlike the other `create_*_pages` methods, no initialization `op` runs, so the pages are
+    /// mapped directly with their final `perms` instead of being created writable and protected
+    /// afterwards, saving a platform permission update.
+    ///
+    /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
+    /// Otherwise, let the kernel choose an available memory region.
+    ///
+    /// `length` is the size of the pages to be created.
+    ///
+    /// Set `flags` to control options such as fixed address, stack, and populate pages.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_pages_no_init(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        perms: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let mut vmem = self.vmem.write();
+        unsafe { vmem.create_pages(suggested_address, length, flags, perms) }
+    }
+
     /// Create stack pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
@@ -275,7 +304,7 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let flags = CreatePagesFlags::IS_STACK | flags;
-        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
+        unsafe { self.create_pages_no_init(suggested_address, length, flags, perms) }
     }
 
     /// Set the initial program break address.
@@ -368,11 +397,21 @@ where
         &self,
         releasable: fn(Range<usize>, VmFlags) -> bool,
     ) -> Result<(), VmemUnmapError> {
+        // Coalesce adjacent releasable ranges so that each contiguous run is released with a
+        // single platform deallocation.
+        let mut ranges: Vec<Range<usize>> = Vec::new();
         for (r, vma) in self.mappings() {
             if !releasable(r.clone(), vma) {
                 continue;
             }
-            let mut vmem = self.vmem.write();
+            match ranges.last_mut() {
+                Some(last) if last.end == r.start => last.end = r.end,
+                _ => ranges.push(r),
+            }
+        }
+
+        let mut vmem = self.vmem.write();
+        for r in ranges {
             let Some(range) = PageRange::new(r.start, r.end) else {
                 unreachable!()
             };
@@ -380,7 +419,6 @@ where
         }
 
         // reset brk
-        let mut vmem = self.vmem.write();
         vmem.brk = 0;
 
         Ok(())

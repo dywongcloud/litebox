@@ -17,7 +17,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -153,7 +152,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (arch, text_sections, section_instructions, control_transfer_targets, trampoline_base_addr) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -172,13 +171,24 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             return Ok(input_binary.to_vec());
         }
 
-        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+        // Decode each section exactly once: the same pass yields both the
+        // control-transfer targets and the instructions used for patching.
+        let mut section_instructions = Vec::with_capacity(text_sections.len());
+        let mut control_transfer_targets = Vec::new();
+        for s in &text_sections {
+            let section_data = section_slice(&*buf, s)?;
+            let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
+            collect_control_transfer_targets(&instructions, &mut control_transfer_targets);
+            section_instructions.push(instructions);
+        }
+        sort_control_transfer_targets(&mut control_transfer_targets);
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
 
         (
             arch,
             text_sections,
+            section_instructions,
             control_transfer_targets,
             trampoline_base_addr,
         )
@@ -192,11 +202,12 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Patch syscalls in-place in buf
     let mut skipped_addrs = Vec::new();
     let mut syscall_insns_found = false;
-    for s in &text_sections {
+    for (s, instructions) in text_sections.iter().zip(&section_instructions) {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
             arch,
             &control_transfer_targets,
+            instructions,
             s.vaddr,
             section_data,
             trampoline_base_addr,
@@ -231,10 +242,14 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         return Ok(out);
     }
 
-    // Build output: [patched ELF][padding to page boundary][trampoline code][header]
-    let mut out = buf.to_vec();
-    let remain = out.len() % 0x1000;
-    out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
+    // Build output: [patched ELF][padding to page boundary][trampoline code][header].
+    // Reserve the exact final size up front so the patched ELF is copied once,
+    // with no reallocation when appending padding, trampoline code, or header.
+    let padded_len = buf.len().next_multiple_of(0x1000);
+    let mut out =
+        Vec::with_capacity(padded_len + trampoline_data.len() + size_of::<TrampolineHeader64>());
+    out.extend_from_slice(buf);
+    out.resize(padded_len, 0);
 
     // Calculate file offset where trampoline code starts
     let trampoline_file_offset = out.len() as u64;
@@ -339,19 +354,23 @@ enum Arch {
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
 ///
-/// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
-/// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
-/// stub jumps to (via `JMP [RIP+disp32]` on x86-64).
+/// `instructions` must be the decoded instructions of `section_data` (see
+/// [`decode_section_instructions`]). `control_transfer_targets` must be sorted
+/// and deduplicated. `trampoline_base_addr` is the virtual address
+/// corresponding to `trampoline_data[0]`. `syscall_entry_addr` is the address
+/// of the 8-byte entry-point value that each trampoline stub jumps to (via
+/// `JMP [RIP+disp32]` on x86-64).
+#[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
-    control_transfer_targets: &BTreeSet<u64>,
+    control_transfer_targets: &[u64],
+    instructions: &[iced_x86::Instruction],
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
     syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
 ) -> core::result::Result<Vec<u64>, InternalError> {
-    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     let mut found_any = false;
     let mut skipped_addrs = Vec::new();
     for (i, inst) in instructions.iter().enumerate() {
@@ -373,7 +392,7 @@ fn hook_syscalls_in_section(
         // the replaced range backward (a jump landing on the syscall would hit
         // NOPs instead). Skip the backward scan and fall through to the
         // forward-only path (hook_syscall_and_after).
-        if !control_transfer_targets.contains(&inst.ip()) {
+        if !is_control_transfer_target(control_transfer_targets, inst.ip()) {
             for inst_id in (0..i).rev() {
                 let prev_inst = &instructions[inst_id];
                 if prev_inst.flow_control() != iced_x86::FlowControl::Next {
@@ -383,7 +402,7 @@ fn hook_syscalls_in_section(
                     replace_start = Some(prev_inst.ip());
                     replace_start_idx = inst_id;
                     break;
-                } else if control_transfer_targets.contains(&prev_inst.ip()) {
+                } else if is_control_transfer_target(control_transfer_targets, prev_inst.ip()) {
                     // If the previous instruction is a control transfer target, we don't want to cross it
                     break;
                 }
@@ -398,7 +417,7 @@ fn hook_syscalls_in_section(
                 trampoline_base_addr,
                 syscall_entry_addr,
                 trampoline_data,
-                &instructions,
+                instructions,
                 i,
             ) {
                 Ok(()) => {}
@@ -437,7 +456,7 @@ fn hook_syscalls_in_section(
                     trampoline_base_addr,
                     syscall_entry_addr,
                     trampoline_data,
-                    &instructions,
+                    instructions,
                     i,
                 ) {
                     Ok(()) => {}
@@ -691,18 +710,15 @@ pub fn patch_code_segment(
 ) -> Result<(Vec<u8>, Vec<u64>)> {
     // Build control-transfer targets for this segment.
     let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
-    let mut control_transfer_targets = BTreeSet::new();
-    for inst in &instructions {
-        let target = inst.near_branch_target();
-        if target != 0 {
-            control_transfer_targets.insert(target);
-        }
-    }
+    let mut control_transfer_targets = Vec::new();
+    collect_control_transfer_targets(&instructions, &mut control_transfer_targets);
+    sort_control_transfer_targets(&mut control_transfer_targets);
 
     let mut trampoline_data = Vec::new();
     match hook_syscalls_in_section(
         Arch::X86_64,
         &control_transfer_targets,
+        &instructions,
         code_vaddr,
         code,
         trampoline_write_vaddr,
@@ -763,22 +779,29 @@ where
         .max()
 }
 
-fn get_control_transfer_targets(
-    arch: Arch,
-    input_binary: &[u8],
-    text_sections: &[TextSectionInfo],
-) -> Result<BTreeSet<u64>> {
-    let mut control_transfer_targets = BTreeSet::new();
-    for s in text_sections {
-        let section_data = section_slice(input_binary, s)?;
-        let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
-        control_transfer_targets.extend(instructions.into_iter().filter_map(|inst| {
-            let target = inst.near_branch_target();
-            (target != 0).then_some(target)
-        }));
-    }
+/// Appends the near-branch targets of `instructions` to `targets`. The result
+/// must be passed through [`sort_control_transfer_targets`] before it can be
+/// queried with [`is_control_transfer_target`].
+fn collect_control_transfer_targets(
+    instructions: &[iced_x86::Instruction],
+    targets: &mut Vec<u64>,
+) {
+    targets.extend(instructions.iter().filter_map(|inst| {
+        let target = inst.near_branch_target();
+        (target != 0).then_some(target)
+    }));
+}
 
-    Ok(control_transfer_targets)
+/// Sorts and deduplicates a control-transfer-target list so that membership
+/// can be tested with a binary search.
+fn sort_control_transfer_targets(targets: &mut Vec<u64>) {
+    targets.sort_unstable();
+    targets.dedup();
+}
+
+/// Membership test on a sorted, deduplicated control-transfer-target list.
+fn is_control_transfer_target(targets: &[u64], ip: u64) -> bool {
+    targets.binary_search(&ip).is_ok()
 }
 
 const MAX_X86_INSTRUCTION_LEN: usize = 15;
@@ -804,7 +827,9 @@ fn decode_section_instructions(
         Arch::X86_64 => 64,
     };
 
-    let mut instructions = Vec::new();
+    // Average x86-64 instruction length is a bit over 4 bytes; reserving
+    // len/4 slots avoids repeated reallocation of a very large Vec.
+    let mut instructions = Vec::with_capacity(section_data.len() / 4);
     let mut offset = 0usize;
 
     while offset < section_data.len() {
@@ -819,7 +844,7 @@ fn decode_section_instructions(
         let chunk_start_ip = section_base_addr + offset as u64;
         let chunk_end_ip = chunk_start_ip + chunk_advance_len as u64;
 
-        append_decoded_instructions(
+        let resume_ip = append_decoded_instructions(
             bitness,
             &remaining[..decode_window_len],
             chunk_start_ip,
@@ -827,19 +852,28 @@ fn decode_section_instructions(
             &mut instructions,
         )?;
 
-        offset = offset.checked_add(chunk_advance_len).unwrap();
+        // An instruction may straddle chunk_end_ip (the overlap window lets it
+        // decode fully). Resuming exactly at chunk_end_ip would then decode
+        // phantom instructions from its tail bytes, so resume at the ip after
+        // the last fully decoded instruction instead.
+        let consumed = usize::try_from(resume_ip - chunk_start_ip).unwrap();
+        assert!(consumed > 0);
+        offset = offset.checked_add(consumed).unwrap();
     }
 
     Ok(instructions)
 }
 
+/// Decodes `window` starting at `chunk_start_ip`, keeping instructions whose
+/// ip is below `chunk_end_ip`. Returns the ip immediately after the last kept
+/// instruction — the point where the next chunk must resume decoding.
 fn append_decoded_instructions(
     bitness: u32,
     window: &[u8],
     chunk_start_ip: u64,
     chunk_end_ip: u64,
     instructions: &mut Vec<iced_x86::Instruction>,
-) -> Result<()> {
+) -> Result<u64> {
     if bytes_until_next_4g_boundary(window.as_ptr()) > window.len() {
         return append_decoded_non_crossing_window(
             bitness,
@@ -887,10 +921,11 @@ fn append_decoded_non_crossing_window(
     chunk_start_ip: u64,
     chunk_end_ip: u64,
     instructions: &mut Vec<iced_x86::Instruction>,
-) -> Result<()> {
+) -> Result<u64> {
     let mut decoder = iced_x86::Decoder::new(bitness, window, iced_x86::DecoderOptions::NONE);
     decoder.set_ip(chunk_start_ip);
 
+    let mut resume_ip = chunk_start_ip;
     for inst in &mut decoder {
         if inst.len() == 0 {
             return Err(Error::DisassemblyFailure(format!(
@@ -903,10 +938,11 @@ fn append_decoded_non_crossing_window(
             break;
         }
 
+        resume_ip = inst.next_ip();
         instructions.push(inst);
     }
 
-    Ok(())
+    Ok(resume_ip)
 }
 
 /// Returns the section data slice from `buf` corresponding to `section`, or an error if out of bounds.
@@ -962,7 +998,7 @@ fn reencode_instructions(
 
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
-    control_transfer_targets: &BTreeSet<u64>,
+    control_transfer_targets: &[u64],
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -978,7 +1014,7 @@ fn hook_syscall_and_after(
     let mut replace_end_idx = inst_index;
 
     for (idx, next_inst) in instructions.iter().enumerate().skip(inst_index + 1) {
-        if control_transfer_targets.contains(&next_inst.ip()) {
+        if is_control_transfer_target(control_transfer_targets, next_inst.ip()) {
             // If the next instruction is a control transfer target, we don't want to cross it
             break;
         }
@@ -1085,6 +1121,30 @@ fn hook_syscall_and_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_decode_does_not_resync_mid_instruction() {
+        // A section longer than one decode chunk, filled with NOPs, with a
+        // 5-byte `MOV EAX, imm32` straddling the chunk boundary. The last two
+        // immediate bytes (0F 05) decode as a phantom SYSCALL if the next
+        // chunk resumes exactly at the boundary (mid-instruction) instead of
+        // at the ip after the last fully decoded instruction.
+        let len = TARGET_DECODE_CHUNK_LEN + 16;
+        let mut code = vec![0x90u8; len];
+        let boundary = TARGET_DECODE_CHUNK_LEN;
+        code[boundary - 3..boundary + 2].copy_from_slice(&[0xB8, 0x90, 0x90, 0x0F, 0x05]);
+
+        let base_addr = 0x1000u64;
+        let instructions = decode_section_instructions(Arch::X86_64, &code, base_addr).unwrap();
+
+        let mut expected_ip = base_addr;
+        for inst in &instructions {
+            assert_eq!(inst.ip(), expected_ip, "instructions must not overlap");
+            assert_ne!(inst.code(), iced_x86::Code::Syscall, "phantom syscall");
+            expected_ip = inst.next_ip();
+        }
+        assert_eq!(expected_ip, base_addr + len as u64);
+    }
 
     #[cfg(target_pointer_width = "64")]
     #[test]

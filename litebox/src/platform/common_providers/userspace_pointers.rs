@@ -213,6 +213,31 @@ fn to_owned_slice<V: ValidateAccess, T: FromBytes>(
     Some(unsafe { data.assume_init() })
 }
 
+fn copy_to_slice<V: ValidateAccess, T: FromBytes>(
+    ptr: *const T,
+    start_offset: usize,
+    buf: &mut [T],
+) -> Option<()> {
+    if buf.is_empty() {
+        return Some(());
+    }
+    let src = ptr.wrapping_add(start_offset);
+    let src =
+        V::validate_slice(core::ptr::slice_from_raw_parts(src, buf.len()).cast_mut())?.cast_const();
+    // SAFETY: The FromBytes bound on T guarantees that any byte pattern is valid for T,
+    // and `buf` is a valid kernel buffer. The memcpy_fallible operation returns an error
+    // on invalid memory access.
+    V::with_user_memory_access(|| unsafe {
+        memcpy_fallible(
+            buf.as_mut_ptr().cast(),
+            src.cast(),
+            core::mem::size_of_val(buf),
+        )
+    })
+    .ok()?;
+    Some(())
+}
+
 impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserConstPtr<V, T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
         read_at_offset::<V, T>(self.as_ptr(), count)
@@ -220,6 +245,10 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserConstPtr<V, T> 
 
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         to_owned_slice::<V, T>(self.as_ptr(), len)
+    }
+
+    fn copy_to_slice(self, start_offset: usize, buf: &mut [T]) -> Option<()> {
+        copy_to_slice::<V, T>(self.as_ptr(), start_offset, buf)
     }
 
     fn as_usize(&self) -> usize {
@@ -285,6 +314,10 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
 
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         to_owned_slice::<V, T>(self.as_ptr().cast_const(), len)
+    }
+
+    fn copy_to_slice(self, start_offset: usize, buf: &mut [T]) -> Option<()> {
+        copy_to_slice::<V, T>(self.as_ptr().cast_const(), start_offset, buf)
     }
 
     fn as_usize(&self) -> usize {

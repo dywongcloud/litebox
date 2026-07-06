@@ -735,6 +735,7 @@ impl<FS: ShimFS> Task<FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
+                        scratch_buf: core::cell::RefCell::new(alloc::vec::Vec::new()),
                     },
                 }),
             )
@@ -1277,7 +1278,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-/// Number of CPUs
+/// Number of CPUs to report when the platform cannot tell us.
 const NR_CPUS: usize = 2;
 
 pub(crate) struct CpuSet {
@@ -1296,9 +1297,15 @@ impl CpuSet {
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `sched_getaffinity`.
     ///
-    /// Note this is a dummy implementation that always returns the same CPU set
+    /// Note this is a dummy implementation that reports every online CPU as
+    /// available.
     pub(crate) fn sys_sched_getaffinity(&self, _pid: Option<i32>) -> CpuSet {
-        let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
+        let ncpus = self
+            .global
+            .platform
+            .num_cpus()
+            .map_or(NR_CPUS, core::num::NonZeroUsize::get);
+        let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; ncpus];
         cpuset.iter_mut().for_each(|mut b| *b = true);
         CpuSet { bits: cpuset }
     }
@@ -1371,7 +1378,45 @@ impl<FS: ShimFS> Task<FS> {
                 )?;
                 0
             }
-            _ => unimplemented!("Unsupported futex operation"),
+            FutexArgs::Requeue {
+                addr,
+                flags,
+                wake_count,
+                addr2,
+                requeue_count,
+            } => {
+                warn_shared_futex!(flags);
+                let (woken, _requeued) = self.global.futex_manager.requeue(
+                    addr,
+                    addr2,
+                    wake_count,
+                    requeue_count,
+                    None,
+                )?;
+                woken as usize
+            }
+            FutexArgs::CmpRequeue {
+                addr,
+                flags,
+                wake_count,
+                addr2,
+                requeue_count,
+                expected,
+            } => {
+                warn_shared_futex!(flags);
+                let (woken, requeued) = self.global.futex_manager.requeue(
+                    addr,
+                    addr2,
+                    wake_count,
+                    requeue_count,
+                    Some(expected),
+                )?;
+                woken as usize + requeued as usize
+            }
+            other => {
+                log_unsupported!("futex operation {other:?}");
+                return Err(Errno::ENOSYS);
+            }
         };
         Ok(res)
     }
@@ -1693,17 +1738,24 @@ mod tests {
 
     #[test]
     fn test_sched_getaffinity() {
+        use litebox::platform::ThreadProvider as _;
+
         let task = crate::syscalls::tests::init_platform(None);
 
+        let expected = task
+            .global
+            .platform
+            .num_cpus()
+            .map_or(super::NR_CPUS, core::num::NonZeroUsize::get);
         let cpuset = task.sys_sched_getaffinity(None);
-        assert_eq!(cpuset.bits.len(), super::NR_CPUS);
+        assert_eq!(cpuset.bits.len(), expected);
         cpuset.bits.iter().for_each(|b| assert!(*b));
         let ones: usize = cpuset
             .as_bytes()
             .iter()
             .map(|b| b.count_ones() as usize)
             .sum();
-        assert_eq!(ones, super::NR_CPUS);
+        assert_eq!(ones, expected);
     }
 
     #[test]

@@ -174,6 +174,27 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Note that the returned ranges should be `ALIGN`-aligned.
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
 
+    /// Discard the contents of already-mapped pages in `range` without unmapping them.
+    ///
+    /// On success the pages remain mapped with unchanged permissions, but their contents are
+    /// reset as if freshly allocated (i.e., zero-filled on next access). This enables an
+    /// in-place fast path for guest `madvise(MADV_DONTNEED)`-style operations, avoiding the
+    /// page-table churn of unmapping and re-creating the mapping.
+    ///
+    /// The default implementation returns [`DiscardError::Unsupported`], in which case the
+    /// caller must fall back to re-creating the mapping. Platforms should only override this
+    /// when discarding pages allocated via [`Self::allocate_pages`] yields zero-fill semantics.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the previous contents of `range` are no longer accessed or
+    /// relied upon, and that `range` only covers pages allocated via [`Self::allocate_pages`]
+    /// (i.e., not file-backed mappings, whose discard semantics may differ).
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    unsafe fn discard_pages(&self, range: Range<usize>) -> Result<(), DiscardError> {
+        Err(DiscardError::Unsupported)
+    }
+
     /// Attempt to allocate pages with copy-on-write semantics backed by static data.
     ///
     /// This method allows platforms that support it to create CoW mappings instead of performing
@@ -236,6 +257,16 @@ pub enum DeallocationError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     AlreadyUnallocated,
+}
+
+/// Possible errors for [`PageManagementProvider::discard_pages`]
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum DiscardError {
+    #[error("in-place page discard is not supported by this platform")]
+    Unsupported,
+    #[error("provided range contains unallocated pages")]
+    Unallocated,
 }
 
 /// Possible errors for [`PageManagementProvider::remap_pages`]

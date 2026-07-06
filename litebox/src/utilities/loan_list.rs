@@ -110,7 +110,6 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
     /// completes and the entry is fully returned.
     ///
     /// If the entry is not currently inserted, this method does nothing.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn remove(self: Pin<&mut Self>) {
         if let Some(list) = self.list {
             list.remove_node(&self.node);
@@ -201,7 +200,12 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                     let _ = node.data.state.block(s.0);
                 }
                 EntryState::REMOVED_WAKING => {
-                    // Spin until the remover finishes waking us.
+                    // Spin until the remover finishes waking us. This wait is
+                    // bounded to the remover executing a single store after its
+                    // wake call returns (see `LoanedEntry::drop`), so spinning
+                    // is acceptable. Note that `block`ing here instead would be
+                    // unsound: the remover issues no further wake after its
+                    // final store to `REMOVED`.
                     core::hint::spin_loop();
                 }
                 state => panic!("invalid state waiting for entry removal: {state:?}"),
@@ -250,9 +254,29 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
     /// ```
     pub fn extract_if(
         &self,
-        mut f: impl FnMut(&T) -> ControlFlow<bool, bool>,
+        f: impl FnMut(&T) -> ControlFlow<bool, bool>,
     ) -> ExtractIf<Platform, T> {
+        match self.extract_if_guarded(|| Ok::<(), core::convert::Infallible>(()), f) {
+            Ok(entries) => entries,
+        }
+    }
+
+    /// Like [`extract_if`](Self::extract_if), but first runs `guard` while
+    /// holding the list lock and **before** any entry is examined or removed.
+    /// If `guard` returns `Err`, the list is left untouched and the error is
+    /// returned; no entries are extracted and no predicate side effects occur.
+    ///
+    /// This lets a caller atomically validate a precondition against state that
+    /// other threads mutate under the same lock (e.g. re-reading a futex word
+    /// for `FUTEX_CMP_REQUEUE`) and the subsequent extraction, matching the
+    /// kernel's "check the value under the bucket lock, then requeue" ordering.
+    pub fn extract_if_guarded<E>(
+        &self,
+        guard: impl FnOnce() -> Result<(), E>,
+        mut f: impl FnMut(&T) -> ControlFlow<bool, bool>,
+    ) -> Result<ExtractIf<Platform, T>, E> {
         let mut this = self.0.lock();
+        guard()?;
         let mut removed = LinkedList::new();
         let mut current = this.head;
         while !current.is_null() {
@@ -283,9 +307,9 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                 break;
             }
         }
-        ExtractIf {
+        Ok(ExtractIf {
             head: unsafe { removed.into_head() },
-        }
+        })
     }
 }
 

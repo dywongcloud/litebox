@@ -65,28 +65,29 @@ pub trait Arg: private::Sealed {
     /// This is similar to [`Self::components`] except with normalization. Look at the tests for
     /// details on normalization.
     fn normalized_components(&self) -> Result<impl Iterator<Item = &str>> {
-        let mut parent_count = 0;
-        let mut rev_norm_components = self
-            .as_rust_str()?
-            .rsplit('/')
-            .filter(|&component| match component {
-                "" | "." => false,
-                ".." => {
-                    parent_count += 1;
-                    false
-                }
-                _ if parent_count > 0 => {
-                    parent_count -= 1;
-                    false
-                }
-                _ => true,
-            })
-            .collect::<alloc::vec::Vec<_>>();
-        rev_norm_components.extend(core::iter::repeat_n("..", parent_count));
-        if self.as_rust_str()?.starts_with('/') {
-            rev_norm_components.push("");
+        let path = self.as_rust_str()?;
+        // A single forward scan, using the components collected so far as a stack:
+        // ordinary components are pushed, and `..` pops the most recent ordinary
+        // component (or is kept, when there is nothing left to pop--i.e., leading
+        // `..`s and the root marker of an absolute path).
+        let mut components = alloc::vec::Vec::new();
+        if path.starts_with('/') {
+            // Marker for the root of an absolute path; never popped by `..`.
+            components.push("");
         }
-        Ok(rev_norm_components.into_iter().rev())
+        for component in path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => match components.last() {
+                    None | Some(&("" | "..")) => components.push(".."),
+                    Some(_) => {
+                        components.pop();
+                    }
+                },
+                _ => components.push(component),
+            }
+        }
+        Ok(components.into_iter())
     }
 
     /// Convenience wrapper around [`Self::normalized_components`]

@@ -13,7 +13,7 @@
 use core::hash::BuildHasher as _;
 use core::num::NonZeroU32;
 use core::pin::pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::RawSyncPrimitivesProvider;
 use crate::event::wait::{WaitContext, WaitError, Waker};
@@ -31,6 +31,21 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
     /// Chaining hash table to map from futex address to waiter lists.
     table: alloc::boxed::Box<[LoanList<Platform, FutexEntry<Platform>>; HASH_TABLE_ENTRIES]>,
     hash_builder: hashbrown::DefaultHashBuilder,
+    /// Number of live waiter entries whose current futex word hashes to a
+    /// bucket other than the one they physically reside in (a result of
+    /// [`FutexManager::requeue`]). When non-zero, wake-ups must scan every
+    /// bucket to find such entries.
+    ///
+    /// This is a single global counter, so while *any* cross-bucket-requeued
+    /// waiter is parked, *every* wake/requeue scans all [`HASH_TABLE_ENTRIES`]
+    /// buckets rather than one. That degradation is bounded to the (uncommon)
+    /// window in which such a waiter stays blocked — cross-bucket requeue only
+    /// arises from `FUTEX_REQUEUE`/`CMP_REQUEUE`, i.e. glibc/musl condvar
+    /// broadcast whose target mutex word hashes elsewhere. Correctness is
+    /// unaffected. FUTURE: track displacement per target bucket so the fast
+    /// path survives, but only with an accounting scheme proven not to skip a
+    /// bucket holding a displaced waiter (a miscount would lose a wake-up).
+    displaced: AtomicUsize,
 }
 
 /// The number of buckets in the hash table.
@@ -40,10 +55,15 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
 const HASH_TABLE_ENTRIES: usize = 256;
 
 struct FutexEntry<Platform: RawSyncPrimitivesProvider> {
-    addr: usize,
+    /// The futex word address this entry is waiting on. Only mutated (under
+    /// the resident bucket's lock) when the waiter is requeued to another
+    /// word; the entry stays in the bucket it was originally inserted into.
+    addr: AtomicUsize,
     waker: Waker<Platform>,
     bitset: u32,
     done: AtomicBool,
+    /// Whether this entry is currently counted in [`FutexManager::displaced`].
+    displaced: AtomicBool,
 }
 
 const ALL_BITS: NonZeroU32 = NonZeroU32::new(u32::MAX).unwrap();
@@ -59,13 +79,19 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         Self {
             table: alloc::boxed::Box::new(core::array::from_fn(|_| LoanList::new())),
             hash_builder: hashbrown::DefaultHashBuilder::default(),
+            displaced: AtomicUsize::new(0),
         }
+    }
+
+    /// Returns the hash table bucket index for the given futex address.
+    fn bucket_index(&self, addr: usize) -> usize {
+        let hash: usize = self.hash_builder.hash_one(addr).trunc();
+        hash % HASH_TABLE_ENTRIES
     }
 
     /// Returns the hash table bucket for the given futex address.
     fn bucket(&self, addr: usize) -> &LoanList<Platform, FutexEntry<Platform>> {
-        let hash: usize = self.hash_builder.hash_one(addr).trunc();
-        &self.table[hash % HASH_TABLE_ENTRIES]
+        &self.table[self.bucket_index(addr)]
     }
 
     /// Performs a futex wait.
@@ -93,29 +119,64 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             return Err(FutexError::NotAligned);
         }
 
+        // Optimistically check the futex word before touching the bucket: if the
+        // value already mismatches, report that without paying for the bucket's
+        // lock. This check alone is insufficient (the value could change right
+        // after it), so the authoritative check below is done after inserting
+        // into the bucket, ensuring no wakeup is missed.
+        let value = futex_addr.read_at_offset(0).ok_or(FutexError::Fault)?;
+        if value != expected_value {
+            return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
+        }
+
         let bucket = self.bucket(addr);
         let mut entry = pin!(LoanListEntry::new(FutexEntry {
-            addr,
+            addr: AtomicUsize::new(addr),
             waker: cx.waker().clone(),
             bitset,
             done: AtomicBool::new(false),
+            displaced: AtomicBool::new(false),
         },));
 
         // Insert into the bucket's list. It will be removed when woken or the
         // entry goes out of scope.
         entry.as_mut().insert(bucket);
 
-        // Check the value once. Do this only after inserting into the list so
+        // Check the value again. Do this after inserting into the list so
         // that we don't miss a wakeup.
-        let value = futex_addr.read_at_offset(0).ok_or(FutexError::Fault)?;
-        if value != expected_value {
-            return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
+        let result = match futex_addr.read_at_offset(0) {
+            None => Err(FutexError::Fault),
+            Some(value) if value != expected_value => {
+                Err(FutexError::ImmediatelyWokenBecauseValueMismatch)
+            }
+            // Only return when woken--don't reevaluate the futex word. This
+            // ensures that the rate control mechanisms provided by the futex
+            // interface are effective.
+            Some(_) => cx
+                .wait_until(|| entry.get().done.load(Ordering::Acquire))
+                .map_err(FutexError::WaitError),
+        };
+
+        // Remove the entry before reading its `displaced` flag: once removed,
+        // no concurrent requeue can touch the entry, making the flag stable.
+        entry.as_mut().remove();
+        // Resolve the wake-vs-timeout/interrupt race in favor of the wake. A
+        // concurrent `wake`/`requeue` may have selected this waiter — counting
+        // it as woken and consuming that wakeup — at the same moment
+        // `wait_until` reported a timeout or interruption. `remove()` above
+        // synchronizes with the waker's release of the entry (see
+        // `LoanedEntry::drop`), so `done` is now stable; if it is set, report
+        // success rather than dropping a wakeup the waker already accounted for
+        // (matching Linux `futex_wait`, where a failed dequeue returns 0).
+        let result = if entry.get().done.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            result
+        };
+        if entry.get().displaced.load(Ordering::Relaxed) {
+            self.displaced.fetch_sub(1, Ordering::SeqCst);
         }
-        // Only return when woken--don't reevaluate the futex word. This
-        // ensures that the rate control mechanisms provided by the futex
-        // interface are effective.
-        cx.wait_until(|| entry.get().done.load(Ordering::Acquire))
-            .map_err(FutexError::WaitError)
+        result
     }
 
     /// Wakes waiters on the given futex word.
@@ -144,26 +205,161 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         }
         let bitset = bitset.unwrap_or(ALL_BITS).get();
         let mut woken = 0;
-        let bucket = self.bucket(addr);
-        // Extract matching entries from the bucket until we've woken enough.
-        let entries = bucket.extract_if(|entry| {
-            if entry.addr != addr || entry.bitset & bitset == 0 {
-                return core::ops::ControlFlow::Continue(false);
+        // Entries requeued across buckets stay in their original bucket, so
+        // when any such entry exists the wake target may reside in any bucket
+        // and they must all be scanned (rare).
+        let buckets = if self.displaced.load(Ordering::SeqCst) == 0 {
+            core::slice::from_ref(self.bucket(addr))
+        } else {
+            &self.table[..]
+        };
+        for bucket in buckets {
+            // Extract matching entries from the bucket until we've woken enough.
+            let entries = bucket.extract_if(|entry| {
+                if entry.addr.load(Ordering::Relaxed) != addr || entry.bitset & bitset == 0 {
+                    return core::ops::ControlFlow::Continue(false);
+                }
+                woken += 1;
+                if woken >= num_to_wake_up.get() {
+                    core::ops::ControlFlow::Break(true)
+                } else {
+                    core::ops::ControlFlow::Continue(true)
+                }
+            });
+            // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
+            // time.
+            for entry in entries {
+                // Clone the waker and publish `done` so the entry loan can be
+                // returned *before* waking: `wake` may issue an expensive host wake
+                // call, and holding the loan across it would block a concurrent
+                // owner-side removal of the entry for that entire duration.
+                let waker = entry.waker.clone();
+                entry.done.store(true, Ordering::Release);
+                drop(entry);
+                waker.wake();
             }
-            woken += 1;
             if woken >= num_to_wake_up.get() {
-                core::ops::ControlFlow::Break(true)
-            } else {
-                core::ops::ControlFlow::Continue(true)
+                break;
             }
-        });
-        // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
-        // time.
-        for entry in entries {
-            entry.done.store(true, Ordering::Relaxed);
-            entry.waker.wake();
         }
         Ok(woken)
+    }
+
+    /// Wakes and requeues waiters on the given futex word, implementing the
+    /// semantics of `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`.
+    ///
+    /// If `expected_value` is `Some`, the current value of the futex word at
+    /// `futex_addr` is first compared against it, failing with
+    /// [`FutexError::ImmediatelyWokenBecauseValueMismatch`] on a mismatch
+    /// (Linux reports this as `EAGAIN`).
+    ///
+    /// Up to `num_to_wake_up` waiters on `futex_addr` are woken. Up to
+    /// `num_to_requeue` of the remaining waiters are moved to wait on
+    /// `target_addr` instead, without waking them; they become eligible for
+    /// subsequent [`FutexManager::wake`] calls on `target_addr`.
+    ///
+    /// Returns `(woken, requeued)`.
+    pub fn requeue(
+        &self,
+        futex_addr: Platform::RawMutPointer<u32>,
+        target_addr: Platform::RawMutPointer<u32>,
+        num_to_wake_up: u32,
+        num_to_requeue: u32,
+        expected_value: Option<u32>,
+    ) -> Result<(u32, u32), FutexError> {
+        let addr = futex_addr.as_usize();
+        let target = target_addr.as_usize();
+        if !addr.is_multiple_of(align_of::<u32>()) || !target.is_multiple_of(align_of::<u32>()) {
+            return Err(FutexError::NotAligned);
+        }
+        let target_bucket_index = self.bucket_index(target);
+        let source_bucket_index = self.bucket_index(addr);
+        // As in `wake`, a displaced (cross-bucket requeued) waiter forces a
+        // full scan; otherwise only the source word's bucket holds candidates.
+        let scan_all = self.displaced.load(Ordering::SeqCst) != 0;
+
+        // Validate the futex word against `expected_value` while holding the
+        // source bucket's lock, before any wake/requeue side effect, matching
+        // Linux's locked value check for `FUTEX_CMP_REQUEUE`. An unlocked
+        // compare would let a waiter that enqueues on the source word (with the
+        // new value) between the check and the scan be requeued onto the target
+        // word based on a stale comparison; because requeue does not mark the
+        // target word contended, a later uncontended unlock would never wake
+        // that waiter and it could hang. The source bucket is always scanned
+        // first so this guard gates the entire operation.
+        let source_guard = move || match expected_value {
+            None => Ok(()),
+            Some(expected) => match futex_addr.read_at_offset(0) {
+                None => Err(FutexError::Fault),
+                Some(value) if value != expected => {
+                    Err(FutexError::ImmediatelyWokenBecauseValueMismatch)
+                }
+                Some(_) => Ok(()),
+            },
+        };
+
+        let mut woken = 0;
+        let mut requeued = 0;
+        let mut source_guard = Some(source_guard);
+        let bucket_order = core::iter::once(source_bucket_index)
+            .chain((0..HASH_TABLE_ENTRIES).filter(move |&i| scan_all && i != source_bucket_index));
+        for resident in bucket_order {
+            let bucket = &self.table[resident];
+            let scan = |entry: &FutexEntry<Platform>| {
+                use core::ops::ControlFlow::{Break, Continue};
+                if entry.addr.load(Ordering::Relaxed) != addr {
+                    return Continue(false);
+                }
+                if woken < num_to_wake_up {
+                    woken += 1;
+                    return if woken >= num_to_wake_up && num_to_requeue == 0 {
+                        Break(true)
+                    } else {
+                        Continue(true)
+                    };
+                }
+                if requeued < num_to_requeue {
+                    requeued += 1;
+                    // Retarget the entry in place; it stays in its resident
+                    // bucket, so track (while holding this bucket's lock)
+                    // whether it is now displaced.
+                    entry.addr.store(target, Ordering::Relaxed);
+                    if target_bucket_index != resident {
+                        if !entry.displaced.swap(true, Ordering::Relaxed) {
+                            self.displaced.fetch_add(1, Ordering::SeqCst);
+                        }
+                    } else if entry.displaced.swap(false, Ordering::Relaxed) {
+                        self.displaced.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    return if requeued >= num_to_requeue {
+                        Break(false)
+                    } else {
+                        Continue(false)
+                    };
+                }
+                Break(false)
+            };
+            // The source bucket (first) carries the locked value-check guard;
+            // on a mismatch it returns before any entry is touched.
+            let entries = match source_guard.take() {
+                Some(guard) => bucket.extract_if_guarded(guard, scan)?,
+                None => bucket.extract_if(scan),
+            };
+            // Wake the waiters outside the `extract_if` closure to minimize
+            // the list's lock hold time.
+            for entry in entries {
+                // As in `wake`: publish `done` and return the entry loan
+                // before issuing the (potentially expensive) host wake.
+                let waker = entry.waker.clone();
+                entry.done.store(true, Ordering::Release);
+                drop(entry);
+                waker.wake();
+            }
+            if woken >= num_to_wake_up && requeued >= num_to_requeue {
+                break;
+            }
+        }
+        Ok((woken, requeued))
     }
 }
 
@@ -357,5 +553,78 @@ mod tests {
         }
 
         assert!((1..=3).contains(&woken));
+    }
+
+    #[test]
+    fn test_futex_requeue() {
+        let platform = MockPlatform::new();
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = Arc::new(FutexManager::new());
+
+        let word_a = Arc::new(AtomicU32::new(0));
+        let word_b = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(Barrier::new(4)); // 3 waiters + 1 requeuer
+
+        let addr_of = |word: &Arc<AtomicU32>| {
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                word.as_ptr() as usize,
+            )
+        };
+
+        let mut waiters = std::vec::Vec::new();
+        for _ in 0..3 {
+            let futex_manager_clone = Arc::clone(&futex_manager);
+            let word_a_clone = Arc::clone(&word_a);
+            let barrier_clone = Arc::clone(&barrier);
+            waiters.push(thread::spawn(move || {
+                let futex_addr =
+                    <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                        word_a_clone.as_ptr() as usize,
+                    );
+                barrier_clone.wait(); // Sync with the requeuer
+                futex_manager_clone.wait(&WaitState::new(platform).context(), futex_addr, 0, None)
+            }));
+        }
+
+        barrier.wait(); // Wait for the waiters to be ready
+        thread::sleep(Duration::from_millis(100)); // Give the waiters time to block
+
+        // A mismatched expected value must fail with EAGAIN semantics without
+        // waking or requeueing anyone.
+        assert!(matches!(
+            futex_manager.requeue(addr_of(&word_a), addr_of(&word_b), 1, u32::MAX, Some(1)),
+            Err(FutexError::ImmediatelyWokenBecauseValueMismatch)
+        ));
+
+        // Wake one waiter and requeue the rest onto word B.
+        let (woken, requeued) = futex_manager
+            .requeue(addr_of(&word_a), addr_of(&word_b), 1, u32::MAX, Some(0))
+            .unwrap();
+        assert_eq!(woken, 1);
+        assert_eq!(requeued, 2);
+
+        // No one is left waiting on word A...
+        let woken_a = futex_manager
+            .wake(addr_of(&word_a), NonZeroU32::new(u32::MAX).unwrap(), None)
+            .unwrap();
+        assert_eq!(woken_a, 0);
+
+        // ...and the requeued waiters must be reachable via word B, even
+        // though they physically reside in word A's bucket.
+        let woken_b = futex_manager
+            .wake(addr_of(&word_b), NonZeroU32::new(u32::MAX).unwrap(), None)
+            .unwrap();
+        assert_eq!(woken_b, 2);
+
+        for waiter in waiters {
+            assert!(waiter.join().unwrap().is_ok());
+        }
+
+        // Every displaced entry must have been un-counted on wake-up.
+        assert_eq!(
+            futex_manager.displaced.load(Ordering::SeqCst),
+            0,
+            "displaced counter must return to zero"
+        );
     }
 }
