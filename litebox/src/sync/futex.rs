@@ -150,6 +150,19 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Remove the entry before reading its `displaced` flag: once removed,
         // no concurrent requeue can touch the entry, making the flag stable.
         entry.as_mut().remove();
+        // Resolve the wake-vs-timeout/interrupt race in favor of the wake. A
+        // concurrent `wake`/`requeue` may have selected this waiter — counting
+        // it as woken and consuming that wakeup — at the same moment
+        // `wait_until` reported a timeout or interruption. `remove()` above
+        // synchronizes with the waker's release of the entry (see
+        // `LoanedEntry::drop`), so `done` is now stable; if it is set, report
+        // success rather than dropping a wakeup the waker already accounted for
+        // (matching Linux `futex_wait`, where a failed dequeue returns 0).
+        let result = if entry.get().done.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            result
+        };
         if entry.get().displaced.load(Ordering::Relaxed) {
             self.displaced.fetch_sub(1, Ordering::SeqCst);
         }
@@ -250,6 +263,16 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             return Err(FutexError::NotAligned);
         }
         if let Some(expected) = expected_value {
+            // Unlike Linux, this comparison is not performed while holding the
+            // source bucket's lock (the bucket only exposes a locked
+            // `extract_if`, not a standalone guard), so the value may change
+            // between here and the scan below. This is benign for the sole
+            // consumer, `FUTEX_CMP_REQUEUE` in POSIX condition-variable
+            // broadcast: a stale pass at most requeues a waiter that Linux
+            // would have rejected with `EAGAIN`, yielding a spurious wakeup —
+            // which condvar users must already tolerate — never a lost one,
+            // since every waiter re-checks the futex word under the bucket
+            // lock in `wait` before parking.
             let value = futex_addr.read_at_offset(0).ok_or(FutexError::Fault)?;
             if value != expected {
                 return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);

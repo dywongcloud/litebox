@@ -177,6 +177,9 @@ impl LinuxUserland {
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         init_fsgsbase_mode();
+        // Probe the CPU count now, before the seccomp filter is installed, so
+        // the query never trips the sandbox (see `num_cpus`).
+        NUM_CPUS.get_or_init(|| std::thread::available_parallelism().ok());
         register_exception_handlers();
 
         let tun_socket_fd = tun_device_name
@@ -1088,7 +1091,11 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     }
 
     fn num_cpus(&self) -> Option<core::num::NonZeroUsize> {
-        std::thread::available_parallelism().ok()
+        // Cache the CPU count: it does not change over the process lifetime,
+        // and `available_parallelism` probes the host (and may consult files
+        // the seccomp filter blocks). Seeded pre-seccomp in `new`; the
+        // `get_or_init` fallback here keeps it correct if queried first.
+        *NUM_CPUS.get_or_init(|| std::thread::available_parallelism().ok())
     }
 
     #[cfg(debug_assertions)]
@@ -2033,6 +2040,10 @@ fn arch_prctl_set_gs(value: u64) {
 
 static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
 static INTERRUPT_SIGNAL_NUMBER: AtomicI32 = AtomicI32::new(0);
+
+/// Cached host CPU count, seeded before the seccomp filter is installed so
+/// that querying it never trips the sandbox. See [`LinuxUserland::num_cpus`].
+static NUM_CPUS: std::sync::OnceLock<Option<core::num::NonZeroUsize>> = std::sync::OnceLock::new();
 
 fn register_exception_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();

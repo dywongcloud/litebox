@@ -284,7 +284,10 @@ impl From<litebox::mm::linux::MappingError> for Errno {
             litebox::mm::linux::MappingError::UnAligned => Errno::EINVAL,
             litebox::mm::linux::MappingError::OutOfMemory => Errno::ENOMEM,
             litebox::mm::linux::MappingError::BadFD(_) => Errno::EBADF,
-            litebox::mm::linux::MappingError::NotAFile => Errno::EISDIR,
+            // `mmap` of a directory or a non-regular fd (pipe/socket/eventfd/
+            // epoll) reports `ENODEV` on Linux ("mmap not supported by this
+            // file"), unlike `read`/`write` which report `EISDIR`.
+            litebox::mm::linux::MappingError::NotAFile => Errno::ENODEV,
             litebox::mm::linux::MappingError::NotForReading => Errno::EACCES,
             litebox::mm::linux::MappingError::MapError(e) => e.into(),
             _ => unimplemented!(),
