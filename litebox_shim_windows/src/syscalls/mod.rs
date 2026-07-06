@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub(crate) mod apphelp;
 pub(crate) mod directory;
 pub(crate) mod event;
 pub(crate) mod file;
@@ -311,6 +312,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         fs_information: Platform::RawMutPointer<u8>,
         length: u32,
         fs_information_class: u32,
+    },
+    NtApphelpCacheControl {
+        service_class: u32,
+        service_data: Option<Platform::RawMutPointer<nt_types::AhcServiceData>>,
     },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
@@ -719,6 +724,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 fs_information:*,
                 length,
                 fs_information_class,
+            })),
+            NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
+                service_class,
+                service_data:*,
             })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,
