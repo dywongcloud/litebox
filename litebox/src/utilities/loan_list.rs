@@ -254,9 +254,29 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
     /// ```
     pub fn extract_if(
         &self,
-        mut f: impl FnMut(&T) -> ControlFlow<bool, bool>,
+        f: impl FnMut(&T) -> ControlFlow<bool, bool>,
     ) -> ExtractIf<Platform, T> {
+        match self.extract_if_guarded(|| Ok::<(), core::convert::Infallible>(()), f) {
+            Ok(entries) => entries,
+        }
+    }
+
+    /// Like [`extract_if`](Self::extract_if), but first runs `guard` while
+    /// holding the list lock and **before** any entry is examined or removed.
+    /// If `guard` returns `Err`, the list is left untouched and the error is
+    /// returned; no entries are extracted and no predicate side effects occur.
+    ///
+    /// This lets a caller atomically validate a precondition against state that
+    /// other threads mutate under the same lock (e.g. re-reading a futex word
+    /// for `FUTEX_CMP_REQUEUE`) and the subsequent extraction, matching the
+    /// kernel's "check the value under the bucket lock, then requeue" ordering.
+    pub fn extract_if_guarded<E>(
+        &self,
+        guard: impl FnOnce() -> Result<(), E>,
+        mut f: impl FnMut(&T) -> ControlFlow<bool, bool>,
+    ) -> Result<ExtractIf<Platform, T>, E> {
         let mut this = self.0.lock();
+        guard()?;
         let mut removed = LinkedList::new();
         let mut current = this.head;
         while !current.is_null() {
@@ -287,9 +307,9 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                 break;
             }
         }
-        ExtractIf {
+        Ok(ExtractIf {
             head: unsafe { removed.into_head() },
-        }
+        })
     }
 }
 

@@ -35,6 +35,16 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
     /// bucket other than the one they physically reside in (a result of
     /// [`FutexManager::requeue`]). When non-zero, wake-ups must scan every
     /// bucket to find such entries.
+    ///
+    /// This is a single global counter, so while *any* cross-bucket-requeued
+    /// waiter is parked, *every* wake/requeue scans all [`HASH_TABLE_ENTRIES`]
+    /// buckets rather than one. That degradation is bounded to the (uncommon)
+    /// window in which such a waiter stays blocked — cross-bucket requeue only
+    /// arises from `FUTEX_REQUEUE`/`CMP_REQUEUE`, i.e. glibc/musl condvar
+    /// broadcast whose target mutex word hashes elsewhere. Correctness is
+    /// unaffected. FUTURE: track displacement per target bucket so the fast
+    /// path survives, but only with an accounting scheme proven not to skip a
+    /// bucket holding a displaced waiter (a miscount would lose a wake-up).
     displaced: AtomicUsize,
 }
 
@@ -262,35 +272,40 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         if !addr.is_multiple_of(align_of::<u32>()) || !target.is_multiple_of(align_of::<u32>()) {
             return Err(FutexError::NotAligned);
         }
-        if let Some(expected) = expected_value {
-            // Unlike Linux, this comparison is not performed while holding the
-            // source bucket's lock (the bucket only exposes a locked
-            // `extract_if`, not a standalone guard), so the value may change
-            // between here and the scan below. This is benign for the sole
-            // consumer, `FUTEX_CMP_REQUEUE` in POSIX condition-variable
-            // broadcast: a stale pass at most requeues a waiter that Linux
-            // would have rejected with `EAGAIN`, yielding a spurious wakeup —
-            // which condvar users must already tolerate — never a lost one,
-            // since every waiter re-checks the futex word under the bucket
-            // lock in `wait` before parking.
-            let value = futex_addr.read_at_offset(0).ok_or(FutexError::Fault)?;
-            if value != expected {
-                return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
-            }
-        }
         let target_bucket_index = self.bucket_index(target);
         let source_bucket_index = self.bucket_index(addr);
-        // As in `wake`, scan all buckets if any entry is displaced.
-        let bucket_indices = if self.displaced.load(Ordering::SeqCst) == 0 {
-            source_bucket_index..source_bucket_index + 1
-        } else {
-            0..HASH_TABLE_ENTRIES
+        // As in `wake`, a displaced (cross-bucket requeued) waiter forces a
+        // full scan; otherwise only the source word's bucket holds candidates.
+        let scan_all = self.displaced.load(Ordering::SeqCst) != 0;
+
+        // Validate the futex word against `expected_value` while holding the
+        // source bucket's lock, before any wake/requeue side effect, matching
+        // Linux's locked value check for `FUTEX_CMP_REQUEUE`. An unlocked
+        // compare would let a waiter that enqueues on the source word (with the
+        // new value) between the check and the scan be requeued onto the target
+        // word based on a stale comparison; because requeue does not mark the
+        // target word contended, a later uncontended unlock would never wake
+        // that waiter and it could hang. The source bucket is always scanned
+        // first so this guard gates the entire operation.
+        let source_guard = move || match expected_value {
+            None => Ok(()),
+            Some(expected) => match futex_addr.read_at_offset(0) {
+                None => Err(FutexError::Fault),
+                Some(value) if value != expected => {
+                    Err(FutexError::ImmediatelyWokenBecauseValueMismatch)
+                }
+                Some(_) => Ok(()),
+            },
         };
+
         let mut woken = 0;
         let mut requeued = 0;
-        for resident in bucket_indices {
+        let mut source_guard = Some(source_guard);
+        let bucket_order = core::iter::once(source_bucket_index)
+            .chain((0..HASH_TABLE_ENTRIES).filter(move |&i| scan_all && i != source_bucket_index));
+        for resident in bucket_order {
             let bucket = &self.table[resident];
-            let entries = bucket.extract_if(|entry| {
+            let scan = |entry: &FutexEntry<Platform>| {
                 use core::ops::ControlFlow::{Break, Continue};
                 if entry.addr.load(Ordering::Relaxed) != addr {
                     return Continue(false);
@@ -323,7 +338,13 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                     };
                 }
                 Break(false)
-            });
+            };
+            // The source bucket (first) carries the locked value-check guard;
+            // on a mismatch it returns before any entry is touched.
+            let entries = match source_guard.take() {
+                Some(guard) => bucket.extract_if_guarded(guard, scan)?,
+                None => bucket.extract_if(scan),
+            };
             // Wake the waiters outside the `extract_if` closure to minimize
             // the list's lock hold time.
             for entry in entries {
