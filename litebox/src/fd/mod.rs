@@ -677,9 +677,11 @@ impl RawDescriptorStorage {
     /// This is similar to [`Self::fd_into_raw_integer`] except that it specifies a specific FD to
     /// be stored into.
     ///
-    /// Will return with `true` iff it succeeds (i.e., nothing else was using that raw integer FD).
-    /// If you want to replace a used slot, you must first consume that slot via
-    /// [`Self::fd_consume_raw_integer`].
+    /// Will return with `true` iff it succeeds. Returns `false` both when the slot is already
+    /// occupied (if you want to replace a used slot, you must first consume that slot via
+    /// [`Self::fd_consume_raw_integer`]) and when `raw_fd` is far enough beyond the current
+    /// backing storage that granting it would force a large, guest-triggerable allocation (see
+    /// below) — callers must treat both as an ordinary failure to insert, not assume success.
     #[must_use]
     #[expect(
         clippy::missing_panics_doc,
@@ -693,12 +695,13 @@ impl RawDescriptorStorage {
         // TODO(jayb): Should we be storing things via a HashMap to make sure this operation cannot
         // be too expensive if someone tries to store into a large raw FD?
         //
-        // If this assertion failure is hit in practice, we might need to be more defensive via the
-        // HashMap, rather than just silently allow big growth
-        assert!(
-            raw_fd < self.stored_fds.len() + 256,
-            "explicit upper bound restriction for now; see implementation details"
-        );
+        // `stored_fds` is a dense, index-by-fd array; growing it to fit an arbitrary raw_fd
+        // (e.g. a guest calling `dup2(fd, 1_000_000)`, valid up to `RLIMIT_NOFILE`) would force
+        // an allocation sized to the requested fd number. Decline rather than growing unbounded
+        // or panicking — this is a real, guest-reachable path, not just a defensive invariant.
+        if raw_fd >= self.stored_fds.len() + 256 {
+            return false;
+        }
         if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
             // There's already something at this slot.
             return false;

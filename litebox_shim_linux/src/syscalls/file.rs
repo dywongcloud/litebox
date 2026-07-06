@@ -765,8 +765,13 @@ impl<FS: ShimFS> Task<FS> {
             Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 if let Some(new_fd) = replace {
-                    let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
-                    assert!(success, "raw_fd slot is empty, so insert must succeed");
+                    // The slot is confirmed empty, so a failure here means
+                    // `raw_fd` exceeds the backing store's growth allowance
+                    // (see `fd_into_specific_raw_integer`), not that it is
+                    // occupied.
+                    if !rds.fd_into_specific_raw_integer(new_fd, raw_fd) {
+                        return Err(Errno::ENOMEM);
+                    }
                 }
                 return Err(Errno::EBADF);
             }
@@ -799,11 +804,13 @@ impl<FS: ShimFS> Task<FS> {
 
         // Insert the replacement into the now-vacated slot while still holding the lock.
         if let Some(new_fd) = replace {
-            let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
-            assert!(
-                success,
-                "we just consumed this raw_fd, so it must be available"
-            );
+            // As above: we just consumed this raw_fd, so a failure here means
+            // it exceeds the backing store's growth allowance, not that it is
+            // occupied.
+            if !rds.fd_into_specific_raw_integer(new_fd, raw_fd) {
+                drop(rds);
+                return Err(Errno::ENOMEM);
+            }
         }
         drop(rds);
 
@@ -2364,7 +2371,19 @@ impl<FS: ShimFS> Task<FS> {
 
             let new_fd = match target {
                 DupFdRequest::Exact(target) => {
-                    let _ = task.do_close_and_replace(target, Some(fd));
+                    // `do_close_and_replace` returns `Err(EBADF)` whenever
+                    // `target` had nothing open to close — the common case
+                    // for dup2 to a fresh fd — even though it still performs
+                    // the replacement insert; that outcome is intentionally
+                    // ignored, matching `close()`'s own semantics. It can
+                    // separately fail with `Err(ENOMEM)` if `target` is far
+                    // beyond the descriptor store's current growth allowance
+                    // (see `fd_into_specific_raw_integer`), in which case the
+                    // replacement was NOT inserted and the dup must fail.
+                    match task.do_close_and_replace(target, Some(fd)) {
+                        Ok(()) | Err(Errno::EBADF) => {}
+                        Err(_) => return Err(DupFdError::TooManyFiles),
+                    }
                     target
                 }
                 DupFdRequest::LowestAvailable => {
@@ -2380,8 +2399,12 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         raw_fd += 1;
                     }
-                    let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
-                    assert!(success);
+                    // As in the `Exact` case: `raw_fd` (bounded only by
+                    // `RLIMIT_NOFILE` via the `max_fd` check above) can still
+                    // exceed the descriptor store's growth allowance.
+                    if !rds.fd_into_specific_raw_integer(fd, raw_fd) {
+                        return Err(DupFdError::TooManyFiles);
+                    }
                     raw_fd
                 }
             };

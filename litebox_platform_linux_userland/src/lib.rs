@@ -1309,9 +1309,17 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 }
                 Ok(())
             }
-            Err(errno) => {
-                unimplemented!("unexpected error {errno}")
-            }
+            Err(errno) => match errno {
+                // The TUN fd is opened O_NONBLOCK, so under ordinary host-side
+                // backpressure (a full transmit queue) this is expected,
+                // not fatal — mirrors the EWOULDBLOCK/EAGAIN handling in
+                // `receive_ip_packet` below.
+                #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
+                syscalls::Errno::EWOULDBLOCK | syscalls::Errno::EAGAIN => {
+                    Err(litebox::platform::SendError::WouldBlock)
+                }
+                _ => unimplemented!("unexpected error {errno}"),
+            },
         }
     }
 
@@ -1878,7 +1886,20 @@ impl ThreadContext<'_> {
         }
         let op = f(self.shim, self.ctx);
         match op {
-            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Resume => {
+                // Guest-controlled paths (notably `rt_sigreturn`, which copies
+                // a guest-memory-supplied `rip`/`rsp`/`eflags` into `ctx`
+                // unchecked) could otherwise resume the guest at an arbitrary
+                // address with an arbitrary stack and privileged RFLAGS bits.
+                // Validate and normalize before every resume, exactly as the
+                // `lvbs`/`snp` platforms do (see
+                // `PtRegs::sanitize_for_user_return`'s doc comment); a thread
+                // that fails this check is terminated instead of resumed.
+                if self.ctx.sanitize_for_user_return() {
+                    unsafe { switch_to_guest(self.ctx) }
+                }
+                litebox_util_log::warn!("terminating thread with invalid user return context");
+            }
             ContinueOperation::Terminate => {}
         }
     }
@@ -2042,7 +2063,8 @@ static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
 static INTERRUPT_SIGNAL_NUMBER: AtomicI32 = AtomicI32::new(0);
 
 /// Cached host CPU count, seeded before the seccomp filter is installed so
-/// that querying it never trips the sandbox. See [`LinuxUserland::num_cpus`].
+/// that querying it never trips the sandbox. See `LinuxUserland`'s
+/// `ThreadProvider::num_cpus` implementation.
 static NUM_CPUS: std::sync::OnceLock<Option<core::num::NonZeroUsize>> = std::sync::OnceLock::new();
 
 fn register_exception_handlers() {

@@ -1528,6 +1528,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
+ "litebox_util_log",
  "seccompiler",
  "spin 0.9.8",
  "syscalls",
