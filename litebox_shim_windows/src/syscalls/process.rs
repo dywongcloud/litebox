@@ -1,13 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::mem::{offset_of, size_of};
 use core::sync::atomic::Ordering;
 use int_enum::IntEnum;
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+use crate::nt_types::ThreadEnvironmentBlock;
 use crate::syscalls::ProcessHandle;
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
 
@@ -19,6 +21,7 @@ const GUEST_PARENT_PROCESS_ID: usize = 0;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
+const TEB_TLS_SLOT_COUNT: usize = 64;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -33,6 +36,20 @@ enum ProcessInformationClass {
     ConsoleHostProcess = 49,
     ImageInformation = 53,
     SchedulerSharedData = 112,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
+enum ProcessTlsOperation {
+    ReplaceIndex = 0,
+    ReplaceVector = 1,
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ProcessTlsThreadDataFlags: u32 {
+        const OLD_DATA_WRITTEN = 0x2;
+    }
 }
 
 #[repr(C)]
@@ -58,6 +75,174 @@ struct ProcessDefaultHardErrorMode {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
 struct ProcessSchedulerSharedDataSlotInformation {
     scheduler_shared_data_handle: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ProcessTlsInformationHeader {
+    flags: u32,
+    operation_type: u32,
+    thread_data_count: u32,
+    tls_index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ProcessTlsInformationExtendedHeader {
+    header: ProcessTlsInformationHeader,
+    _reserved: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ProcessTlsThreadDataSimple {
+    flags: u32,
+    _padding0: u32,
+    tls_data: usize,
+    _reserved: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ProcessTlsThreadDataExtended {
+    flags: u32,
+    _padding0: u32,
+    new_tls_data: usize,
+    old_tls_data: usize,
+    _reserved: usize,
+}
+
+enum ProcessTlsThreadData<Platform: RawPointerProvider> {
+    Simple(MutPtr<Platform, ProcessTlsThreadDataSimple>),
+    Extended(MutPtr<Platform, ProcessTlsThreadDataExtended>),
+}
+
+impl<Platform: RawPointerProvider> ProcessTlsThreadData<Platform> {
+    fn read_tls_data(&self) -> Option<usize> {
+        match self {
+            Self::Simple(ptr) => crate::read_field_at_offset::<Platform, _>(
+                ptr.as_usize(),
+                offset_of!(ProcessTlsThreadDataSimple, tls_data),
+            ),
+            Self::Extended(ptr) => crate::read_field_at_offset::<Platform, _>(
+                ptr.as_usize(),
+                offset_of!(ProcessTlsThreadDataExtended, new_tls_data),
+            ),
+        }
+    }
+
+    fn write_tls_data(&self, value: usize) -> Option<()> {
+        match self {
+            Self::Simple(ptr) => crate::write_field_at_offset::<Platform, _>(
+                ptr.as_usize(),
+                offset_of!(ProcessTlsThreadDataSimple, tls_data),
+                value,
+            ),
+            Self::Extended(ptr) => crate::write_field_at_offset::<Platform, _>(
+                ptr.as_usize(),
+                offset_of!(ProcessTlsThreadDataExtended, old_tls_data),
+                value,
+            ),
+        }
+    }
+
+    fn write_flags(&self, flags: ProcessTlsThreadDataFlags) -> Option<()> {
+        match self {
+            Self::Simple(ptr) => crate::write_field_at_offset::<Platform, _>(
+                ptr.as_usize(),
+                offset_of!(ProcessTlsThreadDataSimple, flags),
+                flags.bits(),
+            ),
+            Self::Extended(ptr) => crate::write_field_at_offset::<Platform, _>(
+                ptr.as_usize(),
+                offset_of!(ProcessTlsThreadDataExtended, flags),
+                flags.bits(),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProcessTlsLayout {
+    Simple,
+    Extended,
+}
+
+impl ProcessTlsLayout {
+    fn detect(thread_data_count: u32, process_information_length: u32) -> Result<Self, NtStatus> {
+        let count = thread_data_count as usize;
+        let extended_len = size_of::<ProcessTlsInformationExtendedHeader>()
+            .checked_add(
+                count
+                    .checked_mul(size_of::<ProcessTlsThreadDataExtended>())
+                    .ok_or(NtStatus::INFO_LENGTH_MISMATCH)?,
+            )
+            .ok_or(NtStatus::INFO_LENGTH_MISMATCH)?;
+        let simple_len = size_of::<ProcessTlsInformationHeader>()
+            .checked_add(
+                count
+                    .checked_mul(size_of::<ProcessTlsThreadDataSimple>())
+                    .ok_or(NtStatus::INFO_LENGTH_MISMATCH)?,
+            )
+            .ok_or(NtStatus::INFO_LENGTH_MISMATCH)?;
+        let provided_len = process_information_length as usize;
+
+        if provided_len >= extended_len {
+            Ok(Self::Extended)
+        } else if provided_len >= simple_len {
+            Ok(Self::Simple)
+        } else {
+            Err(NtStatus::INFO_LENGTH_MISMATCH)
+        }
+    }
+
+    const fn header_size(self) -> usize {
+        match self {
+            Self::Simple => size_of::<ProcessTlsInformationHeader>(),
+            Self::Extended => size_of::<ProcessTlsInformationExtendedHeader>(),
+        }
+    }
+
+    const fn entry_size(self) -> usize {
+        match self {
+            Self::Simple => size_of::<ProcessTlsThreadDataSimple>(),
+            Self::Extended => size_of::<ProcessTlsThreadDataExtended>(),
+        }
+    }
+
+    const fn old_data_offset(self) -> usize {
+        match self {
+            Self::Simple => offset_of!(ProcessTlsThreadDataSimple, tls_data),
+            Self::Extended => offset_of!(ProcessTlsThreadDataExtended, old_tls_data),
+        }
+    }
+
+    fn thread_data<Platform: RawPointerProvider>(
+        self,
+        base: MutPtr<Platform, u8>,
+        index: usize,
+    ) -> Option<ProcessTlsThreadData<Platform>> {
+        match self {
+            Self::Simple => {
+                let arr = MutPtr::<Platform, ProcessTlsThreadDataSimple>::from_usize(
+                    base.as_usize().checked_add(
+                        size_of::<ProcessTlsInformationHeader>()
+                            + index.checked_mul(size_of::<ProcessTlsThreadDataSimple>())?,
+                    )?,
+                );
+                Some(ProcessTlsThreadData::Simple(arr))
+            }
+            Self::Extended => {
+                let arr = MutPtr::<Platform, ProcessTlsThreadDataExtended>::from_usize(
+                    base.as_usize().checked_add(
+                        size_of::<ProcessTlsInformationExtendedHeader>()
+                            + index.checked_mul(size_of::<ProcessTlsThreadDataExtended>())?,
+                    )?,
+                );
+                Some(ProcessTlsThreadData::Extended(arr))
+            }
+        }
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -145,9 +330,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_nt_set_information_process(
+        &self,
         process_handle: ProcessHandle,
         process_information_class: u32,
-        process_information: ConstPtr<Platform, u8>,
+        process_information: MutPtr<Platform, u8>,
         process_information_length: u32,
     ) -> NtStatus {
         let Ok(process_information_class) =
@@ -168,6 +354,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     process_information_length,
                 )
             }
+            ProcessInformationClass::TlsInformation => self.write_process_tls_information(
+                process_handle,
+                process_information,
+                process_information_length,
+            ),
             // TODO: implement additional settable process information classes when a guest
             // exercises them.
             ProcessInformationClass::BasicInformation
@@ -175,7 +366,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | ProcessInformationClass::DefaultHardErrorMode
             | ProcessInformationClass::Wow64Information
             | ProcessInformationClass::DebugFlags
-            | ProcessInformationClass::TlsInformation
             | ProcessInformationClass::Cookie
             | ProcessInformationClass::ConsoleHostProcess
             | ProcessInformationClass::ImageInformation => {
@@ -225,7 +415,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn set_process_scheduler_shared_data(
         process_handle: ProcessHandle,
-        process_information: ConstPtr<Platform, u8>,
+        process_information: MutPtr<Platform, u8>,
         process_information_length: u32,
     ) -> NtStatus {
         if process_information_length
@@ -250,6 +440,238 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
+    fn write_process_tls_information(
+        &self,
+        process_handle: ProcessHandle,
+        process_information: MutPtr<Platform, u8>,
+        process_information_length: u32,
+    ) -> NtStatus {
+        if (process_information_length as usize) < size_of::<ProcessTlsInformationHeader>() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        let Some(header) = ConstPtr::<Platform, ProcessTlsInformationHeader>::from_usize(
+            process_information.as_usize(),
+        )
+        .read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let layout =
+            match ProcessTlsLayout::detect(header.thread_data_count, process_information_length) {
+                Ok(layout) => layout,
+                Err(status) => return status,
+            };
+
+        litebox_util_log::debug!(
+            operation_type = header.operation_type,
+            thread_data_count = header.thread_data_count,
+            tls_index = header.tls_index,
+            process_information_length,
+            layout_header_size = layout.header_size(),
+            layout_entry_size = layout.entry_size(),
+            layout_old_data_offset = layout.old_data_offset();
+            "Handling ProcessTlsInformation"
+        );
+
+        if header.thread_data_count > 1 {
+            // TODO(multi-thread-tls): PROCESS_TLS_INFORMATION entries are positional per-thread
+            // data. The shim currently models only the active TEB, so handling multiple entries
+            // would corrupt prior TLS values by repeatedly writing one TEB's vector.
+            return NtStatus::NOT_SUPPORTED;
+        }
+
+        match ProcessTlsOperation::try_from(header.operation_type) {
+            Ok(ProcessTlsOperation::ReplaceVector) => {
+                self.replace_tls_vector(process_information, header, layout)
+            }
+            Ok(ProcessTlsOperation::ReplaceIndex) => {
+                self.replace_tls_index(process_information, header, layout)
+            }
+            Err(_) => {
+                litebox_util_log::debug!(
+                    operation_type = header.operation_type,
+                    thread_data_count = header.thread_data_count,
+                    tls_index = header.tls_index;
+                    "Unsupported ProcessTlsInformation operation"
+                );
+                NtStatus::INVALID_INFO_CLASS
+            }
+        }
+    }
+
+    fn replace_tls_vector(
+        &self,
+        process_information: MutPtr<Platform, u8>,
+        header: ProcessTlsInformationHeader,
+        layout: ProcessTlsLayout,
+    ) -> NtStatus {
+        for index in 0..header.thread_data_count as usize {
+            let Some(thread_data) = layout.thread_data::<Platform>(process_information, index)
+            else {
+                return NtStatus::INFO_LENGTH_MISMATCH;
+            };
+            let Some(new_tls_data) = thread_data.read_tls_data() else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            // TODO(multi-thread-tls): read ith thread's tls
+            let teb = MutPtr::<Platform, ThreadEnvironmentBlock>::from_usize(self.teb_address);
+            let Some(old_tls_data) = Self::read_teb_tls_pointer(teb) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+
+            litebox_util_log::debug!(
+                thread_data_index = index,
+                new_tls_data:% = format_args!("{new_tls_data:#x}"),
+                old_tls_data:% = format_args!("{old_tls_data:#x}");
+                "Replacing process TLS vector"
+            );
+
+            if let Err(status) = self.copy_initial_tls_slots(old_tls_data, new_tls_data) {
+                return status;
+            }
+            let old_tls_data_for_guest = self.guest_visible_old_tls_vector(old_tls_data);
+
+            if thread_data.write_tls_data(old_tls_data_for_guest).is_none()
+                || Self::write_teb_tls_pointer(teb, new_tls_data).is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            if old_tls_data_for_guest == 0
+                && thread_data
+                    .write_flags(ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN)
+                    .is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+        }
+
+        NtStatus::SUCCESS
+    }
+
+    fn replace_tls_index(
+        &self,
+        process_information: MutPtr<Platform, u8>,
+        header: ProcessTlsInformationHeader,
+        layout: ProcessTlsLayout,
+    ) -> NtStatus {
+        let tls_index = header.tls_index as usize;
+        if tls_index >= TEB_TLS_SLOT_COUNT {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        for index in 0..header.thread_data_count as usize {
+            let Some(thread_data) = layout.thread_data::<Platform>(process_information, index)
+            else {
+                return NtStatus::INFO_LENGTH_MISMATCH;
+            };
+            let Some(new_tls_data) = thread_data.read_tls_data() else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            // TODO(multi-thread-tls): read ith thread's tls
+            let teb = ConstPtr::<Platform, ThreadEnvironmentBlock>::from_usize(self.teb_address);
+            let Some(tls_array) = Self::read_teb_tls_pointer(teb) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            if tls_array == 0 {
+                continue;
+            }
+            let tls_slots = MutPtr::<Platform, usize>::from_usize(tls_array);
+            let Some(old_tls_data) = tls_slots.read_at_offset(tls_index.cast_signed()) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+
+            litebox_util_log::debug!(
+                thread_data_index = index,
+                tls_index,
+                tls_array:% = format_args!("{tls_array:#x}"),
+                new_tls_data:% = format_args!("{new_tls_data:#x}"),
+                old_tls_data:% = format_args!("{old_tls_data:#x}");
+                "Replacing process TLS index"
+            );
+
+            if thread_data.write_tls_data(old_tls_data).is_none()
+                || tls_slots
+                    .write_at_offset(tls_index.cast_signed(), new_tls_data)
+                    .is_none()
+                || thread_data
+                    .write_flags(ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN)
+                    .is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+        }
+
+        NtStatus::SUCCESS
+    }
+
+    fn guest_visible_old_tls_vector(&self, old_tls_data: usize) -> usize {
+        if old_tls_data > 0x10010
+            && old_tls_data >= self.teb_address
+            && old_tls_data
+                < self
+                    .teb_address
+                    .saturating_add(size_of::<ThreadEnvironmentBlock>())
+        {
+            // The loader frees the returned old vector. The initial vector lives inside
+            // TEB.tls_slots, so report no heap-backed vector instead of exposing TEB memory.
+            0
+        } else {
+            old_tls_data
+        }
+    }
+
+    fn copy_initial_tls_slots(
+        &self,
+        old_tls_data: usize,
+        new_tls_data: usize,
+    ) -> Result<(), NtStatus> {
+        if old_tls_data <= 0x10010 || new_tls_data <= 0x10010 {
+            return Ok(());
+        }
+        let initial_tls_slots = self
+            .teb_address
+            .checked_add(offset_of!(ThreadEnvironmentBlock, tls_slots))
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if old_tls_data != initial_tls_slots {
+            return Ok(());
+        }
+        let old_tls_slots = ConstPtr::<Platform, usize>::from_usize(old_tls_data);
+        let new_tls_slots = MutPtr::<Platform, usize>::from_usize(new_tls_data);
+        for index in 0..TEB_TLS_SLOT_COUNT.cast_signed() {
+            let slot_value = old_tls_slots
+                .read_at_offset(index)
+                .ok_or(NtStatus::ACCESS_VIOLATION)?;
+            new_tls_slots
+                .write_at_offset(index, slot_value)
+                .ok_or(NtStatus::ACCESS_VIOLATION)?;
+        }
+
+        Ok(())
+    }
+
+    fn read_teb_tls_pointer<Ptr: litebox::platform::RawConstPointer<ThreadEnvironmentBlock>>(
+        teb: Ptr,
+    ) -> Option<usize> {
+        crate::read_field_at_offset::<Platform, _>(
+            teb.as_usize(),
+            offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer),
+        )
+    }
+
+    fn write_teb_tls_pointer(
+        teb: MutPtr<Platform, ThreadEnvironmentBlock>,
+        value: usize,
+    ) -> Option<()> {
+        crate::write_field_at_offset::<Platform, _>(
+            teb.as_usize(),
+            offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer),
+            value,
+        )
+    }
+
     fn process_basic_information(&self) -> ProcessBasicInformation {
         ProcessBasicInformation {
             exit_status: ACTIVE_PROCESS_EXIT_STATUS,
@@ -272,21 +694,16 @@ pub(crate) const fn default_process_cookie() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr};
+    use crate::tests::{mut_byte_ptr, mut_ptr, null_mut_ptr};
     use litebox::platform::ThreadProvider;
 
     const RETURN_LENGTH_SENTINEL: u32 = 0xaaaa_aaaa;
 
     type TestPlatform = crate::tests::TestPlatform;
-    type TestTask = Task<TestPlatform, crate::tests::TestFS>;
 
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
         let _ = crate::tests::test_platform();
         <TestPlatform as ThreadProvider>::run_test_thread(f)
-    }
-
-    fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
-        ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
     }
 
     #[test]
@@ -366,7 +783,8 @@ mod tests {
     #[test]
     fn nt_set_information_process_scheduler_shared_data_validates_arguments() {
         run_with_test_platform_pointers(|| {
-            let information = ProcessSchedulerSharedDataSlotInformation {
+            let task = crate::tests::test_task();
+            let mut information = ProcessSchedulerSharedDataSlotInformation {
                 scheduler_shared_data_handle: 0,
             };
             let information_len: u32 =
@@ -374,50 +792,50 @@ mod tests {
             let bad_handle = ProcessHandle::from_raw(0x1234);
 
             assert_eq!(
-                TestTask::sys_nt_set_information_process(
+                task.sys_nt_set_information_process(
                     bad_handle,
                     ProcessInformationClass::SchedulerSharedData as u32,
-                    null_const_ptr::<u8>(),
+                    null_mut_ptr::<u8>(),
                     information_len - 1,
                 ),
                 NtStatus::INFO_LENGTH_MISMATCH
             );
 
             assert_eq!(
-                TestTask::sys_nt_set_information_process(
+                task.sys_nt_set_information_process(
                     bad_handle,
                     0xffff,
-                    const_byte_ptr(&information),
+                    mut_byte_ptr(&mut information),
                     information_len - 1,
                 ),
                 NtStatus::INVALID_INFO_CLASS
             );
 
             assert_eq!(
-                TestTask::sys_nt_set_information_process(
+                task.sys_nt_set_information_process(
                     bad_handle,
                     ProcessInformationClass::SchedulerSharedData as u32,
-                    null_const_ptr::<u8>(),
+                    null_mut_ptr::<u8>(),
                     information_len,
                 ),
                 NtStatus::INVALID_HANDLE
             );
 
             assert_eq!(
-                TestTask::sys_nt_set_information_process(
+                task.sys_nt_set_information_process(
                     ProcessHandle::CURRENT,
                     ProcessInformationClass::SchedulerSharedData as u32,
-                    null_const_ptr::<u8>(),
+                    null_mut_ptr::<u8>(),
                     information_len,
                 ),
                 NtStatus::ACCESS_VIOLATION
             );
 
             assert_eq!(
-                TestTask::sys_nt_set_information_process(
+                task.sys_nt_set_information_process(
                     ProcessHandle::CURRENT,
                     ProcessInformationClass::SchedulerSharedData as u32,
-                    const_byte_ptr(&information),
+                    mut_byte_ptr(&mut information),
                     information_len,
                 ),
                 NtStatus::SUCCESS
@@ -562,10 +980,10 @@ mod tests {
         #[test]
         fn nt_set_information_process_scheduler_shared_data_matches_host_statuses() {
             run_with_test_platform_pointers(|| {
-                let null_information = ProcessSchedulerSharedDataSlotInformation {
+                let mut null_information = ProcessSchedulerSharedDataSlotInformation {
                     scheduler_shared_data_handle: 0,
                 };
-                let bogus_information = ProcessSchedulerSharedDataSlotInformation {
+                let mut bogus_information = ProcessSchedulerSharedDataSlotInformation {
                     scheduler_shared_data_handle: 0x1234,
                 };
                 let information_len: u32 =
@@ -598,7 +1016,7 @@ mod tests {
                             ProcessHandle::CURRENT,
                             scheduler_class,
                             core::ptr::from_ref(&null_information).cast::<c_void>(),
-                            const_byte_ptr(&null_information),
+                            mut_byte_ptr(&mut null_information),
                             information_len,
                         ),
                         (
@@ -606,7 +1024,7 @@ mod tests {
                             ProcessHandle::CURRENT,
                             scheduler_class,
                             core::ptr::from_ref(&bogus_information).cast::<c_void>(),
-                            const_byte_ptr(&bogus_information),
+                            mut_byte_ptr(&mut bogus_information),
                             information_len,
                         ),
                         (
@@ -614,7 +1032,7 @@ mod tests {
                             ProcessHandle::CURRENT,
                             scheduler_class,
                             core::ptr::from_ref(&null_information).cast::<c_void>(),
-                            const_byte_ptr(&null_information),
+                            mut_byte_ptr(&mut null_information),
                             information_len - 1,
                         ),
                         (
@@ -622,7 +1040,7 @@ mod tests {
                             ProcessHandle::CURRENT,
                             scheduler_class,
                             core::ptr::null(),
-                            null_const_ptr::<u8>(),
+                            null_mut_ptr::<u8>(),
                             information_len,
                         ),
                         (
@@ -630,7 +1048,7 @@ mod tests {
                             ProcessHandle::CURRENT,
                             bad_class,
                             core::ptr::from_ref(&null_information).cast::<c_void>(),
-                            const_byte_ptr(&null_information),
+                            mut_byte_ptr(&mut null_information),
                             information_len,
                         ),
                         (
@@ -638,7 +1056,7 @@ mod tests {
                             ProcessHandle::from_raw(0x1234),
                             scheduler_class,
                             core::ptr::from_ref(&null_information).cast::<c_void>(),
-                            const_byte_ptr(&null_information),
+                            mut_byte_ptr(&mut null_information),
                             information_len,
                         ),
                         (
@@ -646,7 +1064,7 @@ mod tests {
                             ProcessHandle::from_raw(0x1234),
                             scheduler_class,
                             core::ptr::null(),
-                            null_const_ptr::<u8>(),
+                            null_mut_ptr::<u8>(),
                             information_len - 1,
                         ),
                         (
@@ -654,7 +1072,7 @@ mod tests {
                             ProcessHandle::from_raw(0x1234),
                             bad_class,
                             core::ptr::from_ref(&null_information).cast::<c_void>(),
-                            const_byte_ptr(&null_information),
+                            mut_byte_ptr(&mut null_information),
                             information_len - 1,
                         ),
                         (
@@ -662,7 +1080,7 @@ mod tests {
                             ProcessHandle::from_raw(0x1234),
                             scheduler_class,
                             core::ptr::null(),
-                            null_const_ptr::<u8>(),
+                            null_mut_ptr::<u8>(),
                             information_len,
                         ),
                         (
@@ -670,7 +1088,7 @@ mod tests {
                             ProcessHandle::CURRENT,
                             scheduler_class,
                             core::ptr::null(),
-                            null_const_ptr::<u8>(),
+                            null_mut_ptr::<u8>(),
                             information_len - 1,
                         ),
                         (
@@ -678,7 +1096,7 @@ mod tests {
                             ProcessHandle::CURRENT,
                             bad_class,
                             core::ptr::from_ref(&null_information).cast::<c_void>(),
-                            const_byte_ptr(&null_information),
+                            mut_byte_ptr(&mut null_information),
                             information_len - 1,
                         ),
                     ] {
@@ -688,7 +1106,8 @@ mod tests {
                             host_process_information,
                             process_information_length,
                         );
-                        let shim = TestTask::sys_nt_set_information_process(
+                        let task = crate::tests::test_task();
+                        let shim = task.sys_nt_set_information_process(
                             shim_process_handle,
                             process_information_class,
                             shim_process_information,

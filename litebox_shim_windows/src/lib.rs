@@ -153,17 +153,26 @@ where
     ptr.write_at_offset(0, value)
 }
 
-fn write_field_at_offset<Platform, Struct, Field>(
-    base: MutPtr<Platform, Struct>,
+fn read_field_at_offset<Platform, Field>(base: usize, field_offset: usize) -> Option<Field>
+where
+    Platform: RawPointerProvider,
+    Field: zerocopy::FromBytes,
+{
+    let address = base.checked_add(field_offset)?;
+    let ptr = ConstPtr::<Platform, Field>::from_usize(address);
+    ptr.read_at_offset(0)
+}
+
+fn write_field_at_offset<Platform, Field>(
+    base: usize,
     field_offset: usize,
     value: Field,
 ) -> Option<()>
 where
     Platform: RawPointerProvider,
-    Struct: zerocopy::FromBytes + zerocopy::IntoBytes,
     Field: zerocopy::FromBytes + zerocopy::IntoBytes,
 {
-    let address = base.as_usize().checked_add(field_offset)?;
+    let address = base.checked_add(field_offset)?;
     let ptr = MutPtr::<Platform, Field>::from_usize(address);
     ptr.write_at_offset(0, value)
 }
@@ -1141,7 +1150,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 process_information,
                 process_information_length,
             } => {
-                let status = Self::sys_nt_set_information_process(
+                let status = self.sys_nt_set_information_process(
                     process_handle,
                     process_information_class,
                     process_information,
