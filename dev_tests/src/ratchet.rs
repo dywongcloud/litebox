@@ -38,8 +38,9 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_linux_kernel/", 6),
             // `litebox_platform_linux_userland` includes the process-wide
             // alternate-signal-stack pool (`ALT_STACK_POOL`), a deliberate
-            // cross-thread cache.
-            ("litebox_platform_linux_userland/", 6),
+            // cross-thread cache, and the `HAVE_FSGSBASE` capability flag
+            // read from the guest/host transition assembly.
+            ("litebox_platform_linux_userland/", 7),
             ("litebox_platform_lvbs/", 23),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
