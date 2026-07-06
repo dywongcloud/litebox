@@ -45,7 +45,8 @@ fn copy_file_permissions(
 fn main() -> anyhow::Result<()> {
     let cli_args = CliArgs::parse();
     let mut input_binary = std::fs::File::open(&cli_args.input_binary)?;
-    let mut input_binary_bytes = vec![];
+    let mut input_binary_bytes =
+        Vec::with_capacity(usize::try_from(input_binary.metadata()?.len()).unwrap_or(0));
     input_binary.read_to_end(&mut input_binary_bytes)?;
     let output_binary = litebox_syscall_rewriter::hook_syscalls_in_elf(
         &input_binary_bytes,

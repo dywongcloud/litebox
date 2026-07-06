@@ -23,15 +23,14 @@ impl Task {
         prot: ProtFlags,
         flags: MapFlags,
     ) -> Result<UserMutPtr<u8>, MappingError> {
-        let op = |_| Ok(0);
-        litebox_common_linux::mm::do_mmap(
+        // No initialization needed, so map directly with the final permissions.
+        litebox_common_linux::mm::do_mmap_no_init(
             &self.global.pm,
             suggested_addr,
             len,
             prot,
             flags,
             false,
-            op,
         )
     }
 

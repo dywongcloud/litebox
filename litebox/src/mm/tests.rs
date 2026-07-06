@@ -295,3 +295,50 @@ fn test_vmm_mapping() {
         ]
     );
 }
+
+#[test]
+fn test_vmm_protect_coalescing() {
+    let start: usize = 0x1_0000;
+    let mut vmm = Vmem::new(&DummyVmemBackend);
+    let range = PageRange::new(start, start + 4 * PAGE_SIZE).unwrap();
+    unsafe {
+        vmm.insert_mapping(
+            range,
+            VmArea::new(
+                VmFlags::VM_READ | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
+                false,
+            ),
+            false,
+            crate::platform::page_mgmt::FixedAddressBehavior::Replace,
+        )
+    }
+    .unwrap();
+
+    // Split the mapping: the middle page becomes READ | WRITE.
+    unsafe {
+        vmm.protect_mapping(
+            PageRange::new(start + PAGE_SIZE, start + 2 * PAGE_SIZE).unwrap(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        )
+    }
+    .unwrap();
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![
+            start..start + PAGE_SIZE,
+            start + PAGE_SIZE..start + 2 * PAGE_SIZE,
+            start + 2 * PAGE_SIZE..start + 4 * PAGE_SIZE,
+        ]
+    );
+
+    // Protect the whole range: the areas needing change are coalesced around the already-RW
+    // middle page, and the resulting equal-flag areas merge back into a single mapping.
+    unsafe {
+        vmm.protect_mapping(
+            range,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        )
+    }
+    .unwrap();
+    assert_eq!(collect_mappings(&vmm), vec![start..start + 4 * PAGE_SIZE]);
+}

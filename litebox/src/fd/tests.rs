@@ -117,6 +117,86 @@ fn test_with_entry() {
 }
 
 #[test]
+fn test_lowest_slot_reuse() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+
+    // Span more than one bitmap word to exercise the word-scan logic.
+    let fds: Vec<TypedFd<MockSubsystem>> = (0..70)
+        .map(|i| {
+            let fd = descriptors.insert(MockEntry {
+                data: i.to_string(),
+            });
+            assert_eq!(fd.as_internal_fd().raw, i);
+            fd
+        })
+        .collect();
+
+    // Free a couple of slots (one per bitmap word) and check that the lowest
+    // free slot is always reused first (POSIX lowest-fd semantics).
+    for &idx in &[3usize, 65] {
+        assert!(descriptors.remove(&fds[idx]).is_some());
+    }
+    let fd: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "reused".to_string(),
+    });
+    assert_eq!(fd.as_internal_fd().raw, 3);
+    let fd2 = descriptors.duplicate(&fd).unwrap();
+    assert_eq!(fd2.as_internal_fd().raw, 65);
+    // All lower slots are in use again, so the next insert extends the table.
+    let fd3: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "appended".to_string(),
+    });
+    assert_eq!(fd3.as_internal_fd().raw, 70);
+
+    // Clean up: close everything out (note `fd`/`fd2` share an entry, so only the
+    // last removal returns it).
+    assert!(descriptors.remove(&fd).is_none());
+    assert!(descriptors.remove(&fd2).is_some());
+    assert!(descriptors.remove(&fd3).is_some());
+    for (i, fd) in fds.into_iter().enumerate() {
+        if i != 3 && i != 65 {
+            assert!(descriptors.remove(&fd).is_some());
+        }
+    }
+}
+
+#[test]
+fn test_raw_integer_lowest_reuse() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+    let mut rds = super::RawDescriptorStorage::new();
+
+    let raw_fds: Vec<usize> = (0..3)
+        .map(|i| {
+            let fd: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+                data: i.to_string(),
+            });
+            rds.fd_into_raw_integer(fd)
+        })
+        .collect();
+    assert_eq!(raw_fds, vec![0, 1, 2]);
+
+    // Consuming a raw fd frees its integer for reuse, lowest-first.
+    let _ = rds.fd_consume_raw_integer::<MockSubsystem>(1).unwrap();
+    let fd: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "reused".to_string(),
+    });
+    assert_eq!(rds.fd_into_raw_integer(fd), 1);
+
+    // A specifically-placed fd is skipped over by subsequent allocations.
+    let fd: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "specific".to_string(),
+    });
+    assert!(rds.fd_into_specific_raw_integer(fd, 4));
+    let fd: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "next".to_string(),
+    });
+    assert_eq!(rds.fd_into_raw_integer(fd), 3);
+    assert!(rds.is_alive(4));
+}
+
+#[test]
 fn test_fd_raw_integer() {
     let litebox = litebox();
     let mut descriptors = litebox.descriptor_table_mut();

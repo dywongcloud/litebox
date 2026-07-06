@@ -866,11 +866,15 @@ impl<FS: ShimFS> Task<FS> {
         self.check_raw_fd_exists(fd)?;
         check_iovcnt(iovcnt)?;
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
-        let mut kernel_buffer = vec![0u8; PAGE_SIZE];
-        read_from_iovec(iovs, &mut kernel_buffer, |buf, total| {
-            let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
-            self.sys_read(fd, buf, Some(cur_offset))
-        })
+        self.with_scratch_buf(
+            total_iov_len(iovs.iter().map(|iov| iov.iov_len)),
+            |kernel_buffer| {
+                read_from_iovec(iovs, kernel_buffer, |buf, total| {
+                    let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
+                    self.sys_read(fd, buf, Some(cur_offset))
+                })
+            },
+        )
     }
 
     /// Handle syscall `pwritev`
@@ -903,13 +907,17 @@ impl<FS: ShimFS> Task<FS> {
         self.check_raw_fd_exists(fd)?;
         check_iovcnt(iovcnt)?;
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
-        let mut kernel_buffer = vec![0u8; PAGE_SIZE];
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        read_from_iovec(iovs, &mut kernel_buffer, |buf, _total| {
-            self.sys_read(fd, buf, None)
-        })
+        self.with_scratch_buf(
+            total_iov_len(iovs.iter().map(|iov| iov.iov_len)),
+            |kernel_buffer| {
+                read_from_iovec(iovs, kernel_buffer, |buf, _total| {
+                    self.sys_read(fd, buf, None)
+                })
+            },
+        )
     }
 }
 
@@ -952,6 +960,12 @@ fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno
         }
     }
     Ok(())
+}
+
+/// Total byte count of a set of iovecs, saturated; used only to size kernel
+/// buffers (overlong totals are rejected separately by [`check_iov_lens`]).
+fn total_iov_len(iov_lens: impl IntoIterator<Item = usize>) -> usize {
+    iov_lens.into_iter().fold(0usize, usize::saturating_add)
 }
 
 /// Drain reads into a sequence of user iovecs.
@@ -1022,17 +1036,19 @@ where
             continue;
         }
         if kernel_buffer.is_empty() {
-            kernel_buffer.resize(PAGE_SIZE, 0);
+            kernel_buffer.resize(
+                total_iov_len(iovs.iter().map(|iov| iov.iov_len)).min(crate::MAX_KERNEL_BUF_SIZE),
+                0,
+            );
         }
         let mut iov_written = 0;
         while iov_written < iov_len {
             let to_write = (iov_len - iov_written).min(kernel_buffer.len());
-            let base_offset = isize::try_from(iov_written).unwrap();
-            for (byte_offset, byte) in (0_isize..).zip(kernel_buffer[..to_write].iter_mut()) {
-                let Some(value) = iov_base.read_at_offset(base_offset + byte_offset) else {
-                    return bail(total_written, Errno::EFAULT);
-                };
-                *byte = value;
+            if iov_base
+                .copy_to_slice(iov_written, &mut kernel_buffer[..to_write])
+                .is_none()
+            {
+                return bail(total_written, Errno::EFAULT);
             }
             let size = match write_fn(&kernel_buffer[..to_write], total_written) {
                 Ok(size) => size,

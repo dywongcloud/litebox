@@ -112,10 +112,11 @@ impl core::fmt::Debug for LinuxUserland {
 }
 
 /// Information about a CoW-eligible memory region backed by a file.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CowRegionInfo {
-    /// The path to the backing file on the host filesystem.
-    file_path: PathBuf,
+    /// The backing file, opened read-only once at registration time so that
+    /// each CoW mapping is a single host `mmap` (no per-mapping open/close).
+    file: std::fs::File,
     /// Length of the backing file.
     file_length: usize,
 }
@@ -173,8 +174,11 @@ impl LinuxUserland {
     ///
     /// # Panics
     ///
+    /// Panics if the host does not support user-mode FSGSBASE instructions.
+    ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+        assert_fsgsbase_support();
         register_exception_handlers();
 
         let tun_socket_fd = tun_device_name
@@ -266,11 +270,20 @@ impl LinuxUserland {
     ///
     /// # Panics
     ///
+    /// Panics if the backing file cannot be opened read-only.
+    ///
     /// Panics if an overlapping region is already registered.
     pub fn register_cow_region(&self, data: &'static [u8], file_path: impl Into<PathBuf>) {
         let start = data.as_ptr() as usize;
+        let file_path = file_path.into();
+        let file = std::fs::File::open(&file_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to open CoW backing file {}: {err}",
+                file_path.display()
+            )
+        });
         let info = CowRegionInfo {
-            file_path: file_path.into(),
+            file,
             file_length: data.len(),
         };
 
@@ -285,9 +298,11 @@ impl LinuxUserland {
 
     /// Look up the file backing a static slice for CoW mapping.
     ///
-    /// Returns `Some((file_path, offset_in_file))` if the slice is backed by a registered
-    /// CoW region, `None` otherwise.
-    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(PathBuf, usize)> {
+    /// Returns `Some((fd, offset_in_file))` if the slice is backed by a registered
+    /// CoW region, `None` otherwise. The returned raw fd stays valid for the
+    /// process lifetime: regions are never unregistered and the platform is
+    /// leaked (`&'static`).
+    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(std::os::fd::RawFd, usize)> {
         let slice_start = source_data.as_ptr() as usize;
         let slice_len = source_data.len();
 
@@ -298,7 +313,7 @@ impl LinuxUserland {
             let slice_end = slice_start.checked_add(slice_len).unwrap();
 
             if slice_start >= region_start && slice_end <= region_end {
-                return Some((info.file_path.clone(), slice_start - region_start));
+                return Some((info.file.as_raw_fd(), slice_start - region_start));
             }
         }
         None
@@ -451,6 +466,13 @@ impl LinuxUserland {
             (libc::SYS_clone3, vec![]),
             // sync
             (libc::SYS_futex, vec![]),
+            // time: glibc normally services these via the vDSO, but it falls
+            // back to the real syscalls when the clocksource is not
+            // vDSO-capable (e.g. an unstable TSC in PVM guests), so they must
+            // be allowed. They are read-only and sandbox-safe.
+            (libc::SYS_clock_gettime, vec![]),
+            (libc::SYS_clock_getres, vec![]),
+            (libc::SYS_gettimeofday, vec![]),
             // misc
             (libc::SYS_getrandom, vec![]),
             // required by std spawn
@@ -463,7 +485,9 @@ impl LinuxUserland {
             // required by libc allocator
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
-            // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
+            // CoW backing files are pre-opened at registration time (see
+            // `register_cow_region`); this read-only rule remains for host
+            // libc internals.
             (
                 libc::SYS_open,
                 vec![
@@ -518,6 +542,20 @@ impl litebox::platform::SignalProvider for LinuxUserland {
 
 /// Atomically takes the per-thread pending host signal bitmask.
 fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
+    // Fast path: a plain load first. Only this thread consumes the mask
+    // (signal handlers merely OR bits in), so a zero read means there is
+    // nothing to take and the locked `xchg` can be skipped.
+    let pending: u32;
+    unsafe {
+        core::arch::asm!(
+            concat!("mov {tmp:e}, DWORD PTR ", tls!("pending_host_signals")),
+            tmp = out(reg) pending,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    if pending == 0 {
+        return litebox_common_linux::signal::SigSet::from_u64(0);
+    }
     // Atomically swap the per-thread pending signals with zero.
     // Only the low 32 bits are used (covers traditional signals 1-31).
     let lo: u32;
@@ -980,6 +1018,10 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         thread.interrupt();
     }
 
+    fn num_cpus(&self) -> Option<core::num::NonZeroUsize> {
+        std::thread::available_parallelism().ok()
+    }
+
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
@@ -1225,7 +1267,12 @@ impl litebox::platform::TimeProvider for LinuxUserland {
 
     fn now(&self) -> Self::Instant {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
+        assert!(
+            ret == 0,
+            "clock_gettime(CLOCK_MONOTONIC) failed: {}",
+            std::io::Error::last_os_error()
+        );
         let t = unsafe { t.assume_init() };
         Instant {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
@@ -1238,7 +1285,12 @@ impl litebox::platform::TimeProvider for LinuxUserland {
 
     fn current_time(&self) -> Self::SystemTime {
         let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
+        assert!(
+            ret == 0,
+            "clock_gettime(CLOCK_REALTIME) failed: {}",
+            std::io::Error::last_os_error()
+        );
         let t = unsafe { t.assume_init() };
         SystemTime {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
@@ -1349,7 +1401,6 @@ enum FutexOperation {
 }
 
 /// Safer invocation of the Linux futex syscall, with the "timeout" variant of the arguments.
-#[expect(clippy::similar_names, reason = "sec/nsec are as needed by libc")]
 fn futex_timeout(
     uaddr: &AtomicU32,
     futex_op: FutexOperation,
@@ -1359,20 +1410,9 @@ fn futex_timeout(
 ) -> Result<usize, syscalls::Errno> {
     let uaddr: *const AtomicU32 = std::ptr::from_ref(uaddr);
     let futex_op: i32 = futex_op as _;
-    let timeout = timeout.map(|t| {
-        const TEN_POWER_NINE: u128 = 1_000_000_000;
-        let nanos: u128 = t.as_nanos();
-        let tv_sec = nanos
-            .checked_div(TEN_POWER_NINE)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let tv_nsec = nanos
-            .checked_rem(TEN_POWER_NINE)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        litebox_common_linux::Timespec { tv_sec, tv_nsec }
+    let timeout = timeout.map(|t| litebox_common_linux::Timespec {
+        tv_sec: t.as_secs().try_into().unwrap(),
+        tv_nsec: t.subsec_nanos().into(),
     });
     let uaddr2: *const AtomicU32 = uaddr2.map_or(std::ptr::null(), |u| u);
     unsafe {
@@ -1556,6 +1596,25 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(())
     }
 
+    unsafe fn discard_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::DiscardError> {
+        // A single host `madvise(MADV_DONTNEED)` resets anonymous private pages to
+        // zero-fill-on-demand without remapping. On failure, report `Unsupported` so
+        // that the caller falls back to re-creating the mapping.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::madvise,
+                range.start,
+                range.len(),
+                usize::try_from(libc::MADV_DONTNEED).unwrap(),
+            )
+        }
+        .map(|_| ())
+        .map_err(|_| litebox::platform::page_mgmt::DiscardError::Unsupported)
+    }
+
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
         self.reserved_pages.iter()
     }
@@ -1567,25 +1626,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
-        let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
+        let Some((fd, file_offset)) = self.lookup_cow_region(source_data) else {
             return Err(CowAllocationError::UnsupportedSourceRegion);
         };
         if !file_offset.is_multiple_of(ALIGN) {
             return Err(CowAllocationError::Unaligned);
         }
-
-        let file_path_cstr =
-            std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
-        // TODO(jb): We should likely be storing pre-opened FDs, right?
-        let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
-                file_path_cstr.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
-        let fd = fd.expect("file should remain unchanged on host");
 
         let mut flags = MapFlags::MAP_PRIVATE;
         match fixed_address_behavior {
@@ -1606,7 +1652,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 source_data.len(),
                 prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
                 flags.bits().reinterpret_as_unsigned() as usize,
-                fd,
+                usize::try_from(fd).unwrap(),
                 {
                     #[cfg(target_arch = "x86_64")]
                     {
@@ -1615,8 +1661,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 },
             )
         };
-
-        let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
 
         match result {
             Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
@@ -1793,6 +1837,25 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     }
 }
 
+/// Asserts that the host allows user-mode FSGSBASE instructions.
+///
+/// The guest/host transition code relies on `rdfsbase`/`wrgsbase` etc., which
+/// raise `#UD` (delivered as `SIGILL`) unless the kernel has set
+/// `CR4.FSGSBASE`. Hosts booted with `nofsgsbase` (or CPUs/kernels too old to
+/// support it, e.g. pre-Ivy-Bridge or Linux < 5.9) would otherwise crash with
+/// an undiagnosable `SIGILL` at the first guest entry, so fail fast with an
+/// actionable message instead.
+fn assert_fsgsbase_support() {
+    /// `HWCAP2_FSGSBASE` from `asm/hwcap2.h` (not exposed by the `libc` crate).
+    const HWCAP2_FSGSBASE: libc::c_ulong = 1 << 1;
+    let hwcap2 = unsafe { libc::getauxval(libc::AT_HWCAP2) };
+    assert!(
+        hwcap2 & HWCAP2_FSGSBASE != 0,
+        "host does not support user-mode FSGSBASE instructions, which LiteBox requires \
+         (CPU too old, kernel older than 5.9, or booted with `nofsgsbase`)"
+    );
+}
+
 static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
 static INTERRUPT_SIGNAL_NUMBER: AtomicI32 = AtomicI32::new(0);
 
@@ -1888,41 +1951,53 @@ fn register_exception_handlers() {
     });
 }
 
+/// Free list of alternate signal stacks (base addresses of the guard page).
+///
+/// Stacks are uniform in size, so they can be reused by any thread. Reuse
+/// avoids an mmap/mprotect/munmap round trip per guest thread; the pool is
+/// never shrunk (stacks are reclaimed only at process exit).
+static ALT_STACK_POOL: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
 /// Runs `f` with an alternate signal stack set up.
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let alt_stack_size = libc::SIGSTKSZ * 2;
     let guard_page_size = 0x1000;
-    let stack_base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            guard_page_size + alt_stack_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    assert!(
-        stack_base != libc::MAP_FAILED,
-        "failed to allocate memory for alternate signal stack: {}",
-        std::io::Error::last_os_error()
-    );
-    let _unmap_guard = litebox::utils::defer(|| {
-        let r = unsafe { libc::munmap(stack_base, guard_page_size + alt_stack_size) };
-        assert!(
-            r == 0,
-            "failed to free memory for alternate signal stack: {}",
-            std::io::Error::last_os_error()
-        );
-    });
+    let pooled = ALT_STACK_POOL.lock().unwrap().pop();
+    let stack_base = pooled.map_or_else(
+        || {
+            let stack_base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    guard_page_size + alt_stack_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert!(
+                stack_base != libc::MAP_FAILED,
+                "failed to allocate memory for alternate signal stack: {}",
+                std::io::Error::last_os_error()
+            );
 
-    // Set up a guard page to catch stack overflows.
-    let r = unsafe { libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE) };
-    assert!(
-        r == 0,
-        "failed to set guard page for alternate signal stack: {}",
-        std::io::Error::last_os_error()
+            // Set up a guard page to catch stack overflows.
+            let r = unsafe { libc::mprotect(stack_base, guard_page_size, libc::PROT_NONE) };
+            assert!(
+                r == 0,
+                "failed to set guard page for alternate signal stack: {}",
+                std::io::Error::last_os_error()
+            );
+            stack_base
+        },
+        |addr| addr as *mut libc::c_void,
     );
+    // Return the stack to the pool once we are no longer running on it. This
+    // runs after `_restore_guard` below (drop order is reverse declaration
+    // order), i.e. only after the original signal stack has been restored.
+    let _pool_guard = litebox::utils::defer(|| {
+        ALT_STACK_POOL.lock().unwrap().push(stack_base as usize);
+    });
 
     let alt_stack = libc::stack_t {
         ss_sp: stack_base.cast(),
