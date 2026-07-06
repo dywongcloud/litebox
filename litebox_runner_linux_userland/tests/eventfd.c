@@ -10,7 +10,15 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
+
+#define SENDFILE_DST_PATH "/tmp/lb_eventfd_sendfile_dst"
+
+static ssize_t sys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
+    return (ssize_t)syscall(SYS_sendfile, out_fd, in_fd, offset, count);
+}
 
 static int expect_eagain_read(int fd) {
     uint64_t value = 0;
@@ -85,6 +93,14 @@ static int expect_nonblock(int fd, int expected) {
         return 1;
     }
     return ((flags & O_NONBLOCK) != 0) == expected ? 0 : 2;
+}
+
+static int expect_cloexec(int fd, int expected) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) {
+        return 1;
+    }
+    return ((flags & FD_CLOEXEC) != 0) == expected ? 0 : 2;
 }
 
 static int expect_ebadf_close(int fd) {
@@ -220,6 +236,51 @@ static int test_epoll_wakeup(void) {
         return 8;
     }
     return expect_close(fd) == 0 ? 0 : 9;
+}
+
+static int test_sendfile_in_fd(void) {
+    int fd = eventfd(7, 0);
+    if (fd < 0) {
+        return 1;
+    }
+    int dst = open(SENDFILE_DST_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (dst < 0) {
+        return 2;
+    }
+
+    errno = 0;
+    if (sys_sendfile(dst, fd, NULL, 4) != -1 || errno != EINVAL) {
+        return 3;
+    }
+
+    off_t off = 0;
+    errno = 0;
+    if (sys_sendfile(dst, fd, &off, 4) != -1 || errno != ESPIPE) {
+        return 4;
+    }
+
+    if (expect_close(dst) != 0) {
+        return 5;
+    }
+    unlink(SENDFILE_DST_PATH);
+    return expect_close(fd) == 0 ? 0 : 6;
+}
+
+static int test_cloexec_flag(void) {
+    int fd = eventfd(0, EFD_CLOEXEC);
+    if (fd < 0) {
+        return 1;
+    }
+    if (expect_cloexec(fd, 1) != 0) {
+        return 2;
+    }
+    if (fcntl(fd, F_SETFD, 0) != 0) {
+        return 3;
+    }
+    if (expect_cloexec(fd, 0) != 0) {
+        return 4;
+    }
+    return expect_close(fd) == 0 ? 0 : 5;
 }
 
 int main(void) {
@@ -463,6 +524,12 @@ int main(void) {
     }
     if (test_epoll_wakeup() != 0) {
         return 142;
+    }
+    if (test_sendfile_in_fd() != 0) {
+        return 143;
+    }
+    if (test_cloexec_flag() != 0) {
+        return 144;
     }
 
     alarm(0);
