@@ -65,12 +65,24 @@ impl<M: MemoryProvider> FrameDeallocator<Size4KiB> for PageTableAllocator<M> {
 }
 
 pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
-    let mut flags = PageTableFlags::empty();
+    // Pre-set ACCESSED on every faulted-in leaf PTE. Otherwise the CPU's page-table
+    // walker sets the A bit itself on first access with a locked, microcoded write
+    // that takes the PTE cache line for exclusive ownership (an RFO). Filling in the
+    // software-known result up front avoids that write, cutting cache-coherency
+    // traffic and slightly speeding up the walk. Mirrors Linux's pte_mkyoung() on
+    // fault-in. ACCESSED/DIRTY are excluded from MPROTECT_PTE_MASK, so mprotect never
+    // observes or clears them, and no code in this platform reads A/D for data pages,
+    // so this is a pure hardware-walk optimization with no semantic effect.
+    let mut flags = PageTableFlags::ACCESSED;
     if values.intersects(VmFlags::VM_READ | VmFlags::VM_WRITE) {
         flags |= PageTableFlags::USER_ACCESSIBLE;
     }
     if values.contains(VmFlags::VM_WRITE) {
-        flags |= PageTableFlags::WRITABLE;
+        // Writable leaves are additionally pre-marked DIRTY (matching Linux's
+        // pte_mkdirty()): the first write would otherwise cost a second locked walker
+        // write to set D. DIRTY is only ever set together with WRITABLE, never on a
+        // read-only PTE.
+        flags |= PageTableFlags::WRITABLE | PageTableFlags::DIRTY;
     }
     if !values.contains(VmFlags::VM_EXEC) {
         flags |= PageTableFlags::NO_EXECUTE;
@@ -324,9 +336,15 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 let mut allocator = PageTableAllocator::<M>::new();
                 // TODO: if it is file-backed, we need to read the page from file
                 let frame = PageTableAllocator::<M>::allocate_frame(true).unwrap();
+                // Intermediate (non-leaf) entries the mapper may create for this leaf.
+                // ACCESSED is pre-set for the same reason as on the leaf: it spares the
+                // walker the locked A-bit write on these entries (Linux's _PAGE_TABLE
+                // includes _PAGE_ACCESSED). DIRTY is meaningless on non-leaf entries and
+                // is deliberately omitted.
                 let table_flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE;
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::ACCESSED;
                 match unsafe {
                     inner.map_to_with_table_flags(
                         page,
