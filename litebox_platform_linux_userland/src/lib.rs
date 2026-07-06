@@ -174,11 +174,9 @@ impl LinuxUserland {
     ///
     /// # Panics
     ///
-    /// Panics if the host does not support user-mode FSGSBASE instructions.
-    ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
-        assert_fsgsbase_support();
+        init_fsgsbase_mode();
         register_exception_handlers();
 
         let tun_socket_fd = tun_device_name
@@ -473,6 +471,10 @@ impl LinuxUserland {
             (libc::SYS_clock_gettime, vec![]),
             (libc::SYS_clock_getres, vec![]),
             (libc::SYS_gettimeofday, vec![]),
+            // segment-base switching on hosts without user-mode FSGSBASE
+            // (see `init_fsgsbase_mode`); affects only the calling thread's
+            // fs/gs bases, so it is sandbox-neutral.
+            (libc::SYS_arch_prctl, vec![]),
             // misc
             (libc::SYS_getrandom, vec![]),
             // required by std spawn
@@ -659,6 +661,8 @@ pending_host_signals:
 .globl wait_waker_addr
 wait_waker_addr:
     .quad 0
+host_fsbase:
+    .quad 0
     "
 );
 
@@ -723,10 +727,37 @@ unsafe extern "C-unwind" fn run_thread_arch(
     lea r8, [rsi + {GUEST_CONTEXT_SIZE}]
     mov fs:guest_context_top@tpoff, r8
 
-    // Save host fs base in gs base. This will stay set for the lifetime
+    // Save host fs base in gs base (and mirror it in the host_fsbase TLS
+    // slot for the no-FSGSBASE fallback). This will stay set for the lifetime
     // of this call stack.
+    cmp BYTE PTR [rip + {have_fsgsbase}], {FSGSBASE_NATIVE}
+    jne .Lrta_no_fsgsbase
     rdfsbase r8
     wrgsbase r8
+    jmp .Lrta_gs_done
+.Lrta_no_fsgsbase:
+    // arch_prctl(ARCH_GET_FS) then arch_prctl(ARCH_SET_GS). Raw syscalls
+    // clobber rax/rcx/r11 (dead here) plus the registers we load; rdx still
+    // holds the live `reenter` flag, so preserve it in r9.
+    mov r9, rdx
+    sub rsp, 8
+    mov edi, {ARCH_GET_FS}
+    mov rsi, rsp
+    mov eax, {SYS_arch_prctl}
+    syscall
+    pop r8              // host fs base
+    mov edi, {ARCH_SET_GS}
+    mov rsi, r8
+    mov eax, {SYS_arch_prctl}
+    syscall
+    mov rdx, r9
+.Lrta_gs_done:
+    mov fs:host_fsbase@tpoff, r8
+
+    // Reload the thread-context pointer (first handler argument): the
+    // no-FSGSBASE path above clobbers rdi/rsi with arch_prctl arguments.
+    // The pushed `rdi` (thread_ctx) is at the top of the stack.
+    mov rdi, [rsp]
 
     // Call init_handler or reenter_handler based on reenter flag (in dl).
     test dl, dl
@@ -749,15 +780,12 @@ syscall_callback:
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
 
-    // Restore host fs base.
-    rdfsbase r11
-    mov      gs:guest_fsbase@tpoff, r11
-    rdgsbase r11
-    wrfsbase r11
-
-    // Switch to the top of the guest context.
+    // Switch to the top of the guest context. The guest context is saved
+    // before the host fs base is restored so that the no-FSGSBASE fallback
+    // below may clobber registers and flags freely; until then only
+    // gs-relative TLS (host base) and flag-preserving instructions are used.
     mov     r11, rsp
-    mov     rsp, fs:guest_context_top@tpoff
+    mov     rsp, gs:guest_context_top@tpoff
 
     // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
@@ -783,6 +811,26 @@ syscall_callback:
     push    r13         // pt_regs->r13
     push    r14         // pt_regs->r14
     push    r15         // pt_regs->r15
+
+    // Restore host fs base, capturing the guest's current fs base first.
+    // The full guest register frame is saved at this point, so both paths
+    // may clobber caller-saved registers and flags.
+    cmp BYTE PTR [rip + {have_fsgsbase}], {FSGSBASE_NATIVE}
+    jne .Lsc_no_fsgsbase
+    rdfsbase r11
+    mov      gs:guest_fsbase@tpoff, r11
+    rdgsbase r11
+    wrfsbase r11
+    jmp .Lsc_fs_done
+.Lsc_no_fsgsbase:
+    // Without FSGSBASE the guest cannot have changed its fs base directly
+    // (wrfsbase would fault), so gs:guest_fsbase is already current; just
+    // restore the host fs base saved at entry via arch_prctl(ARCH_SET_FS).
+    mov rsi, gs:host_fsbase@tpoff
+    mov edi, {ARCH_SET_FS}
+    mov eax, {SYS_arch_prctl}
+    syscall
+.Lsc_fs_done:
 
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
@@ -831,6 +879,12 @@ interrupt_callback:
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
+    have_fsgsbase = sym HAVE_FSGSBASE,
+    FSGSBASE_NATIVE = const FSGSBASE_NATIVE,
+    ARCH_GET_FS = const ARCH_GET_FS,
+    ARCH_SET_GS = const ARCH_SET_GS,
+    ARCH_SET_FS = const ARCH_SET_FS,
+    SYS_arch_prctl = const libc::SYS_arch_prctl,
     );
 }
 
@@ -860,9 +914,20 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "jne interrupt_callback",
         // Restore guest context from ctx.
         "mov rsp, rdi",
-        // Switch to the guest fsbase
+        // Switch to the guest fsbase. Every register clobbered below (rax,
+        // rcx, rdx, rsi, rdi, r11, rflags) is restored from the guest context
+        // by the pops that follow.
+        "cmp BYTE PTR [rip + {have_fsgsbase}], {FSGSBASE_NATIVE}",
+        "jne .Lstg_no_fsgsbase",
         "mov rdx, fs:guest_fsbase@tpoff",
         "wrfsbase rdx",
+        "jmp .Lstg_fs_done",
+        ".Lstg_no_fsgsbase:",
+        "mov rsi, fs:guest_fsbase@tpoff",
+        "mov edi, {ARCH_SET_FS}",
+        "mov eax, {SYS_arch_prctl}",
+        "syscall",
+        ".Lstg_fs_done:",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -885,6 +950,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "pop rsp",
         "jmp gs:scratch@tpoff", // jump to the guest
         "switch_to_guest_end:",
+        have_fsgsbase = sym HAVE_FSGSBASE,
+        FSGSBASE_NATIVE = const FSGSBASE_NATIVE,
+        ARCH_SET_FS = const ARCH_SET_FS,
+        SYS_arch_prctl = const libc::SYS_arch_prctl,
     );
 }
 
@@ -1028,13 +1097,17 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // to mirror the TLS base used in guest context, so that test threads can use the
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!(
-                "rdfsbase {tmp}",
-                "wrgsbase {tmp}",
-                tmp = out(reg) _,
-                options(nostack, preserves_flags),
-            );
+        if have_fsgsbase() {
+            unsafe {
+                core::arch::asm!(
+                    "rdfsbase {tmp}",
+                    "wrgsbase {tmp}",
+                    tmp = out(reg) _,
+                    options(nostack, preserves_flags),
+                );
+            }
+        } else {
+            arch_prctl_set_gs(arch_prctl_get_fs());
         }
 
         ThreadHandle::run_with_handle(f)
@@ -1837,23 +1910,125 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     }
 }
 
-/// Asserts that the host allows user-mode FSGSBASE instructions.
+/// Whether user-mode FSGSBASE instructions are usable on this host.
 ///
-/// The guest/host transition code relies on `rdfsbase`/`wrgsbase` etc., which
+/// Values: `0` = not yet detected, `1` = unavailable (use the `arch_prctl`
+/// fallback), `2` = available (use `rdfsbase`/`wrgsbase` etc. natively).
+///
+/// The guest/host transition assembly compares this byte against
+/// [`FSGSBASE_NATIVE`] and takes the fallback path otherwise, so the
+/// not-yet-detected state is safe on any hardware (merely slower).
+static HAVE_FSGSBASE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// [`HAVE_FSGSBASE`] value meaning FSGSBASE instructions may be used.
+const FSGSBASE_NATIVE: u8 = 2;
+
+/// `arch_prctl` operation codes from `asm/prctl.h` (not exposed by `libc`).
+const ARCH_SET_GS: usize = 0x1001;
+const ARCH_SET_FS: usize = 0x1002;
+const ARCH_GET_FS: usize = 0x1003;
+const ARCH_GET_GS: usize = 0x1004;
+
+/// Detects whether user-mode FSGSBASE instructions are available.
+///
+/// The guest/host transition code prefers `rdfsbase`/`wrgsbase` etc., which
 /// raise `#UD` (delivered as `SIGILL`) unless the kernel has set
-/// `CR4.FSGSBASE`. Hosts booted with `nofsgsbase` (or CPUs/kernels too old to
-/// support it, e.g. pre-Ivy-Bridge or Linux < 5.9) would otherwise crash with
-/// an undiagnosable `SIGILL` at the first guest entry, so fail fast with an
-/// actionable message instead.
-fn assert_fsgsbase_support() {
+/// `CR4.FSGSBASE` (CPU too old, kernel older than 5.9, or booted with
+/// `nofsgsbase` — including PVM guests on such hosts). When unavailable, the
+/// transition code falls back to `arch_prctl` syscalls with the host FS base
+/// cached in the `host_fsbase` TLS slot.
+///
+/// Setting `LITEBOX_NO_FSGSBASE` in the environment forces the fallback even
+/// on capable hosts (primarily for testing the fallback path).
+fn init_fsgsbase_mode() {
     /// `HWCAP2_FSGSBASE` from `asm/hwcap2.h` (not exposed by the `libc` crate).
     const HWCAP2_FSGSBASE: libc::c_ulong = 1 << 1;
     let hwcap2 = unsafe { libc::getauxval(libc::AT_HWCAP2) };
-    assert!(
-        hwcap2 & HWCAP2_FSGSBASE != 0,
-        "host does not support user-mode FSGSBASE instructions, which LiteBox requires \
-         (CPU too old, kernel older than 5.9, or booted with `nofsgsbase`)"
+    let native = hwcap2 & HWCAP2_FSGSBASE != 0 && std::env::var_os("LITEBOX_NO_FSGSBASE").is_none();
+    HAVE_FSGSBASE.store(
+        if native { FSGSBASE_NATIVE } else { 1 },
+        core::sync::atomic::Ordering::Release,
     );
+}
+
+/// Returns true if FSGSBASE instructions may be used, detecting on first use.
+///
+/// Signal-handler callers are safe: detection happens at platform creation
+/// (and this function is idempotent), and both `getauxval` and `env::var_os`
+/// here only run outside signal context via `LinuxUserland::new` or
+/// `run_test_thread`.
+fn have_fsgsbase() -> bool {
+    match HAVE_FSGSBASE.load(core::sync::atomic::Ordering::Acquire) {
+        0 => {
+            init_fsgsbase_mode();
+            HAVE_FSGSBASE.load(core::sync::atomic::Ordering::Acquire) == FSGSBASE_NATIVE
+        }
+        v => v == FSGSBASE_NATIVE,
+    }
+}
+
+/// Reads the current thread's GS base without FSGSBASE instructions.
+///
+/// Uses a raw `arch_prctl(ARCH_GET_GS)` syscall, which is async-signal-safe
+/// and does not touch `errno` (the caller may be running with the guest's FS
+/// base, where libc's TLS-based `errno` would corrupt guest memory).
+fn arch_prctl_get_gs() -> u64 {
+    let mut value = 0u64;
+    let r = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_GET_GS,
+            core::ptr::from_mut(&mut value) as usize,
+        )
+    };
+    assert!(r.is_ok(), "arch_prctl(ARCH_GET_GS) failed");
+    value
+}
+
+/// Sets the current thread's FS base without FSGSBASE instructions.
+///
+/// Async-signal-safe; see [`arch_prctl_get_gs`].
+fn arch_prctl_set_fs(value: u64) {
+    let r = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_SET_FS,
+            usize::try_from(value).unwrap(),
+        )
+    };
+    assert!(r.is_ok(), "arch_prctl(ARCH_SET_FS) failed");
+}
+
+/// Reads the current thread's FS base without FSGSBASE instructions.
+///
+/// Async-signal-safe; see [`arch_prctl_get_gs`].
+#[cfg(debug_assertions)]
+fn arch_prctl_get_fs() -> u64 {
+    let mut value = 0u64;
+    let r = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_GET_FS,
+            core::ptr::from_mut(&mut value) as usize,
+        )
+    };
+    assert!(r.is_ok(), "arch_prctl(ARCH_GET_FS) failed");
+    value
+}
+
+/// Sets the current thread's GS base without FSGSBASE instructions.
+///
+/// Async-signal-safe; see [`arch_prctl_get_gs`].
+#[cfg(debug_assertions)]
+fn arch_prctl_set_gs(value: u64) {
+    let r = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::arch_prctl,
+            ARCH_SET_GS,
+            usize::try_from(value).unwrap(),
+        )
+    };
+    assert!(r.is_ok(), "arch_prctl(ARCH_SET_GS) failed");
 }
 
 static mut NEXT_SA: [libc::sigaction; 64] = unsafe { core::mem::zeroed() };
@@ -2041,9 +2216,14 @@ fn signal_handler_exit_guest(
     set_interrupt: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
     unsafe {
-        let gsbase: u64;
-        core::arch::asm! {
-            "rdgsbase {}", out(reg) gsbase
+        let gsbase: u64 = if have_fsgsbase() {
+            let gsbase: u64;
+            core::arch::asm! {
+                "rdgsbase {}", out(reg) gsbase
+            };
+            gsbase
+        } else {
+            arch_prctl_get_gs()
         };
         let is_in_guest = if gsbase == 0 {
             false
@@ -2067,11 +2247,18 @@ fn signal_handler_exit_guest(
             return None;
         }
 
+        if have_fsgsbase() {
+            core::arch::asm! {
+                "wrfsbase {gsbase}",
+                gsbase = in(reg) gsbase,
+                options(nostack, preserves_flags)
+            };
+        } else {
+            arch_prctl_set_fs(gsbase);
+        }
         let guest_context_top: *mut litebox_common_linux::PtRegs;
         core::arch::asm! {
-            "wrfsbase {gsbase}",
             "mov {guest_context_top}, fs:guest_context_top@tpoff",
-            gsbase = in(reg) gsbase,
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
         };
@@ -2347,8 +2534,13 @@ unsafe fn interrupt_signal_handler(
         let is_guest_thread;
         #[cfg(target_arch = "x86_64")]
         {
-            let gsbase: u64;
-            unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
+            let gsbase: u64 = if have_fsgsbase() {
+                let gsbase: u64;
+                unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
+                gsbase
+            } else {
+                arch_prctl_get_gs()
+            };
             is_guest_thread = gsbase != 0;
         }
 
