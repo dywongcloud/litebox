@@ -2,17 +2,17 @@
 // Licensed under the MIT license.
 
 pub(crate) mod apphelp;
-pub(crate) mod directory;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod iocp;
 pub(crate) mod mm;
 pub(crate) mod nls;
+pub(crate) mod object_manager;
 pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod section;
 pub(crate) mod symlink;
-mod sysinfo;
+pub(crate) mod sysinfo;
 pub(crate) mod thread;
 pub(crate) mod timer;
 pub(crate) mod wait_completion_packet;

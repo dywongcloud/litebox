@@ -28,6 +28,9 @@ const MEM_PHYSICAL: u32 = 0x0040_0000;
 const MEM_DIFFERENT_IMAGE_BASE_OK: u32 = 0x0080_0000;
 const SUPPORTED_MAP_ALLOCATION_TYPES: u32 =
     MEM_TOP_DOWN | MEM_PHYSICAL | MEM_DIFFERENT_IMAGE_BASE_OK;
+pub(crate) const WINDOWS_SHARED_SECTION_OBJECT: &str = r"\Windows\SharedSection";
+pub(crate) const WINDOWS_SESSION_SHARED_SECTION_OBJECT: &str = r"\Sessions\0\Windows\SharedSection";
+pub(crate) const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
 
 enum SectionBacking {
     /// LiteBox lacks shared anonymous backing, so a pagefile section is
@@ -40,6 +43,13 @@ enum SectionBacking {
     /// second-concurrent-view and the remap-after-unmap rejects exist. They are
     /// one missing feature, not two unrelated limitations.
     Pagefile,
+    /// CSR shared section is created by kernel and shared across process. For now,
+    /// we create it in userland for a process during initialization, and thus the first
+    /// map request would return the pre-mapped address. Subsequent map requests would
+    /// be rejected as LiteBox lacks shared mapping support.
+    CsrSharedSection {
+        base: usize,
+    },
     ImageFile,
 }
 
@@ -325,7 +335,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             _platform: PhantomData,
         });
         if let Some(name) = &name {
-            let status = self.insert_named_section(name, &section);
+            let status = self.process.object_manager.create_section(name, &section);
             if status != NtStatus::SUCCESS {
                 return status;
             }
@@ -387,24 +397,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(name) => name,
             Err(status) => return status,
         };
-        if self
-            .process
-            .directory_namespace
-            .resolve_object(&name)
-            .is_ok()
-        {
-            return NtStatus::OBJECT_TYPE_MISMATCH;
+        match self.process.object_manager.resolve_section(&name) {
+            Ok(section) => {
+                return self.publish_section_handle(section_handle, section, granted_access);
+            }
+            Err(NtStatus::OBJECT_NAME_NOT_FOUND | NtStatus::OBJECT_PATH_NOT_FOUND) => {}
+            Err(status) => return status,
         }
-        if let Some(section) = self.named_section(&name) {
-            return self.publish_section_handle(section_handle, section, granted_access);
-        }
+        // TODO: Windows creates one image section per known DLL during boot and lets every process
+        // map the same section. LiteBox currently lacks a shared image section subsystem, so we create
+        // a new section for each process that opens a known DLL.
         let Some(fs_path) = known_dll_section_fs_path(&name) else {
             return section_missing_status(
-                self.process
-                    .directory_namespace
-                    .parent_directory_exists(&name),
+                self.process.object_manager.parent_directory_exists(&name),
             );
         };
+        litebox_util_log::debug!(
+            section_name:% = name,
+            fs_path:% = fs_path;
+            "NtOpenSection: creating section for KnownDlls image"
+        );
         let Ok(file_status) = self.fs.file_status(&fs_path) else {
             return NtStatus::OBJECT_NAME_NOT_FOUND;
         };
@@ -521,6 +533,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 page_protection,
                 permissions,
             ),
+            SectionBacking::CsrSharedSection { .. } => self.map_csr_shared_section(
+                request,
+                &section,
+                requested_view_size,
+                section_offset,
+                page_protection,
+            ),
             SectionBacking::ImageFile => self.map_image_section(request, &section, page_protection),
         }
     }
@@ -549,12 +568,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some((view_base, view)) = self.remove_section_view_for_address(base_address) else {
             return NtStatus::NOT_MAPPED_VIEW;
         };
-        let ptr = MutPtr::<Platform, u8>::from_usize(view_base);
-        // SAFETY: Section views are tracked only after this shim successfully creates the pages;
-        // unmapping consumes the tracked view and removes the exact owned range.
-        if unsafe { self.global.page_manager.remove_pages(ptr, view.size) }.is_err() {
-            self.process.section_views.write().insert(view_base, view);
-            return NtStatus::UNABLE_TO_FREE_VM;
+        let owns_pages = view.section.as_ref().is_none_or(|section| {
+            !matches!(section.backing, SectionBacking::CsrSharedSection { .. })
+        });
+        if owns_pages {
+            let ptr = MutPtr::<Platform, u8>::from_usize(view_base);
+            // SAFETY: Section views are tracked only after this shim successfully creates the pages;
+            // unmapping consumes the tracked view and removes the exact owned range.
+            if unsafe { self.global.page_manager.remove_pages(ptr, view.size) }.is_err() {
+                self.process.section_views.write().insert(view_base, view);
+                return NtStatus::UNABLE_TO_FREE_VM;
+            }
         }
         self.process.virtual_allocations.write().remove(&view_base);
         NtStatus::SUCCESS
@@ -590,43 +614,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
-    fn insert_named_section(&self, name: &str, section: &Arc<SectionObject<Platform>>) -> NtStatus {
-        if self
-            .process
-            .directory_namespace
-            .resolve_object(name)
-            .is_ok()
-        {
-            return NtStatus::OBJECT_NAME_COLLISION;
-        }
-        if !self
-            .process
-            .directory_namespace
-            .parent_directory_exists(name)
-        {
-            return NtStatus::OBJECT_PATH_NOT_FOUND;
-        }
-        let key = section_key(name);
-        let mut namespace = self.process.section_namespace.write();
-        if let Some(existing) = namespace.get(&key)
-            && existing.upgrade().is_some()
-        {
-            return NtStatus::OBJECT_NAME_EXISTS;
-        }
-        namespace.insert(key, Arc::downgrade(section));
-        NtStatus::SUCCESS
-    }
-
-    fn named_section(&self, name: &str) -> Option<Arc<SectionObject<Platform>>> {
-        let key = section_key(name);
-        let mut namespace = self.process.section_namespace.write();
-        let section = namespace.get(&key).and_then(alloc::sync::Weak::upgrade);
-        if section.is_none() {
-            namespace.remove(&key);
-        }
-        section
-    }
-
     fn map_pagefile_section(
         &self,
         request: MapViewOfSectionParameters<Platform>,
@@ -656,7 +643,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         match section.backing {
             SectionBacking::Pagefile => {}
-            SectionBacking::ImageFile => return NtStatus::INVALID_FILE_FOR_SECTION,
+            SectionBacking::CsrSharedSection { .. } | SectionBacking::ImageFile => {
+                return NtStatus::INVALID_FILE_FOR_SECTION;
+            }
         }
         if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
             litebox_util_log::debug!(
@@ -713,6 +702,83 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 allocation_protect: section.protection,
                 type_: MemoryType::MEM_MAPPED,
                 pages: committed_pages(base, mapped_size, page_protection),
+            },
+        );
+        NtStatus::SUCCESS
+    }
+
+    fn map_csr_shared_section(
+        &self,
+        request: MapViewOfSectionParameters<Platform>,
+        section: &Arc<SectionObject<Platform>>,
+        requested_view_size: usize,
+        section_offset: usize,
+        page_protection: PageProtection,
+    ) -> NtStatus {
+        if section_offset != 0 {
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        let view_size = if requested_view_size == 0 {
+            section.size
+        } else {
+            requested_view_size
+        };
+        if view_size == 0 || view_size > section.size {
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        let Some(mapped_size) = view_size.checked_next_multiple_of(PAGE_SIZE) else {
+            return NtStatus::INVALID_VIEW_SIZE;
+        };
+        if mapped_size > WINDOWS_SHARED_SECTION_SIZE {
+            litebox_util_log::debug!(
+                section_size = section.size,
+                requested_view_size,
+                section_offset;
+                "Rejected CSR shared section view larger than host limit"
+            );
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
+            return NtStatus::SECTION_PROTECTION;
+        }
+        if section.pagefile_view_active.swap(true, Ordering::AcqRel) {
+            litebox_util_log::debug!(
+                section_size = section.size,
+                requested_view_size,
+                section_offset;
+                "Rejected additional CSR shared section view"
+            );
+            return NtStatus::NOT_SUPPORTED;
+        }
+        // TODO: we just return the pre-mapped base address for now, but we should support mapping at a different base address in the future.
+        let base = match section.backing {
+            SectionBacking::CsrSharedSection { base } => base,
+            SectionBacking::Pagefile | SectionBacking::ImageFile => unreachable!(),
+        };
+        if request.base_address.write_at_offset(0, base).is_none()
+            || request.view_size.write_at_offset(0, view_size).is_none()
+        {
+            section.pagefile_view_active.store(false, Ordering::Release);
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        self.process.section_views.write().insert(
+            base,
+            WindowsSectionView {
+                size: mapped_size,
+                section_offset,
+                section: Some(Arc::clone(section)),
+            },
+        );
+        self.process.virtual_allocations.write().insert(
+            base,
+            crate::WindowsVirtualAllocation {
+                base,
+                size: mapped_size,
+                allocation_protect: section.protection,
+                type_: MemoryType::MEM_MAPPED,
+                // TODO(section-subsystem): honor per-view CSR protections only after
+                // the backing is no longer aliased by PEB direct-deref pointers.
+                pages: committed_pages(base, mapped_size, section.protection),
             },
         );
         NtStatus::SUCCESS
@@ -822,10 +888,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-fn section_key(path: &str) -> String {
-    path.to_ascii_lowercase()
-}
-
 fn section_missing_status(parent_exists: bool) -> NtStatus {
     if parent_exists {
         NtStatus::OBJECT_NAME_NOT_FOUND
@@ -851,11 +913,32 @@ fn known_dll_section_fs_path(object_path: &str) -> Option<String> {
     Some(fs_path)
 }
 
+pub(crate) fn load_time_windows_shared_section<Platform: ShimPlatform>(
+    base: usize,
+) -> Arc<SectionObject<Platform>> {
+    // CSRSS creates this named section for the CSR client/server contract. LiteBox
+    // synthesizes it from the same static server data shape used for the PEB CSR
+    // pointers instead of exposing a zeroed generic pagefile section.
+    Arc::new(SectionObject {
+        fs_path: None,
+        size: WINDOWS_SHARED_SECTION_SIZE,
+        attributes: SectionAllocationAttributes::SEC_COMMIT,
+        protection: PageProtection::PAGE_READWRITE,
+        backing: SectionBacking::CsrSharedSection { base },
+        pagefile_view_active: AtomicBool::new(false),
+        _platform: PhantomData,
+    })
+}
+
 fn strip_case_insensitive_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
+    if value
         .get(..prefix.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-        .then_some(&value[prefix.len()..])
+    {
+        value.get(prefix.len()..)
+    } else {
+        None
+    }
 }
 
 fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
@@ -1058,11 +1141,12 @@ mod tests {
 
     use core::mem::{size_of, size_of_val};
 
-    use litebox::platform::RawMutPointer as _;
+    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
     use crate::nt_types::{ObjectAttributes, UnicodeString};
+    use crate::syscalls::event::EventType;
     use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -1613,5 +1697,40 @@ mod tests {
         );
         assert_ne!(opened, Handle::default());
         assert_ne!(opened, created);
+    }
+
+    #[test]
+    fn event_and_section_names_collide_in_object_namespace() {
+        let task = test_task();
+        let name = wide(r"\BaseNamedObjects\LiteBoxSharedLeafName");
+        let unicode = unicode(&name);
+        let attrs = object_attributes(&unicode);
+        let mut event = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(
+                mut_ptr(&mut event),
+                0x001f_0003,
+                Some(const_ptr(&attrs)),
+                EventType::Notification as u32,
+                0,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let size = 0x1000i64;
+        let mut section = Handle::from_raw(0xffff_ffff);
+        assert_eq!(
+            task.sys_nt_create_section(
+                mut_ptr(&mut section),
+                SectionAccess::ALL_ACCESS.bits(),
+                Some(const_ptr(&attrs)),
+                Some(const_ptr(&size)),
+                PageProtection::PAGE_READWRITE.bits(),
+                SectionAllocationAttributes::SEC_COMMIT.bits(),
+                Handle::default(),
+            ),
+            NtStatus::OBJECT_NAME_EXISTS
+        );
+        assert_eq!(section, Handle::from_raw(0xffff_ffff));
     }
 }
