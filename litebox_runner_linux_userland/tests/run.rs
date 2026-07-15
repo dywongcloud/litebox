@@ -23,24 +23,20 @@ struct Runner {
 impl Runner {
     fn new(target: &Path, unique_name: &str) -> Self {
         let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-        let path = {
-            // new path in out_dir with .hooked suffix
-            let out_path = dir_path.join(format!(
-                "{}.hooked",
-                target.file_name().unwrap().to_str().unwrap()
-            ));
-            let success = common::rewrite_with_cache(target, &out_path, &[]);
-            assert!(success, "failed to run litebox_syscall_rewriter");
-            out_path
-        };
 
-        // create tar file containing all dependencies
+        // create tar file containing the rewritten executable and all dependencies
         let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
         let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32"];
         for dir in dirs_to_create {
             std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
         }
         std::fs::create_dir_all(tar_dir.join("out")).unwrap();
+
+        let target_guest_path = std::path::absolute(target).unwrap();
+        let target_dest_path = tar_dir.join(target_guest_path.strip_prefix("/").unwrap());
+        let success = common::rewrite_with_cache(target, &target_dest_path, &[]);
+        assert!(success, "failed to run litebox_syscall_rewriter");
+
         let libs = common::find_dependencies(target.to_str().unwrap());
         for file in &libs {
             let file_path = std::path::Path::new(file.as_str());
@@ -68,13 +64,14 @@ impl Runner {
             "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
             "--env",
             "HOME=/",
+            "--program-from-tar",
         ]);
 
         Self {
             command,
             dir_path,
             tar_dir,
-            cmd_path: path,
+            cmd_path: target_guest_path,
             cmd_args: Vec::new(),
             has_run: false,
             unique_name: unique_name.to_owned(),
@@ -113,8 +110,7 @@ impl Runner {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn program_from_tar(&mut self, guest_path: &str) -> &mut Self {
-        self.command.arg("--program-from-tar");
+    fn guest_program_path(&mut self, guest_path: &str) -> &mut Self {
         self.cmd_path = PathBuf::from(guest_path);
         self
     }
@@ -212,6 +208,29 @@ fn test_static_exec_with_rewriter() {
     }
 }
 
+#[test]
+fn test_host_program_with_rewrite_syscalls() {
+    let target = common::compile("./tests/hello.c", "host_program_rewriter", true, false);
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+    let output = std::process::Command::new(binary_path)
+        .args(["--unstable", "--rewrite-syscalls"])
+        .arg(target)
+        .output()
+        .expect("Failed to run litebox_runner_linux_userland");
+
+    assert!(
+        output.status.success(),
+        "failed to run litebox_runner_linux_userland: {}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{stdout}");
+    assert!(stdout.contains("argv[0] = "), "unexpected stdout: {stdout}");
+}
+
 /// Get the path of a program using `which`
 #[cfg(target_arch = "x86_64")]
 fn run_which(prog: &str) -> std::path::PathBuf {
@@ -287,40 +306,12 @@ fn run_python(args: &[&str]) -> String {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn has_origin_in_libs(binary_path: &Path) -> bool {
-    let output = std::process::Command::new("readelf")
-        .args(["-d", binary_path.to_str().unwrap()])
-        .output()
-        .expect("Failed to run readelf");
-
-    if !output.status.success() {
-        eprintln!("Warning: readelf failed for {}", binary_path.display());
-        return false;
-    }
-
-    let output_str = String::from_utf8_lossy(&output.stdout);
-    for line in output_str.lines() {
-        // Check for $ORIGIN in NEEDED (shared library) entries
-        if line.contains("(NEEDED)") && line.contains("$ORIGIN") {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn test_runner_with_python() {
     const HELLO_WORLD_PY: &str = "print(\"Hello, World from litebox!\")";
     let python_path = run_which("python3");
 
-    if has_origin_in_libs(&python_path) {
-        println!(
-            "Skipping test: Python executable at {} uses $ORIGIN in library paths",
-            python_path.display()
-        );
-        return;
-    }
+    let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
 
     let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
     println!("Detected PYTHONHOME: {python_home}");
@@ -344,7 +335,6 @@ fn test_runner_with_python() {
         .join(":");
 
     let mut paths_to_stage = std::collections::BTreeSet::new();
-    paths_to_stage.insert(python_home_dir);
     paths_to_stage.extend(python_lib_paths.iter().cloned());
 
     Runner::new(&python_path, "python_rewriter")
@@ -352,6 +342,9 @@ fn test_runner_with_python() {
         .envs([
             &format!("PYTHONHOME={python_home}"),
             &format!("PYTHONPATH={python_lib_paths_str}"),
+            // LiteBox does not provide /proc/self/exe yet; give glibc a fallback
+            // origin for DT_NEEDED entries like $ORIGIN/../lib/libpython*.so.
+            &format!("LD_ORIGIN_PATH={python_guest_dir}"),
             // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
             // Avoid creating .pyc files as tar filesystem is read-only.
             "PYTHONDONTWRITEBYTECODE=1",
@@ -580,20 +573,14 @@ fn test_shebang() {
 
     let output = Runner::new(&bash_path, "shebang_rewriter")
         .with_fs_path(|out_dir| {
-            // Place a rewritten copy of bash inside the guest filesystem so the
-            // shebang interpreter path resolves.
-            let guest_bash = out_dir.join("out/bash");
-            let success = common::rewrite_with_cache(&bash_path, &guest_bash, &[]);
-            assert!(success, "failed to rewrite bash for guest FS");
-
-            // Create a shebang script pointing to the guest bash.
+            // Create a shebang script pointing to the staged bash.
             std::fs::write(
                 out_dir.join("out/script.sh"),
-                "#!/out/bash\necho shebang_test_passed\n",
+                format!("#!{}\necho shebang_test_passed\n", bash_path.display()),
             )
             .unwrap();
         })
-        .program_from_tar("/out/script.sh")
+        .guest_program_path("/out/script.sh")
         .output();
 
     let output_str = String::from_utf8_lossy(&output);
