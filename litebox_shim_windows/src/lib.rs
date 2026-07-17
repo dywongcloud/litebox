@@ -33,6 +33,7 @@ use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
+use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
 use crate::syscalls::object_manager::{
     DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
 };
@@ -404,26 +405,6 @@ fn windows_user_shared_data() -> nt_types::KUserSharedData {
     shared_data
 }
 
-fn map_csr_server_shared_memory<Platform: crate::ShimPlatform>(
-    page_manager: &crate::WindowsPageManager<Platform>,
-) -> Option<usize> {
-    let length = litebox::mm::linux::NonZeroPageSize::new(
-        crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE,
-    )?;
-    // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` leaves address
-    // selection to the page manager, so this cannot replace an existing mapping.
-    unsafe {
-        page_manager.create_writable_pages(
-            None,
-            length,
-            litebox::mm::linux::CreatePagesFlags::empty(),
-            |_| Ok(0),
-        )
-    }
-    .map(|mapping| mapping.as_usize())
-    .ok()
-}
-
 pub struct WindowsShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
 
 impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
@@ -439,26 +420,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         #[cfg(not(target_os = "windows"))]
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
-        let windows_shared_section_addr = map_csr_server_shared_memory(&self.0.page_manager)
-            .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
-        let windows_shared_section =
-            crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_addr);
-
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
+        // TODO: shared section should be only created once and shared across all processes, not created per-process.
+        let windows_shared_section = crate::syscalls::section::load_time_windows_shared_section(
+            load_info.environment.windows_shared_section,
+        );
         let mut process =
             Process::default(Some(load_info.virtual_allocations), windows_shared_section);
         process.ntdll_mapping = load_info.ntdll_mapping;
         process.peb_address = load_info.environment.peb;
-        write_field_at_offset::<Platform, _>(
-            process.peb_address,
-            core::mem::offset_of!(
-                crate::nt_types::ProcessEnvironmentBlock,
-                csr_server_read_only_shared_memory_base
-            ),
-            windows_shared_section_addr,
-        )
-        .ok_or(loader::WindowsLoadError::MemoryAccess)?;
         let process = Arc::new(process);
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
@@ -658,9 +629,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
-            litebox_util_log::debug!(
-                syscall:? = NtSysno::from_raw(ctx.orig_rax);
-                "Unsupported Windows syscall"
+            let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
+                .read_at_offset(0)
+                .unwrap_or_default();
+            litebox_util_log::error!(
+                syscall:? = NtSysno::from_raw(ctx.orig_rax),
+                rip:% = format_args!("{:#x}", ctx.rip),
+                caller:% = format_args!("{caller:#x}"),
+                arg0:% = format_args!("{:#x}", ctx.r10),
+                arg1:% = format_args!("{:#x}", ctx.rdx),
+                arg2:% = format_args!("{:#x}", ctx.r8),
+                arg3:% = format_args!("{:#x}", ctx.r9);
+                "Unsupported Windows syscall; terminating Windows guest"
             );
             return ContinueOperation::Terminate;
         };
@@ -813,6 +793,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     number_of_concurrent_threads,
                 );
                 (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtConnectPort {
+                port_handle,
+                port_name,
+                security_qos,
+                client_view,
+                server_view,
+                max_message_length,
+                connection_information,
+                connection_information_length,
+            } => {
+                let status = self.sys_nt_connect_port(syscalls::lpc::ConnectPortParameters {
+                    port_handle,
+                    port_name,
+                    security_qos,
+                    client_view,
+                    server_view,
+                    max_message_length,
+                    connection_information,
+                    connection_information_length,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSecureConnectPort => {
+                litebox_util_log::debug!(
+                    "Rejected NtSecureConnectPort; only the CSR NtConnectPort subset is modeled"
+                );
+                (NtStatus::NOT_SUPPORTED, ContinueOperation::Resume)
             }
             SyscallRequest::NtCreateSection {
                 section_handle,
@@ -1556,86 +1564,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         raw_fd: usize,
         visitor: impl RawHandleVisitor<Platform, FS>,
     ) -> NtStatus {
-        if remove_raw_handle_by_raw_fd::<Platform, FileObjectSubsystem<FS>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |file| visitor.file(file),
-        ) {
-            return NtStatus::SUCCESS;
+        macro_rules! try_close {
+            ($subsystem:ty, $visit:ident) => {
+                if remove_raw_handle_by_raw_fd::<Platform, $subsystem>(
+                    &self.global.litebox,
+                    &self.process.handles,
+                    raw_fd,
+                    |entry| visitor.$visit(entry),
+                ) {
+                    return NtStatus::SUCCESS;
+                }
+            };
         }
-        if remove_raw_handle_by_raw_fd::<Platform, RegistryKeySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |key| visitor.registry_key(key),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, EventSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |event| visitor.event(event),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, DirectoryObjectSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |directory| visitor.directory(directory),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, SymbolicLinkSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |link| visitor.symbolic_link(link),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, IoCompletionSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |io_completion| visitor.io_completion(io_completion),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, TimerSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |timer| visitor.timer(timer),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, WaitCompletionPacketSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |wait_completion_packet| visitor.wait_completion_packet(wait_completion_packet),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, WorkerFactorySubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |worker_factory| visitor.worker_factory(worker_factory),
-        ) {
-            return NtStatus::SUCCESS;
-        }
-        if remove_raw_handle_by_raw_fd::<Platform, SectionSubsystem<Platform>>(
-            &self.global.litebox,
-            &self.process.handles,
-            raw_fd,
-            |section| visitor.section(section),
-        ) {
-            return NtStatus::SUCCESS;
-        }
+
+        try_close!(FileObjectSubsystem<FS>, file);
+        try_close!(RegistryKeySubsystem<Platform>, registry_key);
+        try_close!(EventSubsystem<Platform>, event);
+        try_close!(DirectoryObjectSubsystem<Platform>, directory);
+        try_close!(SymbolicLinkSubsystem<Platform>, symbolic_link);
+        try_close!(IoCompletionSubsystem<Platform>, io_completion);
+        try_close!(LpcPortSubsystem<Platform>, lpc_port);
+        try_close!(TimerSubsystem<Platform>, timer);
+        try_close!(
+            WaitCompletionPacketSubsystem<Platform>,
+            wait_completion_packet
+        );
+        try_close!(WorkerFactorySubsystem<Platform>, worker_factory);
+        try_close!(SectionSubsystem<Platform>, section);
+
         NtStatus::INVALID_HANDLE
     }
 
@@ -1663,6 +1619,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>);
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
+
+    fn lpc_port(&self, lpc_port: LpcPortHandleObject);
 
     fn timer(&self, timer: TimerHandleObject<Platform>);
 
@@ -1705,6 +1663,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
         Task::<Platform, FS>::close_io_completion(io_completion);
+    }
+
+    fn lpc_port(&self, lpc_port: LpcPortHandleObject) {
+        Task::<Platform, FS>::close_lpc_port(lpc_port);
     }
 
     fn timer(&self, timer: TimerHandleObject<Platform>) {

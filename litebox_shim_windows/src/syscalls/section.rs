@@ -89,6 +89,12 @@ pub(crate) struct MapViewOfSectionParameters<Platform: ShimPlatform> {
     pub(crate) page_protection: u32,
 }
 
+pub(super) struct MappedPagefileSectionView {
+    pub(super) base: usize,
+    pub(super) mapped_size: usize,
+    pub(super) view_size: usize,
+}
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct SectionAllocationAttributes: u32 {
@@ -623,8 +629,66 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         page_protection: PageProtection,
         permissions: MemoryRegionPermissions,
     ) -> NtStatus {
+        let mapped_view = match self.map_pagefile_section_view(
+            section,
+            requested_view_size,
+            section_offset,
+            page_protection,
+            permissions,
+        ) {
+            Ok(mapped_view) => mapped_view,
+            Err(status) => return status,
+        };
+        if request
+            .base_address
+            .write_at_offset(0, mapped_view.base)
+            .is_none()
+            || request
+                .view_size
+                .write_at_offset(0, mapped_view.view_size)
+                .is_none()
+        {
+            self.rollback_pagefile_section_view(mapped_view.base);
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(super) fn map_client_port_section(
+        &self,
+        section_handle: Handle,
+        requested_view_size: usize,
+    ) -> Result<MappedPagefileSectionView, NtStatus> {
+        let entry = self.section_entry(section_handle)?;
+        let section = entry.with_entry(|entry| {
+            entry
+                .granted_access
+                .require(SectionAccess::MAP_READ | SectionAccess::MAP_WRITE)
+                .map(|()| Arc::clone(&entry.section))
+        })?;
+        let page_protection = PageProtection::PAGE_READWRITE;
+        let Some((_, permissions)) = parse_page_protection(page_protection.bits()) else {
+            return Err(NtStatus::INVALID_PAGE_PROTECTION);
+        };
+        self.map_pagefile_section_view(
+            &section,
+            requested_view_size,
+            0,
+            page_protection,
+            permissions,
+        )
+    }
+
+    fn map_pagefile_section_view(
+        &self,
+        section: &Arc<SectionObject<Platform>>,
+        requested_view_size: usize,
+        section_offset: usize,
+        page_protection: PageProtection,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<MappedPagefileSectionView, NtStatus> {
         if section_offset > section.size {
-            return NtStatus::INVALID_VIEW_SIZE;
+            return Err(NtStatus::INVALID_VIEW_SIZE);
         }
         let remaining = section.size - section_offset;
         let view_size = if requested_view_size == 0 {
@@ -633,18 +697,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             requested_view_size
         };
         if view_size == 0 || view_size > remaining {
-            return NtStatus::INVALID_VIEW_SIZE;
+            return Err(NtStatus::INVALID_VIEW_SIZE);
         }
-        let Some(mapped_size) = view_size.checked_next_multiple_of(PAGE_SIZE) else {
-            return NtStatus::INVALID_VIEW_SIZE;
-        };
-        let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(mapped_size) else {
-            return NtStatus::INVALID_VIEW_SIZE;
-        };
+        let mapped_size = view_size
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(NtStatus::INVALID_VIEW_SIZE)?;
+        let length =
+            NonZeroPageSize::<PAGE_SIZE>::new(mapped_size).ok_or(NtStatus::INVALID_VIEW_SIZE)?;
         match section.backing {
             SectionBacking::Pagefile => {}
             SectionBacking::CsrSharedSection { .. } | SectionBacking::ImageFile => {
-                return NtStatus::INVALID_FILE_FOR_SECTION;
+                return Err(NtStatus::INVALID_FILE_FOR_SECTION);
             }
         }
         if !pagefile_view_protection_is_compatible(section.protection, page_protection) {
@@ -653,7 +716,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 page_protection:% = format_args!("{:#x}", page_protection.bits());
                 "Rejected pagefile section view protection incompatible with section protection"
             );
-            return NtStatus::SECTION_PROTECTION;
+            return Err(NtStatus::SECTION_PROTECTION);
         }
         if section.pagefile_view_active.swap(true, Ordering::AcqRel) {
             litebox_util_log::debug!(
@@ -665,27 +728,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Host 25H2 allows repeated and simultaneous pagefile views. LiteBox
             // returns NOT_SUPPORTED until PageManager has first-class shared
             // anonymous backing that avoids kernel-side content storage.
-            return NtStatus::NOT_SUPPORTED;
+            return Err(NtStatus::NOT_SUPPORTED);
         }
-        let Ok(mapping) = create_pages(
+        let mapping = create_pages(
             &self.global.page_manager,
             None,
             length,
             CreatePagesFlags::empty(),
             permissions,
             |_| Ok(0),
-        ) else {
+        )
+        .map_err(|_| {
             section.pagefile_view_active.store(false, Ordering::Release);
-            return NtStatus::NO_MEMORY;
-        };
+            NtStatus::NO_MEMORY
+        })?;
         let base = mapping.as_usize();
-        if request.base_address.write_at_offset(0, base).is_none()
-            || request.view_size.write_at_offset(0, view_size).is_none()
-        {
-            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
-            section.pagefile_view_active.store(false, Ordering::Release);
-            return NtStatus::ACCESS_VIOLATION;
-        }
         self.process.section_views.write().insert(
             base,
             WindowsSectionView {
@@ -704,7 +761,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 pages: committed_pages(base, mapped_size, page_protection),
             },
         );
-        NtStatus::SUCCESS
+        Ok(MappedPagefileSectionView {
+            base,
+            mapped_size,
+            view_size,
+        })
+    }
+
+    pub(super) fn rollback_pagefile_section_view(&self, base_address: usize) {
+        let Some((view_base, view)) = self.remove_section_view_for_address(base_address) else {
+            return;
+        };
+        if let Some(section) = &view.section
+            && matches!(section.backing, SectionBacking::Pagefile)
+        {
+            section.pagefile_view_active.store(false, Ordering::Release);
+        }
+        let _ = remove_view_pages::<Platform>(&self.global.page_manager, view_base, view.size);
+        self.process.virtual_allocations.write().remove(&view_base);
     }
 
     fn map_csr_shared_section(
