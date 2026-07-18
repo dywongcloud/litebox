@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::{
     LiteBox,
     broker::{
-        BrokerControl, BrokerHandleRegistry,
+        BrokerControl, BrokerPollableRegistry,
         error::{BrokerControlError, BrokerObjectError},
         readiness_events,
     },
@@ -46,7 +46,7 @@ pub enum EventCounterError {
 pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
-    registry: Arc<BrokerHandleRegistry<Platform>>,
+    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
 
@@ -68,13 +68,13 @@ where
             .create_event_with_count(initial_count)
             .map_err(BrokerObjectError::from)
             .map_err(EventCounterError::from)?;
-        let registry = litebox.broker_handle_registry();
+        let pollable_registry = litebox.broker_pollable_registry();
         let pollee = Arc::new(Pollee::new());
-        registry.register_pollable(handle, &pollee);
+        pollable_registry.register_pollable(handle, &pollee);
         Ok(Self {
             broker,
             handle,
-            registry,
+            pollable_registry,
             pollee,
         })
     }
@@ -143,7 +143,7 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        self.registry.unregister_pollable(self.handle, &self.pollee);
+        self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
     }
 }
@@ -200,10 +200,13 @@ mod tests {
         let handle = ObjectHandle(7);
         let consume_attempts = Arc::new(AtomicUsize::new(0));
         let read_ready = Arc::new(AtomicBool::new(false));
+        let request_count = Arc::new(AtomicUsize::new(0));
         let local = BrokerLocal::negotiate(FakeLocalControlChannel {
-            handle,
+            next_handle: handle.0,
             consume_attempts: consume_attempts.clone(),
             read_ready: read_ready.clone(),
+            request_count,
+            fail_requests: Arc::new(AtomicBool::new(false)),
             last_request: None,
         })
         .unwrap();
@@ -246,15 +249,159 @@ mod tests {
         );
     }
 
+    #[test]
+    fn broker_association_failure_wakes_blocked_read() {
+        use std::time::{Duration, Instant};
+
+        let platform = MockPlatform::new();
+        let handle = ObjectHandle(7);
+        let consume_attempts = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let local = BrokerLocal::negotiate(FakeLocalControlChannel {
+            next_handle: handle.0,
+            consume_attempts: Arc::clone(&consume_attempts),
+            read_ready: Arc::new(AtomicBool::new(false)),
+            request_count: Arc::clone(&request_count),
+            fail_requests: Arc::new(AtomicBool::new(false)),
+            last_request: None,
+        })
+        .unwrap();
+        let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
+        let counter = Arc::new(EventCounter::new(&litebox, 0).unwrap());
+
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let read_counter = Arc::clone(&counter);
+        let reader = std::thread::spawn(move || {
+            result_sender
+                .send(read_counter.read(
+                    &WaitState::new(platform).context(),
+                    false,
+                    EventCounterReadMode::One,
+                ))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while consume_attempts.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+
+        litebox.broker_failure_dispatcher()();
+
+        assert!(matches!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            Err(TryOpError::Other(EventCounterError::Io))
+        ));
+        reader.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(counter.check_io_events(), Events::ERR);
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn control_transport_failure_notifies_all_event_counters() {
+        let platform = MockPlatform::new();
+        let handle = ObjectHandle(7);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let fail_requests = Arc::new(AtomicBool::new(false));
+        let local = BrokerLocal::negotiate(FakeLocalControlChannel {
+            next_handle: handle.0,
+            consume_attempts: Arc::new(AtomicUsize::new(0)),
+            read_ready: Arc::new(AtomicBool::new(false)),
+            request_count: Arc::clone(&request_count),
+            fail_requests: Arc::clone(&fail_requests),
+            last_request: None,
+        })
+        .unwrap();
+        let litebox = LiteBox::new_with_broker_local(platform, local);
+        let first = EventCounter::new(&litebox, 0).unwrap();
+        let second = EventCounter::new(&litebox, 0).unwrap();
+        let first_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let first_observer_dyn: Arc<dyn Observer<Events>> = first_observer.clone();
+        first.register_observer(Arc::downgrade(&first_observer_dyn), Events::ERR);
+        let second_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let second_observer_dyn: Arc<dyn Observer<Events>> = second_observer.clone();
+        second.register_observer(Arc::downgrade(&second_observer_dyn), Events::ERR);
+
+        fail_requests.store(true, Ordering::SeqCst);
+
+        assert_eq!(first.check_io_events(), Events::ERR);
+        assert!(first_observer.0.load(Ordering::SeqCst));
+        assert!(second_observer.0.load(Ordering::SeqCst));
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+        assert_eq!(second.check_io_events(), Events::ERR);
+        assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn broker_dispatchers_follow_objects_that_outlive_litebox() {
+        let platform = MockPlatform::new();
+        let handle = ObjectHandle(7);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let local = BrokerLocal::negotiate(FakeLocalControlChannel {
+            next_handle: handle.0,
+            consume_attempts: Arc::new(AtomicUsize::new(0)),
+            read_ready: Arc::new(AtomicBool::new(false)),
+            request_count: Arc::clone(&request_count),
+            fail_requests: Arc::new(AtomicBool::new(false)),
+            last_request: None,
+        })
+        .unwrap();
+        let litebox = LiteBox::new_with_broker_local(platform, local);
+        let counter = EventCounter::new(&litebox, 0).unwrap();
+        let read_observer = Arc::new(ReadObserver(AtomicBool::new(false)));
+        let read_observer_dyn: Arc<dyn Observer<Events>> = read_observer.clone();
+        counter.register_observer(Arc::downgrade(&read_observer_dyn), Events::IN);
+        let litebox_weak = Arc::downgrade(&litebox.x);
+        let dispatch_notification = litebox.broker_notification_dispatcher();
+        let dispatch_failure = litebox.broker_failure_dispatcher();
+
+        drop(litebox);
+
+        assert!(litebox_weak.upgrade().is_none());
+        dispatch_notification(BrokerNotification::Readiness(ReadinessNotification {
+            handle,
+            readiness: ReadinessFlags::READ,
+        }));
+        assert!(read_observer.0.load(Ordering::SeqCst));
+        dispatch_failure();
+        assert_eq!(counter.check_io_events(), Events::ERR);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    struct ErrorObserver(AtomicBool);
+
+    impl Observer<Events> for ErrorObserver {
+        fn on_events(&self, events: &Events) {
+            if events.contains(Events::ERR) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    struct ReadObserver(AtomicBool);
+
+    impl Observer<Events> for ReadObserver {
+        fn on_events(&self, events: &Events) {
+            if events.contains(Events::IN) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
     struct FakeLocalControlChannel {
-        handle: ObjectHandle,
+        next_handle: u64,
         consume_attempts: Arc<AtomicUsize>,
         read_ready: Arc<AtomicBool>,
+        request_count: Arc<AtomicUsize>,
+        fail_requests: Arc<AtomicBool>,
         last_request: Option<BrokerRequest>,
     }
 
     impl LocalControlChannel for FakeLocalControlChannel {
-        type Error = core::convert::Infallible;
+        type Error = ();
 
         fn send_handshake_request(
             &mut self,
@@ -276,19 +423,22 @@ mod tests {
             request: &BrokerRequest,
         ) -> core::result::Result<(), Self::Error> {
             self.last_request = Some(request.clone());
+            self.request_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
         fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
+            if self.fail_requests.load(Ordering::SeqCst) {
+                self.last_request.take();
+                return Err(());
+            }
             let response = match self.last_request.take().unwrap() {
                 BrokerRequest::Event(EventRequest::Create(_)) => {
-                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse {
-                        handle: self.handle,
-                    }))
+                    let handle = ObjectHandle(self.next_handle);
+                    self.next_handle += 1;
+                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }))
                 }
-                BrokerRequest::Event(EventRequest::Consume(request))
-                    if request.handle == self.handle =>
-                {
+                BrokerRequest::Event(EventRequest::Consume(_)) => {
                     self.consume_attempts.fetch_add(1, Ordering::SeqCst);
                     if self.read_ready.swap(false, Ordering::SeqCst) {
                         BrokerResponse::Event(EventResponse::Consume(EventConsumption {
@@ -299,10 +449,10 @@ mod tests {
                         BrokerResponse::Error(ErrorCode::WouldBlock)
                     }
                 }
-                BrokerRequest::CloseObject(handle) if handle == self.handle => {
-                    BrokerResponse::ObjectClosed
+                BrokerRequest::CloseObject(_) => BrokerResponse::ObjectClosed,
+                request @ BrokerRequest::Event(_) => {
+                    panic!("unexpected broker request: {request:?}")
                 }
-                request => panic!("unexpected broker request: {request:?}"),
             };
             Ok(Some(response))
         }

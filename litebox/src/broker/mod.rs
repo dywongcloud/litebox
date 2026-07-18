@@ -53,35 +53,31 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
+
+    fn fail_connection(&self);
 }
 
-pub(crate) struct BrokerHandleRegistry<Platform: RawSyncPrimitivesProvider> {
-    handles: Mutex<Platform, HashMap<ObjectHandle, BrokerHandleEntry<Platform>>>,
+pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
+    pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
+impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     pub(crate) fn new() -> Self {
         Self {
-            handles: Mutex::new(HashMap::new()),
+            pollables: Mutex::new(HashMap::new()),
         }
     }
 
     pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        self.handles
-            .lock()
-            .entry(handle)
-            .or_insert_with(BrokerHandleEntry::new)
-            .register_pollable(pollee);
+        let previous = self.pollables.lock().insert(handle, Arc::downgrade(pollee));
+        assert!(
+            previous.is_none(),
+            "broker handle already has a registered pollable"
+        );
     }
 
-    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        let mut handles = self.handles.lock();
-        if let Some(entry) = handles.get_mut(&handle) {
-            entry.unregister_pollable(pollee);
-            if entry.pollables.is_empty() {
-                handles.remove(&handle);
-            }
-        }
+    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle) {
+        self.pollables.lock().remove(&handle);
     }
 
     pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags)
@@ -92,20 +88,32 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
         if events.is_empty() {
             return;
         }
-        let pollables = {
-            let mut handles = self.handles.lock();
-            let Some(entry) = handles.get_mut(&handle) else {
-                return;
-            };
-            entry.prune_stale_pollables();
-            let pollables = entry
-                .pollables
-                .iter()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
-            if entry.pollables.is_empty() {
-                handles.remove(&handle);
+        let pollee = {
+            let mut pollables = self.pollables.lock();
+            let pollee = pollables.get(&handle).and_then(Weak::upgrade);
+            if pollee.is_none() {
+                pollables.remove(&handle);
             }
+            pollee
+        };
+        if let Some(pollee) = pollee {
+            pollee.notify_observers(events);
+        }
+    }
+
+    fn notify_all(&self, events: Events)
+    where
+        Platform: TimeProvider,
+    {
+        let pollables = {
+            let mut pollables = Vec::new();
+            self.pollables.lock().retain(|_, registered| {
+                let Some(pollee) = registered.upgrade() else {
+                    return false;
+                };
+                pollables.push(pollee);
+                true
+            });
             pollables
         };
         for pollee in pollables {
@@ -114,70 +122,74 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
     }
 }
 
-struct BrokerHandleEntry<Platform: RawSyncPrimitivesProvider> {
-    pollables: Vec<Weak<Pollee<Platform>>>,
-}
-
-impl<Platform: RawSyncPrimitivesProvider> BrokerHandleEntry<Platform> {
-    fn new() -> Self {
-        Self {
-            pollables: Vec::new(),
-        }
-    }
-
-    fn register_pollable(&mut self, pollee: &Arc<Pollee<Platform>>) {
-        self.pollables.push(Arc::downgrade(pollee));
-    }
-
-    fn unregister_pollable(&mut self, pollee: &Arc<Pollee<Platform>>) {
-        self.pollables.retain(|registered| {
-            registered
-                .upgrade()
-                .is_some_and(|registered| !Arc::ptr_eq(&registered, pollee))
-        });
-    }
-
-    fn prune_stale_pollables(&mut self) {
-        self.pollables
-            .retain(|registered| registered.strong_count() > 0);
-    }
-}
 pub(crate) struct BrokerLocalControl<
     Platform: RawSyncPrimitivesProvider,
     Channel: LocalControlChannel + Send,
 > {
-    local: Mutex<Platform, BrokerLocal<Channel>>,
+    local: Mutex<Platform, Option<BrokerLocal<Channel>>>,
+    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
 where
-    Platform: RawSyncPrimitivesProvider,
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalControlChannel + Send,
 {
-    pub(crate) const fn new(local: BrokerLocal<Channel>) -> Self {
+    pub(crate) fn new(
+        local: BrokerLocal<Channel>,
+        pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+    ) -> Self {
         Self {
-            local: Mutex::new(local),
+            local: Mutex::new(Some(local)),
+            pollable_registry,
         }
+    }
+
+    fn request<T>(
+        &self,
+        request: impl FnOnce(
+            &mut BrokerLocal<Channel>,
+        ) -> litebox_broker_local::Result<T, Channel::Error>,
+    ) -> core::result::Result<T, BrokerControlError> {
+        let (result, failed_connection) = {
+            let mut local = self.local.lock();
+            let Some(connection) = local.as_mut() else {
+                return Err(BrokerControlError::Transport);
+            };
+            let result = request(connection).map_err(BrokerControlError::from);
+            let failed_connection = if matches!(result.as_ref(), Err(BrokerControlError::Transport))
+            {
+                local.take()
+            } else {
+                None
+            };
+            (result, failed_connection)
+        };
+        if let Some(connection) = failed_connection {
+            drop(connection);
+            self.pollable_registry.notify_all(Events::ERR);
+        }
+        result
     }
 }
 
 impl<Platform, Channel> BrokerControl for BrokerLocalControl<Platform, Channel>
 where
-    Platform: RawSyncPrimitivesProvider,
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalControlChannel + Send,
 {
     fn create_event_with_count(
         &self,
         initial_count: u64,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        Ok(self.local.lock().create_event_with_count(initial_count)?)
+        self.request(|local| local.create_event_with_count(initial_count))
     }
 
     fn wait_event(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
-        Ok(self.local.lock().wait_event(handle)?)
+        self.request(|local| local.wait_event(handle))
     }
 
     fn add_event(
@@ -185,7 +197,7 @@ where
         handle: ObjectHandle,
         value: u64,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
-        Ok(self.local.lock().add_event(handle, value)?)
+        self.request(|local| local.add_event(handle, value))
     }
 
     fn consume_event(
@@ -193,11 +205,19 @@ where
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
-        Ok(self.local.lock().consume_event(handle, mode)?)
+        self.request(|local| local.consume_event(handle, mode))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {
-        Ok(self.local.lock().close_object(handle)?)
+        self.request(|local| local.close_object(handle))
+    }
+
+    fn fail_connection(&self) {
+        let connection = self.local.lock().take();
+        if let Some(connection) = connection {
+            drop(connection);
+            self.pollable_registry.notify_all(Events::ERR);
+        }
     }
 }
 

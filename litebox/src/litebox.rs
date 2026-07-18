@@ -36,7 +36,11 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// If the `enforce_singleton_litebox_instance` compilation feature has been enabled, and more
     /// than one instance is made, will panic.
     pub fn new(platform: &'static Platform) -> Self {
-        Self::new_inner(platform, None)
+        Self::new_inner(
+            platform,
+            None,
+            Arc::new(broker::BrokerPollableRegistry::new()),
+        )
     }
 
     /// Create a new [`LiteBox`] instance with a negotiated broker-local control adapter installed.
@@ -45,19 +49,21 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         broker_local: BrokerLocal<Channel>,
     ) -> Self
     where
+        Platform: TimeProvider,
         Channel: LocalControlChannel + Send + 'static,
     {
-        Self::new_inner(
-            platform,
-            Some(Arc::new(
-                broker::BrokerLocalControl::<Platform, Channel>::new(broker_local),
-            )),
-        )
+        let broker_pollables = Arc::new(broker::BrokerPollableRegistry::new());
+        let broker_control = Arc::new(broker::BrokerLocalControl::<Platform, Channel>::new(
+            broker_local,
+            Arc::clone(&broker_pollables),
+        ));
+        Self::new_inner(platform, Some(broker_control), broker_pollables)
     }
 
     fn new_inner(
         platform: &'static Platform,
         broker_control: Option<Arc<dyn broker::BrokerControl>>,
+        broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
     ) -> Self {
         // This check ensures that there is exactly one `LiteBox` instance in the process.
         //
@@ -102,7 +108,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 platform,
                 descriptors,
                 broker: broker_control,
-                broker_handles: Arc::new(broker::BrokerHandleRegistry::new()),
+                broker_pollables,
             }),
         }
     }
@@ -140,8 +146,8 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         self.x.broker.clone()
     }
 
-    pub(crate) fn broker_handle_registry(&self) -> Arc<broker::BrokerHandleRegistry<Platform>> {
-        Arc::clone(&self.x.broker_handles)
+    pub(crate) fn broker_pollable_registry(&self) -> Arc<broker::BrokerPollableRegistry<Platform>> {
+        Arc::clone(&self.x.broker_pollables)
     }
 
     /// Dispatches one broker notification to the matching local-core object.
@@ -152,7 +158,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         match notification {
             BrokerNotification::Readiness(notification) => self
                 .x
-                .broker_handles
+                .broker_pollables
                 .notify_readiness(notification.handle, notification.readiness),
         }
     }
@@ -162,9 +168,26 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     where
         Platform: TimeProvider + 'static,
     {
-        let litebox = self.clone();
+        let broker_pollables = Arc::downgrade(&self.x.broker_pollables);
         move |notification| {
-            litebox.dispatch_broker_notification(notification);
+            if let Some(broker_pollables) = broker_pollables.upgrade() {
+                match notification {
+                    BrokerNotification::Readiness(notification) => {
+                        broker_pollables
+                            .notify_readiness(notification.handle, notification.readiness);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns a dispatcher that fails all broker-backed objects when the association closes.
+    pub fn broker_failure_dispatcher(&self) -> impl Fn() + Send + 'static {
+        let broker = self.x.broker.as_ref().map(Arc::downgrade);
+        move || {
+            if let Some(broker) = broker.as_ref().and_then(alloc::sync::Weak::upgrade) {
+                broker.fail_connection();
+            }
         }
     }
 }
@@ -174,5 +197,5 @@ pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
     broker: Option<Arc<dyn broker::BrokerControl>>,
-    broker_handles: Arc<broker::BrokerHandleRegistry<Platform>>,
+    broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
 }
