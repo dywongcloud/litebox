@@ -28,17 +28,22 @@ use crate::readiness::ReadinessFlags;
 use primitive::{Decoder, Encoder};
 
 mod event;
+mod pipe;
 mod primitive;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
 const REQUEST_TAG_CLOSE_OBJECT: u8 = 2;
+const REQUEST_TAG_PIPE: u8 = 3;
+const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
 const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
+const RESPONSE_TAG_PIPE: u8 = 5;
+const RESPONSE_TAG_READINESS: u8 = 6;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
@@ -77,7 +82,12 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         REQUEST_TAG_NEGOTIATE => BrokerHandshakeRequest {
             protocol_version: decoder.protocol_version()?,
         },
-        REQUEST_TAG_EVENT | REQUEST_TAG_CLOSE_OBJECT => return Err(WireError::WrongMessagePhase),
+        REQUEST_TAG_EVENT
+        | REQUEST_TAG_CLOSE_OBJECT
+        | REQUEST_TAG_PIPE
+        | REQUEST_TAG_CHECK_READINESS => {
+            return Err(WireError::WrongMessagePhase);
+        }
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -95,9 +105,17 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.u8(REQUEST_TAG_CLOSE_OBJECT);
             encoder.handle(handle);
         }
+        BrokerRequest::CheckReadiness(handle) => {
+            encoder.u8(REQUEST_TAG_CHECK_READINESS);
+            encoder.handle(handle);
+        }
         BrokerRequest::Event(request) => {
             encoder.u8(REQUEST_TAG_EVENT);
             event::encode_event_request(&mut encoder, request);
+        }
+        BrokerRequest::Pipe(request) => {
+            encoder.u8(REQUEST_TAG_PIPE);
+            pipe::encode_pipe_request(&mut encoder, request);
         }
     }
     encoder.finish()
@@ -110,7 +128,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
     let request = match tag {
         REQUEST_TAG_NEGOTIATE => return Err(WireError::WrongMessagePhase),
         REQUEST_TAG_CLOSE_OBJECT => BrokerRequest::CloseObject(decoder.handle()?),
+        REQUEST_TAG_CHECK_READINESS => BrokerRequest::CheckReadiness(decoder.handle()?),
         REQUEST_TAG_EVENT => BrokerRequest::Event(event::decode_event_request(&mut decoder)?),
+        REQUEST_TAG_PIPE => BrokerRequest::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -152,7 +172,10 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
         },
-        RESPONSE_TAG_EVENT | RESPONSE_TAG_OBJECT_CLOSED => {
+        RESPONSE_TAG_EVENT
+        | RESPONSE_TAG_OBJECT_CLOSED
+        | RESPONSE_TAG_PIPE
+        | RESPONSE_TAG_READINESS => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -178,9 +201,17 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
         BrokerResponse::ObjectClosed => {
             encoder.u8(RESPONSE_TAG_OBJECT_CLOSED);
         }
+        BrokerResponse::Readiness(readiness) => {
+            encoder.u8(RESPONSE_TAG_READINESS);
+            encoder.u32(readiness.0);
+        }
         BrokerResponse::Event(response) => {
             encoder.u8(RESPONSE_TAG_EVENT);
             event::encode_event_response(&mut encoder, response);
+        }
+        BrokerResponse::Pipe(response) => {
+            encoder.u8(RESPONSE_TAG_PIPE);
+            pipe::encode_pipe_response(&mut encoder, response);
         }
         BrokerResponse::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
@@ -199,11 +230,13 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_EVENT => BrokerResponse::Event(event::decode_event_response(&mut decoder)?),
+        RESPONSE_TAG_PIPE => BrokerResponse::Pipe(pipe::decode_pipe_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResponse::Error(error)
         }
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResponse::ObjectClosed,
+        RESPONSE_TAG_READINESS => BrokerResponse::Readiness(ReadinessFlags(decoder.u32()?)),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -246,10 +279,13 @@ mod tests {
     use super::*;
     use crate::event::{
         AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
-        CreateEventResponse, EventConsumeMode, EventConsumption, WaitEventRequest,
-        WaitEventResponse,
+        CreateEventResponse, EventConsumeMode, EventConsumption,
     };
-    use crate::message::{EventRequest, EventResponse};
+    use crate::message::{EventRequest, EventResponse, PipeRequest, PipeResponse};
+    use crate::pipe::{
+        CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
+        WritePipeResponse,
+    };
     use crate::{ObjectHandle, ProtocolVersion};
 
     #[test]
@@ -271,13 +307,13 @@ mod tests {
         let handle = ObjectHandle(13);
         let requests = [
             BrokerRequest::CloseObject(handle),
+            BrokerRequest::CheckReadiness(handle),
             BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
             })),
             BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 7,
             })),
-            BrokerRequest::Event(EventRequest::Wait(WaitEventRequest { handle })),
             BrokerRequest::Event(EventRequest::Add(AddEventRequest { handle, value: 3 })),
             BrokerRequest::Event(EventRequest::Consume(ConsumeEventRequest {
                 handle,
@@ -286,6 +322,15 @@ mod tests {
             BrokerRequest::Event(EventRequest::Consume(ConsumeEventRequest {
                 handle,
                 mode: EventConsumeMode::One,
+            })),
+            BrokerRequest::Pipe(PipeRequest::Create(CreatePipeRequest {
+                capacity: 4096,
+                atomic_write_size: 512,
+            })),
+            BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest { handle, length: 32 })),
+            BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest {
+                handle,
+                data: Vec::from([1, 2, 3]),
             })),
         ];
 
@@ -323,13 +368,9 @@ mod tests {
         let handle = ObjectHandle(13);
         let responses = [
             BrokerResponse::ObjectClosed,
+            BrokerResponse::Readiness(ReadinessFlags::READ),
+            BrokerResponse::Readiness(ReadinessFlags::WRITE),
             BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle })),
-            BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
-                readiness: ReadinessFlags::READ,
-            })),
-            BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
-                readiness: ReadinessFlags::WRITE,
-            })),
             BrokerResponse::Event(EventResponse::Add(AddEventResponse {
                 readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
             })),
@@ -337,8 +378,18 @@ mod tests {
                 value: 3,
                 readiness: ReadinessFlags::WRITE,
             })),
+            BrokerResponse::Pipe(PipeResponse::Create(CreatePipeResponse {
+                read_handle: handle,
+                write_handle: ObjectHandle(14),
+            })),
+            BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse {
+                data: Vec::from([1, 2, 3]),
+            })),
+            BrokerResponse::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
+            BrokerResponse::Error(ErrorCode::PeerClosed),
+            BrokerResponse::Error(ErrorCode::OutOfMemory),
             BrokerResponse::Error(ErrorCode::Internal),
         ];
 
@@ -477,7 +528,7 @@ mod tests {
             Err(WireError::WrongMessagePhase)
         );
         assert_eq!(
-            decode_response(&[1, 1, 0xff]),
+            decode_response(&[RESPONSE_TAG_READINESS, 0xff]),
             Err(WireError::TruncatedFrame)
         );
         assert_eq!(
@@ -539,7 +590,7 @@ mod tests {
                     readiness: ReadinessFlags::READ,
                 }
             ))),
-            [1, 2, 1, 0, 0, 0]
+            [1, 1, 1, 0, 0, 0]
         );
     }
 

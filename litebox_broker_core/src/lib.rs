@@ -20,11 +20,12 @@ extern crate std;
 
 mod error;
 pub mod event;
+pub mod pipe;
 mod policy;
 mod session;
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -46,17 +47,23 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 pub struct BrokerCoreLimits {
     /// Maximum live object references.
     pub max_references: usize,
+    /// Maximum total capacity in bytes reserved by live pipes.
+    pub max_total_pipe_capacity: usize,
 }
 
 impl BrokerCoreLimits {
     /// Conservative default limits for initial broker deployments.
     pub const DEFAULT: Self = Self {
         max_references: 4096,
+        max_total_pipe_capacity: 64 * 1024 * 1024,
     };
 
     /// Creates a broker core limit set.
-    pub const fn new(max_references: usize) -> Self {
-        Self { max_references }
+    pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
+        Self {
+            max_references,
+            max_total_pipe_capacity,
+        }
     }
 }
 
@@ -78,6 +85,7 @@ pub struct BrokerCore {
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
+    pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -100,6 +108,7 @@ impl BrokerCore {
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
+            reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -111,6 +120,22 @@ impl BrokerCore {
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         Ok(handle)
+    }
+
+    pub(crate) fn allocate_reference_handle_pair(&self) -> Result<(ObjectHandle, ObjectHandle)> {
+        let mut next_reference_handle = self.next_reference_handle.write();
+        let first = ObjectHandle(*next_reference_handle);
+        let second = ObjectHandle(
+            first
+                .0
+                .checked_add(1)
+                .ok_or(BrokerError::ResourceExhausted)?,
+        );
+        *next_reference_handle = second
+            .0
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        Ok((first, second))
     }
 
     /// Allocates broker authority state for one authenticated caller session.

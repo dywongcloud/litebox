@@ -11,6 +11,7 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
+use litebox_broker_protocol::pipe::CreatePipeResponse;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::event::{Events, polling::Pollee};
@@ -35,7 +36,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         initial_count: u64,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
-    fn wait_event(
+    fn check_readiness(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
@@ -51,6 +52,24 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
+
+    fn create_pipe(
+        &self,
+        capacity: u64,
+        atomic_write_size: u64,
+    ) -> core::result::Result<CreatePipeResponse, BrokerControlError>;
+
+    fn read_pipe(
+        &self,
+        handle: ObjectHandle,
+        length: u32,
+    ) -> core::result::Result<Vec<u8>, BrokerControlError>;
+
+    fn write_pipe(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+    ) -> core::result::Result<usize, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
@@ -185,11 +204,11 @@ where
         self.request(|local| local.create_event_with_count(initial_count))
     }
 
-    fn wait_event(
+    fn check_readiness(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
-        self.request(|local| local.wait_event(handle))
+        self.request(|local| local.check_readiness(handle))
     }
 
     fn add_event(
@@ -206,6 +225,30 @@ where
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
         self.request(|local| local.consume_event(handle, mode))
+    }
+
+    fn create_pipe(
+        &self,
+        capacity: u64,
+        atomic_write_size: u64,
+    ) -> core::result::Result<CreatePipeResponse, BrokerControlError> {
+        self.request(|local| local.create_pipe(capacity, atomic_write_size))
+    }
+
+    fn read_pipe(
+        &self,
+        handle: ObjectHandle,
+        length: u32,
+    ) -> core::result::Result<Vec<u8>, BrokerControlError> {
+        self.request(|local| local.read_pipe(handle, length))
+    }
+
+    fn write_pipe(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+    ) -> core::result::Result<usize, BrokerControlError> {
+        self.request(|local| local.write_pipe(handle, data))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {

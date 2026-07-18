@@ -4,7 +4,11 @@
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CreateEventRequest, CreateEventResponse, WaitEventRequest, WaitEventResponse,
+    CreateEventRequest, CreateEventResponse,
+};
+use crate::pipe::{
+    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
+    WritePipeResponse,
 };
 use crate::readiness::ReadinessFlags;
 use crate::{ObjectHandle, ProtocolVersion};
@@ -21,8 +25,12 @@ pub struct BrokerHandshakeRequest {
 pub enum BrokerRequest {
     /// Close one broker object reference.
     CloseObject(ObjectHandle),
+    /// Check the current readiness of a broker-owned object.
+    CheckReadiness(ObjectHandle),
     /// Event object request family.
     Event(EventRequest),
+    /// Pipe object request family.
+    Pipe(PipeRequest),
 }
 
 /// Broker handshake response sent before the control channel is active.
@@ -54,12 +62,21 @@ pub enum BrokerHandshakeResponse {
 pub enum EventRequest {
     /// Create a broker-owned event object.
     Create(CreateEventRequest),
-    /// Check whether an event wait would complete now.
-    Wait(WaitEventRequest),
     /// Add readiness credits to an event.
     Add(AddEventRequest),
     /// Consume readiness credits from an event.
     Consume(ConsumeEventRequest),
+}
+
+/// Broker-owned pipe object request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PipeRequest {
+    /// Create a broker-owned byte pipe.
+    Create(CreatePipeRequest),
+    /// Read bytes from a pipe.
+    Read(ReadPipeRequest),
+    /// Write bytes to a pipe.
+    Write(WritePipeRequest),
 }
 
 /// Broker response sent over an active control channel.
@@ -67,8 +84,12 @@ pub enum EventRequest {
 pub enum BrokerResponse {
     /// Object close operation completed.
     ObjectClosed,
+    /// Current readiness of a broker-owned object.
+    Readiness(ReadinessFlags),
     /// Event object response family.
     Event(EventResponse),
+    /// Pipe object response family.
+    Pipe(PipeResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -78,12 +99,21 @@ pub enum BrokerResponse {
 pub enum EventResponse {
     /// Create operation response.
     Create(CreateEventResponse),
-    /// Wait operation response.
-    Wait(WaitEventResponse),
     /// Add operation response.
     Add(AddEventResponse),
     /// Consume operation response.
     Consume(ConsumeEventResponse),
+}
+
+/// Broker-owned pipe object response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PipeResponse {
+    /// Create operation response.
+    Create(CreatePipeResponse),
+    /// Read operation response.
+    Read(ReadPipeResponse),
+    /// Write operation response.
+    Write(WritePipeResponse),
 }
 
 /// Broker-initiated asynchronous notification.

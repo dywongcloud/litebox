@@ -159,7 +159,7 @@ where
     fn check_io_events(&self) -> Events {
         let readiness = match self
             .broker
-            .wait_event(self.handle)
+            .check_readiness(self.handle)
             .map_err(|error| self.broker_request_error(error))
         {
             Ok(readiness) => readiness,
@@ -450,7 +450,10 @@ mod tests {
                     }
                 }
                 BrokerRequest::CloseObject(_) => BrokerResponse::ObjectClosed,
-                request @ BrokerRequest::Event(_) => {
+                BrokerRequest::CheckReadiness(_) => {
+                    BrokerResponse::Readiness(ReadinessFlags::WRITE)
+                }
+                request @ (BrokerRequest::Event(_) | BrokerRequest::Pipe(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
             };

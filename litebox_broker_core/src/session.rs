@@ -4,9 +4,11 @@
 use alloc::sync::Arc;
 
 use crate::event::EventObject;
+use crate::pipe::PipeObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
 /// Caller identity information supplied by the broker entry layer.
@@ -43,9 +45,9 @@ pub(crate) struct ObjectReference {
     pub(crate) rights: ObjectRights,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObjectEntry {
     Event(EventObject),
+    Pipe(PipeObject),
 }
 
 /// Broker-owned authority token for one authenticated caller session.
@@ -97,6 +99,37 @@ impl BrokerSession {
         Ok(handle)
     }
 
+    pub(crate) fn create_object_reference_pair(
+        &self,
+        first: ObjectEntry,
+        second: ObjectEntry,
+    ) -> Result<(ObjectHandle, ObjectHandle)> {
+        let rights = self
+            .core
+            .policy
+            .principal_object_rights(self.caller_credential)?;
+        let mut references = self.core.references.write();
+        if references
+            .len()
+            .checked_add(2)
+            .is_none_or(|count| count > self.core.limits.max_references)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
+        for (handle, object) in [(first_handle, first), (second_handle, second)] {
+            references.insert(
+                handle,
+                ObjectReference {
+                    object: Arc::new(RwLock::new(object)),
+                    session_id: self.session_id,
+                    rights,
+                },
+            );
+        }
+        Ok((first_handle, second_handle))
+    }
+
     pub(crate) fn with_authorized_object<T>(
         &self,
         handle: ObjectHandle,
@@ -123,6 +156,16 @@ impl BrokerSession {
         };
         let mut object = object.write();
         f(&mut object)
+    }
+
+    /// Returns the current readiness of a broker-owned object.
+    pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
+        self.with_authorized_object(handle, ObjectRights::WAIT, |object| {
+            Ok(match object {
+                ObjectEntry::Event(event) => event.readiness(),
+                ObjectEntry::Pipe(pipe) => pipe.readiness(),
+            })
+        })
     }
 
     fn authorize_use_object(
@@ -164,6 +207,8 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::Ordering;
+
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
     };
@@ -175,9 +220,20 @@ mod tests {
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            BrokerCoreLimits::new(1),
+            BrokerCoreLimits::new(2, 4),
         )
         .unwrap();
+
+        check_event_reference_lifecycle(&broker);
+        check_session_drop_releases_references(&broker);
+        check_pipe_lifecycle(&broker);
+        check_pipe_reader_closure(&broker);
+        check_pair_handle_exhaustion(&broker);
+
+        assert!(broker.references.read().is_empty());
+    }
+
+    fn check_event_reference_lifecycle(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -189,7 +245,7 @@ mod tests {
 
         assert_ne!(unknown_handle, handle);
         assert_eq!(
-            crate::event::wait(&session, unknown_handle),
+            session.check_readiness(unknown_handle),
             Err(BrokerError::UnknownObject)
         );
 
@@ -198,10 +254,7 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        assert_eq!(
-            crate::event::wait(&session, handle),
-            Ok(ReadinessFlags::WRITE)
-        );
+        assert_eq!(session.check_readiness(handle), Ok(ReadinessFlags::WRITE));
         assert_eq!(
             crate::event::add(&session, handle, 1),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
@@ -213,10 +266,17 @@ mod tests {
                 readiness: ReadinessFlags::WRITE,
             })
         );
+        let second_handle = crate::event::create(&session, 0).unwrap();
         assert_eq!(
             crate::event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
+        assert_eq!(
+            crate::pipe::create(&session, 4, 2),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(session.close_object_reference(second_handle), Ok(()));
 
         assert_eq!(session.close_object_reference(handle), Ok(()));
         {
@@ -227,7 +287,9 @@ mod tests {
             session.close_object_reference(handle),
             Err(BrokerError::UnknownObject)
         );
+    }
 
+    fn check_session_drop_releases_references(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -243,19 +305,96 @@ mod tests {
             let references = broker.references.read();
             assert!(references.is_empty());
         }
+    }
 
+    fn check_pipe_lifecycle(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(
+            crate::pipe::create(&session, 5, 2),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            session.check_readiness(reader),
+            Ok(ReadinessFlags::default())
+        );
+        assert_eq!(
+            crate::pipe::read(&session, reader, 1),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(crate::pipe::write(&session, writer, &[1, 2]), Ok(2));
+        assert_eq!(crate::pipe::write(&session, writer, &[3, 4, 5]), Ok(2));
+        assert_eq!(
+            crate::pipe::write(&session, writer, &[5]),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(
+            crate::pipe::read(&session, reader, 3),
+            Ok(std::vec::Vec::from([1, 2, 3]))
+        );
+        assert_eq!(crate::pipe::write(&session, writer, &[5, 6]), Ok(2));
+        assert_eq!(session.close_object_reference(writer), Ok(()));
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            session.check_readiness(reader),
+            Ok(ReadinessFlags::READ | ReadinessFlags::HANGUP)
+        );
+        assert_eq!(
+            crate::pipe::read(&session, reader, 4),
+            Ok(std::vec::Vec::from([4, 5, 6]))
+        );
+        assert_eq!(
+            crate::pipe::read(&session, reader, 1),
+            Ok(std::vec::Vec::new())
+        );
+        assert_eq!(session.close_object_reference(reader), Ok(()));
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
+
+    fn check_pipe_reader_closure(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
+        assert_eq!(session.close_object_reference(reader), Ok(()));
+        assert_eq!(crate::pipe::write(&session, writer, &[]), Ok(0));
+        assert_eq!(
+            crate::pipe::write(&session, writer, &[1]),
+            Err(BrokerError::PeerClosed)
+        );
+        assert_eq!(
+            session.check_readiness(writer),
+            Ok(ReadinessFlags::WRITE | ReadinessFlags::ERROR)
+        );
+        assert_eq!(session.close_object_reference(writer), Ok(()));
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
+
+    fn check_pair_handle_exhaustion(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         {
             let mut next_reference_handle = broker.next_reference_handle.write();
-            *next_reference_handle = u64::MAX;
+            *next_reference_handle = u64::MAX - 1;
         }
+        assert_eq!(
+            crate::pipe::create(&session, 4, 2),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(*broker.next_reference_handle.read(), u64::MAX - 1);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        let handle = crate::event::create(&session, 0).unwrap();
+        assert_eq!(handle, ObjectHandle(u64::MAX - 1));
+        assert_eq!(session.close_object_reference(handle), Ok(()));
         assert_eq!(
             crate::event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
-        let references = broker.references.read();
-        assert!(references.is_empty());
     }
 }
