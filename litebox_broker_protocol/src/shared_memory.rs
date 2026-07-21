@@ -17,14 +17,19 @@ pub enum SharedMemoryError {
 /// Byte-copy access to a shared-memory resource.
 ///
 /// A value may own a distinct shared-memory object or identify a region in a
-/// larger shared-memory arena. Implementations must keep the backing resource
-/// alive and make concurrent calls within the local process safe without
-/// exposing Rust references into memory writable by another process.
+/// larger shared-memory resource. Each endpoint has its own implementation, and
+/// peers may use different implementation types, such as user and kernel
+/// mappings of the same physical memory. Implementations must keep the backing
+/// resource alive and make concurrent local calls safe without exposing Rust
+/// references into memory writable by the peer.
 ///
-/// Coordination with other processes is the responsibility of the protocol
-/// using the shared memory.
+/// Establishing the shared resource and coordinating access between endpoints
+/// are responsibilities of the deployment and protocol using the shared
+/// memory.
 pub trait SharedMemory: Send + Sync + 'static {
     /// Returns the mapped resource length in bytes.
+    ///
+    /// The length must remain stable for the lifetime of the resource.
     fn len(&self) -> usize;
 
     /// Returns whether the resource is empty.

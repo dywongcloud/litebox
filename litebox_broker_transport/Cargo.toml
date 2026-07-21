@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 std = []
-linux-shared-memory = ["std", "dep:libc", "dep:rustix", "rustix/fs"]
+linux-shared-memory = ["std", "dep:libc", "dep:rustix", "rustix/fs", "rustix/net"]
 unix = ["std"]
 
 [dependencies]
