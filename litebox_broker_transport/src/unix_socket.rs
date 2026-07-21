@@ -11,10 +11,12 @@ use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-#[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
 use crate::shared_memory::MemfdSharedMemory;
+use crate::unix_io::{
+    refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
+};
 use litebox_broker_protocol::channel::{
     HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
     LocalNotificationChannel, PeerCredential,
@@ -30,6 +32,34 @@ use litebox_broker_protocol::wire::{
 };
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
+
+/// Validates that a connected Unix socket belongs to `expected_process_id`.
+pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> IoResult<()> {
+    if peer_process_id(stream)? != expected_process_id {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix socket peer is not the expected process",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that two connected Unix sockets belong to the same process.
+pub fn validate_same_peer_process(first: &UnixStream, second: &UnixStream) -> IoResult<()> {
+    if peer_process_id(first)? != peer_process_id(second)? {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "Unix sockets belong to different peer processes",
+        ));
+    }
+    Ok(())
+}
+
+fn peer_process_id(stream: &UnixStream) -> IoResult<u32> {
+    let credentials = rustix::net::sockopt::socket_peercred(stream)?;
+    u32::try_from(credentials.pid.as_raw_pid())
+        .map_err(|_| invalid_data("Unix peer process ID is invalid"))
+}
 
 /// Local-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamLocalControlChannel {
@@ -79,7 +109,6 @@ impl UnixStreamLocalControlChannel {
     }
 
     /// Receives the memfd associated with this control channel.
-    #[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
     pub fn receive_memfd(
         &mut self,
         expected_len: usize,
@@ -108,6 +137,8 @@ impl Drop for UnixStreamLocalControlChannel {
 /// Host-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamHostControlChannel {
     stream: UnixStream,
+    peer_credential: PeerCredential,
+    setup_deadline: Option<Instant>,
 }
 
 /// Local-side Unix-domain-socket notification channel for the hosted userland POC.
@@ -123,11 +154,24 @@ pub struct UnixStreamHostNotificationChannel {
 impl UnixStreamHostControlChannel {
     /// Creates a host control channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            peer_credential: PeerCredential::Unauthenticated,
+            setup_deadline: None,
+        }
+    }
+
+    /// Creates a host control channel after the deployment has authenticated
+    /// and bound the accepted peer. `setup_deadline` bounds handshake I/O.
+    pub const fn from_host_guaranteed(stream: UnixStream, setup_deadline: Instant) -> Self {
+        Self {
+            stream,
+            peer_credential: PeerCredential::HostGuaranteed,
+            setup_deadline: Some(setup_deadline),
+        }
     }
 
     /// Sends the memfd associated with this control channel.
-    #[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
     pub fn send_memfd(
         &mut self,
         shared_memory: &MemfdSharedMemory,
@@ -166,10 +210,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
         let frame = read_frame_with_deadline(&mut self.stream, self.setup_deadline)?;
-        if self.setup_deadline.take().is_some() {
-            self.stream.set_read_timeout(None)?;
-            self.stream.set_write_timeout(None)?;
-        }
+        self.setup_deadline = None;
         match frame {
             Some(frame) => decode_handshake_response(&frame)
                 .map(Some)
@@ -195,13 +236,11 @@ impl HostControlChannel for UnixStreamHostControlChannel {
     type Error = Error;
 
     fn peer_credential(&self) -> IoResult<PeerCredential> {
-        // TODO(broker): replace the PoC placeholder with Unix peer credential extraction
-        // before this channel is used as an authenticated deployment boundary.
-        Ok(PeerCredential::Unauthenticated)
+        Ok(self.peer_credential)
     }
 
     fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
-        let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.setup_deadline)? else {
             return Ok(HostReceive::PeerClosed);
         };
         match decode_handshake_request(&frame) {
@@ -215,8 +254,12 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         write_frame_with_deadline(
             &mut self.stream,
             &encode_handshake_response(response.clone()),
-            None,
-        )
+            self.setup_deadline,
+        )?;
+        if matches!(response, BrokerHandshakeResponse::Negotiated { .. }) {
+            self.setup_deadline = None;
+        }
+        Ok(())
     }
 
     fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
@@ -262,36 +305,38 @@ fn read_frame_with_deadline(
     stream: &mut UnixStream,
     deadline: Option<Instant>,
 ) -> IoResult<Option<Vec<u8>>> {
-    let mut len_buf = [0; 4];
-    let mut read = 0;
-    while read < len_buf.len() {
-        refresh_stream_io_deadline(stream, deadline)?;
-        match stream.read(&mut len_buf[read..]) {
-            Ok(0) if read == 0 => return Ok(None),
-            Ok(0) => return Err(invalid_data("truncated broker frame length")),
-            Ok(len) => read += len,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+    with_read_deadline(stream, deadline, |stream, deadline| {
+        let mut len_buf = [0; 4];
+        let mut read = 0;
+        while read < len_buf.len() {
+            refresh_read_deadline(stream, deadline)?;
+            match stream.read(&mut len_buf[read..]) {
+                Ok(0) if read == 0 => return Ok(None),
+                Ok(0) => return Err(invalid_data("truncated broker frame length")),
+                Ok(len) => read += len,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
         }
-    }
 
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_FRAME_LEN {
-        return Err(invalid_data("invalid broker frame length"));
-    }
-
-    let mut frame = vec![0; len];
-    let mut read = 0;
-    while read < frame.len() {
-        refresh_stream_io_deadline(stream, deadline)?;
-        match stream.read(&mut frame[read..]) {
-            Ok(0) => return Err(invalid_data("truncated broker frame")),
-            Ok(len) => read += len,
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_FRAME_LEN {
+            return Err(invalid_data("invalid broker frame length"));
         }
-    }
-    Ok(Some(frame))
+
+        let mut frame = vec![0; len];
+        let mut read = 0;
+        while read < frame.len() {
+            refresh_read_deadline(stream, deadline)?;
+            match stream.read(&mut frame[read..]) {
+                Ok(0) => return Err(invalid_data("truncated broker frame")),
+                Ok(len) => read += len,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Some(frame))
+    })
 }
 
 fn write_frame_with_deadline(
@@ -299,12 +344,14 @@ fn write_frame_with_deadline(
     frame: &[u8],
     deadline: Option<Instant>,
 ) -> IoResult<()> {
-    if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
-        return Err(invalid_data("invalid broker frame length"));
-    }
-    let len = u32::try_from(frame.len()).map_err(|_| invalid_data("broker frame too large"))?;
-    write_all_with_deadline(stream, &len.to_le_bytes(), deadline)?;
-    write_all_with_deadline(stream, frame, deadline)
+    with_write_deadline(stream, deadline, |stream, deadline| {
+        if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
+            return Err(invalid_data("invalid broker frame length"));
+        }
+        let len = u32::try_from(frame.len()).map_err(|_| invalid_data("broker frame too large"))?;
+        write_all_with_deadline(stream, &len.to_le_bytes(), deadline)?;
+        write_all_with_deadline(stream, frame, deadline)
+    })
 }
 
 fn write_all_with_deadline(
@@ -313,7 +360,7 @@ fn write_all_with_deadline(
     deadline: Option<Instant>,
 ) -> IoResult<()> {
     while !buffer.is_empty() {
-        refresh_stream_io_deadline(stream, deadline)?;
+        refresh_write_deadline(stream, deadline)?;
         match stream.write(buffer) {
             Ok(0) => {
                 return Err(Error::new(
@@ -327,23 +374,6 @@ fn write_all_with_deadline(
         }
     }
     Ok(())
-}
-
-fn refresh_stream_io_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
-    if let Some(deadline) = deadline {
-        let timeout = io_timeout_for_deadline(deadline)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-    }
-    Ok(())
-}
-
-fn io_timeout_for_deadline(deadline: Instant) -> IoResult<Duration> {
-    let timeout = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|timeout| !timeout.is_zero())
-        .ok_or_else(|| Error::new(ErrorKind::TimedOut, "broker I/O deadline expired"))?;
-    Ok(timeout)
 }
 
 fn invalid_data(message: &'static str) -> Error {
@@ -360,6 +390,22 @@ fn wire_error(error: WireError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn linux_peer_validation_identifies_connected_process() {
+        let (first, second) = UnixStream::pair().unwrap();
+
+        validate_peer_process(&first, std::process::id()).unwrap();
+        validate_same_peer_process(&first, &second).unwrap();
+        let unexpected_process_id = std::process::id().checked_add(1).unwrap();
+        assert_eq!(
+            validate_peer_process(&first, unexpected_process_id)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn frame_round_trip() {
@@ -451,6 +497,69 @@ mod tests {
         assert!(
             matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
             "unexpected timeout error kind: {error:?}"
+        );
+    }
+
+    #[test]
+    fn host_handshake_request_read_setup_deadline_is_wall_clock() {
+        let (mut local_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_host_guaranteed(
+            host_stream,
+            Instant::now() + Duration::from_millis(50),
+        );
+
+        let reader = std::thread::spawn(move || channel.recv_handshake_request().unwrap_err());
+        local_stream.write_all(&8u32.to_le_bytes()).unwrap();
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(20));
+            if local_stream.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+
+        let error = reader.join().expect("timeout reader panicked");
+        assert!(
+            matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "unexpected timeout error kind: {error:?}"
+        );
+    }
+
+    #[test]
+    fn negotiated_host_handshake_restores_active_timeouts() {
+        let (mut local_stream, host_stream) = UnixStream::pair().unwrap();
+        let active_read_timeout = Some(Duration::from_secs(2));
+        let active_write_timeout = Some(Duration::from_secs(3));
+        host_stream.set_read_timeout(active_read_timeout).unwrap();
+        host_stream.set_write_timeout(active_write_timeout).unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_host_guaranteed(
+            host_stream,
+            Instant::now() + Duration::from_secs(1),
+        );
+        let request = BrokerHandshakeRequest {
+            protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+        };
+
+        write_frame_with_deadline(
+            &mut local_stream,
+            &encode_handshake_request(request.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            channel.recv_handshake_request().unwrap(),
+            HostReceive::Message(request)
+        );
+        channel
+            .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            })
+            .unwrap();
+
+        assert_eq!(channel.setup_deadline, None);
+        assert_eq!(channel.stream.read_timeout().unwrap(), active_read_timeout);
+        assert_eq!(
+            channel.stream.write_timeout().unwrap(),
+            active_write_timeout
         );
     }
 
