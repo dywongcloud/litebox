@@ -340,6 +340,11 @@ fn spawn_test_broker(
                 let (control_stream, _) = control_listener
                     .accept()
                     .expect("failed to accept broker local control connection");
+                let shared_memory =
+                    litebox_broker_transport::shared_memory::MemfdSharedMemory::create(
+                        litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE,
+                    )
+                    .expect("failed to create broker test shared memory");
                 let (notification_stream, _) = notification_listener
                     .accept()
                     .expect("failed to accept broker local notification connection");
@@ -365,6 +370,8 @@ fn spawn_test_broker(
                     &broker,
                     &mut channel,
                     &mut notification_channel,
+                    &shared_memory,
+                    |channel| channel.inner.send_memfd(&shared_memory, None),
                 )
                 .expect("broker host failed");
                 assert_eq!(

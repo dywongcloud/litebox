@@ -6,9 +6,11 @@ use std::io::{Error, ErrorKind, Result};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlChannel, UnixStreamLocalNotificationChannel,
@@ -81,7 +83,14 @@ fn run_fake_runner(args: &[OsString]) {
     let control_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
     let _notification_channel =
         connect_notification_with_retry(Path::new(notification_socket_path)).unwrap();
-    let mut local = BrokerLocal::negotiate(control_channel).unwrap();
+    let mut local = BrokerLocal::negotiate(control_channel, |channel| {
+        let shared_memory = channel.receive_memfd(
+            PIPE_TRANSFER_BUFFER_SIZE,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )?;
+        Ok(Arc::new(shared_memory))
+    })
+    .unwrap();
 
     let handle = local.create_event_with_count(0).unwrap();
     assert_eq!(
@@ -95,6 +104,19 @@ fn run_fake_runner(args: &[OsString]) {
     assert_eq!(
         local.check_readiness(handle).unwrap(),
         ReadinessFlags::READ | ReadinessFlags::WRITE
+    );
+
+    let pipe = local.create_pipe(64, 16).unwrap();
+    let data = b"shared pipe data";
+    assert_eq!(
+        local.write_pipe(pipe.write_handle, data).unwrap(),
+        data.len()
+    );
+    assert_eq!(
+        local
+            .read_pipe(pipe.read_handle, data.len().try_into().unwrap())
+            .unwrap(),
+        data
     );
     drop(local);
 

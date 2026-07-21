@@ -3,12 +3,14 @@
 
 use std::{
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
+use litebox_broker_protocol::pipe::PIPE_TRANSFER_BUFFER_SIZE;
 use litebox_broker_transport::unix_socket::{
     UnixStreamLocalControlCancellation, UnixStreamLocalControlChannel,
     UnixStreamLocalNotificationChannel,
@@ -53,7 +55,12 @@ pub(crate) fn connect(
     let control_cancellation = control_channel
         .cancellation_handle()
         .context("failed to create broker control cancellation handle")?;
-    let local = BrokerLocal::negotiate(control_channel).context("broker negotiation failed")?;
+    let local = BrokerLocal::negotiate(control_channel, |channel| {
+        let shared_memory =
+            channel.receive_memfd(PIPE_TRANSFER_BUFFER_SIZE, Some(setup_deadline))?;
+        Ok(Arc::new(shared_memory))
+    })
+    .context("broker negotiation failed")?;
     Ok((
         local,
         BrokerNotifications::new(notification_channel),
