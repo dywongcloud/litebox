@@ -89,6 +89,54 @@ pub(crate) type MutPtr<Platform, T> =
 pub(crate) type WindowsPageManager<Platform> = PageManager<Platform, PAGE_SIZE>;
 pub(crate) type WindowsHandleStore<Platform> =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct DuplicateOptions: u32 {
+        const CLOSE_SOURCE = 0x0000_0001;
+        const SAME_ACCESS = 0x0000_0002;
+        const SAME_ATTRIBUTES = 0x0000_0004;
+
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct HandleAttributes: u32 {
+        const PROTECT_FROM_CLOSE = 0x0000_0001;
+        const INHERIT = 0x0000_0002;
+        const AUDIT_OBJECT_CLOSE = 0x0000_0004;
+
+        const _ = !0;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct WindowsHandleMetadata {
+    granted_access: u32,
+    attributes: HandleAttributes,
+}
+
+pub(crate) trait WindowsHandleSubsystem: litebox::fd::FdEnabledSubsystem {
+    fn normalize_desired_access(desired_access: u32) -> u32;
+
+    fn resolve_duplicate_access(
+        _entry: &Self::Entry,
+        desired_access: u32,
+    ) -> Result<u32, NtStatus> {
+        let maximum_allowed = desired_access & nt_types::AccessMask::MAXIMUM_ALLOWED.bits() != 0;
+        let explicit_access = desired_access & !nt_types::AccessMask::MAXIMUM_ALLOWED.bits();
+        let normalized = Self::normalize_desired_access(explicit_access);
+        Ok(if maximum_allowed {
+            // TODO(dacl-access-check): Derive this grant from the caller's token and the
+            // object's security descriptor instead of assuming a single trust context.
+            normalized | Self::normalize_desired_access(nt_types::AccessMask::GENERIC_ALL.bits())
+        } else {
+            normalized
+        })
+    }
+}
 pub(crate) type WindowsNlsSectionMappings<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
 pub(crate) type WindowsVirtualAllocations<Platform> =
@@ -575,19 +623,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         Subsystem: litebox::fd::FdEnabledSubsystem,
     {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return Err(NtStatus::INVALID_HANDLE);
-        };
-        let typed = {
-            let handles = self.process.handles.read();
-            match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
-                Ok(typed) => typed,
-                Err(litebox::fd::ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
-                Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                    return Err(NtStatus::OBJECT_TYPE_MISMATCH);
-                }
-            }
-        };
+        let typed = self.typed_handle::<Subsystem>(handle)?;
         self.global
             .litebox
             .descriptor_table()
@@ -595,19 +631,104 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok_or(NtStatus::INVALID_HANDLE)
     }
 
-    fn insert_typed_handle<Subsystem>(
+    fn typed_handle_entry_with_access<Subsystem>(
         &self,
-        entry: Subsystem::Entry,
-        cleanup_entry: impl FnOnce(Subsystem::Entry),
-    ) -> Result<syscalls::Handle, NtStatus>
+        handle: syscalls::Handle,
+        required_access: u32,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = self.typed_handle::<Subsystem>(handle)?;
+        self.require_typed_handle_access(&typed, required_access)?;
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&typed)
+            .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
+    fn typed_handle<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+    ) -> Result<Arc<litebox::fd::TypedFd<Subsystem>>, NtStatus>
     where
         Subsystem: litebox::fd::FdEnabledSubsystem,
     {
-        let typed = self
-            .global
+        let Some(raw_fd) = handle.raw_fd() else {
+            return Err(NtStatus::INVALID_HANDLE);
+        };
+        let handles = self.process.handles.read();
+        match handles.fd_from_raw_integer::<Subsystem>(raw_fd) {
+            Ok(typed) => Ok(typed),
+            Err(litebox::fd::ErrRawIntFd::NotFound) => Err(NtStatus::INVALID_HANDLE),
+            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
+        }
+    }
+
+    fn typed_handle_metadata<Subsystem>(
+        &self,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+    ) -> Result<WindowsHandleMetadata, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        self.global
             .litebox
-            .descriptor_table_mut()
-            .insert::<Subsystem>(entry);
+            .descriptor_table()
+            .with_metadata::<Subsystem, WindowsHandleMetadata, _>(typed, |metadata| *metadata)
+            .map_err(|_| NtStatus::INVALID_HANDLE)
+    }
+
+    pub(crate) fn require_handle_access<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        required_access: u32,
+    ) -> Result<(), NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = self.typed_handle::<Subsystem>(handle)?;
+        self.require_typed_handle_access(&typed, required_access)
+    }
+
+    pub(crate) fn require_typed_handle_access<Subsystem>(
+        &self,
+        typed: &litebox::fd::TypedFd<Subsystem>,
+        required_access: u32,
+    ) -> Result<(), NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        if self.typed_handle_metadata(typed)?.granted_access & required_access == required_access {
+            Ok(())
+        } else {
+            Err(NtStatus::ACCESS_DENIED)
+        }
+    }
+
+    fn insert_typed_handle<Subsystem>(
+        &self,
+        entry: Subsystem::Entry,
+        granted_access: u32,
+        cleanup_entry: impl FnOnce(Subsystem::Entry),
+    ) -> Result<syscalls::Handle, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = {
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            let typed = descriptors.insert::<Subsystem>(entry);
+            let old = descriptors.set_fd_metadata(
+                &typed,
+                WindowsHandleMetadata {
+                    granted_access,
+                    attributes: HandleAttributes::empty(),
+                },
+            );
+            debug_assert!(old.is_none());
+            typed
+        };
         insert_raw_handle::<Platform, Subsystem>(
             &self.global.litebox,
             &self.process.handles,
@@ -655,6 +776,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (result, op) = match req {
             SyscallRequest::NtClose { handle } => {
                 let status = self.sys_nt_close(handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtDuplicateObject {
+                source_process_handle,
+                source_handle,
+                target_process_handle,
+                target_handle,
+                desired_access,
+                handle_attributes,
+                options,
+            } => {
+                let status = self.sys_nt_duplicate_object(
+                    source_process_handle,
+                    source_handle,
+                    target_process_handle,
+                    target_handle,
+                    desired_access,
+                    handle_attributes,
+                    options,
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtCreateEvent {
@@ -1557,26 +1698,197 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {
-        let Some(raw_fd) = handle.raw_fd() else {
-            return NtStatus::INVALID_HANDLE;
-        };
-        self.close_raw_fd(raw_fd, CloseRawHandleVisitor { task: self })
+        self.close_handle(handle, CloseRawHandleVisitor { task: self })
     }
 
-    fn close_raw_fd(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the native NtDuplicateObject contract"
+    )]
+    pub(crate) fn sys_nt_duplicate_object(
         &self,
-        raw_fd: usize,
+        source_process_handle: syscalls::ProcessHandle,
+        source_handle: syscalls::Handle,
+        target_process_handle: syscalls::ProcessHandle,
+        target_handle: Option<MutPtr<Platform, syscalls::Handle>>,
+        desired_access: u32,
+        handle_attributes: u32,
+        options: u32,
+    ) -> NtStatus {
+        let options = DuplicateOptions::from_bits_retain(options);
+        if let Some(target_handle) = target_handle
+            && target_handle
+                .write_at_offset(0, syscalls::Handle::default())
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if !source_process_handle.is_current() {
+            // TODO(duplicate-object-cross-process): resolve process handles once LiteBox supports
+            // multiple guest processes and per-process handle tables.
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        let status = self.duplicate_object(
+            source_handle,
+            target_process_handle,
+            target_handle,
+            desired_access,
+            handle_attributes,
+            options,
+        );
+
+        if options.contains(DuplicateOptions::CLOSE_SOURCE) {
+            let _ = self.sys_nt_close(source_handle);
+        }
+        status
+    }
+
+    fn duplicate_object(
+        &self,
+        source_handle: syscalls::Handle,
+        target_process_handle: syscalls::ProcessHandle,
+        target_handle: Option<MutPtr<Platform, syscalls::Handle>>,
+        desired_access: u32,
+        handle_attributes: u32,
+        options: DuplicateOptions,
+    ) -> NtStatus {
+        if target_process_handle.is_null() {
+            return if options.contains(DuplicateOptions::CLOSE_SOURCE) {
+                NtStatus::SUCCESS
+            } else {
+                NtStatus::INVALID_PARAMETER
+            };
+        }
+        if !target_process_handle.is_current() {
+            // TODO(duplicate-object-cross-process): insert into the target process handle table.
+            return NtStatus::INVALID_HANDLE;
+        }
+        let duplicate = match self.duplicate_handle(
+            source_handle,
+            desired_access,
+            handle_attributes,
+            options,
+        ) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+        if let Some(target_handle) = target_handle
+            && target_handle.write_at_offset(0, duplicate).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    fn duplicate_handle(
+        &self,
+        source_handle: syscalls::Handle,
+        desired_access: u32,
+        handle_attributes: u32,
+        options: DuplicateOptions,
+    ) -> Result<syscalls::Handle, NtStatus> {
+        macro_rules! try_duplicate {
+            ($subsystem:ty) => {
+                if let Some(result) = self.try_duplicate_handle::<$subsystem>(
+                    source_handle,
+                    desired_access,
+                    handle_attributes,
+                    options,
+                ) {
+                    return result;
+                }
+            };
+        }
+
+        try_duplicate!(FileObjectSubsystem<FS>);
+        try_duplicate!(RegistryKeySubsystem<Platform>);
+        try_duplicate!(EventSubsystem<Platform>);
+        try_duplicate!(DirectoryObjectSubsystem<Platform>);
+        try_duplicate!(SymbolicLinkSubsystem<Platform>);
+        try_duplicate!(IoCompletionSubsystem<Platform>);
+        try_duplicate!(LpcPortSubsystem<Platform>);
+        try_duplicate!(TimerSubsystem<Platform>);
+        try_duplicate!(WaitCompletionPacketSubsystem<Platform>);
+        try_duplicate!(WorkerFactorySubsystem<Platform>);
+        try_duplicate!(SectionSubsystem<Platform>);
+
+        Err(NtStatus::INVALID_HANDLE)
+    }
+
+    fn try_duplicate_handle<Subsystem>(
+        &self,
+        source_handle: syscalls::Handle,
+        desired_access: u32,
+        handle_attributes: u32,
+        options: DuplicateOptions,
+    ) -> Option<Result<syscalls::Handle, NtStatus>>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = match self.typed_handle::<Subsystem>(source_handle) {
+            Ok(typed) => typed,
+            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
+            Err(status) => return Some(Err(status)),
+        };
+        let source_metadata = match self.typed_handle_metadata(&typed) {
+            Ok(metadata) => metadata,
+            Err(status) => return Some(Err(status)),
+        };
+
+        let source_access = source_metadata.granted_access;
+        let duplicate_access = if options.contains(DuplicateOptions::SAME_ACCESS) {
+            source_access
+        } else {
+            let descriptors = self.global.litebox.descriptor_table();
+            match descriptors.with_entry(&typed, |entry| {
+                Subsystem::resolve_duplicate_access(entry, desired_access)
+            }) {
+                Some(Ok(access)) => access,
+                Some(Err(status)) => return Some(Err(status)),
+                None => return Some(Err(NtStatus::INVALID_HANDLE)),
+            }
+        };
+        let duplicate_attributes = if options.contains(DuplicateOptions::SAME_ATTRIBUTES) {
+            source_metadata.attributes
+        } else {
+            HandleAttributes::from_bits_retain(handle_attributes)
+        };
+
+        let duplicate = {
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            let Some(duplicate) = descriptors.duplicate(&typed) else {
+                return Some(Err(NtStatus::INVALID_HANDLE));
+            };
+            let old = descriptors.set_fd_metadata(
+                &duplicate,
+                WindowsHandleMetadata {
+                    granted_access: duplicate_access,
+                    attributes: duplicate_attributes,
+                },
+            );
+            debug_assert!(old.is_none());
+            duplicate
+        };
+        Some(insert_raw_handle::<Platform, Subsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            duplicate,
+            drop,
+        ))
+    }
+
+    fn close_handle(
+        &self,
+        handle: syscalls::Handle,
         visitor: impl RawHandleVisitor<Platform, FS>,
     ) -> NtStatus {
         macro_rules! try_close {
             ($subsystem:ty, $visit:ident) => {
-                if remove_raw_handle_by_raw_fd::<Platform, $subsystem>(
-                    &self.global.litebox,
-                    &self.process.handles,
-                    raw_fd,
-                    |entry| visitor.$visit(entry),
-                ) {
-                    return NtStatus::SUCCESS;
+                if let Some(status) =
+                    self.try_close_handle::<$subsystem>(handle, |entry| visitor.$visit(entry))
+                {
+                    return status;
                 }
             };
         }
@@ -1597,6 +1909,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_close!(SectionSubsystem<Platform>, section);
 
         NtStatus::INVALID_HANDLE
+    }
+
+    fn try_close_handle<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        cleanup_entry: impl FnOnce(Subsystem::Entry),
+    ) -> Option<NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = match self.typed_handle::<Subsystem>(handle) {
+            Ok(typed) => typed,
+            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
+            Err(status) => return Some(status),
+        };
+        let metadata = match self.typed_handle_metadata(&typed) {
+            Ok(metadata) => metadata,
+            Err(status) => return Some(status),
+        };
+        if metadata
+            .attributes
+            .contains(HandleAttributes::PROTECT_FROM_CLOSE)
+        {
+            return Some(NtStatus::HANDLE_NOT_CLOSABLE);
+        }
+
+        remove_raw_handle::<Platform, Subsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+            cleanup_entry,
+        );
+        Some(NtStatus::SUCCESS)
     }
 
     fn handle_interrupt_request(

@@ -107,14 +107,6 @@ impl DirectoryAccess {
             Self::ALL_ACCESS.bits(),
         ))
     }
-
-    fn require(self, required: Self) -> Result<(), NtStatus> {
-        if self.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
-    }
 }
 
 pub(crate) struct DirectoryObjectSubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -125,9 +117,16 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for DirectoryObjectSubsys
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for DirectoryHandleObject<Platform> {}
 
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+    for DirectoryObjectSubsystem<Platform>
+{
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        DirectoryAccess::from_desired_access(desired_access).bits()
+    }
+}
+
 pub(crate) struct DirectoryHandleObject<Platform: crate::ShimPlatform> {
     directory: Arc<ObjectNode<Platform>>,
-    granted_access: DirectoryAccess,
 }
 
 pub(super) struct ObjectNode<Platform: crate::ShimPlatform> {
@@ -998,11 +997,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         handle: Handle,
     ) -> Result<Arc<ObjectNode<Platform>>, NtStatus> {
-        let entry = self.directory_entry(handle)?;
-        entry.with_entry(|entry| {
-            entry.granted_access.require(DirectoryAccess::TRAVERSE)?;
-            Ok(Arc::clone(&entry.directory))
-        })
+        let entry = self.typed_handle_entry_with_access::<DirectoryObjectSubsystem<Platform>>(
+            handle,
+            DirectoryAccess::TRAVERSE.bits(),
+        )?;
+        Ok(entry.with_entry(|entry| Arc::clone(&entry.directory)))
     }
 
     pub(super) fn read_directory_object_attributes(
@@ -1072,10 +1071,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         granted_access: DirectoryAccess,
     ) -> Result<Handle, NtStatus> {
         self.insert_typed_handle::<DirectoryObjectSubsystem<Platform>>(
-            DirectoryHandleObject {
-                directory,
-                granted_access,
-            },
+            DirectoryHandleObject { directory },
+            granted_access.bits(),
             drop,
         )
     }
@@ -1223,15 +1220,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         params: DirectoryQueryParameters<Platform>,
     ) -> NtStatus {
-        let entry = match self.directory_entry(params.directory_handle) {
+        let entry = match self.typed_handle_entry_with_access::<DirectoryObjectSubsystem<Platform>>(
+            params.directory_handle,
+            DirectoryAccess::QUERY.bits(),
+        ) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        if let Err(status) =
-            entry.with_entry(|entry| entry.granted_access.require(DirectoryAccess::QUERY))
-        {
-            return status;
-        }
         let directory = entry.with_entry(|entry| Arc::clone(&entry.directory));
         let entries = match directory.children_snapshot() {
             Ok(entries) => entries,

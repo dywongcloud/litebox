@@ -28,6 +28,19 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for LpcPortSubsystem<Platform> {
 
 impl FdEnabledSubsystemEntry for LpcPortHandleObject {}
 
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for LpcPortSubsystem<Platform> {
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        desired_access
+    }
+
+    fn resolve_duplicate_access(
+        _entry: &Self::Entry,
+        desired_access: u32,
+    ) -> Result<u32, NtStatus> {
+        Ok(desired_access & !crate::nt_types::AccessMask::MAXIMUM_ALLOWED.bits())
+    }
+}
+
 pub(crate) struct LpcPortHandleObject {
     _port_name: String,
 }
@@ -166,7 +179,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let port = LpcPortHandleObject {
             _port_name: port_name.clone(),
         };
-        let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(port, drop) {
+        let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(port, 0, drop) {
             Ok(handle) => handle,
             Err(status) => {
                 self.rollback_pagefile_section_view(mapped_view.base);

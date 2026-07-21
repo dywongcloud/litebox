@@ -88,10 +88,32 @@ impl<FS: ShimFS> FdEnabledSubsystem for FileObjectSubsystem<FS> {
 
 impl<FS: ShimFS> FdEnabledSubsystemEntry for FileObject<FS> {}
 
+impl<FS: ShimFS> crate::WindowsHandleSubsystem for FileObjectSubsystem<FS> {
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        FileAccess::from_desired_access(desired_access).bits()
+    }
+
+    fn resolve_duplicate_access(entry: &Self::Entry, desired_access: u32) -> Result<u32, NtStatus> {
+        let maximum_allowed = desired_access & AccessMask::MAXIMUM_ALLOWED.bits() != 0;
+        let explicit_access =
+            FileAccess::from_desired_access(desired_access & !AccessMask::MAXIMUM_ALLOWED.bits());
+        if !entry.create_time_access.contains(explicit_access) {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
+        Ok(if maximum_allowed {
+            // TODO(dacl-access-check): Replace this original-open ceiling with a token and
+            // security-descriptor access check when the shim models DACLs.
+            entry.create_time_access.bits()
+        } else {
+            explicit_access.bits()
+        })
+    }
+}
+
 pub(crate) struct FileObject<FS: ShimFS> {
     path: String,
     backing: FileObjectBacking<FS>,
-    granted_access: FileAccess,
+    create_time_access: FileAccess,
     share_access: FileShareAccess,
     create_options: FileCreateOptions,
 }
@@ -398,7 +420,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn insert_file_handle(&self, file: FileObject<FS>) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<FileObjectSubsystem<FS>>(file, |file| self.close_file(file))
+        let granted_access = file.create_time_access.bits();
+        self.insert_typed_handle::<FileObjectSubsystem<FS>>(file, granted_access, |file| {
+            self.close_file(file);
+        })
     }
 
     pub(crate) fn close_file_handle(&self, handle: Handle) {
@@ -753,7 +778,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             FileObject {
                 path,
                 backing: FileObjectBacking::Filesystem { fd, is_directory },
-                granted_access: desired_access,
+                create_time_access: desired_access,
                 share_access,
                 create_options,
             },
@@ -826,7 +851,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             FileObject {
                 path,
                 backing,
-                granted_access: desired_access,
+                create_time_access: desired_access,
                 share_access,
                 create_options,
             },
@@ -932,7 +957,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     fd,
                     is_directory: true,
                 },
-                granted_access: desired_access,
+                create_time_access: desired_access,
                 share_access,
                 create_options,
             },
@@ -992,7 +1017,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let conflicts = entry.with_entry(|file| {
                 identity.matches(file)
                     && (desired_access.conflicts_with_share(file.share_access)
-                        || file.granted_access.conflicts_with_share(share_access))
+                        || file.create_time_access.conflicts_with_share(share_access))
             });
             if conflicts {
                 return Err(NtStatus::SHARING_VIOLATION);
@@ -1328,6 +1353,58 @@ mod tests {
             0,
         );
         (status, handle)
+    }
+
+    #[test]
+    fn nt_duplicate_object_rejects_file_access_escalation() {
+        let task = crate::tests::test_task();
+        create_existing_file(&task, "/tmp/duplicate-read-only.txt", b"data");
+        let (status, source, _) = create_file(
+            &task,
+            "/tmp/duplicate-read-only.txt",
+            FILE_GENERIC_READ,
+            FILE_OPEN,
+        );
+        assert_eq!(status, NtStatus::SUCCESS);
+
+        let mut write_duplicate = Handle::default();
+        assert_eq!(
+            task.sys_nt_duplicate_object(
+                crate::syscalls::ProcessHandle::CURRENT,
+                source,
+                crate::syscalls::ProcessHandle::CURRENT,
+                Some(mut_ptr(&mut write_duplicate)),
+                FileAccess::WRITE_DATA.bits(),
+                0,
+                0,
+            ),
+            NtStatus::ACCESS_DENIED
+        );
+        assert!(write_duplicate.is_null());
+
+        let mut maximum_duplicate = Handle::default();
+        assert_eq!(
+            task.sys_nt_duplicate_object(
+                crate::syscalls::ProcessHandle::CURRENT,
+                source,
+                crate::syscalls::ProcessHandle::CURRENT,
+                Some(mut_ptr(&mut maximum_duplicate)),
+                AccessMask::MAXIMUM_ALLOWED.bits(),
+                0,
+                0,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.typed_handle::<FileObjectSubsystem<TestFS>>(maximum_duplicate)
+                .and_then(|typed| {
+                    task.typed_handle_metadata(&typed)
+                        .map(|metadata| metadata.granted_access)
+                }),
+            Ok(FileAccess::from_desired_access(FILE_GENERIC_READ).bits())
+        );
+        assert_eq!(task.sys_nt_close(source), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(maximum_duplicate), NtStatus::SUCCESS);
     }
 
     #[test]
@@ -2315,6 +2392,15 @@ mod tests {
                 Length: u32,
                 FsInformationClass: u32,
             ) -> i32;
+            fn NtDuplicateObject(
+                SourceProcessHandle: *mut c_void,
+                SourceHandle: *mut c_void,
+                TargetProcessHandle: *mut c_void,
+                TargetHandle: *mut c_void,
+                DesiredAccess: u32,
+                HandleAttributes: u32,
+                Options: u32,
+            ) -> i32;
             fn NtClose(Handle: *mut c_void) -> i32;
         }
 
@@ -2704,6 +2790,70 @@ mod tests {
             assert_eq!(host_status, litebox_status.as_raw());
             assert_eq!(host_io_status.status, litebox_io_status.status);
             assert_eq!(host_io_status.information, litebox_io_status.information);
+        }
+
+        #[test]
+        fn nt_duplicate_object_file_access_matrix_matches_host() {
+            let test_dir = test_tmp_dir("nt_duplicate_object_file_access_matrix_matches_host");
+            let _ = std::fs::remove_dir_all(&test_dir);
+            std::fs::create_dir_all(&test_dir).unwrap();
+            let host_file = test_dir.join("read-only-source.txt");
+            std::fs::write(&host_file, b"host").unwrap();
+
+            let host_name_units = utf16(&host_nt_path(&host_file));
+            let host_name = unicode_string(&host_name_units);
+            let host_attributes = host_object_attributes(&host_name);
+            let mut host_source = core::ptr::null_mut();
+            let mut host_io_status = IoStatusBlock::default();
+            // SAFETY: All pointers reference live locals and ObjectName names the test file.
+            assert_eq!(
+                unsafe {
+                    NtOpenFile(
+                        &raw mut host_source,
+                        FILE_GENERIC_READ,
+                        &raw const host_attributes,
+                        &raw mut host_io_status,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        0,
+                    )
+                },
+                NtStatus::SUCCESS.as_raw()
+            );
+            let mut host_write_duplicate: *mut c_void = core::ptr::null_mut();
+            // SAFETY: The process pseudo-handles and source handle are valid; output is a local.
+            assert_eq!(
+                unsafe {
+                    NtDuplicateObject(
+                        usize::MAX as *mut c_void,
+                        host_source,
+                        usize::MAX as *mut c_void,
+                        (&raw mut host_write_duplicate).cast(),
+                        FileAccess::WRITE_DATA.bits(),
+                        0,
+                        0,
+                    )
+                },
+                NtStatus::ACCESS_DENIED.as_raw()
+            );
+            assert!(host_write_duplicate.is_null());
+            let mut host_maximum_duplicate: *mut c_void = core::ptr::null_mut();
+            // SAFETY: The process pseudo-handles and source handle are valid; output is a local.
+            assert_eq!(
+                unsafe {
+                    NtDuplicateObject(
+                        usize::MAX as *mut c_void,
+                        host_source,
+                        usize::MAX as *mut c_void,
+                        (&raw mut host_maximum_duplicate).cast(),
+                        AccessMask::MAXIMUM_ALLOWED.bits(),
+                        0,
+                        0,
+                    )
+                },
+                NtStatus::SUCCESS.as_raw()
+            );
+            close_host_handle(host_source);
+            close_host_handle(host_maximum_duplicate);
         }
 
         #[test]

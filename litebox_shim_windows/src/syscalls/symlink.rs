@@ -48,14 +48,6 @@ impl SymbolicLinkAccess {
             Self::ALL_ACCESS.bits(),
         ))
     }
-
-    fn require(self, required: Self) -> Result<(), NtStatus> {
-        if self.contains(required) {
-            Ok(())
-        } else {
-            Err(NtStatus::ACCESS_DENIED)
-        }
-    }
 }
 
 pub(crate) struct SymbolicLinkSubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -66,9 +58,16 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for SymbolicLinkSubsystem
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for SymbolicLinkHandleObject<Platform> {}
 
+impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
+    for SymbolicLinkSubsystem<Platform>
+{
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        SymbolicLinkAccess::from_desired_access(desired_access).bits()
+    }
+}
+
 pub(crate) struct SymbolicLinkHandleObject<Platform: crate::ShimPlatform> {
     link: Arc<ObjectNode<Platform>>,
-    granted_access: SymbolicLinkAccess,
 }
 
 fn utf16_units(value: &str) -> Result<Vec<u16>, NtStatus> {
@@ -84,23 +83,14 @@ fn utf16_units(value: &str) -> Result<Vec<u16>, NtStatus> {
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn symbolic_link_entry(
-        &self,
-        handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, SymbolicLinkSubsystem<Platform>>, NtStatus> {
-        self.typed_handle_entry::<SymbolicLinkSubsystem<Platform>>(handle)
-    }
-
     fn insert_symbolic_link_handle(
         &self,
         link: Arc<ObjectNode<Platform>>,
         granted_access: SymbolicLinkAccess,
     ) -> Result<Handle, NtStatus> {
         self.insert_typed_handle::<SymbolicLinkSubsystem<Platform>>(
-            SymbolicLinkHandleObject {
-                link,
-                granted_access,
-            },
+            SymbolicLinkHandleObject { link },
+            granted_access.bits(),
             drop,
         )
     }
@@ -234,15 +224,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         link_target: MutPtr<Platform, UnicodeString>,
         returned_length: Option<MutPtr<Platform, u32>>,
     ) -> NtStatus {
-        let entry = match self.symbolic_link_entry(link_handle) {
+        let entry = match self.typed_handle_entry_with_access::<SymbolicLinkSubsystem<Platform>>(
+            link_handle,
+            SymbolicLinkAccess::QUERY.bits(),
+        ) {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        if let Err(status) =
-            entry.with_entry(|entry| entry.granted_access.require(SymbolicLinkAccess::QUERY))
-        {
-            return status;
-        }
         if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(link_target) {
             return status;
         }
