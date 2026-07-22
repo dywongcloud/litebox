@@ -247,6 +247,26 @@ where
         .ok_or(NtStatus::ACCESS_VIOLATION)
 }
 
+pub(crate) fn probe_guest_output_buffer<Platform>(
+    buffer: MutPtr<Platform, u8>,
+    buffer_length: usize,
+) -> Result<(), NtStatus>
+where
+    Platform: RawPointerProvider,
+{
+    if buffer_length == 0 {
+        return Ok(());
+    }
+    probe_guest_output_preserving_value::<Platform, u8>(buffer)?;
+    let last_offset = isize::try_from(buffer_length - 1).map_err(|_| NtStatus::ACCESS_VIOLATION)?;
+    let value = buffer
+        .read_at_offset(last_offset)
+        .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    buffer
+        .write_at_offset(last_offset, value)
+        .ok_or(NtStatus::ACCESS_VIOLATION)
+}
+
 fn set_guest_teb<Platform>(platform: &Platform, teb_address: usize) -> bool
 where
     Platform: PunchthroughProvider + RawPointerProvider,
@@ -391,6 +411,9 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             platform: self.platform,
             page_manager: PageManager::new(&self.litebox),
             registry: syscalls::registry::RegistryStore::new(&self.litebox),
+            wnf_states: syscalls::wnf::WnfStateStore::new(
+                syscalls::wnf::WnfStateStoreData::default(),
+            ),
             qpc_boot_instant: TimeProvider::now(self.platform),
             litebox: self.litebox,
             _fs: PhantomData,
@@ -502,6 +525,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     platform: &'static Platform,
     page_manager: WindowsPageManager<Platform>,
     registry: syscalls::registry::RegistryStore<Platform>,
+    wnf_states: syscalls::wnf::WnfStateStore<Platform>,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
     litebox: LiteBox<Platform>,
     _fs: PhantomData<FS>,
@@ -516,7 +540,10 @@ pub struct Process<Platform: ShimPlatform> {
     object_manager: WindowsObjectManager<Platform>,
     section_views: WindowsSectionViews<Platform>,
     // TODO: move this into `GlobalState` once we have a proper shared mapping implementation.
-    #[expect(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "keeps alive the section registered weakly in the object namespace"
+    )]
     windows_shared_section: Arc<SectionObject<Platform>>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
@@ -1405,6 +1432,95 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     system_information,
                     system_information_length,
                     return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryWnfStateData {
+                state_name,
+                type_id,
+                explicit_scope,
+                change_stamp,
+                buffer,
+                buffer_size,
+            } => {
+                let status = self.sys_nt_query_wnf_state_data(
+                    state_name,
+                    type_id,
+                    explicit_scope,
+                    change_stamp,
+                    buffer,
+                    buffer_size,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateWnfStateName {
+                state_name,
+                name_lifetime,
+                data_scope,
+                persist_data,
+                type_id,
+                maximum_state_size,
+                security_descriptor,
+            } => {
+                let status = self.sys_nt_create_wnf_state_name(
+                    syscalls::wnf::WnfCreateStateNameParameters {
+                        state_name,
+                        name_lifetime,
+                        data_scope,
+                        persist_data,
+                        type_id,
+                        maximum_state_size,
+                        security_descriptor,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtUpdateWnfStateData {
+                state_name,
+                buffer,
+                buffer_size,
+                type_id,
+                explicit_scope,
+                matching_change_stamp,
+                check_stamp,
+            } => {
+                let status = self.sys_nt_update_wnf_state_data(
+                    syscalls::wnf::WnfUpdateStateDataParameters {
+                        state_name,
+                        buffer,
+                        buffer_size,
+                        type_id,
+                        explicit_scope,
+                        matching_change_stamp,
+                        check_stamp,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtDeleteWnfStateData {
+                state_name,
+                explicit_scope,
+            } => {
+                let status = self.sys_nt_delete_wnf_state_data(state_name, explicit_scope);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtDeleteWnfStateName { state_name } => {
+                let status = self.sys_nt_delete_wnf_state_name(state_name);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryWnfStateNameInformation {
+                state_name,
+                name_information_class,
+                explicit_scope,
+                buffer,
+                buffer_size,
+            } => {
+                let status = self.sys_nt_query_wnf_state_name_information(
+                    state_name,
+                    name_information_class,
+                    explicit_scope,
+                    buffer,
+                    buffer_size,
                 );
                 (status, ContinueOperation::Resume)
             }
