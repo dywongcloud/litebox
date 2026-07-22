@@ -182,8 +182,9 @@ mod tests {
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption};
     use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-        BrokerResponse, EventRequest, EventResponse, ReadinessNotification,
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
+        BrokerRequest, BrokerResponse, BrokerResult, EventRequest, EventResponse,
+        ReadinessNotification,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
 
@@ -471,32 +472,36 @@ mod tests {
                 self.last_request.take();
                 return Err(());
             }
-            let response = match self.last_request.take().unwrap() {
-                BrokerRequest::Event(EventRequest::Create(_)) => {
+            let request = self.last_request.take().unwrap();
+            let result = match request.operation {
+                BrokerOperation::Event(EventRequest::Create(_)) => {
                     let handle = ObjectHandle(self.next_handle);
                     self.next_handle += 1;
-                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }))
+                    BrokerResult::Event(EventResponse::Create(CreateEventResponse { handle }))
                 }
-                BrokerRequest::Event(EventRequest::Consume(_)) => {
+                BrokerOperation::Event(EventRequest::Consume(_)) => {
                     self.consume_attempts.fetch_add(1, Ordering::SeqCst);
                     if self.read_ready.swap(false, Ordering::SeqCst) {
-                        BrokerResponse::Event(EventResponse::Consume(EventConsumption {
+                        BrokerResult::Event(EventResponse::Consume(EventConsumption {
                             value: 1,
                             readiness: ReadinessFlags::WRITE,
                         }))
                     } else {
-                        BrokerResponse::Error(ErrorCode::WouldBlock)
+                        BrokerResult::Error(ErrorCode::WouldBlock)
                     }
                 }
-                BrokerRequest::CloseObject(_) => BrokerResponse::ObjectClosed,
-                BrokerRequest::CheckReadiness(_) => {
-                    BrokerResponse::Readiness(ReadinessFlags::WRITE)
+                BrokerOperation::CloseObject(_) => BrokerResult::ObjectClosed,
+                BrokerOperation::CheckReadiness(_) => {
+                    BrokerResult::Readiness(ReadinessFlags::WRITE)
                 }
-                request @ (BrokerRequest::Event(_) | BrokerRequest::Pipe(_)) => {
+                request @ (BrokerOperation::Event(_) | BrokerOperation::Pipe(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
             };
-            Ok(Some(response))
+            Ok(Some(BrokerResponse {
+                request_id: request.request_id,
+                result,
+            }))
         }
     }
 }

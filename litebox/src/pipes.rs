@@ -931,8 +931,8 @@ mod tests {
     use litebox_broker_protocol::channel::LocalControlChannel;
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-        BrokerResponse, PipeRequest, ReadinessNotification,
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
+        BrokerRequest, BrokerResponse, BrokerResult, PipeRequest, ReadinessNotification,
     };
     use litebox_broker_protocol::pipe::CreatePipeResponse;
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -1179,32 +1179,35 @@ mod tests {
         }
 
         fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            match self.last_request.take().unwrap() {
-                BrokerRequest::Pipe(PipeRequest::Create(_)) => Ok(Some(BrokerResponse::Pipe(
+            let request = self.last_request.take().unwrap();
+            let result = match request.operation {
+                BrokerOperation::Pipe(PipeRequest::Create(_)) => BrokerResult::Pipe(
                     litebox_broker_protocol::message::PipeResponse::Create(CreatePipeResponse {
                         read_handle: ObjectHandle(1),
                         write_handle: ObjectHandle(2),
                     }),
-                ))),
-                BrokerRequest::Pipe(PipeRequest::Read(_))
+                ),
+                BrokerOperation::Pipe(PipeRequest::Read(_))
                     if self.force_transport.load(Ordering::SeqCst) =>
                 {
-                    Err(())
+                    return Err(());
                 }
-                BrokerRequest::Pipe(PipeRequest::Read(_)) => match self.read_failure {
-                    ReadFailure::Transport => Err(()),
-                    ReadFailure::WouldBlock => {
-                        Ok(Some(BrokerResponse::Error(ErrorCode::WouldBlock)))
-                    }
+                BrokerOperation::Pipe(PipeRequest::Read(_)) => match self.read_failure {
+                    ReadFailure::Transport => return Err(()),
+                    ReadFailure::WouldBlock => BrokerResult::Error(ErrorCode::WouldBlock),
                 },
-                BrokerRequest::CloseObject(_) => Ok(Some(BrokerResponse::ObjectClosed)),
-                BrokerRequest::CheckReadiness(_) => {
-                    Ok(Some(BrokerResponse::Readiness(ReadinessFlags::default())))
+                BrokerOperation::CloseObject(_) => BrokerResult::ObjectClosed,
+                BrokerOperation::CheckReadiness(_) => {
+                    BrokerResult::Readiness(ReadinessFlags::default())
                 }
-                request @ (BrokerRequest::Pipe(_) | BrokerRequest::Event(_)) => {
+                request @ (BrokerOperation::Pipe(_) | BrokerOperation::Event(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
-            }
+            };
+            Ok(Some(BrokerResponse {
+                request_id: request.request_id,
+                result,
+            }))
         }
     }
 

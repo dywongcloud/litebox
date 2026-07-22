@@ -459,7 +459,10 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
         if matches!(
             &request,
             litebox_broker_protocol::channel::HostReceive::Message(
-                litebox_broker_protocol::message::BrokerRequest::CloseObject(_)
+                litebox_broker_protocol::message::BrokerRequest {
+                    operation: litebox_broker_protocol::message::BrokerOperation::CloseObject(_),
+                    ..
+                }
             )
         ) {
             self.close_object_count += 1;

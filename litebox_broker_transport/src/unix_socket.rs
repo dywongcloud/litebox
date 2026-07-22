@@ -390,6 +390,8 @@ fn wire_error(error: WireError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox_broker_protocol::RequestId;
+    use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
     use std::time::Duration;
 
     #[test]
@@ -610,11 +612,14 @@ mod tests {
         let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
         write_frame_with_deadline(
             &mut peer_stream,
-            &encode_request(BrokerRequest::Event(
-                litebox_broker_protocol::message::EventRequest::Create(
-                    litebox_broker_protocol::event::CreateEventRequest { initial_count: 0 },
+            &encode_request(BrokerRequest {
+                request_id: RequestId(0),
+                operation: BrokerOperation::Event(
+                    litebox_broker_protocol::message::EventRequest::Create(
+                        litebox_broker_protocol::event::CreateEventRequest { initial_count: 0 },
+                    ),
                 ),
-            )),
+            }),
             None,
         )
         .unwrap();

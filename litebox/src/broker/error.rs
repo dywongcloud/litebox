@@ -10,8 +10,8 @@ use crate::event::{counter::EventCounterError, polling::TryOpError};
 /// Error returned by the deployment-provided broker control path.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub(crate) enum BrokerControlError {
-    #[error("broker control transport failed")]
-    Transport,
+    #[error("broker control association failed")]
+    AssociationFailed,
     #[error("broker returned operation error: {0}")]
     Broker(#[source] ErrorCode),
 }
@@ -41,7 +41,7 @@ pub(crate) enum BrokerObjectError {
 impl From<BrokerControlError> for BrokerObjectError {
     fn from(error: BrokerControlError) -> Self {
         match error {
-            BrokerControlError::Transport => Self::Control,
+            BrokerControlError::AssociationFailed => Self::Control,
             BrokerControlError::Broker(error) => error.into(),
         }
     }
@@ -69,7 +69,10 @@ impl From<ErrorCode> for BrokerObjectError {
 impl<E> From<BrokerLocalError<E>> for BrokerControlError {
     fn from(error: BrokerLocalError<E>) -> Self {
         match error {
-            BrokerLocalError::Channel(_) | BrokerLocalError::ChannelClosed => Self::Transport,
+            BrokerLocalError::Channel(_)
+            | BrokerLocalError::ChannelClosed
+            | BrokerLocalError::RequestIdExhausted
+            | BrokerLocalError::UnexpectedResponseId { .. } => Self::AssociationFailed,
             BrokerLocalError::Broker(error) => Self::Broker(error),
         }
     }
