@@ -1539,8 +1539,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     Err(Errno::ENOPROTOOPT)
                 }
-                // We use fixed buffer size for now
-                SocketOption::RCVBUF | SocketOption::SNDBUF => Err(Errno::EOPNOTSUPP),
+                // SO_RCVBUF / SO_SNDBUF are advisory hints. Accept them and keep
+                // the fixed internal buffer size, instead of returning EOPNOTSUPP.
+                // Log at debug so the accepted-but-ignored option stays visible.
+                SocketOption::RCVBUF | SocketOption::SNDBUF => {
+                    litebox_util_log::debug!(
+                        "accepting and ignoring setsockopt(SO_RCVBUF/SO_SNDBUF) on unix socket; using fixed buffer size"
+                    );
+                    Ok(())
+                }
             },
             SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
