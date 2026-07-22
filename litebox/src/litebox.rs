@@ -50,7 +50,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> Self
     where
         Platform: TimeProvider,
-        Channel: LocalControlChannel + Send + 'static,
+        Channel: LocalControlChannel + Send + Sync + 'static,
     {
         let broker_pollables = Arc::new(broker::BrokerPollableRegistry::new());
         let broker_control = Arc::new(broker::BrokerLocalControl::<Platform, Channel>::new(

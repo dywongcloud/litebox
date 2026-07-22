@@ -3,9 +3,9 @@
 
 //! Typed broker-local adapters for broker requests and notifications.
 //!
-//! The local control adapter owns request/response sequencing but does not own a channel.
-//! Userland, kernel, or ring-buffer deployments can provide channels by
-//! implementing [`litebox_broker_protocol::channel::LocalControlChannel`].
+//! The local control adapter owns request identifiers but does not own transport
+//! sequencing. Userland, kernel, or ring-buffer deployments provide control
+//! channels by implementing [`litebox_broker_protocol::channel::LocalControlChannel`].
 //! Notification receive adapters are intentionally separate so active control
 //! requests remain strictly paired with their responses.
 
@@ -21,6 +21,7 @@ mod event;
 mod pipe;
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_protocol::channel::{LocalControlChannel, LocalNotificationChannel};
 use litebox_broker_protocol::error::ErrorCode;
@@ -42,7 +43,7 @@ pub use error::{BrokerLocalError, Result};
 pub struct BrokerLocal<Channel: LocalControlChannel> {
     channel: Channel,
     shared_memory: Arc<dyn SharedMemory>,
-    next_request_id: u64,
+    next_request_id: AtomicU64,
 }
 
 /// Broker-local receive adapter for broker-initiated asynchronous notifications.
@@ -61,12 +62,9 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// shared memory with an invalid size.
     pub fn negotiate(
         mut channel: Channel,
-        receive_shared_memory: impl FnOnce(
+        activate: impl FnOnce(
             &mut Channel,
-        ) -> core::result::Result<
-            Arc<dyn SharedMemory>,
-            Channel::Error,
-        >,
+        ) -> core::result::Result<Arc<dyn SharedMemory>, Channel::Error>,
     ) -> Result<Self, Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         let request = BrokerHandshakeRequest {
@@ -87,8 +85,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                     requested, broker_protocol_version,
                     "broker returned unexpected negotiation response: {response:?}"
                 );
-                let shared_memory =
-                    receive_shared_memory(&mut channel).map_err(BrokerLocalError::Channel)?;
+                let shared_memory = activate(&mut channel).map_err(BrokerLocalError::Channel)?;
                 assert_eq!(
                     shared_memory.len(),
                     PIPE_TRANSFER_BUFFER_SIZE,
@@ -97,7 +94,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 Ok(Self {
                     channel,
                     shared_memory,
-                    next_request_id: 0,
+                    next_request_id: AtomicU64::new(0),
                 })
             }
             BrokerHandshakeResponse::VersionMismatch { .. } => {
@@ -123,28 +120,26 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match an active request.
     pub(crate) fn request(
-        &mut self,
+        &self,
         operation: BrokerOperation,
     ) -> Result<BrokerResult, Channel::Error> {
-        let request_id = RequestId(self.next_request_id);
-        self.next_request_id = self
+        let request_id = self
             .next_request_id
-            .checked_add(1)
-            .ok_or(BrokerLocalError::RequestIdExhausted)?;
-        self.channel
-            .send_request(&BrokerRequest {
-                request_id,
-                operation,
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |request_id| {
+                request_id.checked_add(1)
             })
-            .map_err(BrokerLocalError::Channel)?;
+            .map(RequestId)
+            .map_err(|_| BrokerLocalError::RequestIdExhausted)?;
         let BrokerResponse {
             request_id: response_id,
             result,
         } = self
             .channel
-            .recv_response()
-            .map_err(BrokerLocalError::Channel)?
-            .ok_or(BrokerLocalError::ChannelClosed)?;
+            .call(BrokerRequest {
+                request_id,
+                operation,
+            })
+            .map_err(BrokerLocalError::Channel)?;
         if response_id != request_id {
             return Err(BrokerLocalError::UnexpectedResponseId {
                 expected: request_id,
@@ -180,10 +175,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
     /// response that does not match the issued readiness request.
-    pub fn check_readiness(
-        &mut self,
-        handle: ObjectHandle,
-    ) -> Result<ReadinessFlags, Channel::Error> {
+    pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags, Channel::Error> {
         match self.request(BrokerOperation::CheckReadiness(handle))? {
             BrokerResult::Readiness(readiness) => Ok(readiness),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
@@ -197,7 +189,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match an object close request.
-    pub fn close_object(&mut self, handle: ObjectHandle) -> Result<(), Channel::Error> {
+    pub fn close_object(&self, handle: ObjectHandle) -> Result<(), Channel::Error> {
         match self.request(BrokerOperation::CloseObject(handle))? {
             BrokerResult::ObjectClosed => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
@@ -229,13 +221,14 @@ impl<Channel: LocalNotificationChannel> BrokerNotifications<Channel> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::cell::Cell;
+    use core::cell::{Cell, RefCell};
     use core::convert::Infallible;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::ProtocolVersion;
     use litebox_broker_protocol::channel::LocalNotificationChannel;
     use litebox_broker_protocol::message::ReadinessNotification;
     use litebox_broker_protocol::readiness::ReadinessFlags;
+    use std::sync::Mutex;
 
     #[test]
     fn negotiate_runs_setup_after_response_before_active_requests() {
@@ -249,7 +242,7 @@ mod tests {
         let local = BrokerLocal::negotiate(channel, |channel| {
             assert!(channel.sent_handshake_request.is_some());
             assert!(channel.handshake_response.is_none());
-            assert!(channel.sent_request.is_none());
+            assert!(channel.sent_request.borrow().is_none());
             setup_calls.set(setup_calls.get() + 1);
             Ok(noop_shared_memory())
         })
@@ -270,15 +263,15 @@ mod tests {
         let request = BrokerOperation::CloseObject(handle);
         let response = BrokerResult::ObjectClosed;
         let channel = FakeControlChannel::new(None, Some(response.clone()));
-        let mut local = BrokerLocal {
+        let local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: 0,
+            next_request_id: AtomicU64::new(0),
         };
 
         assert!(local.close_object(handle).is_ok());
         assert_eq!(
-            local.channel.sent_request,
+            local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
                 operation: request,
@@ -290,35 +283,74 @@ mod tests {
     fn active_requests_use_monotonic_identifiers() {
         let handle = ObjectHandle(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let mut local = BrokerLocal {
+        let local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: 0,
+            next_request_id: AtomicU64::new(0),
         };
 
         local.close_object(handle).unwrap();
         assert_eq!(
-            local.channel.sent_request.as_ref().unwrap().request_id,
+            local
+                .channel
+                .sent_request
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .request_id,
             RequestId(0)
         );
 
-        local.channel.response = Some(BrokerResult::ObjectClosed);
+        *local.channel.response.borrow_mut() = Some(BrokerResult::ObjectClosed);
         local.close_object(handle).unwrap();
         assert_eq!(
-            local.channel.sent_request.as_ref().unwrap().request_id,
+            local
+                .channel
+                .sent_request
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .request_id,
             RequestId(1)
+        );
+    }
+
+    #[test]
+    fn concurrent_active_requests_use_distinct_identifiers() {
+        let local = Arc::new(BrokerLocal {
+            channel: ConcurrentCallChannel {
+                request_ids: Mutex::new(std::vec::Vec::new()),
+            },
+            shared_memory: noop_shared_memory(),
+            next_request_id: AtomicU64::new(0),
+        });
+        let callers = (0..16)
+            .map(|handle| {
+                let local = Arc::clone(&local);
+                std::thread::spawn(move || local.close_object(ObjectHandle(handle)))
+            })
+            .collect::<std::vec::Vec<_>>();
+
+        for caller in callers {
+            caller.join().unwrap().unwrap();
+        }
+        let mut request_ids = local.channel.request_ids.lock().unwrap().clone();
+        request_ids.sort();
+        assert_eq!(
+            request_ids,
+            (0..16).map(RequestId).collect::<std::vec::Vec<_>>()
         );
     }
 
     #[test]
     fn active_request_rejects_mismatched_response_identifier() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let mut local = BrokerLocal {
+        let local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: 0,
+            next_request_id: AtomicU64::new(0),
         };
-        local.channel.response_id = Some(RequestId(9));
+        local.channel.response_id.set(Some(RequestId(9)));
 
         assert!(matches!(
             local.close_object(ObjectHandle(7)),
@@ -332,27 +364,27 @@ mod tests {
     #[test]
     fn active_request_identifier_exhaustion_does_not_wrap() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let mut local = BrokerLocal {
+        let local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: u64::MAX,
+            next_request_id: AtomicU64::new(u64::MAX),
         };
 
         assert!(matches!(
             local.close_object(ObjectHandle(7)),
             Err(BrokerLocalError::RequestIdExhausted)
         ));
-        assert!(local.channel.sent_request.is_none());
+        assert!(local.channel.sent_request.borrow().is_none());
     }
 
     #[test]
     fn active_request_returns_recoverable_broker_error() {
         let channel =
             FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::WouldBlock)));
-        let mut local = BrokerLocal {
+        let local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: 0,
+            next_request_id: AtomicU64::new(0),
         };
 
         assert!(matches!(
@@ -365,10 +397,10 @@ mod tests {
     #[should_panic(expected = "broker returned unrecoverable error")]
     fn active_request_panics_on_unrecoverable_broker_error() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
-        let mut local = BrokerLocal {
+        let local = BrokerLocal {
             channel,
             shared_memory: noop_shared_memory(),
-            next_request_id: 0,
+            next_request_id: AtomicU64::new(0),
         };
 
         let _ = local.create_event_with_count(0);
@@ -458,7 +490,9 @@ mod tests {
         );
 
         assert!(matches!(
-            BrokerLocal::negotiate(channel, |_| Err(FakeChannelError::SharedMemoryReceive)),
+            BrokerLocal::<FakeControlChannel>::negotiate(channel, |_| {
+                Err(FakeChannelError::SharedMemoryReceive)
+            }),
             Err(BrokerLocalError::Channel(
                 FakeChannelError::SharedMemoryReceive
             ))
@@ -499,10 +533,10 @@ mod tests {
 
     struct FakeControlChannel {
         sent_handshake_request: Option<BrokerHandshakeRequest>,
-        sent_request: Option<BrokerRequest>,
+        sent_request: RefCell<Option<BrokerRequest>>,
         handshake_response: Option<BrokerHandshakeResponse>,
-        response: Option<BrokerResult>,
-        response_id: Option<RequestId>,
+        response: RefCell<Option<BrokerResult>>,
+        response_id: Cell<Option<RequestId>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -552,10 +586,10 @@ mod tests {
         ) -> Self {
             Self {
                 sent_handshake_request: None,
-                sent_request: None,
+                sent_request: RefCell::new(None),
                 handshake_response,
-                response,
-                response_id: None,
+                response: RefCell::new(response),
+                response_id: Cell::new(None),
             }
         }
     }
@@ -576,30 +610,79 @@ mod tests {
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
             Ok(self.handshake_response.take())
         }
-
-        fn send_request(
-            &mut self,
-            request: &BrokerRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            self.sent_request = Some(request.clone());
-            Ok(())
-        }
-
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            Ok(self.response.take().map(|result| BrokerResponse {
-                request_id: self.response_id.unwrap_or_else(|| {
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
+            *self.sent_request.borrow_mut() = Some(request);
+            let result = self
+                .response
+                .borrow_mut()
+                .take()
+                .expect("response requires a scripted result");
+            Ok(BrokerResponse {
+                request_id: self.response_id.get().unwrap_or_else(|| {
                     self.sent_request
+                        .borrow()
                         .as_ref()
                         .expect("response requires a sent request")
                         .request_id
                 }),
                 result,
-            }))
+            })
+        }
+
+        fn with_serialized_payload<T>(
+            &self,
+            transfer: impl FnOnce() -> T,
+        ) -> core::result::Result<T, Self::Error> {
+            Ok(transfer())
         }
     }
 
     struct FakeNotificationChannel {
         notification: Option<BrokerNotification>,
+    }
+
+    struct ConcurrentCallChannel {
+        request_ids: Mutex<std::vec::Vec<RequestId>>,
+    }
+
+    impl LocalControlChannel for ConcurrentCallChannel {
+        type Error = Infallible;
+
+        fn send_handshake_request(
+            &mut self,
+            _request: &BrokerHandshakeRequest,
+        ) -> core::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn recv_handshake_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
+            Ok(Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            }))
+        }
+
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
+            self.request_ids.lock().unwrap().push(request.request_id);
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result: BrokerResult::ObjectClosed,
+            })
+        }
+
+        fn with_serialized_payload<T>(
+            &self,
+            transfer: impl FnOnce() -> T,
+        ) -> core::result::Result<T, Self::Error> {
+            Ok(transfer())
+        }
     }
 
     impl LocalNotificationChannel for FakeNotificationChannel {

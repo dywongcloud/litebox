@@ -6,17 +6,25 @@
 //! This module deliberately uses `std` because Unix-domain sockets and `std::io`
 //! framing are hosted userland concerns. Portable broker interfaces live in the
 //! no_std protocol, local, core, and host crates.
+//!
+//! After setup, each caller thread registers its request and writes its complete
+//! frame while holding the shared writer mutex; there is no local request worker.
+//! One response-dispatcher thread exclusively reads responses, correlates them by
+//! request ID, and wakes the matching callers.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
+use std::{collections::HashMap, thread};
 
 use crate::shared_memory::MemfdSharedMemory;
 use crate::unix_io::{
     refresh_read_deadline, refresh_write_deadline, with_read_deadline, with_write_deadline,
 };
+use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::channel::{
     HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
     LocalNotificationChannel, PeerCredential,
@@ -32,6 +40,8 @@ use litebox_broker_protocol::wire::{
 };
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
+/// Maximum number of active calls waiting for broker responses.
+pub const MAX_PENDING_CALLS: usize = 64;
 
 /// Validates that a connected Unix socket belongs to `expected_process_id`.
 pub fn validate_peer_process(stream: &UnixStream, expected_process_id: u32) -> IoResult<()> {
@@ -63,21 +73,45 @@ fn peer_process_id(stream: &UnixStream) -> IoResult<u32> {
 
 /// Local-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamLocalControlChannel {
+    state: UnixStreamLocalControlState,
+}
+
+enum UnixStreamLocalControlState {
+    Setup(UnixStreamLocalSetup),
+    Active(UnixStreamLocalActive),
+    Failed,
+}
+
+struct UnixStreamLocalSetup {
     stream: UnixStream,
     setup_deadline: Option<Instant>,
+    negotiated: bool,
 }
 
 /// Independently owned handle for interrupting local control-channel I/O.
 pub struct UnixStreamLocalControlCancellation {
     stream: UnixStream,
+    pending_calls: Arc<PendingCalls>,
+    association_failure: Arc<dyn Fn() + Send + Sync>,
+}
+
+struct UnixStreamLocalActive {
+    request_stream: Mutex<UnixStream>,
+    shutdown_stream: UnixStream,
+    pending_calls: Arc<PendingCalls>,
+    payload_transfer: Mutex<()>,
+    association_failure: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl UnixStreamLocalControlChannel {
     /// Creates a local control channel from an already-connected Unix stream.
     pub const fn from_connected(stream: UnixStream) -> Self {
         Self {
-            stream,
-            setup_deadline: None,
+            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+                stream,
+                setup_deadline: None,
+                negotiated: false,
+            }),
         }
     }
 
@@ -96,16 +130,12 @@ impl UnixStreamLocalControlChannel {
         deadline: Instant,
     ) -> IoResult<Self> {
         UnixStream::connect(path).map(|stream| Self {
-            stream,
-            setup_deadline: Some(deadline),
+            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+                stream,
+                setup_deadline: Some(deadline),
+                negotiated: false,
+            }),
         })
-    }
-
-    /// Creates a handle that can interrupt pending control-channel I/O.
-    pub fn cancellation_handle(&self) -> IoResult<UnixStreamLocalControlCancellation> {
-        self.stream
-            .try_clone()
-            .map(|stream| UnixStreamLocalControlCancellation { stream })
     }
 
     /// Receives the memfd associated with this control channel.
@@ -114,23 +144,99 @@ impl UnixStreamLocalControlChannel {
         expected_len: usize,
         deadline: Option<Instant>,
     ) -> IoResult<MemfdSharedMemory> {
-        crate::shared_memory::receive_memfd(&mut self.stream, expected_len, deadline)
+        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+            return Err(invalid_data("broker control setup already completed"));
+        };
+        crate::shared_memory::receive_memfd(&mut setup.stream, expected_len, deadline)
+    }
+
+    /// Completes setup and starts the active response pump.
+    pub fn activate(
+        &mut self,
+        association_failure: impl Fn() + Send + Sync + 'static,
+    ) -> IoResult<UnixStreamLocalControlCancellation> {
+        let UnixStreamLocalControlState::Setup(setup) = &self.state else {
+            return Err(invalid_data("broker control channel already active"));
+        };
+        if !setup.negotiated {
+            return Err(invalid_data(
+                "broker control channel activated before negotiation completed",
+            ));
+        }
+        let UnixStreamLocalControlState::Setup(setup) =
+            core::mem::replace(&mut self.state, UnixStreamLocalControlState::Failed)
+        else {
+            unreachable!("broker control setup state disappeared");
+        };
+
+        let response_stream = setup.stream;
+        let request_stream = response_stream.try_clone()?;
+        let shutdown_stream = response_stream.try_clone()?;
+        let cancellation_stream = response_stream.try_clone()?;
+        let response_cancellation = response_stream.try_clone()?;
+        let pending_calls = Arc::new(PendingCalls::new());
+        let association_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(association_failure);
+        let response_pending_calls = Arc::clone(&pending_calls);
+        let response_failure = Arc::clone(&association_failure);
+        thread::Builder::new()
+            .name("litebox-broker-responses".to_owned())
+            .spawn(move || {
+                dispatch_responses(
+                    response_stream,
+                    response_cancellation,
+                    response_pending_calls,
+                    response_failure,
+                );
+            })?;
+
+        self.state = UnixStreamLocalControlState::Active(UnixStreamLocalActive {
+            request_stream: Mutex::new(request_stream),
+            shutdown_stream,
+            pending_calls: Arc::clone(&pending_calls),
+            payload_transfer: Mutex::new(()),
+            association_failure: Arc::clone(&association_failure),
+        });
+        Ok(UnixStreamLocalControlCancellation {
+            stream: cancellation_stream,
+            pending_calls,
+            association_failure,
+        })
     }
 }
 
 impl UnixStreamLocalControlCancellation {
     /// Shuts down the control stream, unblocking pending reads or writes.
     pub fn cancel(&self) -> IoResult<()> {
-        match self.stream.shutdown(Shutdown::Both) {
-            Err(error) if error.kind() == ErrorKind::NotConnected => Ok(()),
-            result => result,
-        }
+        fail_active_channel(
+            &self.pending_calls,
+            &self.stream,
+            self.association_failure.as_ref(),
+            Error::new(ErrorKind::ConnectionAborted, "broker association cancelled"),
+        )
     }
 }
 
 impl Drop for UnixStreamLocalControlChannel {
     fn drop(&mut self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+        let UnixStreamLocalControlState::Active(active) = &self.state else {
+            return;
+        };
+        let _ = fail_active_channel(
+            &active.pending_calls,
+            &active.shutdown_stream,
+            active.association_failure.as_ref(),
+            Error::new(
+                ErrorKind::ConnectionAborted,
+                "broker active channel dropped",
+            ),
+        );
+    }
+}
+
+fn shutdown(stream: &UnixStream) -> IoResult<()> {
+    match stream.shutdown(Shutdown::Both) {
+        Err(error) if error.kind() == ErrorKind::NotConnected => Ok(()),
+        result => result,
     }
 }
 
@@ -143,6 +249,11 @@ pub struct UnixStreamHostControlChannel {
 
 /// Local-side Unix-domain-socket notification channel for the hosted userland POC.
 pub struct UnixStreamLocalNotificationChannel {
+    stream: UnixStream,
+}
+
+/// Independently owned handle for interrupting local notification-channel I/O.
+pub struct UnixStreamLocalNotificationCancellation {
     stream: UnixStream,
 }
 
@@ -191,6 +302,26 @@ impl UnixStreamLocalNotificationChannel {
     pub fn connect(path: impl AsRef<Path>) -> IoResult<Self> {
         UnixStream::connect(path).map(Self::from_connected)
     }
+
+    /// Creates a handle that can interrupt pending notification-channel I/O.
+    pub fn cancellation_handle(&self) -> IoResult<UnixStreamLocalNotificationCancellation> {
+        self.stream
+            .try_clone()
+            .map(|stream| UnixStreamLocalNotificationCancellation { stream })
+    }
+}
+
+impl UnixStreamLocalNotificationCancellation {
+    /// Shuts down the notification stream, unblocking pending reads.
+    pub fn cancel(&self) -> IoResult<()> {
+        shutdown(&self.stream)
+    }
+}
+
+impl Drop for UnixStreamLocalNotificationChannel {
+    fn drop(&mut self) {
+        let _ = shutdown(&self.stream);
+    }
 }
 
 impl UnixStreamHostNotificationChannel {
@@ -204,31 +335,68 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
+        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+            return Err(invalid_data("broker control channel is already active"));
+        };
         let frame = encode_handshake_request(request.clone());
-        write_frame_with_deadline(&mut self.stream, &frame, self.setup_deadline)
+        write_frame_with_deadline(&mut setup.stream, &frame, setup.setup_deadline)
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        let frame = read_frame_with_deadline(&mut self.stream, self.setup_deadline)?;
-        self.setup_deadline = None;
+        let UnixStreamLocalControlState::Setup(setup) = &mut self.state else {
+            return Err(invalid_data("broker control channel is already active"));
+        };
+        let frame = read_frame_with_deadline(&mut setup.stream, setup.setup_deadline)?;
+        setup.setup_deadline = None;
         match frame {
-            Some(frame) => decode_handshake_response(&frame)
-                .map(Some)
-                .map_err(wire_error),
+            Some(frame) => {
+                let response = decode_handshake_response(&frame).map_err(wire_error)?;
+                setup.negotiated = matches!(&response, BrokerHandshakeResponse::Negotiated { .. });
+                Ok(Some(response))
+            }
             None => Ok(None),
         }
     }
 
-    fn send_request(&mut self, request: &BrokerRequest) -> IoResult<()> {
-        let frame = encode_request(request.clone());
-        write_frame_with_deadline(&mut self.stream, &frame, None)
+    fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
+        let UnixStreamLocalControlState::Active(active) = &self.state else {
+            return Err(invalid_data("broker control channel is not active"));
+        };
+        let request_id = request.request_id;
+        let pending_call = active.pending_calls.register(request_id)?;
+        let request_frame = encode_request(request);
+
+        let write_result = {
+            let mut request_stream = active
+                .request_stream
+                .lock()
+                .expect("broker request writer mutex poisoned");
+            match active.pending_calls.current_failure() {
+                Some(error) => Err(copy_io_error(&error)),
+                None => write_frame_with_deadline(&mut request_stream, &request_frame, None),
+            }
+        };
+        if let Err(error) = write_result {
+            let _ = fail_active_channel(
+                &active.pending_calls,
+                &active.shutdown_stream,
+                active.association_failure.as_ref(),
+                error,
+            );
+        }
+
+        pending_call.wait()
     }
 
-    fn recv_response(&mut self) -> IoResult<Option<BrokerResponse>> {
-        match read_frame_with_deadline(&mut self.stream, None)? {
-            Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
-            None => Ok(None),
-        }
+    fn with_serialized_payload<T>(&self, transfer: impl FnOnce() -> T) -> IoResult<T> {
+        let UnixStreamLocalControlState::Active(active) = &self.state else {
+            return Err(invalid_data("broker control channel is not active"));
+        };
+        let _transfer = active
+            .payload_transfer
+            .lock()
+            .expect("broker payload-transfer mutex poisoned");
+        Ok(transfer())
     }
 }
 
@@ -298,6 +466,217 @@ impl HostNotificationChannel for UnixStreamHostNotificationChannel {
             &encode_notification(notification.clone()),
             None,
         )
+    }
+}
+
+struct PendingCalls {
+    state: Mutex<PendingCallState>,
+    capacity_available: Condvar,
+}
+
+struct PendingCallState {
+    calls: HashMap<RequestId, Arc<PendingCall>>,
+    failure: Option<Arc<Error>>,
+}
+
+struct PendingCall {
+    result: Mutex<Option<PendingCallResult>>,
+    result_ready: Condvar,
+}
+
+enum PendingCallResult {
+    Response(BrokerResponse),
+    Failure(Arc<Error>),
+}
+
+impl PendingCall {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            result_ready: Condvar::new(),
+        }
+    }
+
+    fn resolve(&self, result: PendingCallResult) {
+        let mut stored = self
+            .result
+            .lock()
+            .expect("broker pending-call result mutex poisoned");
+        assert!(stored.is_none(), "broker pending call already resolved");
+        *stored = Some(result);
+        self.result_ready.notify_one();
+    }
+
+    fn wait(&self) -> IoResult<BrokerResponse> {
+        let mut result = self
+            .result
+            .lock()
+            .expect("broker pending-call result mutex poisoned");
+        loop {
+            if let Some(result) = result.take() {
+                return match result {
+                    PendingCallResult::Response(response) => Ok(response),
+                    PendingCallResult::Failure(error) => Err(copy_io_error(&error)),
+                };
+            }
+            result = self
+                .result_ready
+                .wait(result)
+                .expect("broker pending-call result mutex poisoned");
+        }
+    }
+}
+
+impl PendingCalls {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PendingCallState {
+                calls: HashMap::new(),
+                failure: None,
+            }),
+            capacity_available: Condvar::new(),
+        }
+    }
+
+    fn register(&self, request_id: RequestId) -> IoResult<Arc<PendingCall>> {
+        let pending_call = Arc::new(PendingCall::new());
+        let mut state = self.state.lock().expect("broker pending mutex poisoned");
+        while state.calls.len() == MAX_PENDING_CALLS && state.failure.is_none() {
+            state = self
+                .capacity_available
+                .wait(state)
+                .expect("broker pending mutex poisoned");
+        }
+        if let Some(error) = state.failure.as_ref() {
+            return Err(copy_io_error(error));
+        }
+        match state.calls.entry(request_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&pending_call));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(invalid_data("duplicate broker request ID"));
+            }
+        }
+        Ok(pending_call)
+    }
+
+    fn complete(&self, response: BrokerResponse) -> IoResult<()> {
+        let pending_call = {
+            let mut state = self.state.lock().expect("broker pending mutex poisoned");
+            if let Some(error) = state.failure.as_ref() {
+                return Err(copy_io_error(error));
+            }
+            let Some(pending_call) = state.calls.remove(&response.request_id) else {
+                return Err(invalid_data("broker returned an unknown response ID"));
+            };
+            self.capacity_available.notify_one();
+            pending_call
+        };
+        pending_call.resolve(PendingCallResult::Response(response));
+        Ok(())
+    }
+
+    fn record_failure(&self, error: Arc<Error>) -> bool {
+        let pending_calls = {
+            let mut state = self.state.lock().expect("broker pending mutex poisoned");
+            if state.failure.is_some() {
+                return false;
+            }
+            state.failure = Some(Arc::clone(&error));
+            let pending_calls = core::mem::take(&mut state.calls);
+            self.capacity_available.notify_all();
+            pending_calls
+        };
+        for pending_call in pending_calls.into_values() {
+            pending_call.resolve(PendingCallResult::Failure(Arc::clone(&error)));
+        }
+        true
+    }
+
+    fn current_failure(&self) -> Option<Arc<Error>> {
+        self.state
+            .lock()
+            .expect("broker pending mutex poisoned")
+            .failure
+            .as_ref()
+            .map(Arc::clone)
+    }
+}
+
+fn dispatch_responses(
+    mut response_stream: UnixStream,
+    response_cancellation: UnixStream,
+    pending_calls: Arc<PendingCalls>,
+    association_failure: Arc<dyn Fn() + Send + Sync>,
+) {
+    loop {
+        let response = match read_frame_with_deadline(&mut response_stream, None) {
+            Ok(Some(frame)) => match decode_response(&frame).map_err(wire_error) {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = fail_active_channel(
+                        &pending_calls,
+                        &response_cancellation,
+                        association_failure.as_ref(),
+                        error,
+                    );
+                    return;
+                }
+            },
+            Ok(None) => {
+                let _ = fail_active_channel(
+                    &pending_calls,
+                    &response_cancellation,
+                    association_failure.as_ref(),
+                    Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "broker closed the active control channel",
+                    ),
+                );
+                return;
+            }
+            Err(error) => {
+                let _ = fail_active_channel(
+                    &pending_calls,
+                    &response_cancellation,
+                    association_failure.as_ref(),
+                    error,
+                );
+                return;
+            }
+        };
+
+        if let Err(error) = pending_calls.complete(response) {
+            let _ = fail_active_channel(
+                &pending_calls,
+                &response_cancellation,
+                association_failure.as_ref(),
+                error,
+            );
+            return;
+        }
+    }
+}
+
+fn fail_active_channel(
+    pending_calls: &PendingCalls,
+    shutdown_stream: &UnixStream,
+    association_failure: &(dyn Fn() + Send + Sync),
+    error: Error,
+) -> IoResult<()> {
+    let first_failure = pending_calls.record_failure(Arc::new(error));
+    let shutdown_result = shutdown(shutdown_stream);
+    if first_failure {
+        association_failure();
+    }
+    shutdown_result
+}
+
+fn copy_io_error(error: &Error) -> Error {
+    match error.raw_os_error() {
+        Some(code) => Error::from_raw_os_error(code),
+        None => Error::new(error.kind(), error.to_string()),
     }
 }
 
@@ -390,9 +769,49 @@ fn wire_error(error: WireError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_protocol::RequestId;
-    use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
+    use litebox_broker_protocol::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
+    };
+    use litebox_broker_protocol::{ObjectHandle, RequestId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, mpsc};
     use std::time::Duration;
+
+    fn activate_test_channel(
+        stream: UnixStream,
+        association_failure: impl Fn() + Send + Sync + 'static,
+    ) -> (
+        UnixStreamLocalControlChannel,
+        UnixStreamLocalControlCancellation,
+    ) {
+        let mut channel = UnixStreamLocalControlChannel {
+            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+                stream,
+                setup_deadline: None,
+                negotiated: true,
+            }),
+        };
+        let cancellation = channel.activate(association_failure).unwrap();
+        (channel, cancellation)
+    }
+
+    fn activate_counting_failure_channel(
+        stream: UnixStream,
+    ) -> (
+        UnixStreamLocalControlChannel,
+        UnixStreamLocalControlCancellation,
+        Arc<AtomicUsize>,
+        mpsc::Receiver<()>,
+    ) {
+        let failure_count = Arc::new(AtomicUsize::new(0));
+        let response_failure_count = Arc::clone(&failure_count);
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        let (channel, cancellation) = activate_test_channel(stream, move || {
+            response_failure_count.fetch_add(1, Ordering::SeqCst);
+            failure_sender.send(()).unwrap();
+        });
+        (channel, cancellation, failure_count, failure_receiver)
+    }
 
     #[test]
     fn linux_peer_validation_identifies_connected_process() {
@@ -431,6 +850,536 @@ mod tests {
             read_frame_with_deadline(&mut reader, None)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn local_control_channel_enforces_setup_and_active_phases() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
+        assert_eq!(
+            channel
+                .call(BrokerRequest {
+                    request_id: RequestId(0),
+                    operation: BrokerOperation::CloseObject(ObjectHandle(1)),
+                })
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        assert_eq!(
+            channel.activate(|| {}).err().unwrap().kind(),
+            ErrorKind::InvalidData
+        );
+        let handshake_request = BrokerHandshakeRequest {
+            protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+        };
+        channel.send_handshake_request(&handshake_request).unwrap();
+        assert_eq!(
+            decode_handshake_request(
+                &read_frame_with_deadline(&mut host_stream, None)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            handshake_request
+        );
+        write_frame_with_deadline(
+            &mut host_stream,
+            &encode_handshake_response(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            channel.recv_handshake_response().unwrap(),
+            Some(BrokerHandshakeResponse::Negotiated { .. })
+        ));
+
+        let _cancellation = channel.activate(|| {}).unwrap();
+
+        assert_eq!(
+            channel.activate(|| {}).err().unwrap().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            channel
+                .send_handshake_request(&BrokerHandshakeRequest {
+                    protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+                })
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let channel = Arc::new(channel);
+        let call_channel = Arc::clone(&channel);
+        let call = thread::spawn(move || {
+            call_channel.call(BrokerRequest {
+                request_id: RequestId(1),
+                operation: BrokerOperation::CloseObject(ObjectHandle(1)),
+            })
+        });
+        let request = decode_request(
+            &read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        write_frame_with_deadline(
+            &mut host_stream,
+            &encode_response(BrokerResponse {
+                request_id: request.request_id,
+                result: BrokerResult::ObjectClosed,
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(call.join().unwrap().unwrap().request_id, RequestId(1));
+    }
+
+    #[test]
+    fn active_channel_matches_out_of_order_responses() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let (channel, _cancellation) = activate_test_channel(local_stream, || {});
+        let channel = Arc::new(channel);
+
+        let first_channel = Arc::clone(&channel);
+        let first = thread::spawn(move || {
+            first_channel.call(BrokerRequest {
+                request_id: RequestId(3),
+                operation: BrokerOperation::CloseObject(ObjectHandle(3)),
+            })
+        });
+        let second_channel = Arc::clone(&channel);
+        let second = thread::spawn(move || {
+            second_channel.call(BrokerRequest {
+                request_id: RequestId(7),
+                operation: BrokerOperation::CloseObject(ObjectHandle(7)),
+            })
+        });
+
+        let first_request = decode_request(
+            &read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let second_request = decode_request(
+            &read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut request_ids = [first_request.request_id, second_request.request_id];
+        request_ids.sort();
+        assert_eq!(request_ids, [RequestId(3), RequestId(7)]);
+
+        write_frame_with_deadline(
+            &mut host_stream,
+            &encode_response(BrokerResponse {
+                request_id: second_request.request_id,
+                result: BrokerResult::ObjectClosed,
+            }),
+            None,
+        )
+        .unwrap();
+        write_frame_with_deadline(
+            &mut host_stream,
+            &encode_response(BrokerResponse {
+                request_id: first_request.request_id,
+                result: BrokerResult::ObjectClosed,
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(first.join().unwrap().unwrap().request_id, RequestId(3));
+        assert_eq!(second.join().unwrap().unwrap().request_id, RequestId(7));
+    }
+
+    #[test]
+    fn active_channel_serializes_shared_payload_transfers() {
+        let (local_stream, _host_stream) = UnixStream::pair().unwrap();
+        let (channel, _cancellation) = activate_test_channel(local_stream, || {});
+        let channel = Arc::new(channel);
+        let (first_entered_sender, first_entered_receiver) = mpsc::sync_channel(1);
+        let (release_first_sender, release_first_receiver) = mpsc::sync_channel(1);
+        let first_channel = Arc::clone(&channel);
+        let first = thread::spawn(move || {
+            first_channel
+                .with_serialized_payload(|| {
+                    first_entered_sender.send(()).unwrap();
+                    release_first_receiver.recv().unwrap();
+                })
+                .unwrap();
+        });
+        first_entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (second_started_sender, second_started_receiver) = mpsc::sync_channel(1);
+        let (second_entered_sender, second_entered_receiver) = mpsc::sync_channel(1);
+        let second = thread::spawn(move || {
+            second_started_sender.send(()).unwrap();
+            channel
+                .with_serialized_payload(|| second_entered_sender.send(()).unwrap())
+                .unwrap();
+        });
+        second_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let entered_before_release = second_entered_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        release_first_sender.send(()).unwrap();
+        if !entered_before_release {
+            second_entered_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+        }
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(!entered_before_release);
+    }
+
+    #[test]
+    fn active_channel_bounds_pending_calls_before_publication() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        host_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (channel, cancellation) = activate_test_channel(local_stream, || {});
+        let channel = Arc::new(channel);
+        let call_start = Arc::new(Barrier::new(MAX_PENDING_CALLS + 2));
+        let callers = (0..=MAX_PENDING_CALLS)
+            .map(|request_id| {
+                let channel = Arc::clone(&channel);
+                let call_start = Arc::clone(&call_start);
+                thread::spawn(move || {
+                    call_start.wait();
+                    channel.call(BrokerRequest {
+                        request_id: RequestId(request_id as u64),
+                        operation: BrokerOperation::CloseObject(ObjectHandle(request_id as u64)),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        call_start.wait();
+        let mut published_request_ids = Vec::with_capacity(MAX_PENDING_CALLS);
+        for _ in 0..MAX_PENDING_CALLS {
+            let frame = read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap();
+            published_request_ids.push(decode_request(&frame).unwrap().request_id);
+        }
+        host_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let error = read_frame_with_deadline(&mut host_stream, None).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+
+        write_frame_with_deadline(
+            &mut host_stream,
+            &encode_response(BrokerResponse {
+                request_id: published_request_ids[0],
+                result: BrokerResult::ObjectClosed,
+            }),
+            None,
+        )
+        .unwrap();
+        host_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let released_request = decode_request(
+            &read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!published_request_ids.contains(&released_request.request_id));
+
+        cancellation.cancel().unwrap();
+        let mut completed = 0;
+        let mut failed = 0;
+        for caller in callers {
+            match caller.join().unwrap() {
+                Ok(_) => completed += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(failed, MAX_PENDING_CALLS);
+    }
+
+    #[test]
+    fn unknown_response_identifier_fails_all_pending_calls() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
+        let channel = Arc::new(channel);
+        let callers = [1, 2].map(|request_id| {
+            let channel = Arc::clone(&channel);
+            thread::spawn(move || {
+                channel.call(BrokerRequest {
+                    request_id: RequestId(request_id),
+                    operation: BrokerOperation::CloseObject(ObjectHandle(request_id)),
+                })
+            })
+        });
+
+        for _ in 0..callers.len() {
+            let frame = read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap();
+            decode_request(&frame).unwrap();
+        }
+        write_frame_with_deadline(
+            &mut host_stream,
+            &encode_response(BrokerResponse {
+                request_id: RequestId(99),
+                result: BrokerResult::ObjectClosed,
+            }),
+            None,
+        )
+        .unwrap();
+
+        for caller in callers {
+            assert_eq!(
+                caller.join().unwrap().unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+        }
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn malformed_response_fails_all_pending_calls() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
+        let channel = Arc::new(channel);
+        let callers = [1, 2].map(|request_id| {
+            let channel = Arc::clone(&channel);
+            thread::spawn(move || {
+                channel.call(BrokerRequest {
+                    request_id: RequestId(request_id),
+                    operation: BrokerOperation::CloseObject(ObjectHandle(request_id)),
+                })
+            })
+        });
+
+        for _ in 0..callers.len() {
+            let frame = read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap();
+            decode_request(&frame).unwrap();
+        }
+        write_frame_with_deadline(&mut host_stream, &[u8::MAX], None).unwrap();
+
+        for caller in callers {
+            assert_eq!(
+                caller.join().unwrap().unwrap_err().kind(),
+                ErrorKind::InvalidData
+            );
+        }
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn response_eof_fails_all_pending_calls() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
+        let channel = Arc::new(channel);
+        let callers = [1, 2].map(|request_id| {
+            let channel = Arc::clone(&channel);
+            thread::spawn(move || {
+                channel.call(BrokerRequest {
+                    request_id: RequestId(request_id),
+                    operation: BrokerOperation::CloseObject(ObjectHandle(request_id)),
+                })
+            })
+        });
+
+        for _ in 0..callers.len() {
+            let frame = read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap();
+            decode_request(&frame).unwrap();
+        }
+        drop(host_stream);
+
+        for caller in callers {
+            assert_eq!(
+                caller.join().unwrap().unwrap_err().kind(),
+                ErrorKind::UnexpectedEof
+            );
+        }
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn request_write_failure_fails_existing_pending_calls() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
+        let channel = Arc::new(channel);
+        let pending_callers = [1, 2].map(|request_id| {
+            let channel = Arc::clone(&channel);
+            thread::spawn(move || {
+                channel.call(BrokerRequest {
+                    request_id: RequestId(request_id),
+                    operation: BrokerOperation::CloseObject(ObjectHandle(request_id)),
+                })
+            })
+        });
+        for _ in 0..pending_callers.len() {
+            let frame = read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap();
+            decode_request(&frame).unwrap();
+        }
+
+        host_stream.shutdown(Shutdown::Read).unwrap();
+        let failing_channel = Arc::clone(&channel);
+        let failing_caller = thread::spawn(move || {
+            failing_channel.call(BrokerRequest {
+                request_id: RequestId(3),
+                operation: BrokerOperation::CloseObject(ObjectHandle(3)),
+            })
+        });
+
+        assert!(failing_caller.join().unwrap().is_err());
+        for caller in pending_callers {
+            assert!(caller.join().unwrap().is_err());
+        }
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn duplicate_response_identifier_fails_other_pending_calls() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        let (channel, _cancellation, failure_count, failure_receiver) =
+            activate_counting_failure_channel(local_stream);
+        let channel = Arc::new(channel);
+        let first_channel = Arc::clone(&channel);
+        let first = thread::spawn(move || {
+            first_channel.call(BrokerRequest {
+                request_id: RequestId(1),
+                operation: BrokerOperation::CloseObject(ObjectHandle(1)),
+            })
+        });
+        let second_channel = Arc::clone(&channel);
+        let second = thread::spawn(move || {
+            second_channel.call(BrokerRequest {
+                request_id: RequestId(2),
+                operation: BrokerOperation::CloseObject(ObjectHandle(2)),
+            })
+        });
+
+        for _ in 0..2 {
+            let frame = read_frame_with_deadline(&mut host_stream, None)
+                .unwrap()
+                .unwrap();
+            decode_request(&frame).unwrap();
+        }
+        let response = encode_response(BrokerResponse {
+            request_id: RequestId(1),
+            result: BrokerResult::ObjectClosed,
+        });
+        write_frame_with_deadline(&mut host_stream, &response, None).unwrap();
+        write_frame_with_deadline(&mut host_stream, &response, None).unwrap();
+
+        assert_eq!(first.join().unwrap().unwrap().request_id, RequestId(1));
+        assert_eq!(
+            second.join().unwrap().unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        failure_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn completed_call_wins_over_later_association_failure() {
+        let pending = PendingCalls::new();
+        let request_id = RequestId(1);
+        let pending_call = pending.register(request_id).unwrap();
+        pending
+            .complete(BrokerResponse {
+                request_id,
+                result: BrokerResult::ObjectClosed,
+            })
+            .unwrap();
+        pending.record_failure(Arc::new(Error::new(
+            ErrorKind::ConnectionAborted,
+            "test failure",
+        )));
+
+        assert_eq!(pending_call.wait().unwrap().request_id, request_id);
+    }
+
+    #[test]
+    fn duplicate_pending_registration_preserves_the_original_call() {
+        let pending = PendingCalls::new();
+        let request_id = RequestId(1);
+        let pending_call = pending.register(request_id).unwrap();
+        assert_eq!(
+            pending.register(request_id).err().unwrap().kind(),
+            ErrorKind::InvalidData
+        );
+        pending
+            .complete(BrokerResponse {
+                request_id,
+                result: BrokerResult::ObjectClosed,
+            })
+            .unwrap();
+
+        assert_eq!(pending_call.wait().unwrap().request_id, request_id);
+    }
+
+    #[test]
+    fn association_failure_wins_before_completion() {
+        let pending = PendingCalls::new();
+        let request_id = RequestId(1);
+        let pending_call = pending.register(request_id).unwrap();
+        pending.record_failure(Arc::new(Error::new(
+            ErrorKind::ConnectionAborted,
+            "test failure",
+        )));
+
+        assert!(
+            pending
+                .complete(BrokerResponse {
+                    request_id,
+                    result: BrokerResult::ObjectClosed,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            pending_call.wait().unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
         );
     }
 
@@ -482,8 +1431,11 @@ mod tests {
     fn local_handshake_response_read_setup_deadline_is_wall_clock() {
         let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
         let mut channel = UnixStreamLocalControlChannel {
-            stream: local_stream,
-            setup_deadline: Some(Instant::now() + Duration::from_millis(50)),
+            state: UnixStreamLocalControlState::Setup(UnixStreamLocalSetup {
+                stream: local_stream,
+                setup_deadline: Some(Instant::now() + Duration::from_millis(50)),
+                negotiated: false,
+            }),
         };
 
         let reader = std::thread::spawn(move || channel.recv_handshake_response().unwrap_err());
@@ -566,36 +1518,49 @@ mod tests {
     }
 
     #[test]
-    fn local_control_cancellation_unblocks_response_read() {
-        let (local_stream, _host_stream) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
-        let cancellation = channel.cancellation_handle().unwrap();
-        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
-        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
-        let reader_completed = completed.clone();
-        let reader = std::thread::spawn(move || {
-            started_sender.send(()).unwrap();
-            result_sender.send(channel.recv_response()).unwrap();
-            reader_completed.store(true, std::sync::atomic::Ordering::Release);
+    fn local_control_cancellation_unblocks_pending_call() {
+        let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
+        host_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (channel, cancellation) = activate_test_channel(local_stream, || {});
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let caller = std::thread::spawn(move || {
+            result_sender
+                .send(channel.call(BrokerRequest {
+                    request_id: RequestId(0),
+                    operation: BrokerOperation::CloseObject(litebox_broker_protocol::ObjectHandle(
+                        1,
+                    )),
+                }))
+                .unwrap();
         });
 
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
+        let frame = read_frame_with_deadline(&mut host_stream, None)
+            .unwrap()
             .unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
+        decode_request(&frame).unwrap();
+        assert!(matches!(
+            result_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         cancellation.cancel().unwrap();
 
-        assert!(result_receiver.recv_timeout(Duration::from_secs(1)).is_ok());
-        reader.join().unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ConnectionAborted
+        );
+        caller.join().unwrap();
     }
 
     #[test]
     fn dropping_local_control_closes_connection_with_cancellation_clone() {
         let (local_stream, mut host_stream) = UnixStream::pair().unwrap();
-        let channel = UnixStreamLocalControlChannel::from_connected(local_stream);
-        let _cancellation = channel.cancellation_handle().unwrap();
+        let (channel, _cancellation) = activate_test_channel(local_stream, || {});
         host_stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();

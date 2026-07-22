@@ -22,7 +22,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
     pub fn create_event_with_count(
-        &mut self,
+        &self,
         initial_count: u64,
     ) -> Result<ObjectHandle, Channel::Error> {
         let response =
@@ -40,7 +40,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
     pub fn add_event(
-        &mut self,
+        &self,
         handle: ObjectHandle,
         value: u64,
     ) -> Result<ReadinessFlags, Channel::Error> {
@@ -58,7 +58,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
     pub fn consume_event(
-        &mut self,
+        &self,
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> Result<ConsumeEventResponse, Channel::Error> {
@@ -70,7 +70,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         }
     }
 
-    fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
+    fn request_event(&self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
         match self.request(BrokerOperation::Event(request))? {
             BrokerResult::Event(response) => Ok(response),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),

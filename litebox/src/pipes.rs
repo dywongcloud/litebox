@@ -952,7 +952,6 @@ mod tests {
         let force_transport = Arc::new(AtomicBool::new(false));
         let local = BrokerLocal::negotiate(
             FailingPipeChannel {
-                last_request: None,
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::Transport,
                 force_transport,
@@ -999,7 +998,6 @@ mod tests {
         let force_transport = Arc::new(AtomicBool::new(false));
         let local = BrokerLocal::negotiate(
             FailingPipeChannel {
-                last_request: None,
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
@@ -1111,7 +1109,6 @@ mod tests {
 
     #[derive(Debug)]
     struct FailingPipeChannel {
-        last_request: Option<BrokerRequest>,
         request_count: Arc<AtomicUsize>,
         read_failure: ReadFailure,
         force_transport: Arc<AtomicBool>,
@@ -1168,18 +1165,11 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
-
-        fn send_request(
-            &mut self,
-            request: &BrokerRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            self.last_request = Some(request.clone());
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
             self.request_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            let request = self.last_request.take().unwrap();
             let result = match request.operation {
                 BrokerOperation::Pipe(PipeRequest::Create(_)) => BrokerResult::Pipe(
                     litebox_broker_protocol::message::PipeResponse::Create(CreatePipeResponse {
@@ -1204,10 +1194,17 @@ mod tests {
                     panic!("unexpected broker request: {request:?}")
                 }
             };
-            Ok(Some(BrokerResponse {
+            Ok(BrokerResponse {
                 request_id: request.request_id,
                 result,
-            }))
+            })
+        }
+
+        fn with_serialized_payload<T>(
+            &self,
+            transfer: impl FnOnce() -> T,
+        ) -> core::result::Result<T, Self::Error> {
+            Ok(transfer())
         }
     }
 
