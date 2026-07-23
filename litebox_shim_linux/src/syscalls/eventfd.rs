@@ -19,13 +19,13 @@ use litebox::{
 };
 use litebox_common_linux::{EfdFlags, errno::Errno};
 
-use crate::{GlobalState, Platform, ShimFS};
+use crate::{GlobalState, ShimFS, ShimPlatform};
 
-pub(crate) struct EventfdSubsystem;
-impl FdEnabledSubsystem for EventfdSubsystem {
+pub(crate) struct EventfdSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
+impl<Platform: ShimPlatform> FdEnabledSubsystem for EventfdSubsystem<Platform> {
     type Entry = EventFile<Platform>;
 }
-impl FdEnabledSubsystemEntry for EventFile<Platform> {}
+impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     counter: EventCounter<Platform>,
@@ -82,7 +82,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
     }
 }
 
-impl<FS: ShimFS> GlobalState<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
     pub(crate) fn create_linux_eventfd(
         &self,
         initval: u32,

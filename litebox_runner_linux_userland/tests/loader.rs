@@ -7,12 +7,12 @@ mod common;
 use std::ffi::CString;
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
-use litebox_platform_multiplex::Platform;
+use litebox_platform_linux_userland::LinuxUserland as Platform;
 
 struct TestLauncher {
     platform: &'static Platform,
-    shim_builder: litebox_shim_linux::LinuxShimBuilder,
-    fs: litebox_shim_linux::DefaultFS,
+    shim_builder: litebox_shim_linux::LinuxShimBuilder<Platform>,
+    fs: litebox_shim_linux::DefaultFS<Platform>,
 }
 
 impl TestLauncher {
@@ -22,8 +22,7 @@ impl TestLauncher {
         tun_device_name: Option<&str>,
     ) -> Self {
         let platform = Platform::new(tun_device_name);
-        litebox_platform_multiplex::set_platform(platform);
-        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
         let litebox = shim_builder.litebox();
 
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
@@ -31,15 +30,12 @@ impl TestLauncher {
             fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to set permissions on root");
         });
-        let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(
-            litebox,
-            if tar_data.is_empty() {
-                litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
-            } else {
-                tar_data.into()
-            },
-        );
-        let fs = shim_builder.default_fs(in_mem_fs, tar_ro_fs);
+        let tar_data = if tar_data.is_empty() {
+            litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
+        } else {
+            tar_data.into()
+        };
+        let fs = shim_builder.default_fs(in_mem_fs, tar_data);
         let mut this = Self {
             platform,
             shim_builder,

@@ -4,7 +4,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
-use litebox_platform_multiplex::Platform;
+use litebox_platform_linux_userland::LinuxUserland as Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -239,24 +239,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         platform.register_cow_region(file.data, file.abs_path);
     }
 
-    litebox_platform_multiplex::set_platform(platform);
-
     let shim_builder = if let Some(broker_connection) = broker_connection {
         let (broker_local, broker_notifications, broker_association_coordinator) =
             broker_connection;
-        let litebox = litebox::LiteBox::new_with_broker_local(
-            litebox_platform_multiplex::platform(),
-            broker_local,
-        );
+        let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
         broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
         broker::start_notification_receiver(
             broker_notifications,
             broker_association_coordinator,
             litebox.broker_notification_dispatcher(),
         )?;
-        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(litebox)
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox)
     } else {
-        litebox_shim_linux::LinuxShimBuilder::new()
+        litebox_shim_linux::LinuxShimBuilder::new(platform)
     };
     let litebox = shim_builder.litebox();
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
@@ -315,20 +310,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 prev_user = mode_and_user.1;
             }
 
-            let open_file =
-                |fs: &mut litebox::fs::in_mem::FileSystem<litebox_platform_multiplex::Platform>,
-                 path,
-                 mode| {
-                    let fd = fs
-                        .open(
-                            path,
-                            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                            mode,
-                        )
-                        .unwrap();
-                    fs.initialize_primarily_read_heavy_file(&fd, prog_data);
-                    fs.close(&fd).unwrap();
-                };
+            let open_file = |fs: &mut litebox::fs::in_mem::FileSystem<Platform>, path, mode| {
+                let fd = fs
+                    .open(
+                        path,
+                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                        mode,
+                    )
+                    .unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data);
+                fs.close(&fd).unwrap();
+            };
             let last = ancestor_modes_and_users.last().ok_or_else(|| {
                 anyhow!("program path has no ancestor directories (is it the root path?)")
             })?;
@@ -355,8 +347,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim_builder.default_fs(in_mem, tar_ro)
+        shim_builder.default_fs(in_mem, tar_data.into())
     };
 
     // We need to get the file path before enabling seccomp.
@@ -399,8 +390,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // TODO: We only wait for ingress packets on the TUN device and thus may block processing egress packets for up to `timeout`.
                 // Set a maximum timeout to ensure we don't wait too long. Alternatively, shim could notify us when there are egress packets to process,
                 // but that would require more invasive changes.
-                litebox_platform_multiplex::platform()
-                    .wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
+                platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
             }
             // Final flush
             // TODO: keep running until all sockets are closed?

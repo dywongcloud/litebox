@@ -2,39 +2,56 @@
 // Licensed under the MIT license.
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
-use litebox::platform::RawConstPointer as _;
 use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
-use litebox_platform_multiplex::{Platform, set_platform};
 use zerocopy::FromBytes as _;
 
-use crate::MutPtr;
+use crate::UserPtrMut;
 
 extern crate std;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 
-#[must_use]
-pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate::DefaultFS> {
-    static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
-    PLATFORM_INIT.call_once(|| {
+/// The concrete platform used by the shim's unit tests.
+///
+/// This is selected by the build target so the tests can run against whichever
+/// userland platform matches the host (Linux or Windows) rather than being
+/// hard-wired to one.
+#[cfg(target_os = "linux")]
+pub(crate) use litebox_platform_linux_userland::LinuxUserland as TestPlatform;
+#[cfg(target_os = "windows")]
+pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatform;
+
+/// Returns the process-wide test platform, initializing it once.
+pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatform {
+    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
+    PLATFORM.get_or_init(|| {
+        // Only the Linux userland platform takes a tun device name.
         #[cfg(target_os = "linux")]
-        let platform = Platform::new(tun_device_name);
+        {
+            TestPlatform::new(tun_device_name)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = tun_device_name;
+            TestPlatform::new()
+        }
+    })
+}
 
-        #[cfg(not(target_os = "linux"))]
-        let platform = Platform::new();
+#[must_use]
+pub(crate) fn init_platform(
+    tun_device_name: Option<&str>,
+) -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+    let platform = test_platform(tun_device_name);
 
-        set_platform(platform);
-    });
-
-    let shim_builder = crate::LinuxShimBuilder::new();
+    let shim_builder = crate::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {
         fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to set permissions on root");
     });
-    let tar_ro_fs = litebox::fs::tar_ro::FileSystem::new(litebox, TEST_TAR_FILE.into());
-    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, tar_ro_fs));
+    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, TEST_TAR_FILE.into()));
     let task = shim_builder.build().0.new_test_task(fs);
 
     if tun_device_name.is_some() {
@@ -183,7 +200,7 @@ fn test_getdent64() {
     let bytes_read = task
         .sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len(),
         )
         .expect("Failed to read directory entries");
@@ -240,7 +257,15 @@ fn test_getdent64() {
     entry_names.sort();
     assert_eq!(
         entry_names,
-        alloc::vec![".", "..", "bar", "foo", "test_file1.txt", "test_file2.txt"]
+        alloc::vec![
+            ".",
+            "..",
+            "bar",
+            "dev",
+            "foo",
+            "test_file1.txt",
+            "test_file2.txt"
+        ]
     );
 
     // Verify that our test files have the correct type (regular file)
@@ -257,7 +282,7 @@ fn test_getdent64() {
     assert_eq!(
         task.sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len()
         )
         .expect("Failed to read directory entries"),
@@ -275,7 +300,7 @@ fn test_getdent64() {
     let bytes = task
         .sys_getdirent64(
             dir_fd,
-            MutPtr::from_usize(small_buffer.as_mut_ptr() as usize),
+            UserPtrMut::from_usize(small_buffer.as_mut_ptr() as usize),
             small_buffer.len(),
         )
         .expect("Failed to read directory entries");
@@ -296,7 +321,7 @@ fn test_getdent64() {
     // Test 3: Invalid file descriptor
     let result = task.sys_getdirent64(
         -1,
-        MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
         buffer.len(),
     );
     assert_eq!(
@@ -313,7 +338,7 @@ fn test_getdent64() {
 
     let result = task.sys_getdirent64(
         file1_fd,
-        MutPtr::from_usize(buffer.as_mut_ptr() as usize),
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
         buffer.len(),
     );
     assert_eq!(
@@ -324,7 +349,11 @@ fn test_getdent64() {
     task.sys_close(file1_fd).expect("Failed to close file");
 
     // Test 5: Zero-length buffer
-    let result = task.sys_getdirent64(dir_fd, MutPtr::from_usize(buffer.as_mut_ptr() as usize), 0);
+    let result = task.sys_getdirent64(
+        dir_fd,
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+        0,
+    );
     assert_eq!(
         result,
         Err(Errno::EINVAL),
@@ -348,7 +377,7 @@ fn test_getdent64() {
         let bytes_read = task
             .sys_getdirent64(
                 dir_fd2,
-                MutPtr::from_usize(chunk_buffer.as_mut_ptr() as usize),
+                UserPtrMut::from_usize(chunk_buffer.as_mut_ptr() as usize),
                 chunk_buffer.len(),
             )
             .expect("Failed to read directory chunk");
@@ -394,7 +423,15 @@ fn test_getdent64() {
     all_entries.sort();
     assert_eq!(
         all_entries,
-        alloc::vec![".", "..", "bar", "foo", "test_file1.txt", "test_file2.txt"]
+        alloc::vec![
+            ".",
+            "..",
+            "bar",
+            "dev",
+            "foo",
+            "test_file1.txt",
+            "test_file2.txt"
+        ]
     );
 }
 
@@ -624,10 +661,7 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
     // We run the test many times to increase the probability of hitting the
     // exact interleaving, since we rely on sleep-based synchronization.
     for _ in 0..200 {
-        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<
-            litebox_platform_multiplex::Platform,
-            u32,
-        >::new(0));
+        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<TestPlatform, u32>::new(0));
         // Step 1: W1 acquires the write lock on the main thread.
         let mut w1_guard = lock.write();
 

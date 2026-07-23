@@ -4,13 +4,11 @@
 //! This module manages the stack layout for the user process.
 
 use alloc::{collections::btree_map::BTreeMap, ffi::CString, vec::Vec};
-use litebox::{
-    platform::{RawConstPointer, RawMutPointer},
-    utils::ReinterpretSignedExt as _,
-};
+use core::marker::PhantomData;
+use litebox::utils::ReinterpretSignedExt as _;
 
 use crate::{
-    MutPtr,
+    ShimPlatform, UserPtrMut,
     loader::auxv::{AuxKey, AuxVec},
 };
 
@@ -52,25 +50,26 @@ use crate::{
 ///
 /// NOTE: The above layout diagram is for 64-bit processes. Similar (but updated to use 32-bit
 /// values, rather than 64-bit values) is used for 32-bit processes.
-pub(super) struct UserStack {
+pub(super) struct UserStack<Platform: ShimPlatform> {
     /// The top of the stack (base address)
-    stack_top: MutPtr<u8>,
+    stack_top: UserPtrMut<u8>,
     /// The length of the stack
     #[expect(dead_code, reason = "should we remove this?")]
     len: usize,
     /// The current position of the stack pointer
     pos: usize,
+    _platform: PhantomData<Platform>,
 }
 
-impl UserStack {
+impl<Platform: ShimPlatform> UserStack<Platform> {
     /// Stack alignment required by libc ABI
     const STACK_ALIGNMENT: usize = 16;
 
     /// Create a new stack for the user process.
     ///
     /// `stack_top` and `len` must be aligned to [`Self::STACK_ALIGNMENT`]
-    pub(super) fn new(stack_top: MutPtr<u8>, len: usize) -> Option<Self> {
-        if stack_top.as_usize() % Self::STACK_ALIGNMENT != 0 {
+    pub(super) fn new(stack_top: UserPtrMut<u8>, len: usize) -> Option<Self> {
+        if !stack_top.as_usize().is_multiple_of(Self::STACK_ALIGNMENT) {
             return None;
         }
         if !len.is_multiple_of(Self::STACK_ALIGNMENT) {
@@ -80,6 +79,7 @@ impl UserStack {
             stack_top,
             len,
             pos: len,
+            _platform: PhantomData,
         })
     }
 
@@ -94,7 +94,8 @@ impl UserStack {
     fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
         let _end = isize::try_from(self.pos).ok()?;
         self.pos = self.pos.checked_sub(bytes.len())?;
-        self.stack_top.copy_from_slice(self.pos, bytes)?;
+        self.stack_top
+            .copy_from_slice::<Platform>(self.pos, bytes)?;
         Some(())
     }
 
@@ -136,10 +137,10 @@ impl UserStack {
         self.push_usize(0)?;
         let size = offsets.len().checked_mul(size_of::<usize>())?;
         self.pos = self.pos.checked_sub(size)?;
-        let ptr: MutPtr<usize> = MutPtr::from_usize(self.stack_top.as_usize() + self.pos);
+        let ptr: UserPtrMut<usize> = UserPtrMut::from_usize(self.stack_top.as_usize() + self.pos);
         for (i, p) in offsets.iter().enumerate() {
             let addr: usize = self.stack_top.as_usize() + *p;
-            ptr.write_at_offset(i.reinterpret_as_signed(), addr)?;
+            ptr.write_at_offset::<Platform>(i.reinterpret_as_signed(), addr)?;
         }
         Some(())
     }
@@ -168,7 +169,7 @@ impl UserStack {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
         self.stack_top
-            .write_at_offset(isize::try_from(self.pos).ok()?, 0)?;
+            .write_at_offset::<Platform>(isize::try_from(self.pos).ok()?, 0)?;
 
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;

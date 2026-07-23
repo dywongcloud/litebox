@@ -12,24 +12,18 @@ use x86_64 as arch;
 use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
-use crate::{ConstPtr, MutPtr, ShimFS, Task};
+use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
-use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _},
-    shim::Exception,
-    sync::Mutex,
-    utils::ReinterpretUnsignedExt as _,
-};
+use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_common_linux::signal::{
     MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
     SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, errno::Errno};
-use litebox_platform_multiplex::Platform;
 
-pub(crate) struct SignalState {
+pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// Pending thread signals.
     pending: RefCell<PendingSignals>,
     /// Pending process signals (shared across all threads).
@@ -37,14 +31,14 @@ pub(crate) struct SignalState {
     /// Currently blocked signals.
     blocked: Cell<SigSet>,
     /// Signal handlers.
-    handlers: RefCell<Arc<SignalHandlers>>,
+    handlers: RefCell<Arc<SignalHandlers<Platform>>>,
     /// Alternate signal stack.
     altstack: Cell<SigAltStack>,
     /// The last exception info recorded for signal delivery.
     last_exception: Cell<litebox::shim::ExceptionInfo>,
 }
 
-impl SignalState {
+impl<Platform: ShimPlatform> SignalState<Platform> {
     pub fn new_process() -> Self {
         Self {
             pending: RefCell::new(PendingSignals::new()),
@@ -115,7 +109,7 @@ impl SignalState {
     }
 }
 
-struct SignalHandlers {
+struct SignalHandlers<Platform: ShimPlatform> {
     inner: Mutex<Platform, SignalHandlersInner>,
 }
 
@@ -152,7 +146,7 @@ struct Handler {
     immutable: bool,
 }
 
-impl SignalHandlers {
+impl<Platform: ShimPlatform> SignalHandlers<Platform> {
     fn new() -> Self {
         Self {
             inner: Mutex::new(SignalHandlersInner {
@@ -173,7 +167,7 @@ impl SignalHandlers {
     }
 }
 
-impl Clone for SignalHandlers {
+impl<Platform: ShimPlatform> Clone for SignalHandlers<Platform> {
     fn clone(&self) -> Self {
         Self {
             inner: Mutex::new(self.inner.lock().clone()),
@@ -293,7 +287,7 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     }
 }
 
-impl SignalState {
+impl<Platform: ShimPlatform> SignalState<Platform> {
     /// Updates the blocked signal mask.
     fn set_signal_mask(&self, mask: SigSet) {
         self.blocked.set(mask);
@@ -380,26 +374,36 @@ impl SignalState {
 /// A fault when delivering a signal.
 struct DeliverFault;
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
+        let old = self.signals.blocked.get();
+        self.signals.set_signal_mask(mask);
+        let result = f();
+        self.signals.set_signal_mask(old);
+        result
+    }
+
     pub(crate) fn sys_rt_sigprocmask(
         &self,
         how: SigmaskHow,
-        set_ptr: Option<crate::ConstPtr<SigSet>>,
-        oldset_ptr: Option<crate::MutPtr<SigSet>>,
+        set_ptr: Option<UserPtr<SigSet>>,
+        oldset_ptr: Option<UserPtrMut<SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if sigsetsize != core::mem::size_of::<SigSet>() {
             return Err(Errno::EINVAL);
         }
         let set = if let Some(set_ptr) = set_ptr {
-            Some(set_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
+            Some(set_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
 
         if let Some(oldset_ptr) = oldset_ptr {
             let oldset = self.signals.blocked.get();
-            oldset_ptr.write_at_offset(0, oldset).ok_or(Errno::EFAULT)?;
+            oldset_ptr
+                .write_at_offset::<Platform>(0, oldset)
+                .ok_or(Errno::EFAULT)?;
         }
 
         if let Some(set) = set {
@@ -423,8 +427,8 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn sys_sigaltstack(
         &self,
-        ss_ptr: Option<ConstPtr<SigAltStack>>,
-        old_ss_ptr: Option<MutPtr<SigAltStack>>,
+        ss_ptr: Option<UserPtr<SigAltStack>>,
+        old_ss_ptr: Option<UserPtrMut<SigAltStack>>,
         ctx: &PtRegs,
     ) -> Result<usize, Errno> {
         let mut old_ss = self.signals.altstack.get();
@@ -433,13 +437,15 @@ impl<FS: ShimFS> Task<FS> {
             if is_on_stack {
                 old_ss.flags |= SsFlags::ONSTACK;
             }
-            old_ss_ptr.write_at_offset(0, old_ss).ok_or(Errno::EFAULT)?;
+            old_ss_ptr
+                .write_at_offset::<Platform>(0, old_ss)
+                .ok_or(Errno::EFAULT)?;
         }
         if let Some(ss_ptr) = ss_ptr {
             if is_on_stack {
                 return Err(Errno::EPERM);
             }
-            let ss = ss_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            let ss = ss_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
             self.signals.set_sigaltstack(ss)?;
         }
         Ok(0)
@@ -447,8 +453,8 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn sys_rt_sigreturn(&self, ctx: &mut PtRegs) -> Result<usize, Errno> {
         let uctx_addr = arch::uctx_addr(ctx);
-        let uctx_ptr = ConstPtr::<Ucontext>::from_usize(uctx_addr);
-        let Some(uctx) = uctx_ptr.read_at_offset(0) else {
+        let uctx_ptr = UserPtr::<Ucontext>::from_usize(uctx_addr);
+        let Some(uctx) = uctx_ptr.read_at_offset::<Platform>(0) else {
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);
         };
@@ -464,8 +470,8 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_rt_sigaction(
         &self,
         signal: Signal,
-        act_ptr: Option<ConstPtr<SigAction>>,
-        oldact_ptr: Option<MutPtr<SigAction>>,
+        act_ptr: Option<UserPtr<SigAction>>,
+        oldact_ptr: Option<UserPtrMut<SigAction>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
         if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
@@ -475,7 +481,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
         let act = if let Some(act_ptr) = act_ptr {
-            Some(act_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?)
+            Some(act_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?)
         } else {
             None
         };
@@ -496,7 +502,7 @@ impl<FS: ShimFS> Task<FS> {
 
         if let Some(oldact_ptr) = oldact_ptr {
             oldact_ptr
-                .write_at_offset(0, old_act)
+                .write_at_offset::<Platform>(0, old_act)
                 .ok_or(Errno::EFAULT)?;
         }
 
@@ -616,7 +622,6 @@ impl<FS: ShimFS> Task<FS> {
     #[cfg(feature = "alarm_fallback")]
     #[inline]
     pub(crate) fn check_alarm_deadline(&self) {
-        use litebox::platform::TimeProvider as _;
         let mut alarm = self.process().alarm_timer.lock();
         if alarm.handle.is_some() {
             // If the platform supports timers, we rely on those to trigger SIGALRM, so we don't need

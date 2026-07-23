@@ -7,15 +7,13 @@
 #![no_std]
 
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
-use core::{
-    arch::asm,
-    sync::atomic::{AtomicU32, AtomicU64},
-};
+use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
-    IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Punchthrough,
-    PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider, RawPointerProvider,
-    StdioProvider, TimeProvider, UnblockedOrTimedOut, page_mgmt::DeallocationError,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
+    ImmediatelyWokenUp, PageManagementProvider, RawMutex as _, RawMutexProvider,
+    RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -23,11 +21,11 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
+use litebox_common_linux::errno::Errno;
 use litebox_common_linux::vmap::{
     GlobalVmapManager, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
     PhysPointerError, VmapManager,
 };
-use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use x86_64::{
     VirtAddr,
     structures::paging::{
@@ -75,8 +73,6 @@ impl PhysPageMapInfo for LvbsPhysPageMapInfo {
         self.size
     }
 }
-
-static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
 
 /// Special page table ID for the base (kernel-only) page table.
 /// No real physical frame has address 0, so this is a safe sentinel.
@@ -151,18 +147,6 @@ const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
 /// to provide a guard region against NULL pointer dereferences.
 /// <https://cateee.net/lkddb/web-lkddb/LSM_MMAP_MIN_ADDR.html>
 const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
-
-#[inline]
-fn is_valid_user_addr(addr: usize) -> bool {
-    (USER_ADDR_MIN..USER_ADDR_MAX).contains(&addr)
-}
-
-/// Checks whether a user context is valid for switching to user mode, i.e.,
-/// both `rsp` and `rip` are within the user-space address range.
-#[inline]
-fn is_valid_user_ctx(ctx: &litebox_common_linux::PtRegs) -> bool {
-    is_valid_user_addr(ctx.rsp) && is_valid_user_addr(ctx.rip)
-}
 
 /// Manages base and task page tables.
 ///
@@ -408,11 +392,6 @@ pub struct LinuxKernel<Host: HostInterface> {
     vtl0_kernel_info: Vtl0KernelInfo,
 }
 
-pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
-    punchthrough: PunchthroughSyscall<'a, LinuxKernel<Host>>,
-    host: core::marker::PhantomData<Host>,
-}
-
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
 /// implementation for LVBS that provides SMAP support.
 pub struct LvbsValidateAccess;
@@ -487,40 +466,41 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
-impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, Host> {
-    type Punchthrough = PunchthroughSyscall<'a, LinuxKernel<Host>>;
-
-    fn execute(
-        self,
-    ) -> Result<
-        <Self::Punchthrough as Punchthrough>::ReturnSuccess,
-        litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
-    > {
-        let r = match self.punchthrough {
-            PunchthroughSyscall::SetFsBase { addr } => {
-                unsafe { litebox_common_linux::wrfsbase(addr) };
-                Ok(0)
+impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
+    fn set_arch_specific_register(
+        &self,
+        reg: &ArchSpecificRegister,
+        val: usize,
+    ) -> Result<(), ArchSpecificError> {
+        match reg {
+            ArchSpecificRegister::FsBase => {
+                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                    unsafe { litebox_common_linux::wrfsbase(val) };
+                    Ok(())
+                } else {
+                    Err(ArchSpecificError::RegisterUnpermittedValue)
+                }
             }
-            PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
-        };
-        match r {
-            Ok(v) => Ok(v),
-            Err(e) => Err(litebox::platform::PunchthroughError::Failure(e)),
+            ArchSpecificRegister::GsBase => {
+                // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
+                unimplemented!()
+            }
+            _ => Err(ArchSpecificError::RegisterUnsupported),
         }
     }
-}
 
-impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
-    type PunchthroughToken<'a> = LinuxPunchthroughToken<'a, Host>;
-
-    fn get_punchthrough_token_for<'a>(
+    fn get_arch_specific_register(
         &self,
-        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken<'a>> {
-        Some(LinuxPunchthroughToken {
-            punchthrough,
-            host: core::marker::PhantomData,
-        })
+        reg: &ArchSpecificRegister,
+    ) -> Result<usize, ArchSpecificError> {
+        match reg {
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            ArchSpecificRegister::GsBase => {
+                // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
+                unimplemented!()
+            }
+            _ => Err(ArchSpecificError::RegisterUnsupported),
+        }
     }
 }
 
@@ -644,10 +624,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             vtl1_phys_frame_range: vtl1_range,
             vtl0_kernel_info: Vtl0KernelInfo::new(),
         }))
-    }
-
-    pub fn init(&self, cpu_mhz: u64) {
-        CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns the physical frame range belonging to VTL1.
@@ -850,7 +826,10 @@ impl<Host: HostInterface> RawMutex<Host> {
     }
 }
 
-/// An implementation of [`litebox::platform::Instant`]
+/// An implementation of [`litebox::platform::Instant`].
+///
+/// Backed by the Hyper-V partition reference counter, which is monotonic
+/// and normalized by the hypervisor across TSC scaling and live migration.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
@@ -872,37 +851,22 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
 
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        self.0.checked_sub(earlier.0).map(|v| {
-            core::time::Duration::from_micros(
-                v / CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed),
-            )
-        })
+        let ticks = self.0.checked_sub(earlier.0)?;
+        // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
+        let nanos = ticks.checked_mul(crate::arch::timer::REF_COUNTER_TICK_NANOS)?;
+        Some(core::time::Duration::from_nanos(nanos))
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
-        let duration_micros: u64 = duration.as_micros().try_into().ok()?;
-        Some(Instant(self.0.checked_add(
-            duration_micros.checked_mul(CPU_MHZ.load(core::sync::atomic::Ordering::Relaxed))?,
-        )?))
+        let nanos: u64 = duration.as_nanos().try_into().ok()?;
+        let ticks = nanos / crate::arch::timer::REF_COUNTER_TICK_NANOS;
+        Some(Instant(self.0.checked_add(ticks)?))
     }
 }
 
 impl Instant {
-    fn rdtsc() -> u64 {
-        let lo: u32;
-        let hi: u32;
-        unsafe {
-            asm!(
-                "rdtsc",
-                out("eax") lo,
-                out("edx") hi,
-            );
-        }
-        (u64::from(hi) << 32) | u64::from(lo)
-    }
-
     fn now() -> Self {
-        Instant(Self::rdtsc())
+        Instant(crate::arch::timer::reference_time_100ns())
     }
 }
 
@@ -1406,7 +1370,15 @@ fn run_thread_inner(
     // `thread_ctx` will be passed to `syscall_handler` later.
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
     // member variable offset calculation in assembly code).
-    unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter)) };
+    //
+    // Arm the preemption timer for this user-thread execution. This function is
+    // idempotent, so `reenter` does not change the timeout.
+    crate::arch::timer::arm_preemption();
+    // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
+    // the duration of the call, and `run_thread_arch` returns exactly once.
+    unsafe {
+        run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
+    }
 }
 
 /// Save callee-saved registers onto the stack.
@@ -1827,32 +1799,41 @@ unsafe extern "C" fn run_thread_arch(
 
 unsafe extern "C" fn init_handler(thread_ctx: &mut ThreadContext) {
     match thread_ctx.call_shim(|shim, ctx| shim.init(ctx)) {
-        ContinueOperation::Resume if is_valid_user_ctx(thread_ctx.ctx) => unsafe {
-            switch_to_user(thread_ctx.ctx)
-        },
-        ContinueOperation::Terminate | ContinueOperation::Resume => {}
+        ContinueOperation::Resume => {
+            if thread_ctx.ctx.sanitize_for_user_return() {
+                unsafe { switch_to_user(thread_ctx.ctx) }
+            }
+            litebox_util_log::warn!("terminating thread with invalid user return context");
+        }
+        ContinueOperation::Terminate => {}
     }
 }
 
 unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
     match thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx)) {
-        ContinueOperation::Resume if is_valid_user_ctx(thread_ctx.ctx) => unsafe {
-            switch_to_user(thread_ctx.ctx)
-        },
-        ContinueOperation::Terminate | ContinueOperation::Resume => {}
+        ContinueOperation::Resume => {
+            if thread_ctx.ctx.sanitize_for_user_return() {
+                unsafe { switch_to_user(thread_ctx.ctx) }
+            }
+            litebox_util_log::warn!("terminating thread with invalid user return context");
+        }
+        ContinueOperation::Terminate => {}
     }
 }
 
 unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
-    if !is_valid_user_ctx(thread_ctx.ctx) {
+    if !thread_ctx.ctx.has_user_return_addresses() {
         return;
     }
 
     match thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx)) {
-        ContinueOperation::Resume if is_valid_user_ctx(thread_ctx.ctx) => unsafe {
-            switch_to_user(thread_ctx.ctx)
-        },
-        ContinueOperation::Terminate | ContinueOperation::Resume => {}
+        ContinueOperation::Resume => {
+            if thread_ctx.ctx.sanitize_for_user_return() {
+                unsafe { switch_to_user(thread_ctx.ctx) }
+            }
+            litebox_util_log::warn!("terminating thread with invalid user return context");
+        }
+        ContinueOperation::Terminate => {}
     }
 }
 
@@ -1915,6 +1896,12 @@ unsafe extern "C" fn exception_handler(
             kernel_mode: false,
         }
     };
+    // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
+    // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
+    if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
+        crate::arch::timer::eoi();
+        crate::arch::timer::mark_user_timeout_kill();
+    }
     match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
         ContinueOperation::Resume => {
             if kernel_mode {
@@ -1922,9 +1909,10 @@ unsafe extern "C" fn exception_handler(
                 0
             } else {
                 // User-mode exception handled; resume user execution.
-                if is_valid_user_ctx(thread_ctx.ctx) {
+                if thread_ctx.ctx.sanitize_for_user_return() {
                     unsafe { switch_to_user(thread_ctx.ctx) }
                 } else {
+                    litebox_util_log::warn!("terminating thread with invalid user return context");
                     0
                 }
             }
@@ -1977,6 +1965,7 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
     #[rustfmt::skip]
     core::arch::naked_asm!(
         "switch_to_user_start:",
+        "cli",
         // Flush TLB by reloading CR3
         "mov rax, cr3",
         "mov cr3, rax",
