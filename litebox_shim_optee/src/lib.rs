@@ -18,9 +18,9 @@ use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{PunchthroughProvider, PunchthroughToken, RawConstPointer as _, RawMutPointer as _},
+    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
-    utils::{ReinterpretUnsignedExt, TruncateExt},
+    utils::TruncateExt,
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, vmap::GlobalVmapManager};
 use litebox_common_optee::{
@@ -144,6 +144,7 @@ impl OpteeShimBuilder {
     pub fn build(self) -> OpteeShim {
         let global = Arc::new(GlobalState {
             platform: self.platform,
+            boot_instant: TimeProvider::now(self.platform),
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
             ta_uuid_map: TaUuidMap::new(),
@@ -157,6 +158,10 @@ impl OpteeShimBuilder {
 struct GlobalState {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
+    /// Monotonic baseline captured when this instance was created; the
+    /// arbitrary origin for GP "system time" (`TEE_GetSystemTime`).
+    /// See [`GlobalState::system_time`].
+    boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The LiteBox instance used throughout the shim.
@@ -198,6 +203,15 @@ impl GlobalState {
     /// Get the TA flags associated with the given TA UUID.
     pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
         self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
+    }
+
+    /// Monotonic time elapsed since this instance was created, used as GP
+    /// "system time" (`TEE_GetSystemTime`).
+    ///
+    /// The clock source is the platform's monotonic clock; the origin is
+    /// [`Self::boot_instant`] which is instance private.
+    fn system_time(&self) -> core::time::Duration {
+        TimeProvider::now(self.platform).duration_since(&self.boot_instant)
     }
 
     /// Remove the TA binary associated with the given TA UUID.
@@ -368,8 +382,7 @@ impl Task {
         let request = match SyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
             Ok(request) => request,
             Err(err) => {
-                // TODO: this seems like the wrong kind of error for OPTEE.
-                ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
+                ctx.rax = TeeResult::from(err) as usize;
                 return ContinueOperation::Resume;
             }
         };
@@ -575,6 +588,7 @@ impl Task {
                         })
                 }
             }
+            SyscallRequest::GetTime { cat, time } => self.sys_get_time(cat, time),
             _ => {
                 #[cfg(debug_assertions)]
                 todo!("unsupported syscall request");
@@ -660,8 +674,7 @@ impl Task {
         let request = match LdelfSyscallRequest::<Platform>::try_from_raw(ctx.orig_rax, ctx) {
             Ok(request) => request,
             Err(err) => {
-                // TODO: this seems like the wrong kind of error for OPTEE.
-                ctx.rax = (err.as_neg() as isize).reinterpret_as_unsigned();
+                ctx.rax = TeeResult::from(err) as usize;
                 return ContinueOperation::Resume;
             }
         };
@@ -876,18 +889,14 @@ impl Task {
     /// every TA entry.
     #[cfg(target_arch = "x86_64")]
     fn restore_guest_tls(&self) {
+        use litebox::platform::ArchSpecificProvider as _;
         let addr = self.tls_base_addr.get();
         if addr == 0 {
             return; // TLS not allocated yet
         }
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for SET_FS");
-        let _ = token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        });
+        litebox_platform_multiplex::platform()
+            .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, addr)
+            .expect("requires guaranteed platform support for FsBase");
     }
 
     /// Retrieve the result of the `ldelf` execution.

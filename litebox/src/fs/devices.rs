@@ -1,24 +1,27 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Device provider for LiteBox including:
-//! 1. Standard input/output devices.
-//! 2. /dev/null device.
+//! Unix-y devices [`super::backend::Backend`].
+//!
+//! Provides `{stdin,stdout,null,urandom,...}` entries, intended to be mounted at `/dev`.
 
 use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
-use crate::{
-    LiteBox,
-    fs::{
-        FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
-        errors::{
-            ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-            ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
-        },
-    },
-    path::Arg,
-    platform::{StdioOutStream, StdioReadError, StdioWriteError},
+use crate::LiteBox;
+use crate::sync::RawSyncPrimitivesProvider;
+
+use super::backend::{
+    Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
+    WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
+use super::errors::{
+    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
+    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+};
+use super::inode_allocator::InodeAllocator;
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: usize = 1024;
@@ -34,6 +37,7 @@ const URANDOM_BLOCK_SIZE: usize = 0x1000;
 /// name=/dev/stdout dev=64 ino=9 rdev=34822
 /// name=/dev/stderr dev=64 ino=9 rdev=34822
 /// ```
+// XXX(jayb): Should we be pulling the device names and such from the inode allocator?
 const STDIO_NODE_INFO: NodeInfo = NodeInfo {
     dev: 64,
     ino: 9,
@@ -53,7 +57,8 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=9
     rdev: core::num::NonZeroUsize::new(0x109),
 };
-#[derive(Debug, Clone, Copy)]
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
     Stdin,
     Stdout,
@@ -62,60 +67,21 @@ enum Device {
     URandom,
 }
 
-/// A backing implementation for [`FileSystem`](super::FileSystem).
-///
-/// This provider provides only `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
-pub struct FileSystem<
-    Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
-> {
-    litebox: LiteBox<Platform>,
-    // cwd invariant: always ends with a `/`
-    current_working_dir: String,
-}
+impl Device {
+    const ALL: &'static [(&'static str, Device)] = &[
+        ("stdin", Device::Stdin),
+        ("stdout", Device::Stdout),
+        ("stderr", Device::Stderr),
+        ("null", Device::Null),
+        ("urandom", Device::URandom),
+    ];
 
-impl<Platform: crate::platform::StdioProvider + crate::sync::RawSyncPrimitivesProvider>
-    FileSystem<Platform>
-{
-    /// Construct a new `FileSystem` instance
-    ///
-    /// This function is expected to only be invoked once per platform, as an initialiation step,
-    /// and the created `FileSystem` handle is expected to be shared across all usage over the
-    /// system.
-    #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        Self {
-            litebox: litebox.clone(),
-            current_working_dir: "/".into(),
-        }
-    }
-}
-
-impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
-    super::private::Sealed for FileSystem<Platform>
-{
-}
-
-impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider>
-    FileSystem<Platform>
-{
-    // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
-    // for any relative paths from current working directory.
-    //
-    // Note: does NOT account for symlinks.
-    fn absolute_path(&self, path: impl Arg) -> Result<String, PathError> {
-        assert!(self.current_working_dir.ends_with('/'));
-        let path = path.as_rust_str()?;
-        if path.starts_with('/') {
-            // Absolute path
-            Ok(path.normalized()?)
-        } else {
-            // Relative path
-            Ok((self.current_working_dir.clone() + path.as_rust_str()?).normalized()?)
-        }
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
     }
 
-    fn device_file_status(device: Device) -> FileStatus {
-        match device {
+    fn file_status(self) -> FileStatus {
+        match self {
             Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
                 file_type: FileType::CharacterDevice,
                 mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
@@ -144,135 +110,201 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioPr
     }
 }
 
-impl<
-    Platform: crate::sync::RawSyncPrimitivesProvider
+/// A [`super::backend::Backend`] that supports Unix-y devices.
+pub struct Devices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider
         + crate::platform::StdioProvider
-        + crate::platform::CrngProvider,
-> super::FileSystem for FileSystem<Platform>
+        + crate::platform::CrngProvider
+        + 'static,
 {
-    fn open(
+    litebox: LiteBox<Platform>,
+    /// Stable inode info for this backend's root directory.
+    root_inode: NodeInfo,
+    _alloc: InodeAllocator,
+}
+
+impl<Platform> Devices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::CrngProvider
+        + 'static,
+{
+    /// Construct a new `Devices` backend.
+    #[must_use]
+    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+        let root_inode = allocator.next();
+        Self {
+            litebox: litebox.clone(),
+            root_inode,
+            _alloc: allocator,
+        }
+    }
+}
+
+/// Owned file handle; identifies which device backs this fd.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceFileHandle {
+    device: Device,
+}
+
+/// Directory handle
+// For devices, since no borrows are needed, we reuse this struct for both the walking handles as
+// well as the dir handles.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceDirHandle;
+
+impl<Platform> super::backend::private::Sealed for Devices<Platform> where
+    Platform: RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::CrngProvider
+        + 'static
+{
+}
+
+impl<Platform> BackendHandles for Devices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::CrngProvider
+        + 'static,
+{
+    type WalkingDirHandle<'a> = DeviceDirHandle;
+    type FileHandle = DeviceFileHandle;
+    type DirHandle = DeviceDirHandle;
+}
+
+impl<Platform> Backend for Devices<Platform>
+where
+    Platform: RawSyncPrimitivesProvider
+        + crate::platform::StdioProvider
+        + crate::platform::CrngProvider
+        + 'static,
+{
+    fn root(&self) -> WalkingDirHandle<'_> {
+        WalkingDirHandle::from_typed::<Self>(DeviceDirHandle)
+    }
+
+    fn walk_directories<'a>(
+        &'a self,
+        from: WalkingDirHandle<'a>,
+        components: &[&str],
+    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
+        let from = from.into_typed::<Self>();
+        // Device files are final path targets, so directory walking must stop before them.
+        if let Some(&component) = components.first() {
+            if Device::from_name(component).is_some() {
+                return Ok(WalkOutcome {
+                    components: vec![],
+                    last: WalkingDirHandle::from_typed::<Self>(from),
+                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                });
+            }
+            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+        }
+        Ok(WalkOutcome {
+            components: vec![],
+            last: WalkingDirHandle::from_typed::<Self>(from),
+            stop_reason: WalkStopReason::CompleteDirectory,
+        })
+    }
+
+    fn owned_dir_at(
         &self,
-        path: impl Arg,
+        dir: WalkingDirHandle<'_>,
+        _flags: OFlags,
+    ) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
+        Some(WalkingDirHandle::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+        ))
+    }
+
+    fn open_file_at(
+        &self,
+        dir: WalkingDirHandle<'_>,
+        name: &str,
         flags: OFlags,
-        mode: Mode,
-    ) -> Result<FileFd<Platform>, OpenError> {
-        let open_directory = flags.contains(OFlags::DIRECTORY);
-        let flags = flags - OFlags::DIRECTORY;
-        let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let flags = flags - OFlags::NONBLOCK;
-        // ignore NOCTTY, NOFOLLOW, and APPEND
-        let flags = flags - OFlags::NOCTTY - OFlags::NOFOLLOW - OFlags::APPEND;
-        let truncate = flags.contains(OFlags::TRUNC);
-        let flags = flags - OFlags::TRUNC;
-        let path = self.absolute_path(path)?;
-        let device = match path.as_str() {
-            "/dev/stdin" => {
-                if flags == OFlags::RDONLY && mode.is_empty() {
-                    Device::Stdin
-                } else {
-                    unimplemented!()
-                }
-            }
-            "/dev/stdout" => {
-                if flags == OFlags::WRONLY && mode.is_empty() {
-                    Device::Stdout
-                } else {
-                    unimplemented!()
-                }
-            }
-            "/dev/stderr" => {
-                if flags == OFlags::WRONLY && mode.is_empty() {
-                    Device::Stderr
-                } else {
-                    unimplemented!()
-                }
-            }
-            "/dev/null" => Device::Null,
-            "/dev/urandom" => Device::URandom,
-            _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
-        };
-        if open_directory {
+    ) -> Result<Permissioned<FileHandle>, OpenError> {
+        let _dir = dir.into_typed::<Self>();
+        let device = Device::from_name(name)
+            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+
+        if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if nonblocking
+        if flags.contains(OFlags::NONBLOCK)
             && matches!(
                 device,
-                Device::Stdin | Device::Stderr | Device::Stdout | Device::URandom
+                Device::Stdin | Device::Stdout | Device::Stderr | Device::URandom
             )
         {
-            unimplemented!("Non-blocking I/O is not supported for {:?}", device);
+            unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
         }
-        let fd = self.litebox.descriptor_table_mut().insert(device);
-        if truncate {
+
+        if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
-            assert!(matches!(
-                self.truncate(&fd, 0, true),
+            debug_assert!(matches!(
+                self.truncate(
+                    &FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
+                    0
+                ),
                 Err(TruncateError::IsTerminalDevice)
             ));
         }
-        Ok(fd)
+
+        Ok(Permissioned {
+            item: FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
+            permissions: PermissionCheck::ByBackend,
+        })
     }
 
-    fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
-        Ok(())
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        let _handle = handle.into_typed::<Self>();
+        Ok(Device::ALL
+            .iter()
+            .map(|(n, d)| DirEntry {
+                name: String::from(*n),
+                file_type: FileType::CharacterDevice,
+                ino_info: Some(d.file_status().node_info),
+            })
+            .collect())
     }
 
-    fn read(
-        &self,
-        fd: &FileFd<Platform>,
-        buf: &mut [u8],
-        offset: Option<usize>,
-    ) -> Result<usize, ReadError> {
-        match &self
-            .litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(ReadError::ClosedFd)?
-            .entry
-        {
-            Device::Stdin => {}
-            Device::Stdout | Device::Stderr => {
-                return Err(ReadError::NotForReading);
-            }
+    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+        let h = h.get_typed::<Self>();
+        match h.device {
+            Device::Stdin => self
+                .litebox
+                .x
+                .platform
+                .read_from_stdin(buf)
+                .map_err(|e| match e {
+                    crate::platform::StdioReadError::Closed => ReadError::Io,
+                }),
+            Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => {
                 // /dev/null read returns EOF
-                return Ok(0);
+                Ok(0)
             }
             Device::URandom => {
                 self.litebox.x.platform.fill_bytes_crng(buf);
-                return Ok(buf.len());
+                Ok(buf.len())
             }
         }
-        if offset.is_some() {
-            unimplemented!()
-        }
-        self.litebox
-            .x
-            .platform
-            .read_from_stdin(buf)
-            .map_err(|e| match e {
-                StdioReadError::Closed => unimplemented!(),
-            })
     }
 
-    fn write(
-        &self,
-        fd: &FileFd<Platform>,
-        buf: &[u8],
-        offset: Option<usize>,
-    ) -> Result<usize, WriteError> {
-        let stream = match &self
-            .litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(WriteError::ClosedFd)?
-            .entry
-        {
+    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        let h = h.get_typed::<Self>();
+        let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
-            Device::Stdout => StdioOutStream::Stdout,
-            Device::Stderr => StdioOutStream::Stderr,
+            Device::Stdout => crate::platform::StdioOutStream::Stdout,
+            Device::Stderr => crate::platform::StdioOutStream::Stderr,
             Device::Null | Device::URandom => {
                 // /dev/null discards data: report as if written fully
                 //
@@ -285,112 +317,75 @@ impl<
                 return Ok(buf.len());
             }
         };
-        if offset.is_some() {
-            unimplemented!()
-        }
         self.litebox
             .x
             .platform
             .write_to(stream, buf)
             .map_err(|e| match e {
-                StdioWriteError::Closed => unimplemented!(),
+                crate::platform::StdioWriteError::Closed => WriteError::Io,
             })
     }
 
-    fn seek(
-        &self,
-        fd: &FileFd<Platform>,
-        _offset: isize,
-        _whence: SeekWhence,
-    ) -> Result<usize, SeekError> {
-        match &self
-            .litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(SeekError::ClosedFd)?
-            .entry
-        {
-            Device::Stdin | Device::Stdout | Device::Stderr => Err(SeekError::NonSeekable),
-            Device::Null | Device::URandom => {
-                // Linux allows lseek on /dev/null and returns position 0 (or sets to length 0).
-                Ok(0)
-            }
-        }
-    }
-
-    fn truncate(
-        &self,
-        _fd: &FileFd<Platform>,
-        _length: usize,
-        _reset_offset: bool,
-    ) -> Result<(), TruncateError> {
+    fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
         Err(TruncateError::IsTerminalDevice)
     }
 
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        unimplemented!()
+    fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
+        let h = h.get_typed::<Self>();
+        match h.device {
+            Device::Stdin | Device::Stdout | Device::Stderr => SeekBehavior::NonSeekable,
+            Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
+        }
     }
 
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn chown(
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(h.get_typed::<Self>().device.file_status())
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let _h = h.get_typed::<Self>();
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info: self.root_inode.clone(),
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
+        })
+    }
+
+    fn create_file_at(
         &self,
-        path: impl Arg,
-        user: Option<u16>,
-        group: Option<u16>,
+        _dir: DirHandle,
+        _name: &str,
+        _mode: Mode,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _user: Option<u16>,
+        _group: Option<u16>,
     ) -> Result<(), ChownError> {
-        unimplemented!()
+        Err(ChownError::ReadOnlyFileSystem)
     }
-
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
-        unimplemented!()
-    }
-
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        unimplemented!()
-    }
-
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
-        unimplemented!()
-    }
-
-    fn read_dir(
-        &self,
-        _fd: &FileFd<Platform>,
-    ) -> Result<alloc::vec::Vec<crate::fs::DirEntry>, ReadDirError> {
-        Err(ReadDirError::NotADirectory)
-    }
-
-    fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
-        let path = self.absolute_path(path)?;
-        let device = match path.as_str() {
-            "/dev/stdin" => Device::Stdin,
-            "/dev/stdout" => Device::Stdout,
-            "/dev/stderr" => Device::Stderr,
-            "/dev/null" => Device::Null,
-            "/dev/urandom" => Device::URandom,
-            _ => return Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)),
-        };
-        Ok(Self::device_file_status(device))
-    }
-
-    fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        let device = self
-            .litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(FileStatusError::ClosedFd)?
-            .entry;
-        Ok(Self::device_file_status(device))
-    }
-}
-
-crate::fd::enable_fds_for_subsystem! {
-    @ Platform: { crate::sync::RawSyncPrimitivesProvider + crate::platform::StdioProvider };
-    FileSystem<Platform>;
-    Device;
-    -> FileFd<Platform>;
 }

@@ -81,6 +81,31 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
 
+  build_and_test_arm64:
+    name: Build and Test (AArch64)
+    runs-on: ubuntu-24.04-arm
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
+      - name: Set up Nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Install diod
+        run: |
+          sudo apt install -y diod
+      - uses: Swatinem/rust-cache@v2
+      - run: ./.github/tools/github_actions_run_cargo fmt
+      - run: |
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox -p litebox_common_linux
+          ./.github/tools/github_actions_run_cargo build -p litebox -p litebox_common_linux
+          ./.github/tools/github_actions_run_cargo nextest -p litebox -p litebox_common_linux
+
   build_and_test_lvbs:
     name: Build and Test LVBS
     runs-on: ubuntu-latest
@@ -157,7 +182,7 @@ jobs:
       - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
       - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
       - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
-      - run: cargo nextest run --locked --profile ci -p litebox_shim_linux --no-default-features --features platform_windows_userland
+      - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
       - run: cargo nextest run --locked --profile ci -p litebox_shim_windows
       - run: |
           cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
@@ -269,10 +294,6 @@ jobs:
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
-          # - `litebox_shim_linux` (in its default feature set) depends on
-          #   `litebox_platform_multiplex`; similarly, ideally we'd do a more
-          #   precise check.
-          #
           # - `litebox_shim_optee` is expected to work with
           #   `litebox_platform_lvbs` (`no_std`) and
           #   `litebox_platform_linux_userland` (for debugging) which
@@ -308,7 +329,6 @@ jobs:
             -not -path './litebox_runner_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
-            -not -path './litebox_shim_linux/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_shim_windows/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \

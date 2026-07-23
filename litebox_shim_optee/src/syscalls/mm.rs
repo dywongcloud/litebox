@@ -4,9 +4,9 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
 use litebox::mm::linux::{MappingError, PAGE_SIZE};
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, user_pointers::UserPtrMut};
 
-use crate::{Task, UserMutPtr};
+use crate::{Platform, Task, UserMutPtr};
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> Option<usize> {
@@ -33,6 +33,7 @@ impl Task {
             false,
             op,
         )
+        .map(UserPtrMut::to_platform_ptr::<Platform>)
     }
 
     /// Handle syscall `mmap`
@@ -92,7 +93,11 @@ impl Task {
     /// Handle syscall `munmap`
     pub(crate) fn sys_munmap(&self, addr: UserMutPtr<u8>, len: usize) -> Result<(), Errno> {
         let pm = &self.global.pm;
-        litebox_common_linux::mm::sys_munmap(pm, addr, len)
+        litebox_common_linux::mm::sys_munmap(
+            pm,
+            UserPtrMut::from_platform_ptr::<Platform>(addr),
+            len,
+        )
     }
 
     /// Handle syscall `mprotect`
@@ -104,6 +109,11 @@ impl Task {
         prot: ProtFlags,
     ) -> Result<(), Errno> {
         let pm = &self.global.pm;
-        litebox_common_linux::mm::sys_mprotect(pm, addr, len, prot)
+        litebox_common_linux::mm::sys_mprotect(
+            pm,
+            UserPtrMut::from_platform_ptr::<Platform>(addr),
+            len,
+            prot,
+        )
     }
 }

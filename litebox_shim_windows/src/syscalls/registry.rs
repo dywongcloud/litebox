@@ -51,7 +51,7 @@ use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_a
 type RegistryFileSystem<Platform> = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
-    litebox::fs::tar_ro::FileSystem<Platform>,
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
 >;
 
 pub(crate) struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -287,14 +287,23 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             }
         });
 
+        let tar_ro = litebox::fs::resolver::Resolver::new(
+            litebox,
+            litebox::fs::composer::Composer::builder()
+                .mount("/", |allocator| {
+                    litebox::fs::tar_ro::TarRo::new(
+                        // TODO: Replace with tar file provided by the user
+                        litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
+                        allocator,
+                    )
+                })
+                .build()
+                .unwrap(),
+        );
         let fs = litebox::fs::layered::FileSystem::new(
             litebox,
             in_mem,
-            litebox::fs::tar_ro::FileSystem::new(
-                litebox,
-                // TODO: Replace with tar file provided by the user
-                litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
-            ),
+            tar_ro,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         );
 

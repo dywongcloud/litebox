@@ -424,6 +424,13 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
     set_vtl_return_value(value);
 
     loop {
+        // Never hand the VP back to VTL0 with the preemption timer live.
+        crate::arch::timer::disarm_preemption();
+        if crate::arch::timer::take_user_timeout_kill() {
+            crate::serial_println!(
+                "Terminated user-mode code which exceeded its execution quantum"
+            );
+        }
         vtl1_vp_exit();
         // Note. The below asm block only touches stable memory locations (no on-demand memory
         // allocation, no permission changes). So, it is safe to exclude the current VP from

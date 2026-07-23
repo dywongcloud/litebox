@@ -267,11 +267,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         }
         // After migrating the data, we also use these FDs to migrate the node-info over, so that
         // any caller that tries to get the inode before/after the migration sees the same inode.
-        if let Some(&layered_id) = self
+        let found = self
             .node_info_lookup
             .read()
             .get(&self.lower.fd_file_status(&lower_fd).unwrap().node_info)
-        {
+            .copied();
+        if let Some(layered_id) = found {
             let old = self.node_info_lookup.write().insert(
                 self.upper
                     .fd_file_status(upper_fd.as_ref().unwrap())
