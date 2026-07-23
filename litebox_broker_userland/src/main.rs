@@ -1,28 +1,37 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use std::cell::Cell;
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
-use litebox_broker_host::{ConnectionTermination, serve_connection};
+use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
+use litebox_broker_protocol::channel::HostReceive;
+use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_memory::{
-    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool,
+    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferPool, SharedMemory,
 };
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamHostControlChannel, UnixStreamHostNotificationChannel, validate_peer_process,
+    UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostNotificationChannel,
+    UnixStreamHostRequestSource, UnixStreamHostResponseSink, validate_peer_process,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+const REQUEST_QUEUE_CAPACITY: usize = 64;
+const WORKER_COUNT: usize = 8;
 
 #[derive(Parser, Debug)]
 struct CliArgs {
@@ -104,35 +113,189 @@ fn serve_runner(
     let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)?;
     let mut control_channel =
         UnixStreamHostControlChannel::from_host_guaranteed(control_stream, setup_deadline);
-    let mut notification_channel =
+    let _notification_channel =
         UnixStreamHostNotificationChannel::from_accepted(notification_stream);
-    let setup_completed = Cell::new(false);
-    let termination = serve_connection(
-        broker,
-        &mut control_channel,
-        &mut notification_channel,
-        &shared_buffers,
-        |channel| {
+    let association =
+        match setup_connection(broker, &mut control_channel, &shared_buffers, |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
-            setup_completed.set(true);
             Ok(())
-        },
-    )?;
-    if termination != ConnectionTermination::PeerClosed {
-        return Err(IoError::new(
-            ErrorKind::InvalidData,
-            "runner violated the broker protocol",
-        )
-        .into());
-    }
-    if !setup_completed.get() {
-        return Err(IoError::new(
-            ErrorKind::UnexpectedEof,
-            "runner closed before completing broker setup",
-        )
-        .into());
-    }
+        })? {
+            Ok(association) => association,
+            Err(ConnectionTermination::PeerClosed) => {
+                return Err(IoError::new(
+                    ErrorKind::UnexpectedEof,
+                    "runner closed before completing broker setup",
+                )
+                .into());
+            }
+            Err(ConnectionTermination::ProtocolViolation) => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "runner violated the broker protocol during setup",
+                )
+                .into());
+            }
+            Err(_) => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "runner ended broker setup unexpectedly",
+                )
+                .into());
+            }
+        };
+    let (request_source, response_sink, shutdown) = control_channel.into_active()?;
+    dispatch_requests(association, request_source, response_sink, shutdown)?;
     Ok(())
+}
+
+fn dispatch_requests<Memory: SharedMemory>(
+    association: BrokerHostAssociation<'_, Memory>,
+    mut request_source: UnixStreamHostRequestSource,
+    response_sink: UnixStreamHostResponseSink,
+    shutdown: UnixStreamHostControlShutdown,
+) -> IoResult<()> {
+    let association = Arc::new(association);
+    let failure = Arc::new(HostAssociationFailure::new(shutdown));
+    let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
+    let request_receiver = Arc::new(Mutex::new(request_receiver));
+
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(WORKER_COUNT);
+        for worker_id in 0..WORKER_COUNT {
+            let association = Arc::clone(&association);
+            let request_receiver = Arc::clone(&request_receiver);
+            let response_sink = response_sink.clone();
+            let worker_failure = Arc::clone(&failure);
+            match std::thread::Builder::new()
+                .name(format!("litebox-broker-worker-{worker_id}"))
+                .spawn_scoped(scope, move || {
+                    run_worker(
+                        &association,
+                        &request_receiver,
+                        &response_sink,
+                        &worker_failure,
+                    );
+                }) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    failure.report(error);
+                    break;
+                }
+            }
+        }
+
+        read_requests(&mut request_source, request_sender, &failure);
+        for worker in workers {
+            if worker.join().is_err() {
+                failure.report(IoError::other("broker request worker panicked"));
+            }
+        }
+    });
+
+    match failure.take_error() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn read_requests(
+    request_source: &mut UnixStreamHostRequestSource,
+    request_sender: SyncSender<BrokerRequest>,
+    failure: &HostAssociationFailure,
+) {
+    loop {
+        if failure.failed() {
+            break;
+        }
+        match request_source.recv_request() {
+            Ok(HostReceive::Message(request)) => {
+                if request_sender.send(request).is_err() {
+                    failure.report(IoError::new(
+                        ErrorKind::BrokenPipe,
+                        "broker request workers stopped",
+                    ));
+                    break;
+                }
+            }
+            Ok(HostReceive::ProtocolViolation) => {
+                failure.report(IoError::new(
+                    ErrorKind::InvalidData,
+                    "runner sent a request for the wrong protocol phase",
+                ));
+                break;
+            }
+            Ok(HostReceive::PeerClosed) => break,
+            Err(error) => {
+                failure.report(error);
+                break;
+            }
+        }
+    }
+}
+
+fn run_worker<Memory: SharedMemory>(
+    association: &BrokerHostAssociation<'_, Memory>,
+    request_receiver: &Mutex<Receiver<BrokerRequest>>,
+    response_sink: &UnixStreamHostResponseSink,
+    failure: &HostAssociationFailure,
+) {
+    loop {
+        let request = request_receiver
+            .lock()
+            .expect("broker request receiver mutex poisoned")
+            .recv();
+        let Ok(request) = request else {
+            break;
+        };
+        if failure.failed() {
+            continue;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            association.execute_request(request, |response| response_sink.send_response(response))
+        })) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failure.report(IoError::other(error)),
+            Err(_) => failure.report(IoError::other("broker request worker panicked")),
+        }
+    }
+}
+
+struct HostAssociationFailure {
+    failed: AtomicBool,
+    error: Mutex<Option<IoError>>,
+    shutdown: UnixStreamHostControlShutdown,
+}
+
+impl HostAssociationFailure {
+    const fn new(shutdown: UnixStreamHostControlShutdown) -> Self {
+        Self {
+            failed: AtomicBool::new(false),
+            error: Mutex::new(None),
+            shutdown,
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn report(&self, error: IoError) {
+        if self.failed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *self
+            .error
+            .lock()
+            .expect("broker association failure mutex poisoned") = Some(error);
+        let _ = self.shutdown.shutdown();
+    }
+
+    fn take_error(&self) -> Option<IoError> {
+        self.error
+            .lock()
+            .expect("broker association failure mutex poisoned")
+            .take()
+    }
 }
 
 fn accept_runner_stream(
@@ -166,5 +329,44 @@ fn accept_runner_stream(
             Err(error) => return Err(error),
         }
         std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
+    use litebox_broker_protocol::channel::HostControlChannel;
+    use litebox_broker_protocol::message::BrokerHandshakeResponse;
+
+    #[test]
+    fn first_failure_is_preserved_and_unblocks_request_reading() {
+        let (peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut control_channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        control_channel
+            .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            })
+            .unwrap();
+        let (mut request_source, _response_sink, shutdown) = control_channel.into_active().unwrap();
+        let failure = HostAssociationFailure::new(shutdown);
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            result_sender.send(request_source.recv_request()).unwrap();
+        });
+
+        failure.report(IoError::new(ErrorKind::TimedOut, "first failure"));
+        failure.report(IoError::other("second failure"));
+        let receive_result = result_receiver.recv_timeout(Duration::from_secs(1));
+        drop(peer_stream);
+        reader.join().unwrap();
+
+        assert!(matches!(
+            receive_result.unwrap(),
+            Ok(HostReceive::PeerClosed) | Err(_)
+        ));
+        let error = failure.take_error().unwrap();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "first failure");
     }
 }
