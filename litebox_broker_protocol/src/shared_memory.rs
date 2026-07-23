@@ -33,6 +33,9 @@ pub enum SharedMemoryError {
     /// The requested byte range is outside the shared-memory resource.
     #[error("shared-memory range is out of bounds")]
     InvalidRange,
+    /// An atomic access is not naturally aligned.
+    #[error("shared-memory atomic access is not naturally aligned")]
+    UnalignedAtomic,
 }
 
 /// Byte-copy access to a shared-memory resource.
@@ -63,6 +66,46 @@ pub trait SharedMemory: Send + Sync + 'static {
 
     /// Copies bytes from `source` into shared memory.
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError>;
+}
+
+/// Ordered atomic access to shared-memory synchronization values.
+///
+/// Implementations must provide naturally aligned, indivisible, system-visible
+/// operations over coherent shared memory. Atomic values must not also be
+/// accessed through [`SharedMemory::read`] or [`SharedMemory::write`] by a
+/// conforming endpoint.
+pub trait AtomicSharedMemory: SharedMemory {
+    /// Atomically loads a naturally aligned native-endian `u32` with acquire
+    /// ordering.
+    fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError>;
+
+    /// Atomically increments a naturally aligned native-endian `u32` with
+    /// release ordering and returns its previous value.
+    fn fetch_add_u32_release(&self, offset: usize, value: u32) -> Result<u32, SharedMemoryError>;
+
+    /// Atomically loads a naturally aligned native-endian `u64` with acquire
+    /// ordering.
+    fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError>;
+
+    /// Atomically stores a naturally aligned native-endian `u64` with release
+    /// ordering.
+    ///
+    /// On error, the value must not have been stored.
+    fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError>;
+
+    /// Atomically release-stores a native-endian `u64`, then release-adds to a
+    /// native-endian `u32`, returning the previous `u32`.
+    ///
+    /// Both values must be naturally aligned and occupy non-overlapping ranges.
+    /// Implementations must validate both accesses before storing either value.
+    /// On error, neither value may have been modified.
+    fn store_u64_and_fetch_add_u32_release(
+        &self,
+        store_offset: usize,
+        value: u64,
+        add_offset: usize,
+        add_value: u32,
+    ) -> Result<u32, SharedMemoryError>;
 }
 
 impl<Memory: SharedMemory + ?Sized> SharedMemory for Arc<Memory> {
