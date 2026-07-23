@@ -1900,6 +1900,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
             }
+            SyscallRequest::NtTestAlert => {
+                // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state
+                // are modeled.
+                litebox_util_log::debug!(
+                    "NtTestAlert is a no-op; user-mode APC delivery is not yet modeled"
+                );
+                (NtStatus::SUCCESS, ContinueOperation::Resume)
+            }
             SyscallRequest::NtManageHotPatch => {
                 (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
             }

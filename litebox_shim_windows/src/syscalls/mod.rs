@@ -604,6 +604,7 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_handle: ProcessHandle,
         exit_status: i32,
     },
+    NtTestAlert,
     /// TODO: not supported yet
     NtManageHotPatch,
 }
@@ -1120,6 +1121,7 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_handle: { ProcessHandle::from_raw },
                 exit_status,
             })),
+            NtSysno::NtTestAlert => Some(SyscallRequest::NtTestAlert),
             NtSysno::NtManageHotPatch => Some(SyscallRequest::NtManageHotPatch),
             _ => None,
         }
