@@ -89,8 +89,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 .expect("/tmp chown cannot fail on a fresh in-memory file system");
         });
 
-        let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
-        shim_builder.default_fs(in_mem, tar_ro)
+        shim_builder.default_fs(in_mem, tar_data.into())
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 

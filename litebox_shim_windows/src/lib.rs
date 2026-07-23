@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,7 +22,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use litebox::LiteBox;
 use litebox::mm::PageManager;
 use litebox::platform::{
-    CrngProvider, PageManagementProvider, PunchthroughProvider, PunchthroughToken,
+    ArchSpecificProvider, ArchSpecificRegister, CrngProvider, PageManagementProvider,
     RawConstPointer as _, RawMutPointer as _, RawPointerProvider, StdioProvider,
     SystemInfoProvider, TimeProvider,
 };
@@ -67,6 +68,7 @@ pub trait ShimPlatform:
     RawSyncPrimitivesProvider
     + RawPointerProvider
     + PageManagementProvider<PAGE_SIZE>
+    + ArchSpecificProvider
     + SystemInfoProvider
     + TimeProvider
     + 'static
@@ -77,6 +79,7 @@ impl<T> ShimPlatform for T where
     T: RawSyncPrimitivesProvider
         + RawPointerProvider
         + PageManagementProvider<PAGE_SIZE>
+        + ArchSpecificProvider
         + SystemInfoProvider
         + TimeProvider
         + 'static
@@ -210,8 +213,8 @@ pub type WindowsFS<Platform> = litebox::fs::layered::FileSystem<
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
         Platform,
-        litebox::fs::devices::FileSystem<Platform>,
-        litebox::fs::tar_ro::FileSystem<Platform>,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
     >,
 >;
 
@@ -300,21 +303,10 @@ where
         .ok_or(NtStatus::ACCESS_VIOLATION)
 }
 
-fn set_guest_teb<Platform>(platform: &Platform, teb_address: usize) -> bool
-where
-    Platform: PunchthroughProvider + RawPointerProvider,
-    <Platform as PunchthroughProvider>::PunchthroughToken<'static>: PunchthroughToken<
-        Punchthrough = litebox_common_linux::PunchthroughSyscall<'static, Platform>,
-    >,
-{
-    let punchthrough: litebox_common_linux::PunchthroughSyscall<'static, Platform> =
-        litebox_common_linux::PunchthroughSyscall::SetFsBase { addr: teb_address };
-    let Some(token) = platform.get_punchthrough_token_for(punchthrough) else {
-        litebox_util_log::warn!(teb:% = format_args!("{teb_address:#x}"); "Failed to get punchthrough token for Windows TEB base");
-        return false;
-    };
-
-    if let Err(error) = token.execute() {
+fn set_guest_teb<Platform: ArchSpecificProvider>(platform: &Platform, teb_address: usize) -> bool {
+    if let Err(error) =
+        platform.set_arch_specific_register(&ArchSpecificRegister::FsBase, teb_address)
+    {
         litebox_util_log::warn!(error:? = error, teb:% = format_args!("{teb_address:#x}"); "Failed to set Windows TEB base");
         return false;
     }
@@ -430,12 +422,12 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     pub fn default_fs(
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
-        tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+        tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform>
     where
         Platform: CrngProvider + StdioProvider,
     {
-        default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
+        default_fs(&self.litebox, in_mem_fs, tar_data)
     }
 
     #[must_use]
@@ -648,13 +640,7 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation
-    where
-        Platform: PunchthroughProvider,
-        <Platform as PunchthroughProvider>::PunchthroughToken<'static>: PunchthroughToken<
-            Punchthrough = litebox_common_linux::PunchthroughSyscall<'static, Platform>,
-        >,
-    {
+    fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         if !set_guest_teb(self.global.platform, self.teb_address) {
             return ContinueOperation::Terminate;
         }
@@ -2296,14 +2282,7 @@ pub struct WindowsShimEntrypoints<Platform: ShimPlatform, FS: ShimFS> {
     _not_send: PhantomData<*const ()>,
 }
 
-impl<Platform, FS> EnterShim for WindowsShimEntrypoints<Platform, FS>
-where
-    Platform: ShimPlatform + PunchthroughProvider,
-    <Platform as PunchthroughProvider>::PunchthroughToken<'static>: PunchthroughToken<
-        Punchthrough = litebox_common_linux::PunchthroughSyscall<'static, Platform>,
-    >,
-    FS: ShimFS,
-{
+impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Platform, FS> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -2345,19 +2324,36 @@ pub struct LoadedProgram<Platform: ShimPlatform, FS: ShimFS> {
 fn default_fs<Platform>(
     litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
-    tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
+    tar_data: Cow<'static, [u8]>,
 ) -> WindowsFS<Platform>
 where
     Platform: ShimPlatform + CrngProvider + StdioProvider,
 {
-    let devices = litebox::fs::devices::FileSystem::new(litebox);
+    let devices = litebox::fs::resolver::Resolver::new(
+        litebox,
+        litebox::fs::composer::Composer::builder()
+            .mount("/dev", |allocator| {
+                litebox::fs::devices::Devices::new(litebox, allocator)
+            })
+            .build()
+            .unwrap(),
+    );
+    let tar_ro = litebox::fs::resolver::Resolver::new(
+        litebox,
+        litebox::fs::composer::Composer::builder()
+            .mount("/", |allocator| {
+                litebox::fs::tar_ro::TarRo::new(tar_data, allocator)
+            })
+            .build()
+            .unwrap(),
+    );
     litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
             litebox,
             devices,
-            tar_ro_fs,
+            tar_ro,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,

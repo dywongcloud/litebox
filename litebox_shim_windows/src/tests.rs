@@ -147,10 +147,8 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             fs.close(&fd).expect("NLS fixture close should succeed");
         }
     });
-    let tar_ro =
-        litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
     let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new(platform);
-    let fs = Arc::new(shim_builder.default_fs(in_mem, tar_ro));
+    let fs = Arc::new(shim_builder.default_fs(in_mem, litebox::fs::tar_ro::EMPTY_TAR_FILE.into()));
     let shim = shim_builder.build();
     let WindowsShim(global) = shim;
 
