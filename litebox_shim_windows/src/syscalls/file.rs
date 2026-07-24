@@ -8,8 +8,8 @@ use core::mem::size_of;
 
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
-use litebox::fs::errors::{FileStatusError, MkdirError, OpenError, PathError};
-use litebox::fs::{FileType, Mode, OFlags};
+use litebox::fs::errors::{FileStatusError, MkdirError, OpenError, PathError, WriteError};
+use litebox::fs::{FileType, Mode, OFlags, SeekWhence};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -29,6 +29,12 @@ const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+/// Append at the current end of file
+const FILE_WRITE_TO_END_OF_FILE: i64 = -1;
+
+/// Use the file object's current position
+const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
 
 // These names and values are Windows ABI constants from WDK headers; Wine's
 // regular file/directory branch and ReactOS' filesystem device query path use
@@ -532,6 +538,129 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         write_file_result::<Platform>(file_handle, io_status_block, result, |handle| {
             self.close_file_handle(handle);
         })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "NtWriteFile has nine ABI parameters; keeping them explicit preserves syscall ordering"
+    )]
+    pub(crate) fn sys_nt_write_file(
+        &self,
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<ConstPtr<Platform, u8>>,
+        apc_context: Option<ConstPtr<Platform, u8>>,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        buffer: ConstPtr<Platform, u8>,
+        length: u32,
+        byte_offset: Option<ConstPtr<Platform, i64>>,
+        key: Option<ConstPtr<Platform, u32>>,
+    ) -> NtStatus {
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let Some(buffer) = buffer.to_owned_slice(length as usize) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if !event.is_null()
+            && let Err(status) = self.check_event_modify_access(event)
+        {
+            return status;
+        }
+        let offset = match byte_offset {
+            Some(byte_offset) => match byte_offset.read_at_offset(0) {
+                Some(FILE_USE_FILE_POINTER_POSITION) => None,
+                Some(FILE_WRITE_TO_END_OF_FILE) => {
+                    let file = match self.file_entry(file_handle) {
+                        Ok(file) => file,
+                        Err(status) => return status,
+                    };
+                    match file.with_entry(|file| self.fs.file_status(&file.path)) {
+                        Ok(status) => Some(status.size),
+                        Err(error) => return map_file_status_error(error),
+                    }
+                }
+                Some(offset) if offset >= 0 => match usize::try_from(offset) {
+                    Ok(offset) => Some(offset),
+                    Err(_) => return NtStatus::INVALID_PARAMETER,
+                },
+                Some(_) => return NtStatus::INVALID_PARAMETER,
+                None => return NtStatus::ACCESS_VIOLATION,
+            },
+            None => None,
+        };
+        if let Some(key) = key {
+            let Some(key) = key.read_at_offset(0) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw(),
+                key = key;
+                "Ignoring NtWriteFile byte-range lock key; byte-range locking is not supported yet"
+            );
+        }
+
+        let file = match self.file_entry(file_handle) {
+            Ok(file) => file,
+            Err(status) => return status,
+        };
+        if !event.is_null()
+            && let Err(status) = self.clear_event(event)
+        {
+            return status;
+        }
+        if apc_routine.is_some() || apc_context.is_some() {
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw();
+                "Ignoring NtWriteFile APC completion arguments for synchronous completion"
+            );
+        }
+        let result = file.with_entry(|file| match &file.backing {
+            FileObjectBacking::Filesystem { fd, is_directory } => {
+                if *is_directory {
+                    return Err(WriteError::NotAFile);
+                }
+                let written = self.fs.write(fd, &buffer, offset)?;
+                // A positional write leaves the backing file offset untouched, but NT advances a
+                // synchronous file object's position past the end of every write, including
+                // explicit-offset and append writes. Asynchronous handles keep their position.
+                if let Some(offset) = offset
+                    && file
+                        .create_options
+                        .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+                {
+                    let _ = self.fs.seek(
+                        fd,
+                        (offset + written).cast_signed(),
+                        SeekWhence::RelativeToBeginning,
+                    );
+                }
+                Ok(written)
+            }
+            FileObjectBacking::CondrvStream { fd, .. } => self.fs.write(fd, &buffer, offset),
+            FileObjectBacking::CondrvControl(_) => Err(WriteError::NotAFile),
+        });
+        let (status, information) = match result {
+            Ok(written) => (NtStatus::SUCCESS, written),
+            Err(WriteError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
+            Err(WriteError::NotForWriting) => (NtStatus::ACCESS_DENIED, 0),
+            Err(WriteError::NotAFile) => (NtStatus::INVALID_DEVICE_REQUEST, 0),
+            Err(_) => (NtStatus::UNSUCCESSFUL, 0),
+        };
+        if io_status_block
+            .write_at_offset(0, IoStatusBlock::new(status, information))
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if !event.is_null() {
+            let event_status = self.set_event(event);
+            if event_status != NtStatus::SUCCESS {
+                return event_status;
+            }
+        }
+        status
     }
 
     pub(crate) fn sys_nt_query_volume_information_file(
