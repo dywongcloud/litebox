@@ -14,7 +14,7 @@ use litebox_broker_protocol::shared_memory::SharedMemory;
 use litebox_broker_protocol::shared_memory::{AtomicSharedMemory, SharedMemoryError};
 
 /// Size of one shared control-ring slot.
-pub const CONTROL_RING_SLOT_SIZE: usize = 4096;
+pub const CONTROL_RING_SLOT_SIZE: usize = 128;
 
 /// Size of the fixed metadata at the start of a control-ring slot.
 pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
@@ -22,6 +22,11 @@ pub const CONTROL_RING_SLOT_HEADER_SIZE: usize = 16;
 /// Maximum encoded request or response size in one control-ring slot.
 pub const CONTROL_RING_PAYLOAD_CAPACITY: usize =
     CONTROL_RING_SLOT_SIZE - CONTROL_RING_SLOT_HEADER_SIZE;
+
+const _: () = assert!(
+    CONTROL_RING_PAYLOAD_CAPACITY >= litebox_broker_protocol::wire::MAX_ENCODED_ACTIVE_MESSAGE_SIZE
+);
+const _: () = assert!(CONTROL_RING_SLOT_SIZE.is_multiple_of(size_of::<u64>()));
 
 /// Number of slots in each direction of the shared control ring.
 pub const CONTROL_RING_SLOT_COUNT: u64 = 64;
@@ -313,6 +318,55 @@ pub struct ControlRingProducer<Memory: AtomicSharedMemory> {
     acknowledged_head: u64,
 }
 
+/// Cloneable, narrow handle for interrupting a wait on one ring endpoint.
+///
+/// This handle intentionally exposes neither the backing memory nor endpoint
+/// state. Hosted transports use it to make liveness and cancellation events
+/// visible to a thread blocked in an OS-specific wait.
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+pub(crate) struct ControlRingWakeHandle<Memory: AtomicSharedMemory> {
+    ring: Arc<ControlRing<Memory>>,
+    wait_epoch: ControlRingWaitEpoch,
+}
+
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+#[derive(Clone, Copy)]
+enum ControlRingWaitEpoch {
+    Producer(ControlRingDirection),
+    Consumer(ControlRingDirection),
+}
+
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+impl ControlRingWaitEpoch {
+    const fn offset(self) -> usize {
+        match self {
+            Self::Producer(direction) => direction.producer_epoch_offset(),
+            Self::Consumer(direction) => direction.consumer_epoch_offset(),
+        }
+    }
+}
+
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+impl<Memory: AtomicSharedMemory> Clone for ControlRingWakeHandle<Memory> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: Arc::clone(&self.ring),
+            wait_epoch: self.wait_epoch,
+        }
+    }
+}
+
+#[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+impl<Memory: AtomicSharedMemory> ControlRingWakeHandle<Memory> {
+    pub(crate) const fn wait_epoch_offset(&self) -> usize {
+        self.wait_epoch.offset()
+    }
+
+    pub(crate) fn memory(&self) -> &Memory {
+        self.ring.memory()
+    }
+}
+
 impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
     fn new(ring: Arc<ControlRing<Memory>>, direction: ControlRingDirection) -> Self {
         Self {
@@ -326,6 +380,14 @@ impl<Memory: AtomicSharedMemory> ControlRingProducer<Memory> {
     /// Returns the ring direction written by this producer.
     pub const fn direction(&self) -> ControlRingDirection {
         self.direction
+    }
+
+    #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+    pub(crate) fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
+        ControlRingWakeHandle {
+            ring: Arc::clone(&self.ring),
+            wait_epoch: ControlRingWaitEpoch::Consumer(self.direction),
+        }
     }
 
     #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
@@ -410,6 +472,14 @@ impl<Memory: AtomicSharedMemory> ControlRingConsumer<Memory> {
     /// Returns the ring direction read by this consumer.
     pub const fn direction(&self) -> ControlRingDirection {
         self.direction
+    }
+
+    #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
+    pub(crate) fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {
+        ControlRingWakeHandle {
+            ring: Arc::clone(&self.ring),
+            wait_epoch: ControlRingWaitEpoch::Producer(self.direction),
+        }
     }
 
     #[cfg(any(test, all(feature = "linux-userland", target_os = "linux")))]
