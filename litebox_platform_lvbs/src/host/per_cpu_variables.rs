@@ -108,7 +108,9 @@ const _: () = assert!(size_of::<PerCpuVariables>() == PER_CPU_ALIGN);
 // masking any RSP within it (including a full stack) recovers the base.
 const _: () = {
     assert!(offset_of!(PerCpuVariables, double_fault_stack) > 0);
-    assert!(offset_of!(PerCpuVariables, double_fault_stack) + DOUBLE_FAULT_STACK_SIZE < PER_CPU_ALIGN);
+    assert!(
+        offset_of!(PerCpuVariables, double_fault_stack) + DOUBLE_FAULT_STACK_SIZE < PER_CPU_ALIGN
+    );
     assert!(offset_of!(PerCpuVariables, exception_stack) > 0);
     assert!(offset_of!(PerCpuVariables, exception_stack) + EXCEPTION_STACK_SIZE < PER_CPU_ALIGN);
     assert!(offset_of!(PerCpuVariables, kernel_stack) > 0);
