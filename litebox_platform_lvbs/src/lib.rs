@@ -595,7 +595,15 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         if base_pt
             .map_phys_frame_range(
                 vtl1_range,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                // ACCESSED/DIRTY are pre-set on these kernel leaf mappings
+                // (mirroring the Linux kernel's `_PAGE_KERNEL`) so the CPU
+                // walker never takes an atomic RMW to set them; the W^X logic
+                // in `map_phys_frame_range` strips WRITABLE and DIRTY for
+                // exec ranges.
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::ACCESSED
+                    | PageTableFlags::DIRTY,
                 Some(&exec_ranges),
             )
             .is_err()
@@ -1158,9 +1166,13 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         }
 
         // VTL0 memory must never be executable from VTL1 (DEP).
-        let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+        // ACCESSED is pre-set on every vmap leaf (avoids the walker's atomic
+        // RMW on first access); DIRTY only together with WRITABLE below,
+        // because WRITABLE=0 + DIRTY=1 is the CET shadow-stack PTE shape.
+        let mut flags =
+            PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | PageTableFlags::ACCESSED;
         if perms.contains(PhysPageMapPermissions::WRITE) {
-            flags |= PageTableFlags::WRITABLE;
+            flags |= PageTableFlags::WRITABLE | PageTableFlags::DIRTY;
         }
 
         // Always allocate a fresh, private virtual address window for the mapping. This lets
