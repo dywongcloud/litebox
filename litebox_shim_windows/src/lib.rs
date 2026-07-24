@@ -28,6 +28,7 @@ use litebox::platform::{
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::RawSyncPrimitivesProvider;
+use litebox::utils::TruncateExt as _;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
@@ -1886,6 +1887,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     self.sys_nt_unmap_view_of_section_ex(process_handle, base_address, flags);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtContinue {
+                context,
+                test_alert,
+            } => match Self::sys_nt_continue(ctx, context, test_alert) {
+                Ok(()) => return ContinueOperation::Resume,
+                Err(status) => (status, ContinueOperation::Resume),
+            },
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
@@ -1901,11 +1909,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
             SyscallRequest::NtTestAlert => {
-                // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state
-                // are modeled.
-                litebox_util_log::debug!(
-                    "NtTestAlert is a no-op; user-mode APC delivery is not yet modeled"
-                );
+                Self::test_alert();
                 (NtStatus::SUCCESS, ContinueOperation::Resume)
             }
             SyscallRequest::NtManageHotPatch => {
@@ -1915,6 +1919,78 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         ctx.rax = result.as_raw().cast_unsigned() as usize;
         op
+    }
+
+    fn sys_nt_continue(
+        ctx: &mut litebox_common_linux::PtRegs,
+        context: ConstPtr<Platform, nt_types::X64Context>,
+        test_alert: bool,
+    ) -> Result<(), NtStatus> {
+        if context.as_usize() == 0 {
+            return Err(NtStatus::ACCESS_VIOLATION);
+        }
+        let context = context
+            .read_at_offset(0)
+            .ok_or(NtStatus::ACCESS_VIOLATION)?;
+
+        if test_alert {
+            Self::test_alert();
+        }
+
+        let context_flags = nt_types::ContextFlags::from_bits_retain(context.context_flags);
+
+        if context_flags.contains(nt_types::ContextFlags::CONTROL) {
+            ctx.rip = context.rip.trunc();
+            ctx.rsp = context.rsp.trunc();
+            ctx.eflags = context.e_flags as usize;
+            ctx.cs = context.seg_cs as usize;
+            ctx.ss = context.seg_ss as usize;
+        }
+
+        if context_flags.contains(nt_types::ContextFlags::INTEGER) {
+            ctx.rax = context.rax.trunc();
+            ctx.rbx = context.rbx.trunc();
+            ctx.rcx = context.rcx.trunc();
+            ctx.rdx = context.rdx.trunc();
+            ctx.rsi = context.rsi.trunc();
+            ctx.rdi = context.rdi.trunc();
+            ctx.rbp = context.rbp.trunc();
+            ctx.r8 = context.r8.trunc();
+            ctx.r9 = context.r9.trunc();
+            ctx.r10 = context.r10.trunc();
+            ctx.r11 = context.r11.trunc();
+            ctx.r12 = context.r12.trunc();
+            ctx.r13 = context.r13.trunc();
+            ctx.r14 = context.r14.trunc();
+            ctx.r15 = context.r15.trunc();
+        }
+
+        // TODO(context-model): Restore floating-point, extended, and debug-register state.
+        if context_flags.contains(nt_types::ContextFlags::FLOATING_POINT) {
+            litebox_util_log::warn!(
+                "NtContinue requested floating-point state, which is not yet restored"
+            );
+        }
+        if context_flags.contains(nt_types::ContextFlags::XSTATE) {
+            litebox_util_log::warn!(
+                "NtContinue requested extended state, which is not yet restored"
+            );
+        }
+        if context_flags.contains(nt_types::ContextFlags::DEBUG_REGISTERS) {
+            litebox_util_log::warn!(
+                "NtContinue requested debug-register state, which is not yet restored"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn test_alert() {
+        // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state
+        // are modeled.
+        litebox_util_log::debug!(
+            "NtTestAlert is a no-op; user-mode APC delivery is not yet modeled"
+        );
     }
 
     pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {
