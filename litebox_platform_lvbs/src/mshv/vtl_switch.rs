@@ -5,7 +5,9 @@
 
 use crate::host::{
     hv_hypercall_page_address,
-    per_cpu_variables::{PER_CPU_ALIGN, PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables},
+    per_cpu_variables::{
+        PER_CPU_ALIGN, PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables,
+    },
 };
 use crate::mshv::{
     HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
