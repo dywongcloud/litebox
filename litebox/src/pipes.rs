@@ -928,7 +928,7 @@ mod tests {
 
     use alloc::sync::Arc;
     use litebox_broker_local::BrokerLocal;
-    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
@@ -950,13 +950,13 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let request_count = Arc::new(AtomicUsize::new(0));
         let force_transport = Arc::new(AtomicBool::new(false));
-        let local = BrokerLocal::negotiate(
+        let (local, ()) = BrokerLocal::negotiate(
             FailingPipeChannel {
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            |_| Ok(Arc::new(NoopSharedMemory)),
+            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
         )
         .unwrap();
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
@@ -996,13 +996,13 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let request_count = Arc::new(AtomicUsize::new(0));
         let force_transport = Arc::new(AtomicBool::new(false));
-        let local = BrokerLocal::negotiate(
+        let (local, ()) = BrokerLocal::negotiate(
             FailingPipeChannel {
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            |_| Ok(Arc::new(NoopSharedMemory)),
+            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
         )
         .unwrap();
         let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
@@ -1148,7 +1148,7 @@ mod tests {
         WouldBlock,
     }
 
-    impl LocalControlChannel for FailingPipeChannel {
+    impl LocalSetupChannel for FailingPipeChannel {
         type Error = ();
 
         fn send_handshake_request(
@@ -1165,6 +1165,11 @@ mod tests {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             }))
         }
+    }
+
+    impl LocalCallChannel for FailingPipeChannel {
+        type Error = ();
+
         fn call(
             &self,
             request: BrokerRequest,

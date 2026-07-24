@@ -25,8 +25,8 @@ use litebox_broker_protocol::shared_memory::{
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::MemfdSharedMemory;
 use litebox_broker_transport::unix_socket::{
-    UnixStreamHostControlChannel, UnixStreamHostControlShutdown, UnixStreamHostNotificationChannel,
-    UnixStreamHostRequestSource, UnixStreamHostResponseSink, validate_peer_process,
+    UnixControlRingHostRequestSource, UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
+    UnixStreamHostSetupChannel, validate_peer_process,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,11 +50,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .prefix("litebox-broker-userland-")
         .tempdir()?;
     let control_socket_path = socket_dir.path().join("broker.sock");
-    let notification_socket_path = socket_dir.path().join("broker-notification.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
-    let notification_listener = UnixListener::bind(&notification_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    notification_listener.set_nonblocking(true)?;
     let broker = BrokerCore::new(PolicyEngine::with_host_guaranteed_rights(
         ObjectRights::all(),
     ))?;
@@ -64,19 +61,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .arg("--unstable")
         .arg("--broker-control-socket")
         .arg(&control_socket_path)
-        .arg("--broker-notification-socket")
-        .arg(&notification_socket_path)
         .args(&args.runner_arguments);
     let mut runner = runner_command.spawn()?;
     let runner_process_id = runner.id();
 
-    let association_result = serve_runner(
-        &broker,
-        &control_listener,
-        &notification_listener,
-        &mut runner,
-        runner_process_id,
-    );
+    let association_result =
+        serve_runner(&broker, &control_listener, &mut runner, runner_process_id);
     if association_result.is_err() {
         let _ = runner.kill();
     }
@@ -91,7 +81,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn serve_runner(
     broker: &BrokerCore,
     control_listener: &UnixListener,
-    notification_listener: &UnixListener,
     runner: &mut Child,
     runner_process_id: u32,
 ) -> Result<(), Box<dyn Error>> {
@@ -103,22 +92,13 @@ fn serve_runner(
         setup_deadline,
         "control",
     )?;
-    let notification_stream = accept_runner_stream(
-        notification_listener,
-        runner,
-        runner_process_id,
-        setup_deadline,
-        "notification",
-    )?;
     let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE)?;
     let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)?;
     let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE)?;
     let control_ring = ControlRing::new(control_memory)
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let mut control_channel =
-        UnixStreamHostControlChannel::from_host_guaranteed(control_stream, setup_deadline);
-    let _notification_channel =
-        UnixStreamHostNotificationChannel::from_accepted(notification_stream);
+        UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
     let association =
         match setup_connection(broker, &mut control_channel, &shared_buffers, |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
@@ -148,16 +128,17 @@ fn serve_runner(
                 .into());
             }
         };
-    let (request_source, response_sink, shutdown) = control_channel.into_active(control_ring)?;
+    let (request_source, response_sink, _notification_channel, shutdown) =
+        control_channel.into_active(control_ring)?;
     dispatch_requests(association, request_source, response_sink, shutdown)?;
     Ok(())
 }
 
 fn dispatch_requests<Memory: SharedMemory>(
     association: BrokerHostAssociation<'_, Memory>,
-    mut request_source: UnixStreamHostRequestSource,
-    response_sink: UnixStreamHostResponseSink,
-    shutdown: UnixStreamHostControlShutdown,
+    mut request_source: UnixControlRingHostRequestSource,
+    response_sink: UnixControlRingHostResponseSink,
+    shutdown: UnixControlRingHostShutdown,
 ) -> IoResult<()> {
     let association = Arc::new(association);
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
@@ -204,7 +185,7 @@ fn dispatch_requests<Memory: SharedMemory>(
 }
 
 fn read_requests(
-    request_source: &mut UnixStreamHostRequestSource,
+    request_source: &mut UnixControlRingHostRequestSource,
     request_sender: SyncSender<BrokerRequest>,
     failure_coordinator: &HostAssociationFailureCoordinator,
 ) {
@@ -241,7 +222,7 @@ fn read_requests(
 fn run_worker<Memory: SharedMemory>(
     association: &BrokerHostAssociation<'_, Memory>,
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
-    response_sink: &UnixStreamHostResponseSink,
+    response_sink: &UnixControlRingHostResponseSink,
     failure_coordinator: &HostAssociationFailureCoordinator,
 ) {
     loop {
@@ -270,11 +251,11 @@ fn run_worker<Memory: SharedMemory>(
 struct HostAssociationFailureCoordinator {
     failed: AtomicBool,
     error: Mutex<Option<IoError>>,
-    shutdown: UnixStreamHostControlShutdown,
+    shutdown: UnixControlRingHostShutdown,
 }
 
 impl HostAssociationFailureCoordinator {
-    const fn new(shutdown: UnixStreamHostControlShutdown) -> Self {
+    const fn new(shutdown: UnixControlRingHostShutdown) -> Self {
         Self {
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
@@ -343,22 +324,22 @@ fn accept_runner_stream(
 mod tests {
     use super::*;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::channel::{HostSetupChannel, LocalControlChannel};
+    use litebox_broker_protocol::channel::{HostSetupChannel, LocalSetupChannel};
     use litebox_broker_protocol::message::BrokerHandshakeResponse;
-    use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
+    use litebox_broker_transport::unix_socket::UnixStreamLocalSetupChannel;
     use std::os::fd::AsFd;
 
     #[test]
     fn first_failure_is_preserved_and_unblocks_request_reading() {
         let (peer_stream, host_stream) = UnixStream::pair().unwrap();
-        let mut local_channel = UnixStreamLocalControlChannel::from_connected(peer_stream);
-        let mut control_channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        let mut local_setup = UnixStreamLocalSetupChannel::from_connected(peer_stream);
+        let mut control_channel = UnixStreamHostSetupChannel::from_accepted(host_stream);
         control_channel
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
             })
             .unwrap();
-        local_channel.recv_handshake_response().unwrap().unwrap();
+        local_setup.recv_handshake_response().unwrap().unwrap();
         let local_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let host_memory = MemfdSharedMemory::from_received_fd(
             local_memory.as_fd().try_clone_to_owned().unwrap(),
@@ -367,13 +348,11 @@ mod tests {
         .unwrap();
         let local_ring = ControlRing::new(local_memory).unwrap();
         let host_ring = ControlRing::new(host_memory).unwrap();
-        let local_activation = std::thread::spawn(move || {
-            let cancellation = local_channel.activate(local_ring, || {}).unwrap();
-            (local_channel, cancellation)
-        });
-        let (mut request_source, _response_sink, shutdown) =
+        let local_activation =
+            std::thread::spawn(move || local_setup.into_active(local_ring, || {}).unwrap());
+        let (mut request_source, _response_sink, _notifications, shutdown) =
             control_channel.into_active(host_ring).unwrap();
-        let (_local_channel, _cancellation) = local_activation.join().unwrap();
+        let (_local_call, _local_notifications, _local_shutdown) = local_activation.join().unwrap();
         let failure_coordinator = HostAssociationFailureCoordinator::new(shutdown);
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let reader = std::thread::spawn(move || {
