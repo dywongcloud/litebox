@@ -122,6 +122,15 @@ macro_rules! __tracing_dispatch {
         )
     };
 
+    // Field: key:x = value (0x-prefixed lowercase hex, via Display)
+    ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :x = $value:expr $(, $($rest:tt)*)?]) => {
+        $crate::__tracing_dispatch!(
+            [$mode] [$level] [$target]
+            [$($acc)* $key = %$crate::__private::Hex($value),]
+            [$($($rest)*)?]
+        )
+    };
+
     // Field: key:err = value (errors use Display)
     ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :err = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(

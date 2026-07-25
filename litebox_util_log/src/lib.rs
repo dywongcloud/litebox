@@ -26,6 +26,8 @@
 //!
 //! - `:?` or `:debug` - Capture the value using `Debug`
 //! - `:%` or `:display` - Capture the value using `Display`
+//! - `:x` - Capture the value using `LowerHex`, rendered as `0x`-prefixed
+//!   lowercase hexadecimal (works with both backends)
 //! - `:err` - Capture the value using `std::error::Error` (requires `kv_std`)
 //! - `:sval` - Capture the value using `sval::Value` (requires `kv_sval`)
 //! - `:serde` - Capture the value using `serde::Serialize` (requires `kv_serde`)
@@ -133,6 +135,16 @@ pub fn format_record<W: core::fmt::Write>(
 /// Breaking changes to this module are not considered semver violations.
 #[doc(hidden)]
 pub mod __private {
+    /// Renders the wrapped value as `0x`-prefixed lowercase hexadecimal
+    /// (i.e. `{:#x}`). Used by the `:x` capture mode on both backends.
+    pub struct Hex<T>(pub T);
+
+    impl<T: core::fmt::LowerHex> core::fmt::Display for Hex<T> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "{:#x}", self.0)
+        }
+    }
+
     #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
     pub use log;
     #[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
