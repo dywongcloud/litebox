@@ -11,7 +11,7 @@ use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
-use crate::session::{ObjectEntry, ObjectRights};
+use crate::session::{ObjectEntry, ObjectRights, SessionUsage};
 use crate::{BrokerError, BrokerSession, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -184,22 +184,61 @@ enum PipeEndpoint {
     Write,
 }
 
+/// Charges one pipe's capacity to its session quota and to the broker-wide
+/// ceiling for as long as the pipe is live.
+///
+/// The reservation outlives the session handle when a pipe endpoint does, so it
+/// keeps the session usage record alive rather than borrowing it.
 struct PipeCapacityReservation {
+    session_usage: Arc<SessionUsage>,
     reserved_capacity: Arc<AtomicUsize>,
     capacity: usize,
 }
 
+/// Adds `capacity` to `reserved` unless that would pass `ceiling`.
+fn reserve_capacity(reserved: &AtomicUsize, capacity: usize, ceiling: usize) -> Result<()> {
+    reserved
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            reserved
+                .checked_add(capacity)
+                .filter(|total| *total <= ceiling)
+        })
+        .map(|_| ())
+        .map_err(|_| BrokerError::ResourceExhausted)
+}
+
+/// Returns `capacity` to a counter a live reservation is holding.
+fn release_capacity(reserved: &AtomicUsize, capacity: usize) {
+    reserved
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            reserved.checked_sub(capacity)
+        })
+        .expect("reserved pipe capacity must include every live pipe");
+}
+
 impl PipeCapacityReservation {
     fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
+        let session_usage = Arc::clone(&session.usage);
         let reserved_capacity = Arc::clone(&session.core.reserved_pipe_capacity);
-        reserved_capacity
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
-                reserved
-                    .checked_add(capacity)
-                    .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
-            })
-            .map_err(|_| BrokerError::ResourceExhausted)?;
+
+        // Charge the session quota first, so a session over its own quota is
+        // rejected on its own account rather than on the shared ceiling.
+        reserve_capacity(
+            &session_usage.pipe_capacity,
+            capacity,
+            session.core.limits.max_pipe_capacity_per_session,
+        )?;
+        if let Err(error) = reserve_capacity(
+            &reserved_capacity,
+            capacity,
+            session.core.limits.max_total_pipe_capacity,
+        ) {
+            release_capacity(&session_usage.pipe_capacity, capacity);
+            return Err(error);
+        }
+
         Ok(Self {
+            session_usage,
             reserved_capacity,
             capacity,
         })
@@ -208,11 +247,8 @@ impl PipeCapacityReservation {
 
 impl Drop for PipeCapacityReservation {
     fn drop(&mut self) {
-        self.reserved_capacity
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
-                reserved.checked_sub(self.capacity)
-            })
-            .expect("reserved pipe capacity must include every live pipe");
+        release_capacity(&self.reserved_capacity, self.capacity);
+        release_capacity(&self.session_usage.pipe_capacity, self.capacity);
     }
 }
 

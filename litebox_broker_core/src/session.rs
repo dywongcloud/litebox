@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
@@ -41,10 +42,63 @@ bitflags::bitflags! {
     }
 }
 
+/// Live broker-owned resources charged to one session.
+///
+/// Every counter is mutated only while the broker core reference map write lock
+/// is held, or through the paired reserve and release of a pipe capacity
+/// reservation, so relaxed ordering is sufficient.
+#[derive(Debug, Default)]
+pub(crate) struct SessionUsage {
+    /// Live object references owned by the session.
+    references: AtomicUsize,
+    /// Capacity in bytes reserved by the live pipes of the session.
+    pub(crate) pipe_capacity: AtomicUsize,
+}
+
+impl SessionUsage {
+    pub(crate) fn references(&self) -> usize {
+        self.references.load(Ordering::Relaxed)
+    }
+}
+
+/// One live object reference, charged to the session that created it.
+///
+/// Dropping the reference releases the charge, so removal through any path --
+/// an explicit close, session teardown, or map maintenance -- returns the quota
+/// to the owning session.
 pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) session_id: SessionId,
     pub(crate) rights: ObjectRights,
+    usage: Arc<SessionUsage>,
+}
+
+impl ObjectReference {
+    fn new(
+        object: ObjectEntry,
+        session_id: SessionId,
+        rights: ObjectRights,
+        usage: Arc<SessionUsage>,
+    ) -> Self {
+        usage.references.fetch_add(1, Ordering::Relaxed);
+        Self {
+            object: Arc::new(RwLock::new(object)),
+            session_id,
+            rights,
+            usage,
+        }
+    }
+}
+
+impl Drop for ObjectReference {
+    fn drop(&mut self) {
+        self.usage
+            .references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |references| {
+                references.checked_sub(1)
+            })
+            .expect("session reference usage must include every live reference");
+    }
 }
 
 pub(crate) enum ObjectEntry {
@@ -63,6 +117,8 @@ pub struct BrokerSession {
     pub(crate) session_id: SessionId,
     /// Broker-entry-authenticated caller credential for this session.
     pub(crate) caller_credential: CallerCredential,
+    /// Live broker resources charged to this session.
+    pub(crate) usage: Arc<SessionUsage>,
 }
 
 impl BrokerSession {
@@ -76,7 +132,35 @@ impl BrokerSession {
             core,
             session_id,
             caller_credential,
+            usage: Arc::new(SessionUsage::default()),
         }
+    }
+
+    /// Admits `count` more object references against both budget tiers.
+    ///
+    /// The per-session quota is checked first, so a session that is over its own
+    /// quota is rejected on its own account rather than on the shared ceiling.
+    fn admit_references(
+        &self,
+        references: &HashMap<ObjectHandle, ObjectReference>,
+        count: usize,
+    ) -> Result<()> {
+        if self
+            .usage
+            .references()
+            .checked_add(count)
+            .is_none_or(|total| total > self.core.limits.max_references_per_session)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        if references
+            .len()
+            .checked_add(count)
+            .is_none_or(|total| total > self.core.limits.max_references)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        Ok(())
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
@@ -85,17 +169,11 @@ impl BrokerSession {
             .policy
             .principal_object_rights(self.caller_credential)?;
         let mut references = self.core.references.write();
-        if references.len() >= self.core.limits.max_references {
-            return Err(BrokerError::ResourceExhausted);
-        }
+        self.admit_references(&references, 1)?;
         let handle = self.core.allocate_reference_handle()?;
         references.insert(
             handle,
-            ObjectReference {
-                object: Arc::new(RwLock::new(object)),
-                session_id: self.session_id,
-                rights,
-            },
+            ObjectReference::new(object, self.session_id, rights, Arc::clone(&self.usage)),
         );
 
         Ok(handle)
@@ -111,22 +189,12 @@ impl BrokerSession {
             .policy
             .principal_object_rights(self.caller_credential)?;
         let mut references = self.core.references.write();
-        if references
-            .len()
-            .checked_add(2)
-            .is_none_or(|count| count > self.core.limits.max_references)
-        {
-            return Err(BrokerError::ResourceExhausted);
-        }
+        self.admit_references(&references, 2)?;
         let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
             references.insert(
                 handle,
-                ObjectReference {
-                    object: Arc::new(RwLock::new(object)),
-                    session_id: self.session_id,
-                    rights,
-                },
+                ObjectReference::new(object, self.session_id, rights, Arc::clone(&self.usage)),
             );
         }
         Ok((first_handle, second_handle))
@@ -222,7 +290,9 @@ mod tests {
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            BrokerCoreLimits::new(2, 4),
+            // Per-session quotas equal to the broker-wide ceilings, so these
+            // checks continue to exercise the ceilings themselves.
+            BrokerCoreLimits::new(2, 4, 2, 4),
         )
         .unwrap();
 

@@ -41,28 +41,55 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 
 /// Resource limits for broker-owned authority state.
 ///
-/// These limits are global to the broker core, not per session.
+/// Every budget is enforced at two tiers. The per-session quota bounds what one
+/// authenticated caller session may hold, so a single compromised or buggy
+/// session cannot deny object and pipe creation to every other session sharing
+/// the broker process. The broker-wide ceiling remains a backstop over the sum
+/// of all sessions.
+///
+/// A per-session quota above its broker-wide ceiling is not rejected; it is
+/// simply unreachable, because the ceiling is enforced as well.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
-    /// Maximum live object references.
+    /// Maximum live object references across the whole broker core.
     pub max_references: usize,
-    /// Maximum total capacity in bytes reserved by live pipes.
+    /// Maximum total capacity in bytes reserved by live pipes across the whole
+    /// broker core.
     pub max_total_pipe_capacity: usize,
+    /// Maximum live object references held by one session.
+    pub max_references_per_session: usize,
+    /// Maximum capacity in bytes reserved by the live pipes of one session.
+    pub max_pipe_capacity_per_session: usize,
 }
 
 impl BrokerCoreLimits {
     /// Conservative default limits for initial broker deployments.
+    ///
+    /// The per-session quotas are a quarter of the broker-wide ceilings, so at
+    /// least four sessions can reach their full quota concurrently.
     pub const DEFAULT: Self = Self {
         max_references: 4096,
         max_total_pipe_capacity: 64 * 1024 * 1024,
+        max_references_per_session: 1024,
+        max_pipe_capacity_per_session: 16 * 1024 * 1024,
     };
 
     /// Creates a broker core limit set.
-    pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
+    ///
+    /// Both tiers are stated explicitly: a caller that sets a broker-wide
+    /// ceiling always states the per-session quota that goes with it.
+    pub const fn new(
+        max_references: usize,
+        max_total_pipe_capacity: usize,
+        max_references_per_session: usize,
+        max_pipe_capacity_per_session: usize,
+    ) -> Self {
         Self {
             max_references,
             max_total_pipe_capacity,
+            max_references_per_session,
+            max_pipe_capacity_per_session,
         }
     }
 }
