@@ -126,7 +126,7 @@ macro_rules! __tracing_dispatch {
     ([$mode:ident] [$level:expr] [$target:tt] [$($acc:tt)*] [$key:ident :x = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__tracing_dispatch!(
             [$mode] [$level] [$target]
-            [$($acc)* $key = %$crate::__private::Hex($value),]
+            [$($acc)* $key = %$crate::__private::Hex(&$value),]
             [$($($rest)*)?]
         )
     };

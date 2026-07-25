@@ -99,7 +99,7 @@ macro_rules! __log_kv {
     ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :x = $value:expr $(, $($rest:tt)*)?]) => {
         $crate::__log_kv!(
             [$level] [$msg]
-            [$($acc)* [$key:% = $crate::__private::Hex($value)]]
+            [$($acc)* [$key:% = $crate::__private::Hex(&$value)]]
             [$($($rest)*)?]
         )
     };

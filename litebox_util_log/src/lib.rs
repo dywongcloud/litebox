@@ -22,7 +22,8 @@
 //!
 //! ## Key-Value Capture Modes
 //!
-//! This crate supports the same capture modes as `log`'s `kv` feature:
+//! This crate supports the capture modes of `log`'s `kv` feature, plus the
+//! facade-specific `:x` mode:
 //!
 //! - `:?` or `:debug` - Capture the value using `Debug`
 //! - `:%` or `:display` - Capture the value using `Display`

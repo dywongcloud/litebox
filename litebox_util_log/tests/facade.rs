@@ -46,6 +46,13 @@ fn test_log_macro_with_kv() {
 
 #[test]
 fn test_log_macro_with_kv_hex() {
+    struct NonCopy(u64);
+    impl core::fmt::LowerHex for NonCopy {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            core::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+
     let value = 0x2a_u32;
     log!(Level::Info, value:x; "hex capture shorthand");
     log!(Level::Info, addr:x = 0xdead_beef_u64; "hex capture with explicit value");
@@ -59,6 +66,13 @@ fn test_log_macro_with_kv_hex() {
     info!(value:x; "hex via info");
     debug!(value:x; "hex via debug");
     trace!(value:x; "hex via trace");
+
+    // `:x` borrows its value like every other capture mode; a non-Copy value
+    // must remain usable after being logged.
+    let non_copy = NonCopy(0x1234);
+    log!(Level::Info, non_copy:x; "hex shorthand borrows");
+    log!(Level::Info, again:x = non_copy; "hex explicit value borrows");
+    assert_eq!(non_copy.0, 0x1234);
 }
 
 #[test]
