@@ -39,30 +39,74 @@ pub use session::{BrokerSession, CallerCredential, ObjectRights};
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
 
+/// Number of equal shares a global ceiling is split into when a limit set does
+/// not state its per-session quota explicitly.
+///
+/// A session may hold one share, so several sessions must each spend their
+/// whole quota before a global ceiling is reached, and no single session can
+/// reach one on its own.
+const DEFAULT_SESSION_QUOTA_SHARES: usize = 4;
+
 /// Resource limits for broker-owned authority state.
 ///
-/// These limits are global to the broker core, not per session.
+/// Every budget has two limits. The global ceiling bounds what all sessions
+/// hold together and keeps the broker process bounded. The per-session quota
+/// bounds what any one session holds, so a malicious or malfunctioning session
+/// cannot spend the whole ceiling and deny object and pipe creation to every
+/// other session served by the same broker core. Both are enforced on every
+/// allocation, with the global ceiling acting as the backstop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
-    /// Maximum live object references.
+    /// Maximum live object references across all sessions.
     pub max_references: usize,
-    /// Maximum total capacity in bytes reserved by live pipes.
+    /// Maximum total capacity in bytes reserved by live pipes across all
+    /// sessions.
     pub max_total_pipe_capacity: usize,
+    /// Maximum live object references held by any one session.
+    pub max_session_references: usize,
+    /// Maximum capacity in bytes reserved by the live pipes of any one session.
+    pub max_session_pipe_capacity: usize,
 }
 
 impl BrokerCoreLimits {
     /// Conservative default limits for initial broker deployments.
-    pub const DEFAULT: Self = Self {
-        max_references: 4096,
-        max_total_pipe_capacity: 64 * 1024 * 1024,
-    };
+    pub const DEFAULT: Self = Self::new(4096, 64 * 1024 * 1024);
 
-    /// Creates a broker core limit set.
+    /// Creates a broker core limit set that gives each session an equal share
+    /// of the global ceilings.
+    ///
+    /// Each session may hold up to a quarter of each ceiling, rounded up, so a
+    /// caller that has not thought about per-session quotas still gets a core
+    /// no single session can exhaust. Use
+    /// [`BrokerCoreLimits::with_session_quotas`] to state the quotas
+    /// explicitly.
     pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
         Self {
             max_references,
             max_total_pipe_capacity,
+            max_session_references: max_references.div_ceil(DEFAULT_SESSION_QUOTA_SHARES),
+            max_session_pipe_capacity: max_total_pipe_capacity
+                .div_ceil(DEFAULT_SESSION_QUOTA_SHARES),
+        }
+    }
+
+    /// Returns these limits with explicit per-session quotas.
+    ///
+    /// A quota above its global ceiling is accepted rather than rejected: the
+    /// ceiling is still enforced, so the effective quota is whichever of the
+    /// two is smaller.
+    #[must_use]
+    pub const fn with_session_quotas(
+        self,
+        max_session_references: usize,
+        max_session_pipe_capacity: usize,
+    ) -> Self {
+        Self {
+            max_references: self.max_references,
+            max_total_pipe_capacity: self.max_total_pipe_capacity,
+            max_session_references,
+            max_session_pipe_capacity,
         }
     }
 }
@@ -150,5 +194,55 @@ impl BrokerCore {
             session::SessionId(session_id),
             caller_credential,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BrokerCoreLimits, DEFAULT_SESSION_QUOTA_SHARES};
+
+    #[test]
+    fn default_limits_bound_what_one_session_can_hold() {
+        let limits = BrokerCoreLimits::DEFAULT;
+
+        assert_eq!(limits.max_references, 4096);
+        assert_eq!(limits.max_total_pipe_capacity, 64 * 1024 * 1024);
+        assert_eq!(
+            limits.max_session_references,
+            limits.max_references / DEFAULT_SESSION_QUOTA_SHARES
+        );
+        assert_eq!(
+            limits.max_session_pipe_capacity,
+            limits.max_total_pipe_capacity / DEFAULT_SESSION_QUOTA_SHARES
+        );
+        // No single session can reach a global ceiling on its own.
+        assert!(limits.max_session_references < limits.max_references);
+        assert!(limits.max_session_pipe_capacity < limits.max_total_pipe_capacity);
+    }
+
+    #[test]
+    fn derived_quotas_never_round_a_usable_ceiling_down_to_nothing() {
+        let limits = BrokerCoreLimits::new(1, 1);
+
+        assert_eq!(limits.max_session_references, 1);
+        assert_eq!(limits.max_session_pipe_capacity, 1);
+    }
+
+    #[test]
+    fn derived_quotas_stay_zero_for_a_ceiling_of_zero() {
+        let limits = BrokerCoreLimits::new(0, 0);
+
+        assert_eq!(limits.max_session_references, 0);
+        assert_eq!(limits.max_session_pipe_capacity, 0);
+    }
+
+    #[test]
+    fn explicit_quotas_replace_the_derived_ones_and_keep_the_ceilings() {
+        let limits = BrokerCoreLimits::new(4096, 64 * 1024 * 1024).with_session_quotas(7, 9);
+
+        assert_eq!(limits.max_references, 4096);
+        assert_eq!(limits.max_total_pipe_capacity, 64 * 1024 * 1024);
+        assert_eq!(limits.max_session_references, 7);
+        assert_eq!(limits.max_session_pipe_capacity, 9);
     }
 }

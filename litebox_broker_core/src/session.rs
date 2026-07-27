@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::AtomicUsize;
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
@@ -57,7 +58,8 @@ pub(crate) enum ObjectEntry {
 ///
 /// User mode does not choose this value. The broker entry layer authenticates
 /// the caller, then BrokerCore assigns this identity for all operations received
-/// on that session. Dropping the session releases all object references it owns.
+/// on that session. Dropping the session releases all object references it owns,
+/// and with them the share of the core-wide budgets they held.
 pub struct BrokerSession {
     pub(crate) core: BrokerCore,
     /// Broker-assigned session identity.
@@ -65,7 +67,18 @@ pub struct BrokerSession {
     /// Broker-entry-authenticated caller credential for this session.
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this session.
+    ///
+    /// The length of this vector is the session's live reference count, so the
+    /// per-session reference quota is enforced against the very state that
+    /// releases it and the two cannot drift apart.
     reference_handles: Mutex<Vec<ObjectHandle>>,
+    /// Capacity in bytes reserved by this session's live pipes.
+    ///
+    /// Reservations share ownership of this counter because a pipe object may
+    /// outlive the session that created it: another worker can hold the
+    /// object's `Arc` across session teardown, and the release must still find
+    /// a live counter to credit.
+    pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
 }
 
 impl BrokerSession {
@@ -80,6 +93,7 @@ impl BrokerSession {
             session_id,
             caller_credential,
             reference_handles: Mutex::new(Vec::new()),
+            reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -89,6 +103,12 @@ impl BrokerSession {
             .policy
             .principal_object_rights(self.caller_credential)?;
         let mut reference_handles = self.reference_handles.lock();
+        // Charge the session before the core-wide table is locked, so a session
+        // that is already at its quota cannot make every other session contend
+        // for the shared lock to be told the core is full.
+        if reference_handles.len() >= self.core.limits.max_session_references {
+            return Err(BrokerError::ResourceExhausted);
+        }
         reference_handles
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
@@ -121,6 +141,13 @@ impl BrokerSession {
             .policy
             .principal_object_rights(self.caller_credential)?;
         let mut reference_handles = self.reference_handles.lock();
+        if reference_handles
+            .len()
+            .checked_add(2)
+            .is_none_or(|count| count > self.core.limits.max_session_references)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
         reference_handles
             .try_reserve(2)
             .map_err(|_| BrokerError::OutOfMemory)?;
@@ -320,6 +347,7 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
     use core::sync::atomic::Ordering;
 
     use crate::{
@@ -329,11 +357,28 @@ mod tests {
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::readiness::ReadinessFlags;
 
+    /// Core-wide ceilings used by every check below.
+    ///
+    /// They are exactly twice the per-session quotas, so two sessions spending
+    /// their full quota reach the ceilings and a third session is refused by
+    /// the backstop rather than by its own quota.
+    const TEST_MAX_REFERENCES: usize = 4;
+    const TEST_MAX_TOTAL_PIPE_CAPACITY: usize = 8;
+    /// Per-session quotas used by every check below.
+    ///
+    /// Two references is the smallest quota that still admits a pipe, whose two
+    /// endpoints are created together.
+    const TEST_MAX_SESSION_REFERENCES: usize = 2;
+    const TEST_MAX_SESSION_PIPE_CAPACITY: usize = 4;
+    /// `TEST_MAX_SESSION_PIPE_CAPACITY` in the width `pipe::create` accepts.
+    const TEST_SESSION_PIPE_CAPACITY_REQUEST: u64 = 4;
+
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            BrokerCoreLimits::new(2, 4),
+            BrokerCoreLimits::new(TEST_MAX_REFERENCES, TEST_MAX_TOTAL_PIPE_CAPACITY)
+                .with_session_quotas(TEST_MAX_SESSION_REFERENCES, TEST_MAX_SESSION_PIPE_CAPACITY),
         )
         .unwrap();
 
@@ -343,9 +388,16 @@ mod tests {
         check_pipe_reader_closure(&broker);
         check_corrupt_index_fails_without_mutation(&broker);
         check_corrupt_index_does_not_break_teardown(&broker);
+        check_reference_quota_is_per_session(&broker);
+        check_pipe_capacity_quota_is_per_session(&broker);
+        check_session_drop_releases_quotas(&broker);
+        check_pipe_capacity_is_released_when_endpoints_are_refused(&broker);
+        // Handle allocation is exhausted for the rest of the process once this
+        // check runs, so it must stay last.
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
     fn check_event_reference_lifecycle(broker: &BrokerCore) {
@@ -527,6 +579,180 @@ mod tests {
 
         drop(session);
 
+        assert!(broker.references.read().is_empty());
+    }
+
+    /// One session spending its whole reference quota must not stop another
+    /// session from creating objects. This is the regression test for the
+    /// core-wide budgets being reachable by a single session.
+    fn check_reference_quota_is_per_session(broker: &BrokerCore) {
+        let greedy = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let neighbor = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let greedy_first = crate::event::create(&greedy, 0).unwrap();
+        let greedy_second = crate::event::create(&greedy, 0).unwrap();
+        // The greedy session stops at its own quota while the core-wide
+        // ceiling still has room for every other session's share.
+        assert_eq!(
+            crate::event::create(&greedy, 0),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(broker.references.read().len(), TEST_MAX_SESSION_REFERENCES);
+
+        let neighbor_first = crate::event::create(&neighbor, 0).unwrap();
+        let neighbor_second = crate::event::create(&neighbor, 0).unwrap();
+        assert_eq!(broker.references.read().len(), TEST_MAX_REFERENCES);
+
+        // With every quota spent, the core-wide ceiling is the backstop.
+        let latecomer = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(
+            crate::event::create(&latecomer, 0),
+            Err(BrokerError::ResourceExhausted)
+        );
+
+        // Closing a reference returns quota to the session that held it.
+        assert_eq!(greedy.close_object_reference(greedy_first), Ok(()));
+        let greedy_third = crate::event::create(&greedy, 0).unwrap();
+
+        assert_eq!(greedy.close_object_reference(greedy_second), Ok(()));
+        assert_eq!(greedy.close_object_reference(greedy_third), Ok(()));
+        assert_eq!(neighbor.close_object_reference(neighbor_first), Ok(()));
+        assert_eq!(neighbor.close_object_reference(neighbor_second), Ok(()));
+        assert!(broker.references.read().is_empty());
+    }
+
+    /// The same isolation must hold for reserved pipe capacity, which is
+    /// tracked in a counter rather than in the reference table.
+    fn check_pipe_capacity_quota_is_per_session(broker: &BrokerCore) {
+        let greedy = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let neighbor = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let (greedy_reader, greedy_writer) =
+            crate::pipe::create(&greedy, TEST_SESSION_PIPE_CAPACITY_REQUEST, 2).unwrap();
+        assert_eq!(
+            greedy.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_SESSION_PIPE_CAPACITY
+        );
+        assert_eq!(
+            broker.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_SESSION_PIPE_CAPACITY
+        );
+        // The greedy session is refused by its own quota, without charging the
+        // core-wide counter it would otherwise have consumed.
+        assert_eq!(
+            crate::pipe::create(&greedy, 1, 1),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(
+            broker.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_SESSION_PIPE_CAPACITY
+        );
+
+        let (neighbor_reader, neighbor_writer) =
+            crate::pipe::create(&neighbor, TEST_SESSION_PIPE_CAPACITY_REQUEST, 2).unwrap();
+        assert_eq!(
+            broker.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_TOTAL_PIPE_CAPACITY
+        );
+
+        // The core-wide ceiling backstops a session that is within its quota,
+        // and the refused reservation leaves no charge behind on either counter.
+        let latecomer = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(
+            crate::pipe::create(&latecomer, 1, 1),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(latecomer.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            broker.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_TOTAL_PIPE_CAPACITY
+        );
+
+        // Capacity is held until both endpoints are gone, then credited back to
+        // the session and to the core together.
+        assert_eq!(greedy.close_object_reference(greedy_reader), Ok(()));
+        assert_eq!(
+            greedy.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_SESSION_PIPE_CAPACITY
+        );
+        assert_eq!(greedy.close_object_reference(greedy_writer), Ok(()));
+        assert_eq!(greedy.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            broker.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_SESSION_PIPE_CAPACITY
+        );
+
+        assert_eq!(neighbor.close_object_reference(neighbor_reader), Ok(()));
+        assert_eq!(neighbor.close_object_reference(neighbor_writer), Ok(()));
+        assert_eq!(neighbor.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert!(broker.references.read().is_empty());
+    }
+
+    /// Tearing a session down must return everything it held, so a session that
+    /// stops making progress cannot pin a share of the core-wide budgets past
+    /// its own lifetime.
+    fn check_session_drop_releases_quotas(broker: &BrokerCore) {
+        // Twice, so the second session proves the first really gave the
+        // core-wide budgets back rather than merely stopping using them.
+        for _ in 0..2 {
+            let session = broker
+                .create_session(CallerCredential::Unauthenticated)
+                .unwrap();
+            let (reader, writer) =
+                crate::pipe::create(&session, TEST_SESSION_PIPE_CAPACITY_REQUEST, 2).unwrap();
+            assert_ne!(reader, writer);
+            assert_eq!(broker.references.read().len(), 2);
+            assert_eq!(
+                broker.reserved_pipe_capacity.load(Ordering::Relaxed),
+                TEST_MAX_SESSION_PIPE_CAPACITY
+            );
+            // Outlives the session, so the per-session charge stays observable
+            // across teardown.
+            let session_capacity = Arc::clone(&session.reserved_pipe_capacity);
+            assert_eq!(
+                session_capacity.load(Ordering::Relaxed),
+                TEST_MAX_SESSION_PIPE_CAPACITY
+            );
+
+            drop(session);
+
+            assert!(broker.references.read().is_empty());
+            assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+            assert_eq!(session_capacity.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// Pipe capacity is reserved before the endpoint references exist, so a
+    /// session that is at its reference quota must get the reservation back.
+    fn check_pipe_capacity_is_released_when_endpoints_are_refused(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let first = crate::event::create(&session, 0).unwrap();
+        let second = crate::event::create(&session, 0).unwrap();
+
+        assert_eq!(
+            crate::pipe::create(&session, TEST_SESSION_PIPE_CAPACITY_REQUEST, 2),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(session.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+
+        assert_eq!(session.close_object_reference(first), Ok(()));
+        assert_eq!(session.close_object_reference(second), Ok(()));
         assert!(broker.references.read().is_empty());
     }
 
