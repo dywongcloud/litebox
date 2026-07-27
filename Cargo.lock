@@ -1441,6 +1441,7 @@ dependencies = [
  "hashbrown",
  "litebox_broker_local",
  "litebox_broker_protocol",
+ "litebox_broker_transport",
  "litebox_util_log",
  "rangemap",
  "ringbuf",
@@ -1473,6 +1474,7 @@ dependencies = [
  "hashbrown",
  "litebox_broker_core",
  "litebox_broker_protocol",
+ "litebox_broker_transport",
  "spin 0.9.8",
  "thiserror",
 ]
@@ -1482,6 +1484,7 @@ name = "litebox_broker_local"
 version = "0.1.0"
 dependencies = [
  "litebox_broker_protocol",
+ "litebox_broker_transport",
  "thiserror",
 ]
 
@@ -1496,8 +1499,17 @@ dependencies = [
 name = "litebox_broker_transport"
 version = "0.1.0"
 dependencies = [
+ "litebox_broker_protocol",
+ "thiserror",
+]
+
+[[package]]
+name = "litebox_broker_transport_linux_userland"
+version = "0.1.0"
+dependencies = [
  "libc",
  "litebox_broker_protocol",
+ "litebox_broker_transport",
  "rustix",
 ]
 
@@ -1511,6 +1523,7 @@ dependencies = [
  "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_broker_transport",
+ "litebox_broker_transport_linux_userland",
  "tempfile",
 ]
 
@@ -1704,6 +1717,7 @@ dependencies = [
  "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_broker_transport",
+ "litebox_broker_transport_linux_userland",
  "litebox_common_linux",
  "litebox_platform_linux_userland",
  "litebox_shim_linux",
