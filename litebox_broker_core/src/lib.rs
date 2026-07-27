@@ -95,7 +95,19 @@ impl BrokerCoreLimits {
     ///
     /// A quota above its global ceiling is accepted rather than rejected: the
     /// ceiling is still enforced, so the effective quota is whichever of the
-    /// two is smaller.
+    /// two is smaller. A deployment that knowingly serves one session can
+    /// therefore hand it the whole core by raising each quota to its ceiling.
+    ///
+    /// ```
+    /// use litebox_broker_core::BrokerCoreLimits;
+    ///
+    /// let shared = BrokerCoreLimits::DEFAULT;
+    /// assert_eq!(shared.max_session_references, 1024);
+    ///
+    /// let single_tenant =
+    ///     shared.with_session_quotas(shared.max_references, shared.max_total_pipe_capacity);
+    /// assert_eq!(single_tenant.max_session_references, shared.max_references);
+    /// ```
     #[must_use]
     pub const fn with_session_quotas(
         self,
@@ -184,11 +196,17 @@ impl BrokerCore {
 
     /// Allocates broker authority state for one authenticated caller session.
     pub fn create_session(&self, caller_credential: CallerCredential) -> Result<BrokerSession> {
-        let mut next_session_id = self.next_session_id.write();
-        let session_id = *next_session_id;
-        *next_session_id = session_id
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
+        // Release the identity lock before building the session: session
+        // construction allocates the per-session capacity counter, and every
+        // session creation contends for this lock.
+        let session_id = {
+            let mut next_session_id = self.next_session_id.write();
+            let session_id = *next_session_id;
+            *next_session_id = session_id
+                .checked_add(1)
+                .ok_or(BrokerError::ResourceExhausted)?;
+            session_id
+        };
         Ok(BrokerSession::new(
             self.clone(),
             session::SessionId(session_id),

@@ -223,6 +223,13 @@ impl Drop for CapacityCharge {
 /// Both charges are released together when the pipe's shared state is dropped,
 /// which happens once the last reference to either endpoint is closed or its
 /// owning session is torn down.
+///
+/// Each counter is at every instant at least the total capacity of the live
+/// pipes it covers, because a charge is taken before the pipe state that owns
+/// it exists and released after that state is destroyed. The two charges are
+/// therefore not jointly atomic, and do not need to be: the only transient a
+/// concurrent creator can observe is over-counting, which can refuse it
+/// slightly too early but can never admit it too late.
 struct PipeCapacityReservation {
     _session_charge: CapacityCharge,
     _core_charge: CapacityCharge,

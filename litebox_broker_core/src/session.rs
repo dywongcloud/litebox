@@ -136,6 +136,11 @@ impl BrokerSession {
         first: ObjectEntry,
         second: ObjectEntry,
     ) -> Result<(ObjectHandle, ObjectHandle)> {
+        // `first` and `second` are parameters, so they are dropped after every
+        // lock guard declared in this body. That is what makes each failure
+        // return below destroy the pipe endpoints, which take the pipe-state
+        // lock, only once both reference-index locks are released. Do not
+        // rebind them to locals declared after either guard.
         let rights = self
             .core
             .policy
@@ -187,6 +192,12 @@ impl BrokerSession {
         rights: ObjectRights,
     ) {
         let session_reference_index = reference_handles.len();
+        // Both callers check `contains_key` first, so this always replaces
+        // nothing. Anything dropped here would be destroyed while both the
+        // session's reference-handle lock and the core-wide reference lock are
+        // held, so `ObjectReference` must never gain a destructor that takes
+        // either. Keeping this insert infallible is also what lets the caller's
+        // pair loop run without a rollback path.
         references.insert(
             handle,
             ObjectReference {
@@ -615,6 +626,15 @@ mod tests {
             crate::event::create(&latecomer, 0),
             Err(BrokerError::ResourceExhausted)
         );
+        // Same backstop on the pair path, which admits two references at once.
+        // No pipe is alive here, so the capacity ceiling cannot short-circuit
+        // it, and the latecomer is well inside its own quota.
+        assert_eq!(
+            crate::pipe::create(&latecomer, 1, 1),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(latecomer.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
 
         // Closing a reference returns quota to the session that held it.
         assert_eq!(greedy.close_object_reference(greedy_first), Ok(()));
