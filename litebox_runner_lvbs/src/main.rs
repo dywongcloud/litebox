@@ -69,7 +69,14 @@ const R_X86_64_RELATIVE: u64 = 8;
 const KERNEL_OFFSET: u64 = litebox_platform_lvbs::KERNEL_OFFSET;
 
 /// Page table entry flags for Phase 1 mappings (present + writable).
-const PTE_TABLE_FLAGS: u64 = PageTableFlags::PRESENT.bits() | PageTableFlags::WRITABLE.bits();
+///
+/// ACCESSED and DIRTY are pre-set here too (mirroring the Linux kernel's
+/// `_KERNPG_TABLE`) so the CPU's page-table walker doesn't need an atomic
+/// read-modify-write on these entries the first time they're traversed.
+const PTE_TABLE_FLAGS: u64 = PageTableFlags::PRESENT.bits()
+    | PageTableFlags::WRITABLE.bits()
+    | PageTableFlags::ACCESSED.bits()
+    | PageTableFlags::DIRTY.bits();
 
 /// x86-64 page table structure constants
 const ENTRIES_PER_PT_PAGE: usize = 512;

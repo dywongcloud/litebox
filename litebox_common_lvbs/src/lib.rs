@@ -49,6 +49,9 @@ pub const VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY: u32 = 0x1_ffec;
 // This VSM function ID for setting the platform root key is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY: u32 = 0x1_ffed;
 
+// This VSM function ID for generating the identity signing key is subject to change
+pub const VSM_VTL_CALL_FUNC_ID_GENERATE_IDENTITY_SIGNING_KEY: u32 = 0x1_ffee;
+
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
 
@@ -72,6 +75,7 @@ pub enum VsmFunction {
     OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
     AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
     SetPlatformRootKey = VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY,
+    GenerateIdentitySigningKey = VSM_VTL_CALL_FUNC_ID_GENERATE_IDENTITY_SIGNING_KEY,
 }
 
 // `HV_STATUS_*` constants used as discriminants for `HypervCallError`.
