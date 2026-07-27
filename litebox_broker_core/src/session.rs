@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
@@ -9,7 +9,7 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use spin::rwlock::RwLock;
+use spin::{Mutex, rwlock::RwLock};
 
 /// Caller identity information supplied by the broker entry layer.
 ///
@@ -45,6 +45,7 @@ pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) session_id: SessionId,
     pub(crate) rights: ObjectRights,
+    session_reference_index: usize,
 }
 
 pub(crate) enum ObjectEntry {
@@ -63,6 +64,8 @@ pub struct BrokerSession {
     pub(crate) session_id: SessionId,
     /// Broker-entry-authenticated caller credential for this session.
     pub(crate) caller_credential: CallerCredential,
+    /// Handles of the live object references owned by this session.
+    reference_handles: Mutex<Vec<ObjectHandle>>,
 }
 
 impl BrokerSession {
@@ -76,6 +79,7 @@ impl BrokerSession {
             core,
             session_id,
             caller_credential,
+            reference_handles: Mutex::new(Vec::new()),
         }
     }
 
@@ -84,18 +88,24 @@ impl BrokerSession {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
+        let mut reference_handles = self.reference_handles.lock();
+        reference_handles
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
         let mut references = self.core.references.write();
         if references.len() >= self.core.limits.max_references {
             return Err(BrokerError::ResourceExhausted);
         }
         let handle = self.core.allocate_reference_handle()?;
-        references.insert(
+        if references.contains_key(&handle) {
+            return Err(BrokerError::Internal);
+        }
+        self.insert_object_reference(
+            &mut references,
+            &mut reference_handles,
             handle,
-            ObjectReference {
-                object: Arc::new(RwLock::new(object)),
-                session_id: self.session_id,
-                rights,
-            },
+            object,
+            rights,
         );
 
         Ok(handle)
@@ -110,6 +120,10 @@ impl BrokerSession {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
+        let mut reference_handles = self.reference_handles.lock();
+        reference_handles
+            .try_reserve(2)
+            .map_err(|_| BrokerError::OutOfMemory)?;
         let mut references = self.core.references.write();
         if references
             .len()
@@ -119,17 +133,43 @@ impl BrokerSession {
             return Err(BrokerError::ResourceExhausted);
         }
         let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
+        if first_handle == second_handle
+            || references.contains_key(&first_handle)
+            || references.contains_key(&second_handle)
+        {
+            return Err(BrokerError::Internal);
+        }
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
-            references.insert(
+            self.insert_object_reference(
+                &mut references,
+                &mut reference_handles,
                 handle,
-                ObjectReference {
-                    object: Arc::new(RwLock::new(object)),
-                    session_id: self.session_id,
-                    rights,
-                },
+                object,
+                rights,
             );
         }
         Ok((first_handle, second_handle))
+    }
+
+    fn insert_object_reference(
+        &self,
+        references: &mut HashMap<ObjectHandle, ObjectReference>,
+        reference_handles: &mut Vec<ObjectHandle>,
+        handle: ObjectHandle,
+        object: ObjectEntry,
+        rights: ObjectRights,
+    ) {
+        let session_reference_index = reference_handles.len();
+        references.insert(
+            handle,
+            ObjectReference {
+                object: Arc::new(RwLock::new(object)),
+                session_id: self.session_id,
+                rights,
+                session_reference_index,
+            },
+        );
+        reference_handles.push(handle);
     }
 
     pub(crate) fn with_authorized_object<T>(
@@ -190,20 +230,91 @@ impl BrokerSession {
     /// Closes one object reference owned by this session.
     ///
     /// The underlying object is released when this was the last live reference.
+    /// Destruction happens after releasing the process-wide reference-table
+    /// lock, so an object may safely release platform resources.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
-        let mut references = self.core.references.write();
-        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.session_id != self.session_id {
-            return Err(BrokerError::UnknownObject);
-        }
-        references.remove(&handle);
+        let reference = self.remove_object_reference(handle)?;
+        drop(reference);
         Ok(())
+    }
+
+    fn remove_object_reference(&self, handle: ObjectHandle) -> Result<ObjectReference> {
+        let mut reference_handles = self.reference_handles.lock();
+        let mut references = self.core.references.write();
+        let reference = references
+            .remove(&handle)
+            .ok_or(BrokerError::UnknownObject)?;
+        let index = reference.session_reference_index;
+        // Keep fallible validation in a nested scope so `?` and early returns
+        // reach the shared rollback below instead of dropping the removed
+        // reference while either reference-index lock is held.
+        let removal_result = (|| {
+            if reference.session_id != self.session_id {
+                return Err(BrokerError::UnknownObject);
+            }
+            if reference_handles.get(index) != Some(&handle) {
+                return Err(BrokerError::Internal);
+            }
+            let last_index = reference_handles
+                .len()
+                .checked_sub(1)
+                .ok_or(BrokerError::Internal)?;
+            if index != last_index {
+                let moved_handle = *reference_handles
+                    .get(last_index)
+                    .ok_or(BrokerError::Internal)?;
+                let moved_reference = references
+                    .get_mut(&moved_handle)
+                    .ok_or(BrokerError::Internal)?;
+                if moved_reference.session_id != self.session_id
+                    || moved_reference.session_reference_index != last_index
+                {
+                    return Err(BrokerError::Internal);
+                }
+                moved_reference.session_reference_index = index;
+            }
+            reference_handles.swap_remove(index);
+            Ok(())
+        })();
+
+        if let Err(error) = removal_result {
+            let replaced_reference = references.insert(handle, reference);
+            drop(references);
+            drop(reference_handles);
+            if replaced_reference.is_some() {
+                return Err(BrokerError::Internal);
+            }
+            return Err(error);
+        }
+        Ok(reference)
     }
 }
 
 impl Drop for BrokerSession {
     fn drop(&mut self) {
-        self.core.close_session(self.session_id);
+        loop {
+            let Some(handle) = self.reference_handles.lock().pop() else {
+                break;
+            };
+            // Do not restore an inconsistent handle: retrying it forever would
+            // prevent later valid references from being released.
+            let reference = {
+                let mut references = self.core.references.write();
+                let Some(reference) = references.get(&handle) else {
+                    continue;
+                };
+                if reference.session_id != self.session_id {
+                    continue;
+                }
+                let Some(reference) = references.remove(&handle) else {
+                    continue;
+                };
+                reference
+            };
+            // Object destruction may release platform resources and must never
+            // run while either reference index lock is held.
+            drop(reference);
+        }
     }
 }
 
@@ -230,6 +341,8 @@ mod tests {
         check_session_drop_releases_references(&broker);
         check_pipe_lifecycle(&broker);
         check_pipe_reader_closure(&broker);
+        check_corrupt_index_fails_without_mutation(&broker);
+        check_corrupt_index_does_not_break_teardown(&broker);
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());
@@ -278,27 +391,26 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-        assert_eq!(session.close_object_reference(second_handle), Ok(()));
-
+        // Closing the older handle exercises swap-removing a non-last entry.
         assert_eq!(session.close_object_reference(handle), Ok(()));
-        {
-            let references = broker.references.read();
-            assert!(references.is_empty());
-        }
         assert_eq!(
             session.close_object_reference(handle),
             Err(BrokerError::UnknownObject)
         );
+        assert_eq!(session.close_object_reference(second_handle), Ok(()));
+        assert!(broker.references.read().is_empty());
     }
 
     fn check_session_drop_releases_references(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let _handle = crate::event::create(&session, 0).unwrap();
+        let first = crate::event::create(&session, 0).unwrap();
+        let second = crate::event::create(&session, 0).unwrap();
+        assert_ne!(first, second);
         {
             let references = broker.references.read();
-            assert_eq!(references.len(), 1);
+            assert_eq!(references.len(), 2);
         }
 
         drop(session);
@@ -375,6 +487,47 @@ mod tests {
         );
         assert_eq!(session.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
+
+    fn check_corrupt_index_fails_without_mutation(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let older = crate::event::create(&session, 0).unwrap();
+        let newer = crate::event::create(&session, 0).unwrap();
+        {
+            let mut references = broker.references.write();
+            references.get_mut(&older).unwrap().session_reference_index = usize::MAX;
+        }
+
+        assert_eq!(
+            session.close_object_reference(older),
+            Err(BrokerError::Internal)
+        );
+        {
+            let mut references = broker.references.write();
+            references.get_mut(&older).unwrap().session_reference_index = 0;
+        }
+        assert_eq!(session.close_object_reference(older), Ok(()));
+        assert_eq!(session.close_object_reference(newer), Ok(()));
+    }
+
+    fn check_corrupt_index_does_not_break_teardown(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let _older = crate::event::create(&session, 0).unwrap();
+        let newer = crate::event::create(&session, 0).unwrap();
+        broker
+            .references
+            .write()
+            .get_mut(&newer)
+            .unwrap()
+            .session_reference_index = usize::MAX;
+
+        drop(session);
+
+        assert!(broker.references.read().is_empty());
     }
 
     fn check_pair_handle_exhaustion(broker: &BrokerCore) {

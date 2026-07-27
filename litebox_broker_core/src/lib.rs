@@ -151,9 +151,4 @@ impl BrokerCore {
             caller_credential,
         ))
     }
-
-    pub(crate) fn close_session(&self, session_id: session::SessionId) {
-        let mut references = self.references.write();
-        references.retain(|_, reference| reference.session_id != session_id);
-    }
 }
