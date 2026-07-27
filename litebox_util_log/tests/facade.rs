@@ -104,14 +104,15 @@ fn test_hex_capture_renders_prefixed_lowercase() {
         fn flush(&self) {}
     }
 
-    static LOGGER: CaptureLogger = CaptureLogger(Mutex::new(String::new()));
-    log::set_logger(&LOGGER).expect("no other test installs a logger");
+    let logger: &'static CaptureLogger =
+        Box::leak(Box::new(CaptureLogger(Mutex::new(String::new()))));
+    log::set_logger(logger).expect("no other test installs a logger");
     log::set_max_level(log::LevelFilter::Info);
 
     let addr = 0xBEEF_usize;
     info!(addr:x, value:x = 0x2a_u32; "hex render");
 
-    let output = LOGGER.0.lock().unwrap();
+    let output = logger.0.lock().unwrap();
     assert!(
         output.contains("addr=0xbeef"),
         "unexpected output: {output}"
