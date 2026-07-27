@@ -536,6 +536,20 @@ where
     }
 }
 
+impl From<litebox::event::counter::EventCounterError> for Errno {
+    fn from(value: litebox::event::counter::EventCounterError) -> Self {
+        match value {
+            litebox::event::counter::EventCounterError::InvalidInput => Errno::EINVAL,
+            litebox::event::counter::EventCounterError::WouldBlock
+            | litebox::event::counter::EventCounterError::ResourceExhausted => Errno::EAGAIN,
+            litebox::event::counter::EventCounterError::PermissionDenied => Errno::EACCES,
+            litebox::event::counter::EventCounterError::Io
+            | litebox::event::counter::EventCounterError::Unavailable => Errno::EIO,
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
         match value {
@@ -562,9 +576,14 @@ impl From<litebox::sync::futex::FutexError> for Errno {
 impl From<litebox::pipes::errors::ReadError> for Errno {
     fn from(value: litebox::pipes::errors::ReadError) -> Self {
         match value {
-            litebox::pipes::errors::ReadError::ClosedFd => Errno::EBADFD,
-            litebox::pipes::errors::ReadError::NotForReading => Errno::EINVAL,
+            litebox::pipes::errors::ReadError::ClosedFd
+            | litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::pipes::errors::ReadError::WouldBlock => Errno::EWOULDBLOCK,
+            litebox::pipes::errors::ReadError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
+            litebox::pipes::errors::ReadError::Io => Errno::EIO,
             _ => todo!(),
         }
     }
@@ -575,8 +594,25 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
         match value {
             litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
             litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
-            litebox::pipes::errors::WriteError::NotForWriting => Errno::EINVAL,
+            litebox::pipes::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::pipes::errors::WriteError::WouldBlock => Errno::EWOULDBLOCK,
+            litebox::pipes::errors::WriteError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
+            litebox::pipes::errors::WriteError::Io => Errno::EIO,
+            _ => todo!(),
+        }
+    }
+}
+
+impl From<litebox::pipes::errors::CreateError> for Errno {
+    fn from(value: litebox::pipes::errors::CreateError) -> Self {
+        match value {
+            litebox::pipes::errors::CreateError::ResourceExhausted => Errno::ENFILE,
+            litebox::pipes::errors::CreateError::OutOfMemory => Errno::ENOMEM,
+            litebox::pipes::errors::CreateError::PermissionDenied => Errno::EACCES,
+            litebox::pipes::errors::CreateError::Io => Errno::EIO,
             _ => todo!(),
         }
     }

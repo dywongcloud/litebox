@@ -49,6 +49,9 @@ jobs:
       - name: Install diod
         run: |
           sudo apt install -y diod
+      - name: Install AArch64 binutils
+        run: |
+          sudo apt install -y binutils-aarch64-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Cache custom out directories
         uses: actions/cache@v5
@@ -176,17 +179,18 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland
-      - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland
-      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland
+      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
+      - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
+      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
       - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
+      - run: cargo nextest run --locked --profile ci -p litebox_shim_windows
       - run: |
-          cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland
+          cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
 
   build_and_test_snp:
     name: Build and Test SNP
@@ -251,6 +255,14 @@ jobs:
           # - `litebox_platform_windows_userland` is allowed to have `std` access,
           #   since it is a purely-userland implementation.
           #
+          # - `litebox_broker_transport_linux_userland` is allowed to have
+          #   `std` access, since it is the Linux-userland binding that owns
+          #   both the local and the broker/host endpoints of the current
+          #   Unix-domain-socket control channel.
+          #
+          # - `litebox_broker_userland` is allowed to have `std` access,
+          #   since it is the hosted userland broker executable.
+          #
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
@@ -264,7 +276,15 @@ jobs:
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
+          # - `litebox_runner_windows_on_linux_userland` is allowed to have `std`
+          #   access since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
           # - `litebox_runner_linux_userland` is allowed to have `std` access
+          #   since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
+          # - `litebox_runner_windows_userland` is allowed to have `std` access
           #   since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
@@ -279,6 +299,9 @@ jobs:
           #   `litebox_platform_lvbs` (`no_std`) and
           #   `litebox_platform_linux_userland` (for debugging) which
           #   depends on `litebox_platform_multiplex`.
+          #
+          # - `litebox_shim_windows` itself is `no_std` but depends on
+          #   `litebox_platform_multiplex`.
           #
           # - `litebox_syscall_rewriter` is allowed to have `std` access since
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
@@ -295,15 +318,20 @@ jobs:
           #   can safely use std.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
+            -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
+            -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
+            -not -path './litebox_runner_windows_on_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
+            -not -path './litebox_runner_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
+            -not -path './litebox_shim_windows/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \

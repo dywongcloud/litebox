@@ -1510,6 +1510,9 @@ dependencies = [
  "buddy_system_allocator",
  "either",
  "hashbrown",
+ "litebox_broker_local",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
  "litebox_util_log",
  "rangemap",
  "ringbuf",
@@ -1522,6 +1525,77 @@ dependencies = [
  "thiserror",
  "windows-sys 0.60.2",
  "zerocopy",
+]
+
+[[package]]
+name = "litebox_broker_core"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "hashbrown",
+ "litebox_broker_protocol",
+ "spin 0.9.8",
+ "thiserror",
+]
+
+[[package]]
+name = "litebox_broker_host"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "litebox_broker_core",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "spin 0.9.8",
+ "thiserror",
+]
+
+[[package]]
+name = "litebox_broker_local"
+version = "0.1.0"
+dependencies = [
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "thiserror",
+]
+
+[[package]]
+name = "litebox_broker_protocol"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "litebox_broker_transport"
+version = "0.1.0"
+dependencies = [
+ "litebox_broker_protocol",
+ "thiserror",
+]
+
+[[package]]
+name = "litebox_broker_transport_linux_userland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "rustix",
+]
+
+[[package]]
+name = "litebox_broker_userland"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "litebox_broker_core",
+ "litebox_broker_host",
+ "litebox_broker_local",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "litebox_broker_transport_linux_userland",
+ "tempfile",
 ]
 
 [[package]]
@@ -1560,6 +1634,15 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "num_enum",
+ "zerocopy",
+]
+
+[[package]]
+name = "litebox_common_windows"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror",
  "zerocopy",
 ]
 
@@ -1700,6 +1783,12 @@ dependencies = [
  "glob",
  "libc",
  "litebox",
+ "litebox_broker_core",
+ "litebox_broker_host",
+ "litebox_broker_local",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "litebox_broker_transport_linux_userland",
  "litebox_common_linux",
  "litebox_platform_linux_userland",
  "litebox_shim_linux",
@@ -1765,6 +1854,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_windows_on_linux_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_windows",
+ "litebox_platform_linux_userland",
+ "litebox_shim_windows",
+ "litebox_util_log",
+ "tar",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "litebox_runner_windows_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_windows_userland",
+ "litebox_shim_windows",
+ "litebox_syscall_rewriter",
+ "litebox_util_log",
+ "tar",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "litebox_shim_linux"
 version = "0.1.0"
 dependencies = [
@@ -1815,6 +1936,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_shim_windows"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "int-enum",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_windows",
+ "litebox_platform_linux_userland",
+ "litebox_platform_windows_userland",
+ "litebox_util_log",
+ "rangemap",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_syscall_rewriter"
 version = "0.1.0"
 dependencies = [
@@ -1822,6 +1960,7 @@ dependencies = [
  "clap",
  "iced-x86",
  "insta",
+ "litebox_common_windows",
  "object",
  "similar",
  "tempfile",

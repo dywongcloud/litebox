@@ -9,6 +9,8 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
+mod broker;
+
 extern crate alloc;
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
@@ -77,6 +79,16 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Broker-supplied Unix socket path for the local control channel.
+    #[arg(
+        long = "broker-control-socket",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_control_socket: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -136,6 +148,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             cli_args.program_and_arguments[0]
         );
     }
+
+    let broker_connection = match cli_args.broker_control_socket.as_deref() {
+        Some(control_socket_path) => Some(broker::connect(control_socket_path)?),
+        None => None,
+    };
 
     let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
 
@@ -200,7 +217,29 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         platform.register_cow_region(file.data, file.abs_path);
     }
 
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+    let mut broker_positional_io_fds = Vec::new();
+    let mut broker_shutdown_fds = Vec::new();
+    let shim_builder = if let Some(broker_connection) = broker_connection {
+        let broker::BrokerConnection {
+            local: broker_local,
+            notifications: broker_notifications,
+            coordinator: broker_association_coordinator,
+            positional_io_fds,
+            shutdown_fd,
+        } = broker_connection;
+        broker_positional_io_fds.extend(positional_io_fds);
+        broker_shutdown_fds.push(shutdown_fd);
+        let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
+        broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
+        broker::start_notification_receiver(
+            broker_notifications,
+            broker_association_coordinator,
+            litebox.broker_notification_dispatcher(),
+        )?;
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox)
+    } else {
+        litebox_shim_linux::LinuxShimBuilder::new(platform)
+    };
     let litebox = shim_builder.litebox();
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) }
@@ -371,7 +410,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     #[cfg(target_arch = "x86_64")]
-    litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();
+    litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
+        &broker_positional_io_fds,
+        &broker_shutdown_fds,
+    );
 
     let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
 
