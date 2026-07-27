@@ -88,7 +88,7 @@ where
     ) -> Result<u64, TryOpError<EventCounterError>> {
         self.pollee.wait(cx, nonblock, Events::IN, || {
             let response = self.consume(mode)?;
-            if response.readiness.0 & ReadinessFlags::WRITE.0 != 0 {
+            if response.readiness.contains(ReadinessFlags::WRITE) {
                 self.pollee.notify_observers(Events::OUT);
             }
             Ok(response.value)
@@ -107,7 +107,7 @@ where
         }
         self.pollee.wait(cx, nonblock, Events::OUT, || {
             let readiness = self.add(value)?;
-            if value != 0 && readiness.0 & ReadinessFlags::READ.0 != 0 {
+            if value != 0 && readiness.contains(ReadinessFlags::READ) {
                 self.pollee.notify_observers(Events::IN);
             }
             Ok(core::mem::size_of::<u64>())
@@ -485,7 +485,9 @@ mod tests {
                 BrokerOperation::CheckReadiness(_) => {
                     BrokerResult::Readiness(ReadinessFlags::WRITE)
                 }
-                request @ (BrokerOperation::Event(_) | BrokerOperation::Pipe(_)) => {
+                request @ (BrokerOperation::Event(_)
+                | BrokerOperation::Pipe(_)
+                | BrokerOperation::Socket(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
             };
