@@ -1,0 +1,40 @@
+{
+  "name": "tencent-bd-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tencent Cloud NA BD Operating System - secure Next.js dashboard",
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start --port 3000",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "cross-env NODE_OPTIONS=--conditions=react-server tsx --env-file-if-exists=./.env.local --env-file-if-exists=./.env src/db/migrate.ts",
+    "db:seed": "cross-env NODE_OPTIONS=--conditions=react-server tsx --env-file-if-exists=./.env.local --env-file-if-exists=./.env src/db/seed.ts",
+    "db:reset": "cross-env NODE_OPTIONS=--conditions=react-server tsx --env-file-if-exists=./.env.local --env-file-if-exists=./.env src/db/reset.ts",
+    "verify": "cross-env NODE_OPTIONS=--conditions=react-server tsx --env-file-if-exists=./.env.local --env-file-if-exists=./.env scripts/verify.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "drizzle-orm": "^0.38.4",
+    "next": "^16.2.12",
+    "next-intl": "^4.3.4",
+    "opencc-js": "^1.0.5",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "server-only": "^0.0.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.7",
+    "@types/react": "^19.0.7",
+    "@types/react-dom": "^19.0.3",
+    "cross-env": "^10.1.0",
+    "drizzle-kit": "^0.30.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=22.9.0"
+  }
+}

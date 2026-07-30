@@ -1,0 +1,42 @@
+[
+ {
+  "id": 1,
+  "title": "完成 P1 产品的第一轮学习",
+  "detail": "先掌握 CVM/COS/CDN/EdgeOne/TRTC/VOD/MPS/GME/Hunyuan/VectorDB，形成 60 秒 pitch。",
+  "owner": "Me",
+  "priority": "P0",
+  "status": "This Week",
+  "due": "",
+  "link": ""
+ },
+ {
+  "id": 2,
+  "title": "建立 100 个 North America target accounts",
+  "detail": "按 Gaming、Video、China-linked、AI、Cross-border 五个 bucket 建立账户池。",
+  "owner": "Me",
+  "priority": "P0",
+  "status": "This Week",
+  "due": "",
+  "link": ""
+ },
+ {
+  "id": 3,
+  "title": "向 mentor 验证 P1 产品与 ICP",
+  "detail": "带着初步判断提问，不问泛泛的“我应该学什么”。",
+  "owner": "Mentor",
+  "priority": "P1",
+  "status": "Backlog",
+  "due": "",
+  "link": ""
+ },
+ {
+  "id": 4,
+  "title": "为前 20 个账户写 Account Thesis",
+  "detail": "每个账户写 incumbent、pain、trigger、wedge、buyer、warm path、next step。",
+  "owner": "Me",
+  "priority": "P1",
+  "status": "Backlog",
+  "due": "",
+  "link": ""
+ }
+]
