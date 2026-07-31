@@ -150,7 +150,14 @@
     "syncLast": "上次同步：{when}，来源 {source}",
     "syncSuccess": "同步完成：新增 {created}，更新 {updated}，共处理 {seen}。",
     "syncFailed": "同步失败：{reason}",
-    "syncUnavailable": "未配置上游凭据，当前使用内置产品目录。"
+    "syncUnavailable": "未配置上游凭据，当前使用内置产品目录。",
+    "chartPriorityTitle": "优先级构成",
+    "chartPriorityCenter": "个产品",
+    "chartKnowledgeTitle": "掌握度阶梯",
+    "chartKnowledgeHint": "每个产品从“待学习”到“可销售”的进展情况。",
+    "chartCoverageLabel": "P1 复盘覆盖率",
+    "chartCategoryTitle": "最大的类别",
+    "chartConfidenceTitle": "证据可信度"
   },
   "evidence": {
     "title": "BD Evidence Studio",

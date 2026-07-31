@@ -1,22 +1,28 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 
-const FOCUSABLE_SELECTOR =
-  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 
 /**
- * Presentational modal shell.
+ * Compatibility shell over the Radix dialog in `ui/dialog.tsx`.
  *
- * Purely controlled by the caller's open/closed state -- this component holds
- * no state of its own beyond refs, so a caller that also drives a
- * `useActionState` form inside never has two sources of truth to reconcile.
+ * Keeps the call signature the six existing dialogs already use -- they mount
+ * this conditionally and hand it an `onClose`, rather than driving an `open`
+ * prop -- so swapping the implementation underneath moved no call sites. The
+ * hand-written version this replaces reimplemented a focus trap, focus
+ * restore, Escape handling and an overlay-click guard in about sixty lines;
+ * all four now come from Radix, along with the page-inerting and scroll-lock
+ * the hand-rolled one never had.
  *
- * Traps focus while open and restores it to the element that opened the modal
- * on close: without this, a keyboard or screen-reader user can Tab straight
- * out of the dialog into the dimmed page behind it, and loses their place in
- * the underlying table entirely once the modal closes.
+ * `open` is hard-coded true because mounting *is* the open signal in this
+ * API; `onOpenChange` fires only on a close request, which is forwarded to
+ * `onClose` so the parent unmounts us.
+ *
+ * The visible heading is supplied by each caller's own `.modal-header`, so the
+ * `DialogTitle` Radix requires for `aria-labelledby` is rendered visually
+ * hidden rather than duplicated on screen -- omitting it entirely would leave
+ * the dialog unlabelled for a screen reader.
  */
 export function Modal({
   title,
@@ -29,80 +35,17 @@ export function Modal({
   children: ReactNode;
   wide?: boolean;
 }) {
-  const boxRef = useRef<HTMLDivElement>(null);
-  const previouslyFocused = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    previouslyFocused.current = document.activeElement as HTMLElement | null;
-
-    const box = boxRef.current;
-    const focusable = box?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
-    (focusable?.[0] ?? box)?.focus();
-
-    return () => {
-      previouslyFocused.current?.focus();
-    };
-  }, []);
-
-  useEffect(() => {
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        onClose();
-        return;
-      }
-
-      if (event.key !== 'Tab') return;
-
-      const box = boxRef.current;
-      if (!box) return;
-
-      const focusable = Array.from(box.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-        (el) => el.offsetParent !== null,
-      );
-      if (focusable.length === 0) return;
-
-      const first = focusable[0]!;
-      const last = focusable[focusable.length - 1]!;
-      const active = document.activeElement;
-
-      // Cycle rather than let Tab escape into the dimmed page behind the
-      // overlay: this is the whole of what a native focus trap buys, done by
-      // hand because `Modal` predates this app's use of `<dialog>`.
-      if (event.shiftKey && active === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && active === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    }
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
-
   return (
-    // The overlay's own click closes the modal; a click that starts inside the
-    // box and is only reported on the overlay via bubbling is excluded by the
-    // ref check, so dragging a text selection out past the edge cannot
-    // accidentally dismiss the form.
-    <div
-      className="modal-overlay"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (boxRef.current && !boxRef.current.contains(event.target as Node)) onClose();
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        if (!next) onClose();
       }}
     >
-      <div
-        className="modal-box"
-        ref={boxRef}
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        tabIndex={-1}
-        style={wide ? { width: 'min(1400px, 98vw)' } : undefined}
-      >
+      <DialogContent wide={wide} showClose={false}>
+        <DialogTitle className="sr-only">{title}</DialogTitle>
         {children}
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }

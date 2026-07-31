@@ -19,12 +19,23 @@ import {
 import type { Product, ProductEvidence } from '@/db/schema';
 import { CSRF_FIELD } from '@/lib/security/csrf-constants';
 import { Link } from '@/i18n/navigation';
+import { BookOpen, FlaskConical, Gauge, MoreHorizontal, Pencil } from 'lucide-react';
+
 import { ConfirmButton } from '@/components/ConfirmButton';
 import { Modal } from '@/components/Modal';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { TruncatedCell } from '@/components/ui/tooltip';
 import { SelectField, TextAreaField, TextField } from '@/components/fields';
 import { SubmitButton } from '@/components/SubmitButton';
 import { TranslateField } from '@/components/TranslateField';
-import { useToast } from '@/components/Toast';
+import { useToast } from '@/components/ui/toast';
 import {
   exportProductsCsv,
   removeProduct,
@@ -132,9 +143,19 @@ export function ProductsClient({
                 <td>{product.commercialCategory}</td>
                 <td className="product-cell">{product.product}</td>
                 <td>{product.category}</td>
-                <td title={product.solutionStory}>{truncate(product.solutionStory, 90)}</td>
-                <td title={product.competitors}>{truncate(product.competitors, 80)}</td>
-                <td title={product.painPoints}>{truncate(product.painPoints, 80)}</td>
+                {/* `title` gave a ~1s unstyled browser tooltip with no touch
+                    or screen-reader equivalent; `TruncatedCell` is a real
+                    Radix tooltip wired to the trigger's `aria-describedby`
+                    and reachable by keyboard. */}
+                <td>
+                  <TruncatedCell value={product.solutionStory} />
+                </td>
+                <td>
+                  <TruncatedCell value={product.competitors} />
+                </td>
+                <td>
+                  <TruncatedCell value={product.painPoints} />
+                </td>
                 <td>{product.knowledge}</td>
                 <td>{product.confidence}</td>
                 <td>{product.status}</td>
@@ -281,9 +302,14 @@ function Pagination({
 }
 
 /**
- * The row-action buttons, shared between the table row and its responsive
+ * The row-action menu, shared between the table row and its responsive
  * card-list counterpart -- one definition, so a permission change or a new
  * action never needs updating in two places that could drift apart.
+ *
+ * Collapsed behind a single trigger rather than rendered as four inline
+ * buttons: at forty rows that was ~200 competing targets and made Actions the
+ * widest column on the page. The menu also gives each action a full label
+ * instead of the abbreviations the inline buttons had to use to fit.
  */
 function ProductRowActions({
   product,
@@ -301,26 +327,47 @@ function ProductRowActions({
   const t = useTranslations('products');
   const tCommon = useTranslations('common');
 
+  if (!canWrite && !canDelete) return null;
+
   return (
-    <div className="row">
-      {canWrite ? (
-        <>
-          <button type="button" onClick={() => setModal({ type: 'edit', product })}>
-            {tCommon('edit')}
-          </button>
-          <button type="button" onClick={() => setModal({ type: 'evidence', product })}>
-            {t('openEvidence')}
-          </button>
-          <button type="button" onClick={() => setModal({ type: 'story', product })}>
-            {t('openStory')}
-          </button>
-          <button type="button" onClick={() => setModal({ type: 'score', product })}>
-            {t('openScore')}
-          </button>
-        </>
-      ) : null}
-      {canDelete ? <DeleteProductButton id={product.id} csrfToken={csrfToken} label={tCommon('delete')} /> : null}
-    </div>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon-sm" aria-label={tCommon('actions')}>
+          <MoreHorizontal />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent>
+        {canWrite ? (
+          <>
+            <DropdownMenuItem onSelect={() => setModal({ type: 'edit', product })}>
+              <Pencil />
+              {tCommon('edit')}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setModal({ type: 'evidence', product })}>
+              <FlaskConical />
+              {t('openEvidence')}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setModal({ type: 'story', product })}>
+              <BookOpen />
+              {t('openStory')}
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setModal({ type: 'score', product })}>
+              <Gauge />
+              {t('openScore')}
+            </DropdownMenuItem>
+          </>
+        ) : null}
+        {canWrite && canDelete ? <DropdownMenuSeparator /> : null}
+        {canDelete ? (
+          // Rendered outside a `DropdownMenuItem`: the delete flow is a form
+          // POST with a two-step confirm, and an item would close the menu on
+          // the first click before the confirm could ever be shown.
+          <div className="px-1 py-0.5">
+            <DeleteProductButton id={product.id} csrfToken={csrfToken} label={tCommon('delete')} />
+          </div>
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

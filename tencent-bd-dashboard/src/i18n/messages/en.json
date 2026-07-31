@@ -150,7 +150,14 @@
     "syncLast": "Last synced {when} from {source}",
     "syncSuccess": "Sync complete: {created} created, {updated} updated, {seen} seen.",
     "syncFailed": "Sync failed: {reason}",
-    "syncUnavailable": "Upstream credentials are not configured. The bundled catalog is in use."
+    "syncUnavailable": "Upstream credentials are not configured. The bundled catalog is in use.",
+    "chartPriorityTitle": "Priority mix",
+    "chartPriorityCenter": "products",
+    "chartKnowledgeTitle": "Knowledge ladder",
+    "chartKnowledgeHint": "How far each product has climbed from \"to learn\" to \"can sell\".",
+    "chartCoverageLabel": "P1 review coverage",
+    "chartCategoryTitle": "Largest categories",
+    "chartConfidenceTitle": "Evidence confidence"
   },
   "evidence": {
     "title": "BD Evidence Studio",

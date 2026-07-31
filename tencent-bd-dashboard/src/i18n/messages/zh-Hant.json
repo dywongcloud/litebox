@@ -150,7 +150,14 @@
     "syncLast": "上次同步：{when}，來源 {source}",
     "syncSuccess": "同步完成：新增 {created}，更新 {updated}，共處理 {seen}。",
     "syncFailed": "同步失敗：{reason}",
-    "syncUnavailable": "未配置上游憑據，當前使用內置產品目錄。"
+    "syncUnavailable": "未配置上游憑據，當前使用內置產品目錄。",
+    "chartPriorityTitle": "優先級構成",
+    "chartPriorityCenter": "個產品",
+    "chartKnowledgeTitle": "掌握度階梯",
+    "chartKnowledgeHint": "每個產品從「待學習」到「可銷售」的進展情況。",
+    "chartCoverageLabel": "P1 覆盤覆蓋率",
+    "chartCategoryTitle": "最大的類別",
+    "chartConfidenceTitle": "證據可信度"
   },
   "evidence": {
     "title": "BD Evidence Studio",

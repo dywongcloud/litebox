@@ -24,7 +24,7 @@ import { ConfirmButton } from '@/components/ConfirmButton';
 import { Modal } from '@/components/Modal';
 import { SelectField, TextAreaField, TextField } from '@/components/fields';
 import { SubmitButton } from '@/components/SubmitButton';
-import { useToast } from '@/components/Toast';
+import { useToast } from '@/components/ui/toast';
 import { moveTodoCard, removeTodo, saveTodo } from '@/server/actions/board';
 import type { FormActionState } from '@/server/actions/shared';
 

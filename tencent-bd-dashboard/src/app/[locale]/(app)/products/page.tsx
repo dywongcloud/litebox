@@ -12,6 +12,7 @@ import { can } from '@/lib/auth/rbac';
 import * as session from '@/lib/auth/session';
 import { readToken } from '@/lib/security/csrf';
 import { FilterForm } from '@/components/FilterForm';
+import { PortfolioAnalytics } from '@/components/PortfolioAnalytics';
 import { computeCoverage, listCategories, listProducts } from '@/server/data/products';
 import { getLastSyncRun } from '@/server/catalog/sync';
 import { hasTencentCredentials } from '@/lib/env';
@@ -81,6 +82,8 @@ export default async function ProductsPage({
           <b>{coverage.coverage}%</b>
         </div>
       </div>
+
+      <PortfolioAnalytics analytics={coverage} />
 
       <div className="workspace-banner">
         <div className="workspace-card">

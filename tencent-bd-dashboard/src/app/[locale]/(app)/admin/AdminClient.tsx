@@ -7,7 +7,7 @@ import type { Locale, UserRole } from '@/domain/enums';
 import { CSRF_FIELD } from '@/lib/security/csrf-constants';
 import { SelectField, TextField } from '@/components/fields';
 import { SubmitButton } from '@/components/SubmitButton';
-import { useToast } from '@/components/Toast';
+import { useToast } from '@/components/ui/toast';
 import { resetToInitialCorpus, createUserAccount, updateUserAccount } from '@/server/actions/admin';
 import { approveTranslation } from '@/server/actions/translation';
 import { exportAllData } from '@/server/actions/data-export';
