@@ -18,7 +18,6 @@ import * as schema from './schema';
  * and the WAL lock would eventually be exhausted.
  */
 declare global {
-  // eslint-disable-next-line no-var
   var __bdOsDatabase: Database.Database | undefined;
 }
 
@@ -35,6 +34,18 @@ function openDatabase(): Database.Database {
 
   const connection = new Database(path);
 
+  // Must be the FIRST pragma set on the connection, before anything that can
+  // itself contend for the database lock (journal_mode above all). `next
+  // build` spawns several worker processes that each import this module and
+  // open the same fresh database file concurrently -- the very first WAL
+  // conversion below is exactly the kind of write that can hit SQLITE_BUSY
+  // while another worker is mid-initialisation. Setting the busy timeout
+  // first makes better-sqlite3 retry internally for up to 5s instead of
+  // throwing immediately; setting it after `journal_mode = WAL` (as a
+  // one-shot connection-local setting has no lock to wait on) does nothing
+  // for the call that actually needs it.
+  connection.pragma('busy_timeout = 5000');
+
   // WAL lets readers proceed during a write, which matters because every page
   // render reads while server actions write.
   connection.pragma('journal_mode = WAL');
@@ -46,20 +57,28 @@ function openDatabase(): Database.Database {
   // evidence, research and sessions from outliving their parent rows.
   connection.pragma('foreign_keys = ON');
 
-  // Fail a contended write after 5s rather than throwing SQLITE_BUSY at once.
-  connection.pragma('busy_timeout = 5000');
-
   // Reject a write that would silently truncate an oversized value.
   connection.pragma('trusted_schema = OFF');
+
+  // SQLite's defaults here are tuned for a constrained embedded device, not a
+  // server process: a 2MB page cache and mmap I/O off. 64MB of cache and a
+  // 256MB memory-mapped window cost nothing on a server and pay for
+  // themselves on every read-heavy tab (the product catalog alone is 181+
+  // rows re-scanned on most filter changes).
+  connection.pragma('cache_size = -64000');
+  connection.pragma('mmap_size = 268435456');
 
   return connection;
 }
 
+// Cached unconditionally, not just in development: Turbopack can duplicate a
+// module across multiple output chunks that are all evaluated within the same
+// running process, and each evaluation of this file must resolve to the exact
+// same open handle -- two live `Database` connections to one WAL-mode file in
+// one process is itself a source of the lock contention this module exists to
+// avoid, not merely a development-mode hot-reload concern.
 export const sqlite: Database.Database = globalThis.__bdOsDatabase ?? openDatabase();
-
-if (process.env.NODE_ENV !== 'production') {
-  globalThis.__bdOsDatabase = sqlite;
-}
+globalThis.__bdOsDatabase = sqlite;
 
 /**
  * Drizzle handle. Every query in the application goes through this: it is the

@@ -34,7 +34,7 @@ export function createTodo(values: NewTodo): Todo {
       .get();
 
     return db.insert(todos).values({ ...values, position: (row?.maxPosition ?? -1) + 1 }).returning().get();
-  });
+  }, { behavior: 'immediate' });
 }
 
 export function updateTodo(id: number, values: Partial<NewTodo>): Todo | undefined {
@@ -77,7 +77,7 @@ export function moveTodo(id: number, status: TodoStatus, position: number): Todo
       .where(eq(todos.id, id))
       .returning()
       .get();
-  });
+  }, { behavior: 'immediate' });
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ export function replaceSopSteps(bodies: string[]): SopStep[] {
       db.insert(sopSteps).values({ body, position } satisfies NewSopStep).run();
     });
     return listSopSteps();
-  });
+  }, { behavior: 'immediate' });
 }
 
 // ---------------------------------------------------------------------------

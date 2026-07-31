@@ -7,6 +7,7 @@ import {
   formDataToObject,
   idSchema,
   priorityScoreSchema,
+  productFilterSchema,
   productSchema,
   productStorySchema,
   toFieldErrors,
@@ -14,10 +15,12 @@ import {
 import { PRIORITY_SCORE_TOTAL_MAX } from '@/domain/enums';
 import * as audit from '@/lib/security/audit';
 import { requireMutation } from '@/lib/auth/guard';
+import { toCsv } from '@/lib/csv';
 import {
   createProduct,
   deleteProduct,
   getProduct,
+  listProductsForExport,
   replaceEvidence,
   updateProduct,
 } from '@/server/data/products';
@@ -225,4 +228,68 @@ export async function runCatalogSync(_prev: FormActionState, formData: FormData)
   return result.ok
     ? { success: true, message: `Sync complete: ${result.created} created, ${result.updated} updated, ${result.seen} seen.` }
     : { message: `Sync failed: ${result.error ?? 'unknown error'}` };
+}
+
+// ---------------------------------------------------------------------------
+// CSV export
+// ---------------------------------------------------------------------------
+
+const CSV_COLUMNS = [
+  { header: 'Priority', field: 'priority' },
+  { header: 'Category', field: 'category' },
+  { header: 'Product', field: 'product' },
+  { header: 'Commercial Category', field: 'commercialCategory' },
+  { header: 'Sell Mode', field: 'sellMode' },
+  { header: 'Description', field: 'description' },
+  { header: 'Solution Story', field: 'solutionStory' },
+  { header: 'Primary Competitor', field: 'primaryCompetitor' },
+  { header: 'Competitors', field: 'competitors' },
+  { header: 'Use Cases', field: 'useCases' },
+  { header: 'Industries', field: 'industries' },
+  { header: 'Company Size', field: 'companySize' },
+  { header: 'Pain Points', field: 'painPoints' },
+  { header: 'Knowledge', field: 'knowledge' },
+  { header: 'Confidence', field: 'confidence' },
+  { header: 'Status', field: 'status' },
+  { header: 'Owner', field: 'owner' },
+  { header: 'Reference Customers', field: 'referenceCustomers' },
+  { header: 'Tencent Edge', field: 'tencentEdge' },
+] as const;
+
+export interface CsvExportResult {
+  readonly ok: boolean;
+  readonly message?: string;
+  readonly csv?: string;
+  readonly count?: number;
+}
+
+/**
+ * Product catalog as CSV, respecting whatever filter the caller currently has
+ * applied on the table -- an operator exporting a filtered view expects the
+ * file to match what they see, not the whole 180+ row catalog every time.
+ *
+ * Deliberately a narrower column set than `exportAllData`'s full JSON dump:
+ * this is the catalog for spreadsheet/CRM handoff, not a backup, so the
+ * evidence-ledger and messaging-library detail fields are left out in favor
+ * of what a BD reviewing the list actually wants columns for.
+ */
+export async function exportProductsCsv(formData: FormData): Promise<CsvExportResult> {
+  let actor;
+  try {
+    actor = await requireMutation('data.export', formData, { bucket: 'export' });
+  } catch (error) {
+    return { ok: false, message: actorMessage(error) };
+  }
+
+  const filter = productFilterSchema.parse(formDataToObject(formData));
+  const rows = listProductsForExport(filter);
+
+  const csv = toCsv(
+    CSV_COLUMNS.map((c) => c.header),
+    rows.map((row) => CSV_COLUMNS.map((c) => row[c.field as keyof typeof row])),
+  );
+
+  audit.record({ action: 'data.exported', actorUserId: actor.user.id, metadata: { format: 'csv', rowCount: rows.length } });
+
+  return { ok: true, csv, count: rows.length };
 }

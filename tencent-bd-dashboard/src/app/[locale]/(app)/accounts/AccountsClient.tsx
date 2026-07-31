@@ -6,6 +6,7 @@ import { useTranslations } from 'next-intl';
 import { ACCOUNT_FITS, ACCOUNT_SIZES, ACCOUNT_STAGES } from '@/domain/enums';
 import type { Account } from '@/db/schema';
 import { CSRF_FIELD } from '@/lib/security/csrf-constants';
+import { ConfirmButton } from '@/components/ConfirmButton';
 import { Modal } from '@/components/Modal';
 import { SelectField, TextAreaField, TextField } from '@/components/fields';
 import { Link } from '@/i18n/navigation';
@@ -53,7 +54,7 @@ export function AccountsClient({
         </div>
       ) : null}
 
-      <div className="table-wrap">
+      <div className="table-wrap" data-responsive>
         <table className="account-table">
           <thead>
             <tr>
@@ -98,32 +99,7 @@ export function AccountsClient({
                 <td title={account.nextAction}>{truncate(account.nextAction)}</td>
                 <td>{account.dueOn || '-'}</td>
                 <td>
-                  <div className="row">
-                    {canWrite ? (
-                      <button type="button" onClick={() => setModal({ type: 'edit', account })}>
-                        {tCommon('edit')}
-                      </button>
-                    ) : null}
-                    <Link href={`/accounts/${account.id}`} className="btn">
-                      {t('openResearch')}
-                    </Link>
-                    {canDelete ? (
-                      <form
-                        action={async (formData) => {
-                          await removeAccount(formData);
-                        }}
-                        onSubmit={(event) => {
-                          if (!window.confirm(tCommon('confirmDelete'))) event.preventDefault();
-                        }}
-                      >
-                        <input type="hidden" name={CSRF_FIELD} value={csrfToken} />
-                        <input type="hidden" name="id" value={account.id} />
-                        <button type="submit" className="danger">
-                          {tCommon('delete')}
-                        </button>
-                      </form>
-                    ) : null}
-                  </div>
+                  <AccountRowActions account={account} canWrite={canWrite} canDelete={canDelete} csrfToken={csrfToken} setModal={setModal} />
                 </td>
               </tr>
             ))}
@@ -136,6 +112,42 @@ export function AccountsClient({
             ) : null}
           </tbody>
         </table>
+
+        <div className="responsive-cards">
+          {items.map((account) => (
+            <div className="data-card" key={account.id}>
+              <div className="row" style={{ justifyContent: 'space-between', marginBottom: 'var(--space-2)' }}>
+                <span className="pill" data-tone="brand">
+                  {account.stage}
+                </span>
+                <span className="pill" data-tone={fitTone(account.fit)}>
+                  {account.fit}
+                </span>
+              </div>
+              <div className="data-card-title">
+                <Link href={`/accounts/${account.id}`}>{account.company}</Link>
+              </div>
+              <dl>
+                <div className="data-card-row">
+                  <dt>{t('colIndustry')}</dt>
+                  <dd>{account.industry || '-'}</dd>
+                </div>
+                <div className="data-card-row">
+                  <dt>{t('colPain')}</dt>
+                  <dd>{truncate(account.pain)}</dd>
+                </div>
+                <div className="data-card-row">
+                  <dt>{t('colDue')}</dt>
+                  <dd>{account.dueOn || '-'}</dd>
+                </div>
+              </dl>
+              <div className="data-card-actions">
+                <AccountRowActions account={account} canWrite={canWrite} canDelete={canDelete} csrfToken={csrfToken} setModal={setModal} />
+              </div>
+            </div>
+          ))}
+          {items.length === 0 ? <p className="empty-state">{tCommon('emptyState')}</p> : null}
+        </div>
       </div>
 
       {totalPages > 1 ? (
@@ -155,6 +167,47 @@ export function AccountsClient({
         />
       ) : null}
     </>
+  );
+}
+
+function AccountRowActions({
+  account,
+  canWrite,
+  canDelete,
+  csrfToken,
+  setModal,
+}: {
+  account: Account;
+  canWrite: boolean;
+  canDelete: boolean;
+  csrfToken: string;
+  setModal: (state: { type: 'create' } | { type: 'edit'; account: Account }) => void;
+}) {
+  const t = useTranslations('accounts');
+  const tCommon = useTranslations('common');
+
+  return (
+    <div className="row">
+      {canWrite ? (
+        <button type="button" onClick={() => setModal({ type: 'edit', account })}>
+          {tCommon('edit')}
+        </button>
+      ) : null}
+      <Link href={`/accounts/${account.id}`} className="btn">
+        {t('openResearch')}
+      </Link>
+      {canDelete ? (
+        <form
+          action={async (formData) => {
+            await removeAccount(formData);
+          }}
+        >
+          <input type="hidden" name={CSRF_FIELD} value={csrfToken} />
+          <input type="hidden" name="id" value={account.id} />
+          <ConfirmButton label={tCommon('delete')} />
+        </form>
+      ) : null}
+    </div>
   );
 }
 

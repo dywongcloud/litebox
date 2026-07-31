@@ -144,6 +144,8 @@
     "openScore": "评分",
     "syncCatalog": "同步上游产品目录",
     "syncRunning": "同步中…",
+    "exportCsv": "导出 CSV",
+    "exportingCsv": "导出中…",
     "syncNever": "尚未同步",
     "syncLast": "上次同步：{when}，来源 {source}",
     "syncSuccess": "同步完成：新增 {created}，更新 {updated}，共处理 {seen}。",
@@ -364,7 +366,8 @@
     "editTitle": "编辑 Next Step",
     "createTitle": "新增 Next Step",
     "overdue": "已逾期",
-    "dueToday": "今天到期"
+    "dueToday": "今天到期",
+    "dragHandle": "拖动以重新排序，或使用下方的状态下拉菜单"
   },
   "playbooks": {
     "heading": "切入 Playbooks",

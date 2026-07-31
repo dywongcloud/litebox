@@ -25,7 +25,8 @@ export type RateLimitBucket =
   | 'mutation'
   | 'translate'
   | 'catalog-sync'
-  | 'export';
+  | 'export'
+  | 'csp-report';
 
 interface BucketPolicy {
   readonly limit: number;
@@ -43,6 +44,11 @@ const POLICIES: Record<RateLimitBucket, BucketPolicy> = {
   translate: { limit: 60, windowMs: 60_000 },
   'catalog-sync': { limit: 4, windowMs: 60 * 60_000 },
   export: { limit: 12, windowMs: 60_000 },
+  // Generous: a real policy regression (a bad deploy, a rogue extension) can
+  // legitimately trip the same directive on every page a browser has open.
+  // The goal here is capping abuse of an unauthenticated public endpoint, not
+  // dropping a genuine burst of first-party reports.
+  'csp-report': { limit: 60, windowMs: 60_000 },
 };
 
 export interface RateLimitResult {
@@ -57,7 +63,11 @@ export interface RateLimitResult {
  *
  * The read-modify-write runs inside a synchronous better-sqlite3 transaction,
  * so two concurrent requests cannot both observe `count = limit - 1` and both
- * be allowed through.
+ * be allowed through. `behavior: 'immediate'` grabs the write lock at the
+ * start of the transaction rather than the default `deferred` (lock acquired
+ * lazily on the first write): this function runs on nearly every request, so
+ * it is exactly the read-then-maybe-write shape that can mutually deadlock
+ * two deferred transactions against each other under real concurrency.
  */
 export function consume(bucket: RateLimitBucket, subject: string): RateLimitResult {
   const policy = POLICIES[bucket];
@@ -104,7 +114,7 @@ export function consume(bucket: RateLimitBucket, subject: string): RateLimitResu
       remaining: policy.limit - (existing.count + 1),
       resetAt,
     };
-  });
+  }, { behavior: 'immediate' });
 }
 
 /** Clear a subject's counter, e.g. after a successful sign-in. */

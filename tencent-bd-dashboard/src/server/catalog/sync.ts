@@ -76,6 +76,12 @@ export async function syncCatalog(triggeredBy: number): Promise<SyncOutcome> {
   let created = 0;
   let updated = 0;
 
+  // `immediate` grabs the write lock up front rather than the default
+  // `deferred` (lock acquired lazily on the first write): a deferred
+  // transaction that starts with a read and only later upgrades to a write
+  // can mutually deadlock against a concurrent transaction doing the same,
+  // in a way `busy_timeout` alone cannot resolve. Every write transaction in
+  // this codebase uses this for the same reason.
   db.transaction(() => {
     for (const item of result.data) {
       const byCode = findProductByUpstreamCode(item.code);
@@ -102,7 +108,7 @@ export async function syncCatalog(triggeredBy: number): Promise<SyncOutcome> {
         .run();
       created++;
     }
-  });
+  }, { behavior: 'immediate' });
 
   db.update(catalogSyncRuns)
     .set({

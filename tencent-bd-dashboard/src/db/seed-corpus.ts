@@ -298,7 +298,7 @@ export function applySeedCorpus(): { products: number; accounts: number; todos: 
           .run();
       }
     }
-  });
+  }, { behavior: 'immediate' });
 
   return {
     products: seedProducts.length,

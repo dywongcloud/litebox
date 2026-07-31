@@ -7,6 +7,7 @@ import type { Locale, UserRole } from '@/domain/enums';
 import { CSRF_FIELD } from '@/lib/security/csrf-constants';
 import { SelectField, TextField } from '@/components/fields';
 import { SubmitButton } from '@/components/SubmitButton';
+import { useToast } from '@/components/Toast';
 import { resetToInitialCorpus, createUserAccount, updateUserAccount } from '@/server/actions/admin';
 import { approveTranslation } from '@/server/actions/translation';
 import { exportAllData } from '@/server/actions/data-export';
@@ -109,10 +110,14 @@ function UsersSection({
   const tCommon = useTranslations('common');
   const [createState, createAction] = useActionState(createUserAccount, initialState);
   const [showCreate, setShowCreate] = useState(false);
-
-  useEffect(() => {
+  // `useActionState` hands back a new object each time the action settles, so
+  // comparing identity during render (rather than `success` in a `useEffect`)
+  // reacts to exactly one settle without the extra render pass an effect costs.
+  const [handledCreateState, setHandledCreateState] = useState(createState);
+  if (createState !== handledCreateState) {
+    setHandledCreateState(createState);
     if (createState.success) setShowCreate(false);
-  }, [createState.success]);
+  }
 
   return (
     <div className="card">
@@ -260,8 +265,31 @@ function TranslationReviewItem({ item, csrfToken }: { item: PendingTranslation; 
 
 function DataSection({ csrfToken }: { csrfToken: string }) {
   const tCommon = useTranslations('common');
+  const toast = useToast();
   const [exporting, setExporting] = useState(false);
+  const [confirmingReset, setConfirmingReset] = useState(false);
   const [resetState, resetAction] = useActionState(resetToInitialCorpus, initialState);
+
+  // Closing the confirm step is state derived from a new action result, so it
+  // is set during render (see the `handledCreateState` comment above);
+  // showing the toast is a genuine side effect on an external system (the
+  // toast region) and stays in an effect.
+  const [handledResetState, setHandledResetState] = useState(resetState);
+  if (resetState !== handledResetState) {
+    setHandledResetState(resetState);
+    if (resetState.success) setConfirmingReset(false);
+  }
+
+  useEffect(() => {
+    if (resetState.success) {
+      toast.show(tCommon('saved'), 'success');
+    } else if (resetState.message) {
+      toast.show(resetState.message, 'error');
+    }
+    // toast.show is a stable callback from context; including it would refire
+    // on every provider re-render for no reason.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetState.success, resetState.message]);
 
   async function handleExport() {
     setExporting(true);
@@ -270,7 +298,7 @@ function DataSection({ csrfToken }: { csrfToken: string }) {
       formData.set(CSRF_FIELD, csrfToken);
       const result = await exportAllData(formData);
       if (!result.ok || !result.data) {
-        window.alert(result.message ?? 'Export failed.');
+        toast.show(result.message ?? 'Export failed.', 'error');
         return;
       }
       const blob = new Blob([JSON.stringify(result.data, null, 2)], { type: 'application/json' });
@@ -282,6 +310,7 @@ function DataSection({ csrfToken }: { csrfToken: string }) {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+      toast.show(tCommon('saved'), 'success');
     } finally {
       setExporting(false);
     }
@@ -295,21 +324,24 @@ function DataSection({ csrfToken }: { csrfToken: string }) {
         </button>
       </div>
 
-      <form
-        action={resetAction}
-        className="row"
-        style={{ marginTop: 12 }}
-        onSubmit={(event) => {
-          if (!window.confirm(tCommon('resetConfirm'))) event.preventDefault();
-        }}
-      >
+      <form action={resetAction} className="row" style={{ marginTop: 12 }}>
         <input type="hidden" name={CSRF_FIELD} value={csrfToken} />
-        <input type="text" name="confirm" placeholder="RESET" style={{ width: 120 }} />
-        <SubmitButton className="danger">{tCommon('reset')}</SubmitButton>
+        {confirmingReset ? (
+          <>
+            <input type="text" name="confirm" placeholder="RESET" style={{ width: 120 }} autoFocus />
+            <SubmitButton className="danger">{tCommon('reset')}</SubmitButton>
+            <button type="button" onClick={() => setConfirmingReset(false)}>
+              {tCommon('cancel')}
+            </button>
+          </>
+        ) : (
+          <button type="button" className="danger" onClick={() => setConfirmingReset(true)}>
+            {tCommon('reset')}
+          </button>
+        )}
         {resetState.errors?.confirm ? <span className="field-error">{resetState.errors.confirm[0]}</span> : null}
-        {resetState.message ? <span className="field-error">{resetState.message}</span> : null}
-        {resetState.success ? <span className="small">{tCommon('saved')}</span> : null}
       </form>
+      {confirmingReset ? <p className="small">{tCommon('resetConfirm')}</p> : null}
     </div>
   );
 }

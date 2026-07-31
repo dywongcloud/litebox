@@ -50,6 +50,7 @@ export default async function ProductsPage({
   const canWrite = can(active.user.role, 'catalog.write');
   const canDelete = can(active.user.role, 'catalog.delete');
   const canSync = can(active.user.role, 'catalog.sync');
+  const canExport = can(active.user.role, 'data.export');
   const csrfToken = await readToken(active.sessionId);
 
   return (
@@ -170,6 +171,7 @@ export default async function ProductsPage({
         canWrite={canWrite}
         canDelete={canDelete}
         canSync={canSync}
+        canExport={canExport}
         csrfToken={csrfToken}
         syncStatus={
           lastSync

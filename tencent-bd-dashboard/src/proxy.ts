@@ -70,6 +70,12 @@ function contentSecurityPolicy(nonce: string, isProduction: boolean): string {
     `frame-src 'none'`,
     `worker-src 'self' blob:`,
     `manifest-src 'self'`,
+
+    // A violation is reported through both the legacy directive (broadest
+    // browser support) and the modern named endpoint below -- a browser that
+    // understands only one of the two still gets a report through.
+    `report-uri /api/csp-report`,
+    `report-to csp-endpoint`,
   ];
 
   if (isProduction) {
@@ -79,6 +85,13 @@ function contentSecurityPolicy(nonce: string, isProduction: boolean): string {
   return directives.join('; ');
 }
 
+/**
+ * Reporting API v1 endpoint group, named by `report-to` above. Declared as its
+ * own header (rather than folded into the CSP header) because that is what the
+ * spec requires -- browsers resolve the `report-to` group name against this.
+ */
+const REPORTING_ENDPOINTS = 'csp-endpoint="/api/csp-report"';
+
 function applySecurityHeaders(
   response: NextResponse,
   nonce: string,
@@ -87,6 +100,7 @@ function applySecurityHeaders(
   const headers = response.headers;
 
   headers.set('Content-Security-Policy', contentSecurityPolicy(nonce, isProduction));
+  headers.set('Reporting-Endpoints', REPORTING_ENDPOINTS);
 
   // Stop the browser from second-guessing a declared Content-Type, which is how
   // a JSON export gets reinterpreted as HTML and executed.

@@ -17,6 +17,9 @@
 *.db-wal
 *.db-shm
 
+# Local hot-backup output (npm run db:backup)
+/backups/
+
 # TypeScript incremental build info
 *.tsbuildinfo
 next-env.d.ts

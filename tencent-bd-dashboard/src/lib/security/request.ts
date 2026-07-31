@@ -66,10 +66,21 @@ function allowedOrigins(): string[] {
  *
  * A missing `Origin` on a mutation is treated as a failure rather than waved
  * through -- being permissive here would reopen exactly the hole this closes.
+ *
+ * `Sec-Fetch-Site` is checked first, ahead of `Origin`/`Referer`: it is a
+ * browser-computed Fetch Metadata header a script cannot set or override (unlike
+ * `Referer`, which a `Referrer-Policy` or an extension can strip), so an
+ * explicit `cross-site` value is rejected immediately regardless of what
+ * `Origin` claims. Its absence -- an older browser, or a non-fetch client --
+ * is not itself a failure; it just means this layer has nothing to add, and
+ * the request falls through to the Origin/Referer check below.
  */
 export async function isSameOrigin(): Promise<boolean> {
   const h = await headers();
   const permitted = allowedOrigins();
+
+  const fetchSite = h.get('sec-fetch-site');
+  if (fetchSite === 'cross-site') return false;
 
   const origin = h.get('origin');
   if (origin) {

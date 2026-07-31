@@ -19,11 +19,14 @@ import {
 import type { Product, ProductEvidence } from '@/db/schema';
 import { CSRF_FIELD } from '@/lib/security/csrf-constants';
 import { Link } from '@/i18n/navigation';
+import { ConfirmButton } from '@/components/ConfirmButton';
 import { Modal } from '@/components/Modal';
 import { SelectField, TextAreaField, TextField } from '@/components/fields';
 import { SubmitButton } from '@/components/SubmitButton';
 import { TranslateField } from '@/components/TranslateField';
+import { useToast } from '@/components/Toast';
 import {
+  exportProductsCsv,
   removeProduct,
   runCatalogSync,
   saveEvidenceStudio,
@@ -57,6 +60,7 @@ export function ProductsClient({
   canWrite,
   canDelete,
   canSync,
+  canExport,
   csrfToken,
   syncStatus,
   hasTencentCredentials,
@@ -69,6 +73,7 @@ export function ProductsClient({
   canWrite: boolean;
   canDelete: boolean;
   canSync: boolean;
+  canExport: boolean;
   csrfToken: string;
   syncStatus: { status: string; finishedAt: string | null; sourceKind: string } | null;
   hasTencentCredentials: boolean;
@@ -89,6 +94,7 @@ export function ProductsClient({
             </button>
           ) : null}
           {canSync ? <SyncButton csrfToken={csrfToken} t={t} /> : null}
+          {canExport ? <ExportCsvButton csrfToken={csrfToken} filterQuery={filterQuery} t={t} /> : null}
         </div>
         <span className="small">
           {syncStatus
@@ -98,7 +104,7 @@ export function ProductsClient({
         </span>
       </div>
 
-      <div className="table-wrap">
+      <div className="table-wrap" data-responsive>
         <table>
           <thead>
             <tr>
@@ -133,25 +139,13 @@ export function ProductsClient({
                 <td>{product.confidence}</td>
                 <td>{product.status}</td>
                 <td>
-                  <div className="row">
-                    {canWrite ? (
-                      <>
-                        <button type="button" onClick={() => setModal({ type: 'edit', product })}>
-                          {tCommon('edit')}
-                        </button>
-                        <button type="button" onClick={() => setModal({ type: 'evidence', product })}>
-                          {t('openEvidence')}
-                        </button>
-                        <button type="button" onClick={() => setModal({ type: 'story', product })}>
-                          {t('openStory')}
-                        </button>
-                        <button type="button" onClick={() => setModal({ type: 'score', product })}>
-                          {t('openScore')}
-                        </button>
-                      </>
-                    ) : null}
-                    {canDelete ? <DeleteProductButton id={product.id} csrfToken={csrfToken} label={tCommon('delete')} /> : null}
-                  </div>
+                  <ProductRowActions
+                    product={product}
+                    canWrite={canWrite}
+                    canDelete={canDelete}
+                    csrfToken={csrfToken}
+                    setModal={setModal}
+                  />
                 </td>
               </tr>
             ))}
@@ -164,6 +158,46 @@ export function ProductsClient({
             ) : null}
           </tbody>
         </table>
+
+        <div className="responsive-cards">
+          {items.map((product) => (
+            <div className="data-card" key={product.id}>
+              <div className="row" style={{ justifyContent: 'space-between', marginBottom: 'var(--space-2)' }}>
+                <span className="pill" data-tone={priorityTone(product.priority)}>
+                  {product.priority}
+                </span>
+                <span className="pill" data-tone="neutral">
+                  {product.status}
+                </span>
+              </div>
+              <div className="data-card-title">{product.product}</div>
+              <dl>
+                <div className="data-card-row">
+                  <dt>{t('colCommercial')}</dt>
+                  <dd>{product.commercialCategory}</dd>
+                </div>
+                <div className="data-card-row">
+                  <dt>{t('colKnowledge')}</dt>
+                  <dd>{product.knowledge}</dd>
+                </div>
+                <div className="data-card-row">
+                  <dt>{t('colStory')}</dt>
+                  <dd>{truncate(product.solutionStory, 90)}</dd>
+                </div>
+              </dl>
+              <div className="data-card-actions">
+                <ProductRowActions
+                  product={product}
+                  canWrite={canWrite}
+                  canDelete={canDelete}
+                  csrfToken={csrfToken}
+                  setModal={setModal}
+                />
+              </div>
+            </div>
+          ))}
+          {items.length === 0 ? <p className="empty-state">{tCommon('emptyState')}</p> : null}
+        </div>
       </div>
 
       <Pagination page={page} totalPages={totalPages} total={total} pageSize={pageSize} filterQuery={filterQuery} tCommon={tCommon} />
@@ -246,23 +280,110 @@ function Pagination({
   );
 }
 
-function DeleteProductButton({ id, csrfToken, label }: { id: number; csrfToken: string; label: string }) {
+/**
+ * The row-action buttons, shared between the table row and its responsive
+ * card-list counterpart -- one definition, so a permission change or a new
+ * action never needs updating in two places that could drift apart.
+ */
+function ProductRowActions({
+  product,
+  canWrite,
+  canDelete,
+  csrfToken,
+  setModal,
+}: {
+  product: Product;
+  canWrite: boolean;
+  canDelete: boolean;
+  csrfToken: string;
+  setModal: (state: ModalState) => void;
+}) {
+  const t = useTranslations('products');
   const tCommon = useTranslations('common');
+
+  return (
+    <div className="row">
+      {canWrite ? (
+        <>
+          <button type="button" onClick={() => setModal({ type: 'edit', product })}>
+            {tCommon('edit')}
+          </button>
+          <button type="button" onClick={() => setModal({ type: 'evidence', product })}>
+            {t('openEvidence')}
+          </button>
+          <button type="button" onClick={() => setModal({ type: 'story', product })}>
+            {t('openStory')}
+          </button>
+          <button type="button" onClick={() => setModal({ type: 'score', product })}>
+            {t('openScore')}
+          </button>
+        </>
+      ) : null}
+      {canDelete ? <DeleteProductButton id={product.id} csrfToken={csrfToken} label={tCommon('delete')} /> : null}
+    </div>
+  );
+}
+
+function DeleteProductButton({ id, csrfToken, label }: { id: number; csrfToken: string; label: string }) {
   return (
     <form
       action={async (formData) => {
         await removeProduct(formData);
       }}
-      onSubmit={(event) => {
-        if (!window.confirm(tCommon('confirmDelete'))) event.preventDefault();
-      }}
     >
       <input type="hidden" name={CSRF_FIELD} value={csrfToken} />
       <input type="hidden" name="id" value={id} />
-      <button type="submit" className="danger">
-        {label}
-      </button>
+      <ConfirmButton label={label} />
     </form>
+  );
+}
+
+function ExportCsvButton({
+  csrfToken,
+  filterQuery,
+  t,
+}: {
+  csrfToken: string;
+  filterQuery: Record<string, string>;
+  t: ReturnType<typeof useTranslations>;
+}) {
+  const toast = useToast();
+  const [exporting, setExporting] = useState(false);
+
+  async function handleExport() {
+    setExporting(true);
+    try {
+      const formData = new FormData();
+      formData.set(CSRF_FIELD, csrfToken);
+      for (const [key, value] of Object.entries(filterQuery)) {
+        formData.set(key, value);
+      }
+      const result = await exportProductsCsv(formData);
+      if (!result.ok || !result.csv) {
+        toast.show(result.message ?? 'Export failed.', 'error');
+        return;
+      }
+      // Prefix with a UTF-8 BOM: Excel on Windows otherwise guesses the
+      // system codepage and mangles CJK product names on open.
+      const blob = new Blob(['﻿', result.csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `product-catalog-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.show(`Exported ${result.count ?? 0} products.`, 'success');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  return (
+    <button type="button" onClick={handleExport} disabled={exporting}>
+      {exporting ? t('exportingCsv') : t('exportCsv')}
+    </button>
   );
 }
 
@@ -562,8 +683,6 @@ function EvidenceModal({ product, csrfToken, onClose }: { product: Product; csrf
     return () => {
       cancelled = true;
     };
-    // Runs once per product id; loadProductEvidence is a stable server action reference.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [product.id]);
 
   useEffect(() => {

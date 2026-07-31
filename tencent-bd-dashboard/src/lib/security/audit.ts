@@ -50,7 +50,8 @@ export type AuditAction =
   | 'catalog.sync.failed'
   | 'data.exported'
   | 'data.imported'
-  | 'data.reset';
+  | 'data.reset'
+  | 'security.csp-violation';
 
 export interface AuditInput {
   readonly action: AuditAction;

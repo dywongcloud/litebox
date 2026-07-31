@@ -5,6 +5,7 @@ import { useTranslations } from 'next-intl';
 
 import type { Motion } from '@/db/schema';
 import { CSRF_FIELD } from '@/lib/security/csrf-constants';
+import { ConfirmButton } from '@/components/ConfirmButton';
 import { Modal } from '@/components/Modal';
 import { TextAreaField, TextField } from '@/components/fields';
 import { SubmitButton } from '@/components/SubmitButton';
@@ -50,15 +51,10 @@ export function PlaybooksClient({ items, canWrite, csrfToken }: { items: Motion[
                   action={async (formData) => {
                     await removeMotion(formData);
                   }}
-                  onSubmit={(event) => {
-                    if (!window.confirm(tCommon('confirmDelete'))) event.preventDefault();
-                  }}
                 >
                   <input type="hidden" name={CSRF_FIELD} value={csrfToken} />
                   <input type="hidden" name="id" value={motion.id} />
-                  <button type="submit" className="danger">
-                    {tCommon('delete')}
-                  </button>
+                  <ConfirmButton label={tCommon('delete')} />
                 </form>
               </div>
             ) : null}

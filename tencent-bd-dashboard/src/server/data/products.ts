@@ -82,6 +82,16 @@ export function listProducts(filter: ProductFilter): ProductListResult {
   return { items, total: countRow?.count ?? 0, page: filter.page, pageSize: PAGE_SIZE };
 }
 
+/**
+ * All rows matching `filter`, unpaginated -- for CSV export, where the point
+ * is to hand back everything the on-screen filter currently matches, not one
+ * `PAGE_SIZE` page of it.
+ */
+export function listProductsForExport(filter: ProductFilter): Product[] {
+  const where = filterClause(filter);
+  return db.select().from(products).where(where).orderBy(asc(products.product)).all();
+}
+
 /** Distinct categories currently in use, for the filter dropdown. */
 export function listCategories(): string[] {
   const rows = db
@@ -160,7 +170,7 @@ export function replaceEvidence(
       .set({ ...fields, updatedAt: new Date() })
       .where(eq(products.id, productId))
       .run();
-  });
+  }, { behavior: 'immediate' });
 }
 
 /** Coverage KPI: share of P1 products that are at least "Reviewed". */

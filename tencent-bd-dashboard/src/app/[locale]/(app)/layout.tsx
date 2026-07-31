@@ -6,15 +6,16 @@ import * as session from '@/lib/auth/session';
 import { LocaleSwitcher } from '@/components/LocaleSwitcher';
 import { NavTabs } from '@/components/NavTabs';
 import { SignOutForm } from '@/components/SignOutForm';
+import { ToastProvider } from '@/components/Toast';
 
 /**
  * Chrome for every authenticated dashboard route: header, tab strip, and the
  * `<main>` content wrapper.
  *
  * This is a second, independent authentication check on top of the redirect
- * middleware already performs -- see the note in `src/middleware.ts` on why
- * the Edge layer cannot itself validate a session. This is the check that
- * actually grants or denies the page.
+ * `src/proxy.ts` already performs -- see the note there on why the Edge layer
+ * cannot itself validate a session. This is the check that actually grants or
+ * denies the page.
  */
 export default async function AppLayout({
   children,
@@ -34,7 +35,7 @@ export default async function AppLayout({
   const permissions = permissionsFor(active.user.role);
 
   return (
-    <>
+    <ToastProvider>
       <header className="app-header">
         <div className="app-header-row">
           <div>
@@ -42,7 +43,7 @@ export default async function AppLayout({
             <div className="sub">{t('subtitle')}</div>
           </div>
           <div className="app-actions">
-            <span className="small" style={{ color: '#b9c7db' }}>
+            <span className="small app-user-info">
               {t('signedInAs', { name: active.user.displayName || active.user.email })}
               {' · '}
               {t('role')}: {active.user.role}
@@ -56,6 +57,6 @@ export default async function AppLayout({
       <NavTabs grantedPermissions={permissions} isAdmin={active.user.role === 'admin'} />
 
       <main className="app-main">{children}</main>
-    </>
+    </ToastProvider>
   );
 }

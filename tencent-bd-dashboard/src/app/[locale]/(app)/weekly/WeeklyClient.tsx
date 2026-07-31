@@ -1,6 +1,6 @@
 'use client';
 
-import { useActionState, useEffect, useState } from 'react';
+import { useActionState, useState } from 'react';
 import { useTranslations } from 'next-intl';
 
 import { CSRF_FIELD } from '@/lib/security/csrf-constants';
@@ -60,10 +60,14 @@ function ReviewQuestion({ question, canWrite, csrfToken }: { question: QuestionD
   const t = useTranslations('weekly');
   const [state, formAction] = useActionState(saveReviewAnswer, initialState);
   const [expanded, setExpanded] = useState(false);
-
-  useEffect(() => {
+  // See the equivalent comment in AdminClient: collapsing on a new successful
+  // save is state derived from the action result, set during render instead
+  // of via an effect.
+  const [handledState, setHandledState] = useState(state);
+  if (state !== handledState) {
+    setHandledState(state);
     if (state.success) setExpanded(false);
-  }, [state.success]);
+  }
 
   return (
     <div>

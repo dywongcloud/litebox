@@ -1,15 +1,30 @@
 'use client';
 
-import { useActionState, useEffect, useState } from 'react';
+import { useActionState, useEffect, useMemo, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import {
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  PointerSensor,
+  closestCorners,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import type { DragEndEvent, DragOverEvent, DragStartEvent } from '@dnd-kit/core';
+import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 
 import { TODO_OWNERS, TODO_PRIORITIES, TODO_STATUSES } from '@/domain/enums';
 import type { TodoStatus } from '@/domain/enums';
 import type { Todo } from '@/db/schema';
 import { CSRF_FIELD } from '@/lib/security/csrf-constants';
+import { ConfirmButton } from '@/components/ConfirmButton';
 import { Modal } from '@/components/Modal';
 import { SelectField, TextAreaField, TextField } from '@/components/fields';
 import { SubmitButton } from '@/components/SubmitButton';
+import { useToast } from '@/components/Toast';
 import { moveTodoCard, removeTodo, saveTodo } from '@/server/actions/board';
 import type { FormActionState } from '@/server/actions/shared';
 
@@ -22,15 +37,101 @@ const COLUMN_LABELS: Record<TodoStatus, string> = {
   Done: 'colDone',
 };
 
+type ColumnState = Record<TodoStatus, number[]>;
+
+function groupByStatus(items: Todo[]): ColumnState {
+  const grouped = Object.fromEntries(TODO_STATUSES.map((status) => [status, [] as number[]])) as ColumnState;
+  for (const todo of items) grouped[todo.status].push(todo.id);
+  return grouped;
+}
+
+function containerOf(columns: ColumnState, id: number): TodoStatus | undefined {
+  return TODO_STATUSES.find((status) => columns[status].includes(id));
+}
+
 export function BoardClient({ items, canWrite, csrfToken }: { items: Todo[]; canWrite: boolean; csrfToken: string }) {
   const t = useTranslations('board');
   const tCommon = useTranslations('common');
+  const toast = useToast();
   const [modal, setModal] = useState<{ type: 'create' } | { type: 'edit'; todo: Todo } | null>(null);
 
-  const byStatus = Object.fromEntries(TODO_STATUSES.map((status) => [status, items.filter((i) => i.status === status)])) as Record<
-    TodoStatus,
-    Todo[]
-  >;
+  const todosById = useMemo(() => new Map(items.map((todo) => [todo.id, todo])), [items]);
+  const [columns, setColumns] = useState<ColumnState>(() => groupByStatus(items));
+  const [activeId, setActiveId] = useState<number | null>(null);
+
+  // The server is the source of truth: whenever a fresh `items` prop arrives
+  // (after a save, delete, or `revalidatePath` following a move), resync the
+  // local drag order to it during render -- this is the "adjusting state
+  // when a prop changes" case, not a side effect on an external system, so it
+  // does not belong in a `useEffect`. A drag in flight keeps its own
+  // optimistic order via onDragOver until onDragEnd persists and the next
+  // `items` prop takes back over here.
+  const [syncedItems, setSyncedItems] = useState(items);
+  if (items !== syncedItems) {
+    setSyncedItems(items);
+    setColumns(groupByStatus(items));
+  }
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  function handleDragStart(event: DragStartEvent) {
+    setActiveId(Number(event.active.id));
+  }
+
+  function handleDragOver(event: DragOverEvent) {
+    const { active, over } = event;
+    if (!over) return;
+
+    const activeId = Number(active.id);
+    const overId = String(over.id);
+
+    const from = containerOf(columns, activeId);
+    const to = (TODO_STATUSES as readonly string[]).includes(overId)
+      ? (overId as TodoStatus)
+      : containerOf(columns, Number(overId));
+    if (!from || !to || from === to) return;
+
+    setColumns((current) => {
+      const sourceIds = current[from].filter((id) => id !== activeId);
+      const overIndex = current[to].indexOf(Number(overId));
+      const insertAt = overIndex >= 0 ? overIndex : current[to].length;
+      const destIds = [...current[to]];
+      destIds.splice(insertAt, 0, activeId);
+      return { ...current, [from]: sourceIds, [to]: destIds };
+    });
+  }
+
+  async function handleDragEnd(event: DragEndEvent) {
+    setActiveId(null);
+    const { active, over } = event;
+    if (!over || !canWrite) return;
+
+    const id = Number(active.id);
+    const overId = String(over.id);
+    const status =
+      (TODO_STATUSES as readonly string[]).includes(overId) ? (overId as TodoStatus) : containerOf(columns, Number(overId));
+    if (!status) return;
+
+    const ids = columns[status];
+    const position = ids.includes(id) ? ids.indexOf(id) : ids.length;
+
+    const formData = new FormData();
+    formData.set(CSRF_FIELD, csrfToken);
+    formData.set('id', String(id));
+    formData.set('status', status);
+    formData.set('position', String(position));
+
+    const result = await moveTodoCard(formData);
+    if (!result.success) {
+      toast.show(result.message ?? 'Could not move that card.', 'error');
+      setColumns(groupByStatus(items));
+    }
+  }
+
+  const activeTodo = activeId !== null ? todosById.get(activeId) : undefined;
 
   return (
     <>
@@ -42,26 +143,54 @@ export function BoardClient({ items, canWrite, csrfToken }: { items: Todo[]; can
         </div>
       ) : null}
 
-      <div className="board">
-        {TODO_STATUSES.map((status) => (
-          <div className="board-col" key={status}>
-            <h3>{t(COLUMN_LABELS[status] as 'colBacklog')}</h3>
-            {byStatus[status].map((todo) => (
-              <TodoCard
-                key={todo.id}
-                todo={todo}
-                canWrite={canWrite}
-                csrfToken={csrfToken}
-                onEdit={() => setModal({ type: 'edit', todo })}
-              />
-            ))}
-            {byStatus[status].length === 0 ? <p className="small">{tCommon('emptyState')}</p> : null}
-          </div>
-        ))}
-      </div>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCorners}
+        onDragStart={handleDragStart}
+        onDragOver={handleDragOver}
+        onDragEnd={handleDragEnd}
+        onDragCancel={() => setActiveId(null)}
+      >
+        <div className="board">
+          {TODO_STATUSES.map((status) => (
+            <BoardColumn key={status} status={status} label={t(COLUMN_LABELS[status] as 'colBacklog')}>
+              <SortableContext items={columns[status]} strategy={verticalListSortingStrategy}>
+                {columns[status].map((id) => {
+                  const todo = todosById.get(id);
+                  if (!todo) return null;
+                  return (
+                    <TodoCard
+                      key={todo.id}
+                      todo={todo}
+                      canWrite={canWrite}
+                      csrfToken={csrfToken}
+                      onEdit={() => setModal({ type: 'edit', todo })}
+                    />
+                  );
+                })}
+              </SortableContext>
+              {columns[status].length === 0 ? <p className="small">{tCommon('emptyState')}</p> : null}
+            </BoardColumn>
+          ))}
+        </div>
+
+        <DragOverlay>
+          {activeTodo ? <TodoCard todo={activeTodo} canWrite={canWrite} csrfToken={csrfToken} onEdit={() => {}} overlay /> : null}
+        </DragOverlay>
+      </DndContext>
 
       {modal ? <TodoFormModal todo={modal.type === 'edit' ? modal.todo : undefined} csrfToken={csrfToken} onClose={() => setModal(null)} /> : null}
     </>
+  );
+}
+
+function BoardColumn({ status, label, children }: { status: TodoStatus; label: string; children: React.ReactNode }) {
+  const { setNodeRef, isOver } = useDroppable({ id: status });
+  return (
+    <div className="board-col" ref={setNodeRef} data-drop-active={isOver}>
+      <h3>{label}</h3>
+      {children}
+    </div>
   );
 }
 
@@ -75,18 +204,50 @@ function TodoCard({
   canWrite,
   csrfToken,
   onEdit,
+  overlay = false,
 }: {
   todo: Todo;
   canWrite: boolean;
   csrfToken: string;
   onEdit: () => void;
+  overlay?: boolean;
 }) {
   const t = useTranslations('board');
   const tCommon = useTranslations('common');
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: todo.id,
+    disabled: !canWrite || overlay,
+  });
+
+  const style = overlay
+    ? undefined
+    : {
+        transform: CSS.Transform.toString(transform),
+        transition,
+      };
 
   return (
-    <div className="todo-card" data-done={todo.status === 'Done'}>
-      <div className="todo-title">{todo.title}</div>
+    <div
+      className="todo-card"
+      data-done={todo.status === 'Done'}
+      data-dragging={isDragging}
+      ref={overlay ? undefined : setNodeRef}
+      style={style}
+    >
+      <div className="todo-card-head">
+        <div className="todo-title">{todo.title}</div>
+        {canWrite ? (
+          <button
+            type="button"
+            className="todo-drag-handle"
+            aria-label={t('dragHandle')}
+            {...attributes}
+            {...listeners}
+          >
+            ⠿
+          </button>
+        ) : null}
+      </div>
       <div className="meta">
         <span className="pill" data-tone="neutral">
           {todo.owner}
@@ -119,15 +280,10 @@ function TodoCard({
             action={async (formData) => {
               await removeTodo(formData);
             }}
-            onSubmit={(event) => {
-              if (!window.confirm(tCommon('confirmDelete'))) event.preventDefault();
-            }}
           >
             <input type="hidden" name={CSRF_FIELD} value={csrfToken} />
             <input type="hidden" name="id" value={todo.id} />
-            <button type="submit" className="danger">
-              {tCommon('delete')}
-            </button>
+            <ConfirmButton label={tCommon('delete')} />
           </form>
         </div>
       ) : null}
@@ -144,9 +300,9 @@ function MoveSelect({ todo, csrfToken }: { todo: Todo; csrfToken: string }) {
     >
       <input type="hidden" name={CSRF_FIELD} value={csrfToken} />
       <input type="hidden" name="id" value={todo.id} />
-      {/* Appends to the end of the target column; within-column reordering is
-          not exposed in this UI -- `position` still exists for a future drag
-          interaction to use without a data model change. */}
+      {/* Appends to the end of the target column; this is the keyboard- and
+          screen-reader-accessible alternative to the drag handle above, which
+          reorders within a column too but only via pointer or arrow keys. */}
       <input type="hidden" name="position" value={9999} />
       <select
         name="status"

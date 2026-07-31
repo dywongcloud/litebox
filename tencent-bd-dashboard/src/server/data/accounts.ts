@@ -58,11 +58,14 @@ export function getAccountResearch(accountId: number): AccountResearch | undefin
 }
 
 export function createAccount(values: NewAccount): Account {
+  // `immediate`: grabs the write lock up front rather than lazily on the
+  // first write, avoiding a deferred-transaction lock-upgrade deadlock under
+  // concurrent writers (see the fuller note in `catalog/sync.ts`).
   return db.transaction(() => {
     const account = db.insert(accounts).values(values).returning().get();
     db.insert(accountResearch).values({ accountId: account.id }).run();
     return account;
-  });
+  }, { behavior: 'immediate' });
 }
 
 export function updateAccount(id: number, values: Partial<NewAccount>): Account | undefined {
@@ -97,7 +100,7 @@ export function saveAccountResearch(
     // Touch the parent row so "last updated" on the pipeline table reflects
     // research edits too, not only pipeline-field edits.
     db.update(accounts).set({ updatedAt: new Date() }).where(eq(accounts.id, accountId)).run();
-  });
+  }, { behavior: 'immediate' });
 
   const result = getAccountResearch(accountId);
   if (!result) throw new Error('Account research row missing after save');

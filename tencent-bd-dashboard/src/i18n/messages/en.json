@@ -144,6 +144,8 @@
     "openScore": "Score",
     "syncCatalog": "Sync upstream catalog",
     "syncRunning": "Syncing...",
+    "exportCsv": "Export CSV",
+    "exportingCsv": "Exporting...",
     "syncNever": "Never synced",
     "syncLast": "Last synced {when} from {source}",
     "syncSuccess": "Sync complete: {created} created, {updated} updated, {seen} seen.",
@@ -364,7 +366,8 @@
     "editTitle": "Edit next step",
     "createTitle": "New next step",
     "overdue": "Overdue",
-    "dueToday": "Due today"
+    "dueToday": "Due today",
+    "dragHandle": "Drag to reorder, or use the status dropdown below"
   },
   "playbooks": {
     "heading": "Entry Playbooks",
