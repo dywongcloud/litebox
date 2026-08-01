@@ -184,19 +184,19 @@ enum PipeEndpoint {
     Write,
 }
 
-struct PipeCapacityReservation {
+/// Capacity charged to one counter for as long as this value is alive.
+struct CapacityCharge {
     reserved_capacity: Arc<AtomicUsize>,
     capacity: usize,
 }
 
-impl PipeCapacityReservation {
-    fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
-        let reserved_capacity = Arc::clone(&session.core.reserved_pipe_capacity);
+impl CapacityCharge {
+    fn new(reserved_capacity: Arc<AtomicUsize>, capacity: usize, limit: usize) -> Result<Self> {
         reserved_capacity
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved
                     .checked_add(capacity)
-                    .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
+                    .filter(|total| *total <= limit)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
         Ok(Self {
@@ -206,13 +206,54 @@ impl PipeCapacityReservation {
     }
 }
 
-impl Drop for PipeCapacityReservation {
+impl Drop for CapacityCharge {
     fn drop(&mut self) {
         self.reserved_capacity
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_sub(self.capacity)
             })
             .expect("reserved pipe capacity must include every live pipe");
+    }
+}
+
+/// Both capacity budgets one live pipe holds.
+///
+/// The per-session quota keeps one session from reserving the whole core-wide
+/// ceiling; the core-wide ceiling remains the backstop across all sessions.
+/// Both charges are released together when the pipe's shared state is dropped,
+/// which happens once the last reference to either endpoint is closed or its
+/// owning session is torn down.
+///
+/// Each counter is at every instant at least the total capacity of the live
+/// pipes it covers, because a charge is taken before the pipe state that owns
+/// it exists and released after that state is destroyed. The two charges are
+/// therefore not jointly atomic, and do not need to be: the only transient a
+/// concurrent creator can observe is over-counting, which can refuse it
+/// slightly too early but can never admit it too late.
+struct PipeCapacityReservation {
+    _session_charge: CapacityCharge,
+    _core_charge: CapacityCharge,
+}
+
+impl PipeCapacityReservation {
+    fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
+        // Charge the session first: a session already at its quota is rejected
+        // without touching the shared counter, and the `?` below releases this
+        // charge if the core-wide ceiling then rejects the pipe.
+        let session_charge = CapacityCharge::new(
+            Arc::clone(&session.reserved_pipe_capacity),
+            capacity,
+            session.core.limits.max_session_pipe_capacity,
+        )?;
+        let core_charge = CapacityCharge::new(
+            Arc::clone(&session.core.reserved_pipe_capacity),
+            capacity,
+            session.core.limits.max_total_pipe_capacity,
+        )?;
+        Ok(Self {
+            _session_charge: session_charge,
+            _core_charge: core_charge,
+        })
     }
 }
 
