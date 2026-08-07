@@ -7,6 +7,11 @@
 //! The actual NT syscall, PE loading, and Windows process environment support
 //! will be filled in piece by piece.
 
+// The NT guest ABI this shim implements is the x86-64 one throughout: the PE
+// loader, the syscall dispatch and the exception plumbing all speak it, and the
+// syscall rewriter's aarch64 support covers Linux ELF images only. Every runner
+// above this crate is already gated the same way.
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 
 extern crate alloc;

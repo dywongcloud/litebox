@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// This broker speaks the Linux host transport (`memfd` shared memory and
+// `SCM_RIGHTS` over Unix sockets), which `litebox_broker_transport_linux_userland`
+// confines to Linux, so the whole crate follows it there.
+#![cfg(target_os = "linux")]
+
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};

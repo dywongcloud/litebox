@@ -1737,6 +1737,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_platform_macos_userland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_util_log",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_platform_multiplex"
 version = "0.1.0"
 dependencies = [
@@ -1745,6 +1756,7 @@ dependencies = [
  "litebox_platform_linux_kernel",
  "litebox_platform_linux_userland",
  "litebox_platform_lvbs",
+ "litebox_platform_macos_userland",
  "litebox_platform_windows_userland",
  "once_cell",
 ]
@@ -1896,6 +1908,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_platform_linux_userland",
+ "litebox_platform_macos_userland",
  "litebox_platform_windows_userland",
  "litebox_syscall_rewriter",
  "litebox_util_log",

@@ -1,7 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#[cfg(target_arch = "x86_64")]
+// See the OCI dependency block in Cargo.toml for why these are the hosts
+// that can pull images.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
 pub mod oci;
 
 use anyhow::{Context, bail};
@@ -93,14 +98,20 @@ fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
 /// Run the packaging tool.
 pub fn run(args: CliArgs) -> anyhow::Result<()> {
     if let Some(ref image_ref) = args.oci_image {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_vendor = "apple")
+        ))]
         {
             return run_oci(image_ref, &args);
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_vendor = "apple")
+        )))]
         {
             let _ = image_ref;
-            bail!("--oci-image is only supported on x86_64");
+            bail!("--oci-image is only supported on x86-64 hosts and Apple Silicon");
         }
     }
 
@@ -263,7 +274,10 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
 }
 
 /// Run the packager in OCI mode: pull image, extract rootfs, rewrite ELFs, build tar.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
 fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     // --- Phase 1: Pull and extract OCI image ---
     eprintln!("Pulling OCI image: {image_ref}");

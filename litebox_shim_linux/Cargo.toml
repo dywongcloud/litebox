@@ -33,6 +33,9 @@ tempfile = "3"
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0" }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland/", version = "0.1.0" }
+
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 litebox_platform_windows_userland = { path = "../litebox_platform_windows_userland/", version = "0.1.0" }
 

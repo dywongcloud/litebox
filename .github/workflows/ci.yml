@@ -105,6 +105,44 @@ jobs:
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox -p litebox_common_linux
           ./.github/tools/github_actions_run_cargo build -p litebox -p litebox_common_linux
           ./.github/tools/github_actions_run_cargo nextest -p litebox -p litebox_common_linux
+      - name: Build the Linux shim for AArch64
+        run: |
+          ./.github/tools/github_actions_run_cargo clippy --all-features -p litebox_shim_linux --lib
+          ./.github/tools/github_actions_run_cargo build -p litebox_shim_linux --lib
+          # Only the library: the shim's unit tests need a concrete platform, and
+          # `litebox_platform_linux_userland` is still x86-64 only.
+
+  build_and_test_macos:
+    name: Build and Test macOS (Apple Silicon)
+    # `macos-14` and later are AArch64 runners. LiteBox runs guest instructions
+    # natively, so an Apple Silicon host is only useful to an AArch64 guest --
+    # there is deliberately no x86-64 macOS configuration.
+    runs-on: macos-14
+    env:
+      RUSTFLAGS: -Dwarnings
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target aarch64-apple-darwin
+      - name: Set up Nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      # `litebox_runner_lvbs` and `litebox_runner_snp` are freestanding images
+      # built for custom targets; they are not built for a hosted target on any
+      # platform.
+      - run: cargo clippy --locked --verbose --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland
+      - run: cargo build --locked --verbose --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland
+      # The 9p tests need `diod`, which has no macOS package.
+      - run: cargo nextest run --locked --profile ci -p litebox -p litebox_common_linux -E 'not test(nine_p)'
+      - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
+      - run: cargo test --locked --verbose --doc -p litebox -p litebox_common_linux -p litebox_platform_macos_userland
+      - name: Build documentation (fail on warnings)
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
 
   build_and_test_lvbs:
     name: Build and Test LVBS

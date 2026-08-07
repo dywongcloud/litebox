@@ -18,6 +18,8 @@ const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 /// hard-wired to one.
 #[cfg(target_os = "linux")]
 pub(crate) use litebox_platform_linux_userland::LinuxUserland as TestPlatform;
+#[cfg(target_os = "macos")]
+pub(crate) use litebox_platform_macos_userland::MacOsUserland as TestPlatform;
 #[cfg(target_os = "windows")]
 pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatform;
 
@@ -27,6 +29,10 @@ pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatf
     PLATFORM.get_or_init(|| {
         // Only the Linux userland platform takes a tun device name.
         #[cfg(target_os = "linux")]
+        {
+            TestPlatform::new(tun_device_name)
+        }
+        #[cfg(target_os = "macos")]
         {
             TestPlatform::new(tun_device_name)
         }

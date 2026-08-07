@@ -688,7 +688,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
+        // `st_size` is pointer-width and unsigned in the x86-64 `struct stat`,
+        // and a signed 64-bit field in the generic layout aarch64 uses.
+        #[cfg(target_arch = "x86_64")]
         let file_size = stat.st_size;
+        #[cfg(target_arch = "aarch64")]
+        let Ok(file_size) = usize::try_from(stat.st_size) else {
+            return (false, 0, 0, 0);
+        };
         if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }
@@ -1125,11 +1132,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::{
-        fs::{Mode, OFlags},
-        platform::PageManagementProvider,
-    };
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox::fs::{Mode, OFlags};
+    // Only `test_collision_with_global_allocator` needs these, and it is gated to
+    // the hosts whose allocator layout it knows.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use litebox::platform::PageManagementProvider;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use litebox_common_linux::MRemapFlags;
+    use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};

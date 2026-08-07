@@ -5,10 +5,11 @@ use crate::ShimPlatform;
 use crate::UserPtrMut;
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use core::mem::offset_of;
+use litebox::shim::{Exception, ExceptionInfo};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
     PtRegs,
-    signal::{SaFlags, SigAction, Siginfo, Ucontext, x86_64::Sigcontext},
+    signal::{SaFlags, SigAction, Siginfo, Signal, Ucontext, x86_64::Sigcontext},
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -18,6 +19,34 @@ struct SignalFrame {
     return_address: usize,
     ucontext: Ucontext,
     siginfo: Siginfo,
+}
+
+/// State recorded for a thread that has taken no exception yet.
+pub(super) const NO_EXCEPTION: ExceptionInfo = ExceptionInfo {
+    exception: Exception(0),
+    error_code: 0,
+    cr2: 0,
+    kernel_mode: false,
+};
+
+/// Maps an x86 exception vector to the signal Linux raises for it, together
+/// with the address reported in the accompanying `si_addr`.
+pub(super) fn exception_signal(info: &ExceptionInfo) -> (Signal, usize) {
+    let signal = match info.exception {
+        Exception::DIVIDE_ERROR => Signal::SIGFPE,
+        Exception::BREAKPOINT => Signal::SIGTRAP,
+        Exception::INVALID_OPCODE => Signal::SIGILL,
+        // Page faults and unknown exceptions map to SIGSEGV. There may be
+        // more appropriate signals in some other cases (e.g., SIGBUS).
+        _ => Signal::SIGSEGV,
+    };
+    // Only a page fault carries a faulting address.
+    let fault_address = if info.exception == Exception::PAGE_FAULT {
+        info.cr2
+    } else {
+        0
+    };
+    (signal, fault_address)
 }
 
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {

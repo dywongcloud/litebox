@@ -138,6 +138,36 @@ pub struct LinuxShimEntrypoints<Platform: ShimPlatform, FS: ShimFS> {
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
+/// Decodes a host exception into the pair the memory manager needs to service a
+/// demand fault -- the faulting address and the architecture's raw fault status
+/// word -- or `None` when the exception is not a memory fault at all.
+///
+/// x86-64 reports the address in `CR2` and the status in the hardware error
+/// code; aarch64 reports them in `FAR_EL1` and `ESR_EL1`. Both are opaque here:
+/// the platform's [`VmemPageFaultHandler`](litebox::mm::linux::VmemPageFaultHandler)
+/// is what decodes the status word.
+#[cfg(target_arch = "x86_64")]
+fn page_fault_info(info: &litebox::shim::ExceptionInfo) -> Option<(usize, u64)> {
+    (info.exception == litebox::shim::Exception::PAGE_FAULT)
+        .then(|| (info.cr2, u64::from(info.error_code)))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn page_fault_info(info: &litebox::shim::ExceptionInfo) -> Option<(usize, u64)> {
+    use litebox::shim::Exception;
+
+    // Both abort classes are memory faults; the current-EL variants are the
+    // ones raised by LiteBox's own accesses to guest memory.
+    let is_abort = matches!(
+        info.exception,
+        Exception::DATA_ABORT_CURRENT_EL
+            | Exception::DATA_ABORT_LOWER_EL
+            | Exception::INSTRUCTION_ABORT_CURRENT_EL
+            | Exception::INSTRUCTION_ABORT_LOWER_EL
+    );
+    is_abort.then_some((info.fault_address, info.esr))
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
     for LinuxShimEntrypoints<Platform, FS>
 {
@@ -156,12 +186,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
+        if info.kernel_mode
+            && let Some((fault_address, error_code)) = page_fault_info(info)
+        {
             if unsafe {
                 self.task
                     .global
                     .pm
-                    .handle_page_fault(info.cr2, info.error_code.into())
+                    .handle_page_fault(fault_address, error_code)
             }
             .is_ok()
             {
@@ -577,6 +609,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             ctx.rax = return_value;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // The aarch64 Linux syscall ABI returns in x0.
+            ctx.regs[0] = return_value;
+        }
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
@@ -589,6 +626,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+        // The aarch64 Linux syscall ABI passes the number in x8, which the entry
+        // path records in `pt_regs::syscallno`. Sign-extending keeps an
+        // out-of-range value (the kernel writes -1 for "no syscall") looking the
+        // same as it does in x86-64's `orig_rax`, so the dispatch below rejects
+        // it identically on both architectures.
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = (ctx.syscallno as isize).reinterpret_as_unsigned();
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
         match request {
@@ -1022,7 +1066,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
-            #[cfg(target_arch = "x86_64")]
+            // Reached through `newfstatat` on x86-64 and `fstatat` on aarch64,
+            // where it is the only path-based stat syscall the kernel offers.
             SyscallRequest::Newfstatat {
                 dirfd,
                 pathname,
@@ -1082,6 +1127,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     let _ = user_desc;
                     Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // aarch64 has no `set_thread_area` either; the thread
+                    // pointer is `TPIDR_EL0`, set through `clone`'s `tls`
+                    // argument.
+                    let _ = user_desc;
+                    Err(Errno::ENOSYS)
                 }
             }
             SyscallRequest::SetTidAddress { tidptr } => {

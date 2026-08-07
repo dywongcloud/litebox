@@ -34,6 +34,19 @@ macro_rules! ex_table_section {
     };
 }
 
+#[cfg(target_vendor = "apple")]
+macro_rules! ex_table_section {
+    () => {
+        // Mach-O spells a section as `segment,section[,type[,attributes]]`.
+        // `__TEXT` keeps the table read-only (the entries are link-time-resolved
+        // relative offsets, so no runtime relocation is needed), matching where
+        // the platform ABI already puts `__gcc_except_tab`. `no_dead_strip` is
+        // the Mach-O counterpart of ELF's `R` (retain) flag: the entries carry
+        // no symbol of their own, so without it the linker would drop them.
+        "__TEXT,__ex_table,regular,no_dead_strip"
+    };
+}
+
 macro_rules! ex_table_entry {
     ($start:tt, $stop:tt, $recover:tt) => {
         concat!(
@@ -333,6 +346,74 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
             STOP_EX_TABLE
                 .as_ptr()
                 .offset_from_unsigned(START_EX_TABLE.as_ptr()),
+        )
+    }
+}
+
+/// Returns the exception table, found by locating the Mach-O section through
+/// the current image's load commands.
+///
+/// Mach-O has no linker-synthesized `__start_`/`__stop_` pair for an arbitrary
+/// section, so the table is located the same way the Windows path locates its
+/// PE section: from the image headers at runtime. `__dso_handle` is the Mach-O
+/// header of the image this code was linked into, and `getsectiondata` walks
+/// its load commands and applies the slide.
+#[cfg(target_vendor = "apple")]
+#[expect(clippy::cast_ptr_alignment)]
+fn exception_table() -> &'static [ExceptionTableEntry] {
+    unsafe extern "C" {
+        /// This image's Mach-O header. Rust prefixes Mach-O symbols with `_`,
+        /// so this resolves to `___dso_handle`, the symbol the linker
+        /// synthesizes for every image.
+        static __dso_handle: u8;
+
+        /// `<mach-o/getsect.h>`: yields the in-memory address (slide applied)
+        /// and size of `segname,sectname` within the image at `mhp`, or null
+        /// when the image has no such section.
+        fn getsectiondata(
+            mhp: *const u8,
+            segname: *const core::ffi::c_char,
+            sectname: *const core::ffi::c_char,
+            size: *mut core::ffi::c_ulong,
+        ) -> *mut u8;
+    }
+
+    // Ensure the section exists even if no recovery descriptors get generated.
+    //
+    // SAFETY: just a no-op asm block to force the section to be created.
+    unsafe {
+        core::arch::asm!(concat!(
+            ".pushsection ",
+            ex_table_section!(),
+            "\n",
+            ".popsection"
+        ));
+    }
+
+    let mut size: core::ffi::c_ulong = 0;
+    // SAFETY: `__dso_handle` is this image's Mach-O header, both names are
+    // NUL-terminated, and `getsectiondata` only reads the image's load
+    // commands. It reports a null base for an absent section.
+    let start = unsafe {
+        getsectiondata(
+            &raw const __dso_handle,
+            c"__TEXT".as_ptr(),
+            c"__ex_table".as_ptr(),
+            &raw mut size,
+        )
+    };
+    if start.is_null() {
+        // No recovery descriptors.
+        return &[];
+    }
+    let size = usize::try_from(size).expect("a section is never larger than the address space");
+    assert_eq!(size % size_of::<ExceptionTableEntry>(), 0);
+    // SAFETY: this section is made up solely of `ExceptionTableEntry` entries,
+    // each `.balign 4`-ed by `ex_table_entry!` to the type's alignment.
+    unsafe {
+        core::slice::from_raw_parts(
+            start.cast::<ExceptionTableEntry>(),
+            size / size_of::<ExceptionTableEntry>(),
         )
     }
 }

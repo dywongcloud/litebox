@@ -17,8 +17,24 @@ use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 
-/// Page size in bytes
+/// Page size in bytes.
+///
+/// This is the granularity at which LiteBox maps, unmaps and re-protects guest
+/// memory, so it has to be at least the host's own page size -- a host kernel
+/// rejects a fixed mapping or a protection change that is not aligned to it.
+///
+/// Apple Silicon uses 16 KiB pages, so a macOS/aarch64 host needs the larger
+/// value; every other supported host uses 4 KiB. The guest sees this through
+/// `AT_PAGESZ`, which is exactly how a Linux kernel configured for 16 KiB or
+/// 64 KiB pages reports itself, and aarch64 ELF images are conventionally
+/// linked with a 64 KiB maximum page size so their segments stay aligned either
+/// way.
+#[cfg(not(all(target_vendor = "apple", target_arch = "aarch64")))]
 pub const PAGE_SIZE: usize = 4096;
+
+/// Page size in bytes. See the 4 KiB definition for details.
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+pub const PAGE_SIZE: usize = 16384;
 
 bitflags::bitflags! {
     /// Flags to describe the properties of a memory region.

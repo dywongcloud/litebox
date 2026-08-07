@@ -1253,7 +1253,13 @@ where
         st_gid: 0,
         st_rdev: 0,
         st_size: 0,
+        // The x86-64 `struct stat` declares `st_blksize` as a signed word the
+        // width of a pointer; the generic layout aarch64 uses declares it as a
+        // plain `int`. Both are wide enough for any block size LiteBox reports.
+        #[cfg(target_arch = "x86_64")]
         st_blksize: blksize,
+        #[cfg(target_arch = "aarch64")]
+        st_blksize: blksize.reinterpret_as_signed().trunc(),
         st_blocks: 0,
         ..Default::default()
     };

@@ -48,7 +48,15 @@ pub enum ArchSpecificRegister {
 /// Architecture-specific registers for AArch64.
 #[cfg(target_arch = "aarch64")]
 #[non_exhaustive]
-pub enum ArchSpecificRegister {}
+pub enum ArchSpecificRegister {
+    /// The guest's thread pointer, `TPIDR_EL0`.
+    ///
+    /// This is the aarch64 counterpart of x86-64's `FsBase`. The platform keeps
+    /// the hardware register as its own per-thread anchor and virtualizes the
+    /// guest's view of it into a platform-managed slot, so a shim reaches the
+    /// guest value through here rather than by executing `MRS`/`MSR` itself.
+    TpidrEl0,
+}
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.
 #[non_exhaustive]

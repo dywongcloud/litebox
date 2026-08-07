@@ -15,6 +15,7 @@ LiteBox exposes a Rust-y [`nix`](https://docs.rs/nix)/[`rustix`](https://docs.rs
 
 Example use cases include:
 - Running unmodified Linux programs on Windows
+- Running unmodified Linux programs on macOS (Apple Silicon) -- see [docs/macos.md](./docs/macos.md)
 - Sandboxing Linux applications on Linux
 - Run programs on top of SEV SNP
 - Running OP-TEE programs on Linux

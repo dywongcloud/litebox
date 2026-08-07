@@ -70,7 +70,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::ReadAt
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
+        // `st_size` is unsigned and pointer-width in the x86-64 `struct stat`
+        // and a signed 64-bit field in the generic layout aarch64 uses; a
+        // negative file size is not representable either way.
+        let size = self.task.sys_fstat(self.fd)?.st_size;
+        u64::try_from(size).map_err(|_| Errno::EINVAL)
     }
 }
 

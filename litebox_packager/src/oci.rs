@@ -94,6 +94,19 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     }
 
     // Create async runtime for the OCI client (which is async-based)
+    #[allow(
+        clippy::items_after_statements,
+        reason = "kept next to its only caller below"
+    )]
+    /// The OCI architecture name for the host LiteBox is running on.
+    fn host_image_arch() -> oci_spec::image::Arch {
+        if cfg!(target_arch = "aarch64") {
+            oci_spec::image::Arch::ARM64
+        } else {
+            oci_spec::image::Arch::Amd64
+        }
+    }
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -102,14 +115,17 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     let image_data = rt.block_on(async {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
-            // Always pull linux/amd64 images regardless of host platform.
+            // Pull the Linux image whose architecture matches the host. LiteBox
+            // runs guest instructions natively rather than emulating them, so a
+            // guest of any other architecture could not execute here -- pulling
+            // one would only defer the failure to run time.
             platform_resolver: Some(Box::new(|entries| {
                 entries
                     .iter()
                     .find(|entry| {
                         entry.platform.as_ref().is_some_and(|p| {
                             p.os == oci_spec::image::Os::Linux
-                                && p.architecture == oci_spec::image::Arch::Amd64
+                                && p.architecture == host_image_arch()
                         })
                     })
                     .map(|e| e.digest.clone())

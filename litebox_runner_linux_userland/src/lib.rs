@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// Restrict this crate to the host its platform supports. `litebox_platform_linux_userland`
+// is itself gated to x86-64 Linux, so on anything else this runner has no platform to
+// drive and compiles to nothing.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};

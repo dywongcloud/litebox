@@ -29,11 +29,17 @@ extern crate alloc;
 cfg_if::cfg_if! {
     if #[cfg(all(feature = "platform_linux_userland", target_os = "linux"))] {
         pub type Platform = litebox_platform_linux_userland::LinuxUserland;
+    } else if #[cfg(all(feature = "platform_macos_userland", target_os = "macos"))] {
+        pub type Platform = litebox_platform_macos_userland::MacOsUserland;
     } else if #[cfg(all(feature = "platform_windows_userland", target_os = "windows"))] {
         pub type Platform = litebox_platform_windows_userland::WindowsUserland;
-    } else if #[cfg(feature = "platform_lvbs")] {
+    // LVBS and SNP exist only on x86-64; without the architecture guard a build
+    // for another one silently selects a platform whose whole crate is
+    // configured out, and fails with an unresolved-module error instead of the
+    // hint below.
+    } else if #[cfg(all(feature = "platform_lvbs", target_arch = "x86_64"))] {
         pub type Platform = litebox_platform_lvbs::host::LvbsLinuxKernel;
-    } else if #[cfg(feature = "platform_linux_snp")] {
+    } else if #[cfg(all(feature = "platform_linux_snp", target_arch = "x86_64"))] {
         pub type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
     } else {
         compile_error!(

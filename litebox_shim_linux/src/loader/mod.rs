@@ -2,8 +2,14 @@
 // Licensed under the MIT license.
 
 //! This module contains the loader for the LiteBox shim.
+//!
+//! Nothing in here is architecture-specific: segment mapping, the auxiliary
+//! vector and the initial stack layout are all defined by the generic
+//! System V/Linux ABI, and the ELF machine type is carried by the image rather
+//! than assumed. The module is therefore built for every architecture the rest
+//! of the shim supports, so an aarch64 host gets the same loader an x86-64 host
+//! does.
 
-#![cfg(target_arch = "x86_64")]
 pub mod auxv;
 pub mod elf;
 mod stack;
