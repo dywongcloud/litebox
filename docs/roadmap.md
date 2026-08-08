@@ -73,18 +73,21 @@ subsystem.
   per-thread part comes from `TPIDRRO_EL0`, which is already per-thread, so this
   design stays compatible with per-thread guest TPs rather than foreclosing them.
 
-  What remains: a macOS loader must write `guest_tp_slot_byte_offset()` (the
-  reserved `pthread_key_create` key scaled by 8, exposed by
-  `litebox_platform_macos_userland`) into that header slot, the same way
-  `load_trampoline` already writes the syscall entry point at offset 0. Until it
-  does, the rewriter's packaging-time seed stands, so gates behave exactly as the
-  old baked-immediate ones did rather than addressing offset 0 -- which would be
-  pthread TSD slot 0, live libpthread state. Nothing reaches this path in
-  production today: no macOS runner wires `MacOsUserland` into
-  `litebox_shim_linux` yet.
+  **The loader half has landed too.** `SystemInfoProvider::get_guest_tp_slot_offset`
+  reports the offset a host decides at run time (`None` on every host that bakes
+  it in); `litebox_platform_macos_userland` answers with
+  `guest_tp_slot_byte_offset()`, the reserved `pthread_key_create` key scaled by
+  8. `litebox_common_linux`'s `load_trampoline` publishes it into the header slot
+  in the same window it already writes the syscall entry point -- while the
+  trampoline is still writable and before the flip to read+execute. That window
+  is the only correct place for it. `litebox_common_linux` cannot depend on the
+  rewriter, so `litebox_shim_linux` holds the two slot constants together with a
+  `const` assertion rather than a comment.
 
-  Also still needed for a `TPIDR_EL0`-using guest: `pthread_setspecific` of each
-  guest thread's pointer into the reserved key.
+  What remains for a `TPIDR_EL0`-using guest: `pthread_setspecific` of each guest
+  thread's pointer into the reserved key, and a macOS runner to exercise any of
+  it -- none wires `MacOsUserland` into `litebox_shim_linux` today, so this whole
+  path is still unexercised end to end on hardware.
 * **The platform's *own* per-thread context-switch bookkeeping** — a separate
   problem from the rewriter's guest slot above. Studying
   `litebox_platform_linux_userland`'s x86_64
@@ -172,6 +175,33 @@ Linux binary runs."
   three hand-written struct layouts the fault handler depends on. Anything
   else hand-written against Darwin/Mach headers in the future should get the
   same treatment rather than trusting a one-time reading of the headers.
+
+## The test suite's own macOS gaps
+
+Running `cargo test` on an Apple Silicon machine surfaced defects in the tests
+rather than in the code they cover. Three are fixed; one is not.
+
+* **Fixed:** the globals ratchet listed no prefix for
+  `litebox_platform_macos_userland`, so the check failed on three files and
+  `cargo test` could not pass on any macOS machine. The copyright check had no
+  header rule for the vendored `tencent-bd-dashboard/` tree (135 TypeScript/TSX
+  files), which is not LiteBox's to license; it is skipped by directory now.
+  `litebox/src/mm/tests.rs` hardcoded the Linux `TASK_ADDR_MIN`, which is below
+  `__PAGEZERO` on arm64 Mach-O, so every mapping failed with `BelowMinAddress`;
+  it derives the floor from the backend now. The 9P tests drive a real `diod`
+  server, packaged for Linux only, and panicked on the missing binary rather than
+  testing anything -- they are gated to Linux.
+
+* **Not fixed: `litebox_shim_linux`'s mm tests assume 4 KiB pages.**
+  `test_mremap` and five neighbours pass literal `0x1000`/`0x2000` sizes, which
+  are page-sized only where `PAGE_SIZE` is 4096. Apple Silicon's is 16384, so the
+  arithmetic these assertions encode does not hold and six tests fail
+  deterministically. The fix is to derive each size from `PAGE_SIZE` rather than
+  to adjust the literals, since the same tests must keep passing on both hosts.
+  A further one or two failures on top of those six are *flaky*, not
+  page-size-related: repeated runs of an unchanged tree produced 6, 7 and 8
+  failures, and each extra test passes in isolation, so something in that module
+  shares process-wide address-space state across concurrently running tests.
 
 ## Needs a real multi-threaded guest to exercise
 

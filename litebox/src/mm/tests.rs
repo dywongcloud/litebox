@@ -89,7 +89,14 @@ fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>
 
 #[test]
 fn test_vmm_mapping() {
-    let start_addr: usize = 0x1_0000;
+    // Anchored to the backend's own floor rather than a literal, because that
+    // floor is host-dependent: an arm64 Mach-O process reserves the first 4 GiB
+    // as `__PAGEZERO`, so the Linux value this used to hardcode is not a mappable
+    // address there and every insert failed with `BelowMinAddress`. The hex in
+    // the comments below traces the Linux base; on another host the same layout
+    // sits at that host's floor.
+    let start_addr: usize =
+        <DummyVmemBackend as crate::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN;
     let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
     let mut vmm = Vmem::new(&DummyVmemBackend);
 

@@ -12,6 +12,16 @@ use litebox::{
 use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
 use thiserror::Error;
 
+/// The loader and the rewriter must name the same word for the guest
+/// thread-pointer offset. `litebox_common_linux` cannot depend on the rewriter,
+/// so this crate -- which depends on both -- is where the two are held together.
+/// A drift here would make the loader publish the offset into the middle of an
+/// instruction instead of into the slot the gates read.
+const _: () = assert!(
+    litebox_common_linux::loader::TRAMPOLINE_GUEST_TP_SLOT_OFFSET
+        == litebox_syscall_rewriter::TRAMPOLINE_GUEST_TP_SLOT_OFFSET
+);
+
 use crate::{
     UserPtrMut,
     loader::auxv::{AuxKey, AuxVec},
@@ -212,7 +222,8 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         // (UnpatchedBinary error), the runtime patching during mmap will patch
         // code segments as they are mapped.
         if syscall_entry_point != 0 {
-            match parsed.parse_trampoline(&mut &file, syscall_entry_point) {
+            let guest_tp_slot_offset = task.global.platform.get_guest_tp_slot_offset();
+            match parsed.parse_trampoline(&mut &file, syscall_entry_point, guest_tp_slot_offset) {
                 Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
                     // Ok: pre-patched trampoline found, or unpatched binary
                     // that the runtime mmap hook will handle.

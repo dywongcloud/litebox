@@ -30,7 +30,12 @@ mod fcall;
 
 pub mod transport;
 
-#[cfg(test)]
+// Every test in here drives a real `diod` 9P server as a child process, and
+// `diod` is packaged for Linux only -- the harness's own failure message says
+// `apt install diod`. Building them on another host produced 25 tests that
+// panicked on a missing binary rather than reporting anything about the 9P
+// client, which meant `cargo test` could not pass on a macOS machine at all.
+#[cfg(all(test, target_os = "linux"))]
 mod tests;
 
 const DEVICE_ID: usize = u32::from_le_bytes(*b"NINE") as usize;

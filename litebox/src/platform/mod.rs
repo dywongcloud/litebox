@@ -522,6 +522,20 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// The byte offset from this host's per-thread anchor register at which the
+    /// runtime keeps the guest thread pointer.
+    ///
+    /// Returns `None` on a host whose rewritten guest images already carry that
+    /// offset as an immediate, which is every host that can decide the number
+    /// when the image is packaged. A host returns `Some` only when the number is
+    /// a property of the running process rather than of the image -- macOS, where
+    /// the slot is a pthread TSD key whose value depends on the runner binary's
+    /// own startup sequence. A loader writes it into the trampoline so the gates
+    /// read the slot the runtime actually reserved.
+    fn get_guest_tp_slot_offset(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A provider for thread-local storage.

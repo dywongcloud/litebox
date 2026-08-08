@@ -36,7 +36,15 @@ fn ratchet_globals() -> Result<()> {
             ("dev_bench/", 1),
             ("litebox_broker_core/", 1),
             ("litebox_broker_transport_linux_userland/", 1),
-            ("litebox/", 9),
+            // 10, not 9: the macOS port added `extern "C" { static __dso_handle }`
+            // to `litebox/src/mm/exception_table.rs`. Mach-O has no
+            // linker-synthesized bounds for an arbitrary section, so the
+            // exception table is found via `getsectiondata` off the image
+            // handle. It is a link-time symbol reference, not the mutable global
+            // state this ratchet exists to discourage; the heuristic counts any
+            // line starting with `static`, including the two extern table bounds
+            // already in this count.
+            ("litebox/", 10),
             ("litebox_platform_linux_kernel/", 6),
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 24),
@@ -46,7 +54,10 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),
-            ("litebox_shim_optee/", 4),
+            // 5, not 4: `static INIT_FUNC` arrived with the OP-TEE syscall
+            // support in 071841e and the table was never updated, so this count
+            // has been stale since well before the macOS work.
+            ("litebox_shim_optee/", 5),
             ("litebox_shim_windows/", 1),
         ],
         |file| {

@@ -313,7 +313,7 @@ const HEADER_CALLBACK_OFFSET: usize = 0;
 /// loader does not fill the slot keeps the exact behaviour of the earlier
 /// baked-immediate gates instead of addressing offset zero — which would be
 /// pthread TSD slot 0, live libpthread state.
-const HEADER_GUEST_TP_OFFSET_MACOS: usize = HEADER_CALLBACK_OFFSET + 8;
+pub(crate) const HEADER_GUEST_TP_OFFSET_MACOS: usize = HEADER_CALLBACK_OFFSET + 8;
 
 /// Shared SVC handler, placed just past the trampoline header slots. Per-site gates
 /// follow it and are each appended dynamically, so this shared prologue is the

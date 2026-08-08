@@ -25,6 +25,12 @@ fn copyright_header() -> Result<()> {
         if skipped_files.contains(file.as_os_str()) {
             continue;
         }
+        if SKIP_DIRS
+            .iter()
+            .any(|dir| file.to_string_lossy().starts_with(dir))
+        {
+            continue;
+        }
         let Some(ext) = file.extension() else {
             errors.push(format!("extension-less file {file:?}"));
             continue;
@@ -142,4 +148,20 @@ const SKIP_FILES: &[&str] = &[
     "litebox_syscall_rewriter/tests/hello",
     "litebox_syscall_rewriter/tests/hello-32",
     "litebox_syscall_rewriter/tests/hello-aarch64",
+];
+
+/// Directory prefixes holding source that is not LiteBox's to license.
+///
+/// LiteBox's header rule says every source file carries the Microsoft copyright.
+/// That is a claim about authorship, so it can only be applied to trees this
+/// repository actually owns; stamping it across vendored third-party source
+/// would assert something untrue. Skipping by prefix rather than by listing each
+/// file keeps a vendored tree from having to be re-enumerated whenever it gains
+/// a file.
+const SKIP_DIRS: &[&str] = &[
+    // A separate Next.js/TypeScript application that lives in this repository
+    // but is not part of LiteBox: no LiteBox crate builds, links, or tests
+    // against it. Its ~135 files are TypeScript, TSX and JavaScript, none of
+    // which the header table above describes.
+    "tencent-bd-dashboard/",
 ];

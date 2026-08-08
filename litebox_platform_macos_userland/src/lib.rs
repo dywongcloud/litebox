@@ -982,6 +982,14 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
         // because the kernel's fallback trampoline lives in the vDSO.
         None
     }
+
+    fn get_guest_tp_slot_offset(&self) -> Option<usize> {
+        // `Host::MacOs` gates read this offset from the trampoline rather than
+        // carrying it as an immediate, because the TSD key backing it is handed
+        // out by `pthread_key_create` in this process and is not knowable to the
+        // rewriter that packaged the image.
+        guest_tp_slot_byte_offset()
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-//
+
 // Struct-layout conformance probe for the hand-written arm64 Mach/BSD structs
 // in `src/darwin.rs` (`ArmExceptionState64`, `ArmThreadState64`,
 // `McontextPrefix64`). Those types exist because Rust has no binding for

@@ -97,6 +97,15 @@ pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 /// Darwin TSD layout this rests on.
 pub const MACOS_GUEST_TPIDR_TSD_SLOT: u16 = arm64::MACOS_GUEST_TPIDR_TSD_SLOT;
 
+/// Byte offset, within an emitted AArch64 trampoline, of the word holding the
+/// guest thread-pointer byte offset.
+///
+/// A loader writes the offset its runtime actually reserved into this word
+/// before making the trampoline executable; gates emitted for a host that reads
+/// the offset at run time load it from here. Exported so a loader names the same
+/// slot the emitter wrote rather than repeating the number.
+pub const TRAMPOLINE_GUEST_TP_SLOT_OFFSET: usize = arm64::HEADER_GUEST_TP_OFFSET_MACOS;
+
 /// Rewrite a supported binary for LiteBox.
 ///
 /// ELF64 inputs are passed through [`hook_syscalls_in_elf`]. PE64 inputs have
