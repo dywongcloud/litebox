@@ -36,10 +36,14 @@ subsystem.
   into Apple's own pthread structure, so it no longer risks corrupting
   libpthread state the way the earlier design did.
   
-  `litebox_platform_macos_userland::new` now (this pass) calls
-  `pthread_key_create` at startup and asserts the returned key matches --
-  **and that assertion currently always fails on real hardware.** Measured on
-  this M3 Pro (macOS 26.3.1): a minimal Rust binary's first
+  `litebox_platform_macos_userland::new` calls `pthread_key_create` at startup
+  and records the key. It originally *asserted* the key equalled the baked slot
+  -- **which always fails on real hardware**, making the platform
+  unconstructable -- so that was softened (this pass) to a loud warning that
+  leaves construction working (regression test
+  `reserving_the_tsd_slot_does_not_panic_on_mismatch`); a syscall-only guest is
+  unaffected, a `TPIDR_EL0`-using guest is unsupported until the real fix below.
+  Measured on this M3 Pro (macOS 26.3.1): a minimal Rust binary's first
   `pthread_key_create` call returns 259; a plain C `main`'s first call
   returns 258. Neither is 256. Something in libSystem's startup path claims a
   few dynamic keys before user code runs, undocumented and not guaranteed

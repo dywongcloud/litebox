@@ -210,33 +210,31 @@ issues syscalls already runs end to end. The pieces:
    apple-oss-distributions/libpthread as the first dynamic
    `pthread_key_create` key), i.e. `[TPIDRRO_EL0 + 256 * 8]`, **not** a raw
    offset into Apple's own pthread structure, so it no longer risks
-   corrupting libpthread state. `litebox_platform_macos_userland::new` now
-   calls `pthread_key_create` at startup and asserts the returned key matches
-   -- and **that assertion currently always fails on real hardware.** A
-   minimal Rust binary's first `pthread_key_create` call returns **259**, not
-   256, measured on this same Apple M3 Pro/macOS 26.3.1 (a plain C `main`'s
-   first call returns 258 -- still not 256, so this isn't even Rust-runtime-
-   specific). Something in libSystem's own startup path claims a few dynamic
-   keys before any user code runs, and that count is not part of any
-   documented contract -- it can plausibly differ across macOS versions, or
-   across different binaries depending on exactly what else gets statically
-   linked in and runs its own static initializers first. This means the
-   entire "bake one fixed slot number into the rewriter's gates at packaging
-   time" design has a deeper problem than picking the wrong constant: the
-   actual slot `pthread_key_create` returns is a property of the *specific
-   runner binary's* full startup sequence, which the rewriter (a separate
-   process, running separately, earlier, with no visibility into that) cannot
-   know in advance. The failure mode is safe -- a loud panic at
-   `MacOsUserland::new()`, not silent corruption, since the assertion added
-   this pass exists precisely to catch this -- but the feature does not work
-   yet. Fixing it needs either verifying the actual runner binary's granted
-   slot empirically and keeping the rewriter and runtime in lockstep on it
-   (fragile, breaks on any dependency change), or a different mechanism
-   entirely that doesn't require the AOT-rewritten gates to predict a
-   runtime-assigned number. What remains before a guest actually runs also
-   still includes `pthread_setspecific`-ing each guest thread's pointer into
-   whichever slot is actually reserved -- part of guest entry (item 3 below),
-   still unimplemented.
+   corrupting libpthread state. `litebox_platform_macos_userland::new` calls
+   `pthread_key_create` at startup and records the key. It **cannot** match
+   the baked slot on real hardware: a minimal Rust binary's first
+   `pthread_key_create` call returns **259**, not 256, on this Apple M3
+   Pro/macOS 26.3.1 (a plain C `main`'s first call returns 258 -- still not
+   256, so this isn't even Rust-runtime-specific). Something in libSystem's
+   own startup path claims a few dynamic keys before any user code runs, and
+   that count is not part of any documented contract -- it can plausibly
+   differ across macOS versions, or across different binaries depending on
+   what else gets statically linked in and runs its own static initializers
+   first. So the entire "bake one fixed slot number into the rewriter's gates
+   at packaging time" design has a deeper problem than picking the wrong
+   constant: the actual slot `pthread_key_create` returns is a property of the
+   *specific runner binary's* full startup sequence, which the AOT rewriter (a
+   separate, earlier process) cannot know in advance. That mismatch used to be
+   a hard panic at `MacOsUserland::new()`, which made the platform
+   unconstructable and blocked everything else; it is now a loud warning that
+   leaves construction working (a syscall-only guest is unaffected; a
+   `TPIDR_EL0`-using guest is unsupported until the fix). The real fix is
+   load-time offset indirection -- the gate loads its guest-TP byte offset
+   from a trampoline slot the loader fills from the runtime-reserved key,
+   addressing `[TPIDRRO_EL0 + offset_reg]` -- tracked as
+   `macos-guest-tp-runtime-offset` in `docs/roadmap.md`. What remains before a
+   `TPIDR_EL0`-using guest runs also includes `pthread_setspecific`-ing each
+   guest thread's pointer into whichever slot is actually reserved.
 2. **Filling the trampoline.** The rewriter writes the syscall-callback address
    at offset 0 of the trampoline it appends to the image; the loader must write
    `SystemInfoProvider::get_syscall_entry_point` there before any guest `SVC`

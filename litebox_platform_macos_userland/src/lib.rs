@@ -1360,29 +1360,41 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
 // Guest thread pointer
 // ---------------------------------------------------------------------------
 
+/// The pthread TSD key LiteBox reserved for the guest thread pointer, or
+/// `u32::MAX` before [`reserve_guest_tpidr_tsd_slot`] has run.
+static GUEST_TP_TSD_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
+
 /// Reserve the pthread TSD slot the rewriter's `Host::MacOs` gates read the
-/// guest thread pointer from.
+/// guest thread pointer from, recording it in [`GUEST_TP_TSD_KEY`].
 ///
 /// `litebox_syscall_rewriter::arm64`'s `Host::MacOs` gates are emitted
 /// *ahead of time*, when a binary is packaged -- they have
-/// `litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT` (the first dynamic
-/// `pthread_key_create` key on macOS) baked in as a fixed byte offset from
-/// `TPIDRRO_EL0`. For that to be correct at guest-run time, this process's
-/// very first `pthread_key_create` call has to be this one -- if anything
-/// else in the process (another library's static initializer, for instance)
-/// claims a dynamic TSD key first, every already-rewritten guest binary's
-/// gates silently target the wrong slot. Asserting the returned key matches
-/// turns that mismatch into a loud, immediate failure instead of guest
-/// threads reading garbage out of some other TSD consumer's slot.
+/// `litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT` baked in as a fixed
+/// byte offset from `TPIDRRO_EL0`. For that to line up at guest-run time, this
+/// process's first `pthread_key_create` call would have to return exactly that
+/// slot. **It does not, and cannot be relied upon to:** measured on real
+/// hardware (Apple M3 Pro, macOS 26.3.1), the first dynamic key is 259 from a
+/// Rust binary and 258 from a C `main` -- libSystem's own startup claims a few
+/// dynamic keys first, and that count is undocumented and not stable across OS
+/// versions or across binaries with different static initializers. The AOT
+/// rewriter (a separate, earlier process) therefore cannot predict the runner's
+/// slot; a fixed baked immediate is fundamentally the wrong model. The real fix
+/// is load-time offset indirection (see the `macos-guest-tp-runtime-offset`
+/// roadmap item and `docs/roadmap.md`).
 ///
-/// The reserved key's value once a guest thread starts is `pthread_setspecific`
-/// with that thread's `PtRegs`-relative guest thread pointer; that call is
-/// part of guest entry, not this reservation.
+/// Until that lands, this reserves a key and records it, but does **not** hard
+/// fail on a mismatch: panicking here made the whole platform unconstructable
+/// on real hardware, blocking everything else (memory, syscalls, the context
+/// switch) that does not touch the guest thread pointer at all. Instead it
+/// warns loudly. A guest that never reads/writes `TPIDR_EL0` is unaffected; a
+/// guest that does would target the stale baked slot and is **not supported**
+/// until the load-time fix -- no macOS runner loads guests yet, so nothing hits
+/// this path in production today.
 ///
 /// # Panics
 ///
-/// Panics if `pthread_key_create` fails, or if it returns a key other than
-/// [`litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT`].
+/// Panics only if `pthread_key_create` itself fails (genuine resource
+/// exhaustion), not on a slot-number mismatch.
 fn reserve_guest_tpidr_tsd_slot() -> libc::pthread_key_t {
     let mut key: libc::pthread_key_t = 0;
     // SAFETY: `key` is a valid, uniquely-owned out-parameter; no destructor is
@@ -1393,16 +1405,34 @@ fn reserve_guest_tpidr_tsd_slot() -> libc::pthread_key_t {
         rc, 0,
         "failed to reserve the guest thread-pointer TSD slot: pthread_key_create returned {rc}"
     );
-    assert_eq!(
-        u16::try_from(key).ok(),
-        Some(litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT),
-        "pthread_key_create returned TSD slot {key}, but litebox_syscall_rewriter::Host::MacOs's \
-         gates have slot {} baked in at AOT-rewrite time -- something else in this process \
-         claimed a dynamic pthread key before LiteBox could reserve the first one. See \
-         docs/roadmap.md.",
-        litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT,
-    );
+    GUEST_TP_TSD_KEY.store(u32::try_from(key).unwrap_or(u32::MAX), Ordering::Relaxed);
+
+    let baked = litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT;
+    if u16::try_from(key).ok() != Some(baked) {
+        litebox_util_log::warn!(
+            key:? = key, baked_slot:? = baked;
+            "guest thread-pointer TSD slot mismatch: pthread_key_create gave a slot the \
+             AOT-rewritten Host::MacOs gates do not use. Guests that access TPIDR_EL0 are \
+             unsupported until load-time offset indirection lands (see docs/roadmap.md, \
+             macos-guest-tp-runtime-offset). Syscall-only guests are unaffected."
+        );
+    }
     key
+}
+
+/// Reserving the guest thread-pointer TSD slot must not panic on real hardware
+/// even when the runtime key does not match the AOT-baked slot (it never does;
+/// see [`reserve_guest_tpidr_tsd_slot`]). A hard panic here previously made the
+/// whole platform unconstructable.
+#[cfg(test)]
+#[test]
+fn reserving_the_tsd_slot_does_not_panic_on_mismatch() {
+    let key = reserve_guest_tpidr_tsd_slot();
+    assert_eq!(
+        GUEST_TP_TSD_KEY.load(Ordering::Relaxed),
+        u32::try_from(key).unwrap(),
+        "the reserved key should be recorded for the future load-time-offset fix"
+    );
 }
 
 // ---------------------------------------------------------------------------
