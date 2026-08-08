@@ -154,6 +154,10 @@ Darwin has no realtime signals to take it from instead.
 
 ## Remaining work
 
+See also [`docs/roadmap.md`](./roadmap.md) for this and everything else
+outstanding across the tree, grouped by how much verification each item
+needs before it can land.
+
 Guest entry is the one seam that is not implemented. It lives in
 `litebox_platform_macos_userland::guest` and is documented there; the summary:
 

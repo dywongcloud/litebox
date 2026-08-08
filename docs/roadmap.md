@@ -1,0 +1,108 @@
+# Roadmap: known gaps and follow-up work
+
+This is a working list of gaps found while porting LiteBox to macOS/Apple
+Silicon and auditing the rest of the tree for related issues. Each entry
+below was deliberately **not** implemented in that pass, because doing it
+correctly needs either real hardware/kernel verification this repo's CI
+cannot provide from a Linux-hosted sandbox, or a genuine design decision
+rather than a mechanical fix. Implementing any of these without that
+verification risks the exact kind of half-finished, silently-wrong change
+this list exists to avoid.
+
+Items are grouped by how much verification they need before landing, not by
+subsystem.
+
+## Needs real Apple Silicon hardware
+
+* **`Host::MacOs` in `litebox_syscall_rewriter` and the guest-entry context
+  switch.** Already scoped in [`docs/macos.md`](./macos.md#remaining-work):
+  establish whether Darwin preserves `TPIDR_EL0` across a context switch (the
+  rewriter's current gates assume it), then either use it as the guest
+  thread-pointer anchor or move to a Darwin-owned per-thread slot and add the
+  rewriter variant. This is the one seam standing between the current macOS
+  port and actually running a guest.
+* **The `jit_write_protect` bracketing gap** documented in
+  [`docs/macos.md`](./macos.md#wx-map_jit-and-code-signing): nothing in
+  `litebox_shim_linux`'s ELF loader or syscall-rewriter patching calls
+  `pthread_jit_write_protect_np` around its writes into a `MAP_JIT` mapping.
+  The fix is a `PageManagementProvider` hook (no-op default, macOS override)
+  wrapping the write call sites in `litebox_shim_linux/src/syscalls/mm.rs`
+  (`maybe_patch_exec_segment`, `apply_trap_fallback`) -- straightforward to
+  write, but only real hardware can confirm it actually resolves the SIGBUS
+  this gap implies rather than papering over a misunderstanding of the API.
+* **Darwin ABI drift beyond what `darwin_abi_probe.c` already checks.** The
+  probe (added this pass, see the `Build and Test macOS` CI job) covers the
+  three hand-written struct layouts the fault handler depends on. Anything
+  else hand-written against Darwin/Mach headers in the future should get the
+  same treatment rather than trusting a one-time reading of the headers.
+
+## Needs a real multi-threaded guest to exercise
+
+* **Per-thread `PENDING_SIGNALS`.** Currently process-wide (see
+  `docs/macos.md`'s note on `SignalProvider`); correct for the single guest
+  thread that's reachable today, wrong once guest entry supports more than
+  one. Fix: per-thread pending-signal state plus the signal-mask discipline
+  `litebox_platform_linux_userland` already uses, or `pthread_sigqueue` if it
+  turns out to support the needed payload delivery.
+* **`sa_restorer` and FP/SIMD signal-frame state** (`docs/macos.md`): no
+  vDSO means a guest handler without `SA_RESTORER` has nowhere to return to,
+  and the signal frame's vector-state area is zeroed rather than populated.
+  Both are inert until a guest actually installs a handler and executes.
+
+## Needs a design decision, not just an errno swap
+
+Found while sweeping `litebox_shim_linux` for `unimplemented!()`/`todo!()`
+panics reachable from guest syscall arguments (most of the sweep landed
+directly -- see the commit that added this file for what did). Left alone:
+
+* `sys_prlimit`/`sys_get_robust_list`'s "specific pid" handling
+  (`litebox_shim_linux/src/syscalls/process.rs`) treats any non-`None`/
+  non-zero pid as unsupported, but a guest calling with its own real pid
+  (rather than the `0`/`None` "self" sentinel) is equally valid on real Linux
+  and should be treated as self, not rejected. Needs comparing against the
+  caller's own pid, not a blanket errno.
+* `do_mmap_file_memcpy`'s `Errno -> MappingError` mapping
+  (`litebox_shim_linux/src/syscalls/mm.rs`) has a catch-all `unimplemented!()`
+  for any `sys_read` errno beyond the three it explicitly handles.
+  `MappingError` (`litebox/src/mm/linux.rs`) has no generic "underlying I/O
+  error" variant to map onto -- needs a new variant, which is an API change
+  to `litebox` core, not a local fix.
+* IPv6 `copy_sockaddr_to_user`, unnamed-Unix-socket autobind, `O_DIRECT`,
+  `SO_BROADCAST` disable, non-TCP `SO_KEEPALIVE`, and several other
+  `net.rs`/`pipe.rs`/`unix.rs` gaps (grep for `todo!`/`unimplemented!` in
+  those files) are genuine missing features, not missing error paths --
+  each needs its own implementation, not a blanket conversion.
+* `EpollDescriptor::Epoll` in `epoll.rs` and a handful of `_ =>
+  unimplemented!()` catch-alls in `net.rs`/`process.rs` are exhaustiveness
+  arms over enums with variants the current code paths don't construct;
+  confirm actual unreachability (or handle it) case by case rather than
+  assuming.
+
+## Larger architectural work, out of scope for a single pass
+
+These came out of researching how comparable sandboxes (gVisor, Firecracker,
+WASI/wasmtime, Seatbelt/Landlock) solve problems LiteBox has today. Each is
+a real, multi-day project on its own:
+
+* **Seatbelt (`sandbox_init`) defense-in-depth for the macOS platform**,
+  mirroring the existing Linux seccomp filter -- macOS currently has no
+  second sandboxing layer behind LiteBox's own guest/host boundary.
+* **Landlock integration** for the existing Linux seccomp filter, which
+  currently has no path-scoping: a compromised guest that finds a seccomp
+  gap can still reach any path the host process can.
+* **A WASI-style capability redesign for `litebox_broker_host`'s filesystem
+  and socket authorization** -- preopen-style directory capabilities and a
+  per-destination socket policy hook, replacing today's coarser
+  per-principal rights.
+* **`litebox_runner_snp`'s TCP+9P bootstrap migrated to a vsock-style
+  channel**, following Firecracker's precedent, to avoid exposing the boot
+  channel on a real network interface.
+* **Process-level jailing of `litebox_broker_host`** itself (Firecracker's
+  jailer, or crosvm's minijail, are the precedents), so a broken broker isn't
+  a fully-privileged process.
+* **An async-signal-safety audit** across every platform's signal handlers --
+  none of the platform crates currently have one, and LiteBox's whole fault
+  and interrupt-delivery model runs inside handlers.
+* **CI checks that `CallerCredential::Unauthenticated` can't reach the broker
+  in non-test builds**, and that malformed/truncated broker messages fail
+  closed -- currently enforced by code review, not by an automated check.

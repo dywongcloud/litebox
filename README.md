@@ -31,6 +31,7 @@ See the following files for details:
 - [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)
 - [SECURITY.md](./SECURITY.md)
 - [SUPPORT.md](./SUPPORT.md)
+- [docs/roadmap.md](./docs/roadmap.md) for known gaps and follow-up work
 
 ## License
 
