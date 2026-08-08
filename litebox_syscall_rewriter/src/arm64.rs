@@ -809,6 +809,10 @@ fn emit_shared_prologue(
     // Offset 0: callback address.
     trampoline_data.extend_from_slice(&callback.to_le_bytes());
 
+    // Offset 8: guest thread-pointer value (macOS single-guest-thread model).
+    // Placeholder value; the platform fills this at runtime before any guest entry.
+    trampoline_data.extend_from_slice(&0u64.to_le_bytes());
+
     emit_shared_svc_handler(
         trampoline_data,
         SHARED_SVC_HANDLER_OFFSET,
