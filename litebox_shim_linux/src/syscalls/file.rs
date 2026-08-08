@@ -297,8 +297,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -1616,8 +1616,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 .ok_or(Errno::EFAULT)?;
                             Ok(0)
                         },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
+                        |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
@@ -1638,8 +1638,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // can always acquire the lock it owns, so we don't need to maintain anything.
                             Ok(0)
                         },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
+                        |_fd| Err(Errno::EBADF),
+                        |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
                         |_fd| Err(Errno::EBADF),
@@ -1908,6 +1908,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .flatten()?;
                 Ok(0)
             }
+            // `FD_CLOEXEC` lives on the descriptor-table entry, not on
+            // anything specific to a given fd kind, so every kind sets it the
+            // same way.
             IoctlArg::FIOCLEX => files.run_on_raw_fd(
                 desc,
                 |fd| {
@@ -1918,8 +1921,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 },
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
                 |fd| {
                     let _old = self
                         .global

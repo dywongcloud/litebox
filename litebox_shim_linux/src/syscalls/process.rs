@@ -863,13 +863,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if new_limit.rlim_max > old_rlimit.rlim_max {
                 return Err(Errno::EPERM);
             }
-            match resource {
-                litebox_common_linux::RlimitResource::NOFILE => {
-                    let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-                    self.thread.process.limits.set_rlimit(resource, new_limit);
-                    self.files.borrow().set_max_fd(new_max_fd);
-                }
-                _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
+            if let litebox_common_linux::RlimitResource::NOFILE = resource {
+                let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
+                self.thread.process.limits.set_rlimit(resource, new_limit);
+                self.files.borrow().set_max_fd(new_max_fd);
+            } else {
+                log_unsupported!("Unsupported resource for set_rlimit: {:?}", resource);
+                return Err(Errno::EINVAL);
             }
         }
         Ok(old_rlimit)
@@ -1376,7 +1376,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )?;
                 0
             }
-            _ => unimplemented!("Unsupported futex operation"),
+            _ => {
+                log_unsupported!("futex operation {:?}", arg);
+                return Err(Errno::ENOSYS);
+            }
         };
         Ok(res)
     }

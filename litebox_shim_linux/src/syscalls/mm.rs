@@ -419,7 +419,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             && prot.contains(ProtFlags::PROT_WRITE)
             && !flags.contains(MapFlags::MAP_ANONYMOUS)
         {
-            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
+            log_unsupported!("MAP_SHARED with PROT_WRITE on file-backed mappings");
+            return Err(Errno::EINVAL);
         }
 
         if flags.intersects(
@@ -432,7 +433,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 | MapFlags::MAP_HUGE_2MB
                 | MapFlags::MAP_HUGE_1GB,
         ) {
-            todo!("Unsupported flags {:?}", flags);
+            log_unsupported!("mmap flags {:?}", flags);
+            return Err(Errno::EINVAL);
         }
 
         let aligned_len = align_up(len, PAGE_SIZE);
