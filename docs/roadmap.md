@@ -12,15 +12,23 @@ this list exists to avoid.
 Items are grouped by how much verification they need before landing, not by
 subsystem.
 
-## Needs real Apple Silicon hardware
+## Resolved on real hardware this pass
+
+* **The `TPIDR_EL0` anchor question is answered.** Measured on an Apple M3
+  Pro (macOS 26.3.1): `TPIDR_EL0` does not survive a context switch (XNU
+  overwrites it with its own value, not merely leaves it stale) and cannot
+  anchor the guest thread pointer. `TPIDRRO_EL0` is stable across a reschedule
+  and distinct per thread, matching Apple's documented pthread-self-pointer
+  use. See [`docs/macos.md`](./macos.md#remaining-work) for the full
+  measurement and the resulting design (a reserved pthread TSD slot read via
+  a `TPIDRRO_EL0`-relative direct-TSD sequence, mirroring libSystem's own
+  fast accessors). What's left is implementation, not research:
+
+## Needs real Apple Silicon hardware (implementation, not open questions)
 
 * **`Host::MacOs` in `litebox_syscall_rewriter` and the guest-entry context
-  switch.** Already scoped in [`docs/macos.md`](./macos.md#remaining-work):
-  establish whether Darwin preserves `TPIDR_EL0` across a context switch (the
-  rewriter's current gates assume it), then either use it as the guest
-  thread-pointer anchor or move to a Darwin-owned per-thread slot and add the
-  rewriter variant. This is the one seam standing between the current macOS
-  port and actually running a guest.
+  switch**, now that the anchor design above is settled. This is the one
+  seam standing between the current macOS port and actually running a guest.
 * **The `jit_write_protect` bracketing gap** documented in
   [`docs/macos.md`](./macos.md#wx-map_jit-and-code-signing): nothing in
   `litebox_shim_linux`'s ELF loader or syscall-rewriter patching calls

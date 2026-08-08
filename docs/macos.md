@@ -161,14 +161,35 @@ needs before it can land.
 Guest entry is the one seam that is not implemented. It lives in
 `litebox_platform_macos_userland::guest` and is documented there; the summary:
 
-1. **A host thread-pointer anchor.** The rewriter's gates read `TPIDR_EL0` and
-   expect the guest's own thread pointer at `[TPIDR_EL0 + GUEST_TPIDR_OFFSET]`.
-   Darwin keeps the thread self-pointer in `TPIDRRO_EL0` and does not document
-   `TPIDR_EL0` as available to userland, so **whether Darwin preserves
-   `TPIDR_EL0` across a context switch has to be established on real hardware
-   before it can be used as the anchor.** If it does not, the anchor must move to
-   a Darwin-owned per-thread slot and the rewriter needs a `Host::MacOs` variant
-   emitting gates against it.
+1. **A host thread-pointer anchor.** **Resolved on real hardware (Apple M3
+   Pro, macOS 26.3.1): `TPIDR_EL0` does *not* survive a context switch and
+   cannot be used as the guest thread-pointer anchor.** A probe that wrote a
+   sentinel into `TPIDR_EL0`, then read it back after `thread::sleep` (a
+   voluntary reschedule) and again from inside a `SIGUSR1` handler, found the
+   register already overwritten by the time execution resumed in both cases
+   -- overwritten with the *same* small value (`0x1009` in the run that
+   established this) each time, meaning XNU's own scheduler or pthread
+   runtime actively repurposes this register for its own bookkeeping rather
+   than merely leaving it stale. `TPIDRRO_EL0`, by contrast, was confirmed
+   stable across the same reschedule (`0x1fda871e0` before and after
+   `thread::sleep`) and distinct per thread (a second thread read
+   `0x16dd330e0`) -- consistent with Apple's own documented use of it as the
+   pthread self-pointer. The anchor therefore has to move to a Darwin-owned
+   per-thread slot reachable from `TPIDRRO_EL0` (the same "direct TSD" fast
+   path libSystem's own `errno`/QoS-class accessors use: read `TPIDRRO_EL0`,
+   index a small fixed offset into the per-thread block it points at), and
+   the rewriter needs a `Host::MacOs` variant emitting gates against that
+   instead of `TPIDR_EL0`. Concretely: reserve one pthread TSD slot for
+   LiteBox's guest-pointer value (`pthread_key_create` at platform-init time
+   is the safe, public way to reserve a slot number rather than guessing an
+   unused "direct" index), have the platform's thread-entry path
+   `pthread_setspecific` the guest thread pointer into it once per guest
+   thread, and have the rewriter's gates read it back through the same
+   `TPIDRRO_EL0`-relative sequence libSystem uses internally for a direct-TSD
+   read, rather than going through the full `pthread_getspecific` call --
+   the whole reason `TPIDR_EL0` looked attractive originally was a
+   single-instruction anchor, and a fast, inlined `TPIDRRO_EL0`-relative read
+   is the only replacement that keeps that property.
 2. **Filling the trampoline.** The rewriter writes the syscall-callback address
    at offset 0 of the trampoline it appends to the image; the loader must write
    `SystemInfoProvider::get_syscall_entry_point` there before any guest `SVC`
