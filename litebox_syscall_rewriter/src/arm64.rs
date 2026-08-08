@@ -275,10 +275,18 @@ const MSR_FRAME_OFF_VALUE: u16 = 16;
 /// Callback address slot.
 const HEADER_CALLBACK_OFFSET: usize = 0;
 
-/// Shared SVC handler, placed just past the 8-byte callback slot. Per-site gates
+/// Guest thread-pointer value slot (macOS single-guest-thread model). The platform
+/// writes the guest's TPIDR_EL0 value here when entering a guest; the rewriter's
+/// `Host::MacOs` gates read/write from this slot instead of using the runtime-offset
+/// TSD slot, avoiding the startup-dependent pthread_key_create mismatch (see
+/// `docs/roadmap.md`, `macos-guest-tp-runtime-offset`). Must be filled by the
+/// loader before any guest entry.
+const HEADER_GUEST_TP_OFFSET_MACOS: usize = HEADER_CALLBACK_OFFSET + 8;
+
+/// Shared SVC handler, placed just past the trampoline header slots. Per-site gates
 /// follow it and are each appended dynamically, so this shared prologue is the
 /// only fixed-offset region the emitters reference.
-const SHARED_SVC_HANDLER_OFFSET: usize = HEADER_CALLBACK_OFFSET + 8;
+const SHARED_SVC_HANDLER_OFFSET: usize = HEADER_GUEST_TP_OFFSET_MACOS + 8;
 
 // ============================================================
 // Instruction encoders
@@ -312,6 +320,10 @@ enum Opcode {
     AddImm = 0x9100_0000,
     StrUimm = 0xF900_0000,
     LdrUimm = 0xF940_0000,
+    /// STR with register offset (LSL #3).
+    StrReg = 0xF8000000,
+    /// LDR with register offset (LSL #3).
+    LdrReg = 0xF8400000,
     Stp = 0xA900_0000,
     Ldp = 0xA940_0000,
     MrsTpidrEl0 = MRS_TPIDR_EL0_BITS,
@@ -388,6 +400,12 @@ fn ldst_uimm12(op: Opcode, rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
     Some(op.bits() | (u32::from(imm12) << 10) | (u32::from(rn) << 5) | u32::from(rt))
 }
 
+/// `op | rm<<16 | 0x6000 | rn<<5 | rt` — register offset (LSL #3) 64-bit load/store
+/// (`STR`/`LDR [Xn, Xm, LSL #3]`). The LSL #3 is implicit for 64-bit register offsets.
+fn ldst_reg_offset(op: Opcode, rt: u8, rn: u8, rm: u8) -> u32 {
+    op.bits() | (u32::from(rm) << 16) | 0x6000 | (u32::from(rn) << 5) | u32::from(rt)
+}
+
 /// `op | imm7<<15 | rt2<<10 | rn<<5 | rt` — signed scaled (×8) 64-bit load/store
 /// pair (`STP`/`LDP`). `imm_bytes` must be a multiple of 8 within ±512 bytes.
 fn ldst_pair(op: Opcode, rt: u8, rt2: u8, rn: u8, imm_bytes: i16) -> Option<u32> {
@@ -435,6 +453,10 @@ enum Insn {
     StrUimm { rt: u8, rn: u8, imm_bytes: u16 },
     /// `LDR Xt, [Xn, #imm_bytes]` (unsigned scaled; `imm_bytes` multiple of 8).
     LdrUimm { rt: u8, rn: u8, imm_bytes: u16 },
+    /// `STR Xt, [Xn, Xm]` (register offset, LSL #3).
+    StrReg { rt: u8, rn: u8, rm: u8 },
+    /// `LDR Xt, [Xn, Xm]` (register offset, LSL #3).
+    LdrReg { rt: u8, rn: u8, rm: u8 },
     /// `STP Xt, Xt2, [Xn, #imm_bytes]` (signed scaled; `imm_bytes` multiple of 8).
     Stp {
         rt: u8,
@@ -481,6 +503,8 @@ impl Insn {
             Insn::AddImm { rd, rn, imm12 } => data_imm12(Opcode::AddImm, rd, rn, imm12),
             Insn::StrUimm { rt, rn, imm_bytes } => ldst_uimm12(Opcode::StrUimm, rt, rn, imm_bytes),
             Insn::LdrUimm { rt, rn, imm_bytes } => ldst_uimm12(Opcode::LdrUimm, rt, rn, imm_bytes),
+            Insn::StrReg { rt, rn, rm } => Some(ldst_reg_offset(Opcode::StrReg, rt, rn, rm)),
+            Insn::LdrReg { rt, rn, rm } => Some(ldst_reg_offset(Opcode::LdrReg, rt, rn, rm)),
             Insn::Stp {
                 rt,
                 rt2,

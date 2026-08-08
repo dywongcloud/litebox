@@ -1364,6 +1364,16 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
 /// `u32::MAX` before [`reserve_guest_tpidr_tsd_slot`] has run.
 static GUEST_TP_TSD_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// The current guest thread-pointer value for the single-guest-thread model.
+/// When a guest enters, this is set to the guest's thread-pointer value.
+/// The rewriter's `Host::MacOs` gates read and write the guest-TP through the
+/// trampoline's HEADER_GUEST_TP_OFFSET_MACOS slot (filled by the loader before
+/// guest entry), avoiding the runtime TSD offset mismatch (see `docs/roadmap.md`,
+/// `macos-guest-tp-runtime-offset`). This approach matches the context switch's
+/// existing single-thread limitation.
+#[allow(non_upper_case_globals)]
+pub static GUEST_TP_VALUE: AtomicU64 = AtomicU64::new(0);
+
 /// Reserve the pthread TSD slot the rewriter's `Host::MacOs` gates read the
 /// guest thread pointer from, recording it in [`GUEST_TP_TSD_KEY`].
 ///
