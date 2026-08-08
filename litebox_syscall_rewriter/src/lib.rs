@@ -15,17 +15,20 @@
 //! This crate currently supports x86-64 ELFs for syscall hooking and x86-64 PEs for syscall
 //! hooking plus rewriting Windows TEB accesses from GS segment overrides to FS segment overrides.
 //!
-//! It also supports AArch64 ELFs. AArch64 support currently targets **Linux guests on Linux
-//! hosts** and rewrites `SVC #imm` syscalls plus both directions of guest thread-pointer access
-//! (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads): the host owns the hardware `TPIDR_EL0`
-//! anchor and the guest thread pointer is fully virtualized to a host-managed memory slot. This
-//! thread-pointer virtualization is Linux-host-specific; other hosts (Linux-on-Windows,
-//! Linux-on-macOS) must anchor and virtualize TLS differently. See the `arm64` module for details.
+//! It also supports AArch64 ELFs, for Linux guests on Linux or macOS hosts (see [`Host`]), and
+//! rewrites `SVC #imm` syscalls plus both directions of guest thread-pointer access
+//! (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads): the host owns a per-thread anchor register
+//! and the guest thread pointer is fully virtualized to a host-managed memory slot reached through
+//! it. Which register anchors the host varies by host OS -- [`hook_syscalls_in_elf`] defaults to
+//! [`Host::Linux`]; [`hook_syscalls_in_elf_for_host`] selects explicitly. See the `arm64` module
+//! for details, including a caveat on `Host::MacOs` guests that use `x18`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
 mod arm64;
+
+pub use arm64::Host;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -168,7 +171,21 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 /// with a trapping instruction so it faults instead of escaping to the host
 /// kernel: `icebp; hlt` on x86-64, and `BRK` on AArch64 (where a patch site is
 /// an `SVC`, `MSR TPIDR_EL0`, or `MRS TPIDR_EL0` instruction).
+///
+/// AArch64 gates against [`Host::Linux`]'s anchor (`TPIDR_EL0`); use
+/// [`hook_syscalls_in_elf_for_host`] to target a different host.
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    hook_syscalls_in_elf_for_host(input_binary, trampoline, Host::Linux)
+}
+
+/// As [`hook_syscalls_in_elf`], but selects the AArch64 host anchor explicitly
+/// instead of defaulting to [`Host::Linux`]. Ignored for x86-64 input, which
+/// has no per-host anchor concept.
+pub fn hook_syscalls_in_elf_for_host(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    host: Host,
+) -> Result<Vec<u8>> {
     if input_binary.ends_with(BUN_FOOTER_MARKER) {
         return Err(Error::UnsupportedExecutable(
             "Bun-packaged executable".into(),
@@ -246,6 +263,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             &text_sections,
             trampoline_base_addr,
             trampoline.unwrap_or(0),
+            host,
         );
     }
 
@@ -779,14 +797,10 @@ fn hook_aarch64_elf(
     text_sections: &[TextSectionInfo],
     trampoline_base_addr: u64,
     callback: u64,
+    host: Host,
 ) -> Result<Vec<u8>> {
-    let Some(outcome) = arm64::hook_syscalls_aarch64(
-        buf,
-        text_sections,
-        trampoline_base_addr,
-        callback,
-        arm64::Host::Linux,
-    )?
+    let Some(outcome) =
+        arm64::hook_syscalls_aarch64(buf, text_sections, trampoline_base_addr, callback, host)?
     else {
         // No patch sites: emit the original binary with a size-0 sentinel
         // header so the loader knows there is no trampoline to map.
@@ -1787,7 +1801,8 @@ mod tests {
             file_offset: 0,
             size: buf.len() as u64,
         }];
-        let err = hook_aarch64_elf(&input, &mut buf, &sections, 0x1000_0000, 0).unwrap_err();
+        let err =
+            hook_aarch64_elf(&input, &mut buf, &sections, 0x1000_0000, 0, Host::Linux).unwrap_err();
         assert!(
             matches!(err, Error::UnpatchableSyscalls(_)),
             "expected UnpatchableSyscalls, got {err:?}"

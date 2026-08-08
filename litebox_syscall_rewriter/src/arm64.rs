@@ -158,6 +158,15 @@ const MSR_TPIDR_EL0_BITS: u32 = 0xD51B_D040;
 const MRS_TPIDR_EL0_MASK: u32 = 0xFFFF_FFE0;
 const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
 
+/// `MRS Xd, TPIDRRO_EL0` (`0xD53BD06d`) — [`Host::MacOs`]'s anchor read.
+/// `TPIDRRO_EL0` differs from `TPIDR_EL0` only in the `op2` system-register
+/// field (3 instead of 2), which is bit 5 of the instruction word, so this is
+/// exactly [`MRS_TPIDR_EL0_BITS`] with that bit set. Confirmed against a real
+/// toolchain (`cc`/`otool -tvV` on an Apple M3 Pro): `mrs x9, TPIDR_EL0` and
+/// `mrs x9, TPIDRRO_EL0` assemble to `0xD53BD049` and `0xD53BD069`
+/// respectively.
+const MRS_TPIDRRO_EL0_BITS: u32 = 0xD53B_D060;
+
 /// `BRK` immediate planted at a patch site whose gate lies outside the `B`
 /// instruction's ±128MB reach. Executing the site raises a synchronous debug
 /// exception (`SIGTRAP`) carrying this immediate, faulting the guest rather than
@@ -273,6 +282,8 @@ enum Opcode {
     Stp = 0xA900_0000,
     Ldp = 0xA940_0000,
     MrsTpidrEl0 = MRS_TPIDR_EL0_BITS,
+    /// [`Host::MacOs`]'s anchor read.
+    MrsTpidrroEl0 = MRS_TPIDRRO_EL0_BITS,
     Brk = 0xD420_0000,
 }
 
@@ -407,6 +418,8 @@ enum Insn {
     },
     /// `MRS Xt, TPIDR_EL0` (read thread pointer).
     MrsTpidrEl0(u8),
+    /// `MRS Xt, TPIDRRO_EL0` — [`Host::MacOs`]'s anchor read.
+    MrsTpidrroEl0(u8),
     /// `BRK #imm16` — software breakpoint raising a synchronous debug exception.
     Brk(u16),
 }
@@ -447,6 +460,7 @@ impl Insn {
                 imm_bytes,
             } => ldst_pair(Opcode::Ldp, rt, rt2, rn, imm_bytes),
             Insn::MrsTpidrEl0(rt) => Some(sysreg_move(Opcode::MrsTpidrEl0.bits(), rt)),
+            Insn::MrsTpidrroEl0(rt) => Some(sysreg_move(Opcode::MrsTpidrroEl0.bits(), rt)),
             Insn::Brk(imm) => Some(Opcode::Brk.bits() | (u32::from(imm) << 5)),
         }
     }
@@ -461,29 +475,44 @@ impl Insn {
 /// The guest thread pointer is virtualized the same way on every host; only the
 /// *anchor register* a gate reads to reach the host's per-thread block varies.
 /// [`Host`] selects that register, so a gate names the anchor through
-/// [`Host::anchor_read`] rather than hardcoding a system register. Adding a host
+/// `Host::anchor_read` rather than hardcoding a system register. Adding a host
 /// is a new variant plus its anchor-read arm.
 ///
 /// Other host OSes need a different stable anchor register (a future variant
-/// supplying its own [`Host::anchor_read`]), and beyond that a host-specific
+/// supplying its own `Host::anchor_read`), and beyond that a host-specific
 /// shared SVC handler — not just a different trampoline base address:
 ///
-/// * **Linux-on-macOS** (Apple Silicon): XNU clobbers `TPIDR_EL0` on
-///   signals/preemption and zeroes `x18` on every exception entry, so neither
-///   register survives a host transition. The stable anchor becomes the
-///   read-only `TPIDRRO_EL0` (which XNU keeps per-pthread), and *both*
-///   `TPIDR_EL0` and `x18` must be fully virtualized — `x18` via per-site gates.
+/// * **Linux-on-macOS** (Apple Silicon): confirmed on real hardware (Apple M3
+///   Pro, macOS 26.3.1) that XNU clobbers `TPIDR_EL0` across both a voluntary
+///   context switch and a signal-handler invocation — not merely leaves it
+///   stale, but overwrites it with its own per-thread value — so it cannot
+///   anchor the guest thread pointer. The stable anchor is the read-only
+///   `TPIDRRO_EL0`, confirmed stable across a reschedule and distinct per
+///   thread on the same hardware, matching Apple's documented pthread-self-
+///   pointer use. [`Host::MacOs`] below implements the anchor-read half of
+///   this. XNU also zeroes `x18` on every exception entry, which the anchor
+///   swap alone does not address: **`x18` still needs to be fully virtualized
+///   via per-site gates before `Host::MacOs` is safe to use on a guest that
+///   touches `x18`** (uncommon in ordinary AAPCS64-compiled code, since `x18`
+///   is the reserved "platform register", but not guaranteed absent). See
+///   `docs/roadmap.md`.
 /// * **Linux-on-Windows** (Windows on ARM64): Windows does not preserve
 ///   `TPIDR_EL0` across context switches and reserves `x18` as the TEB pointer
 ///   (always valid). The TEB is the stable anchor: the per-thread TLS state is
 ///   reached through a TEB TLS slot, and `TPIDR_EL0` (plus guest `x18`, where the
 ///   guest uses it) is virtualized against that.
 #[derive(Clone, Copy)]
-pub(crate) enum Host {
+pub enum Host {
     /// Linux host. The kernel preserves `TPIDR_EL0` across host execution, so the
     /// host keeps its anchor there and the guest thread-pointer slot lives beside
     /// it; the anchor read is `MRS Xd, TPIDR_EL0`.
     Linux,
+    /// macOS host (Apple Silicon). `TPIDR_EL0` does not survive a host
+    /// transition (see above), so the anchor read uses the read-only
+    /// `TPIDRRO_EL0` instead; the guest thread-pointer slot is still reached
+    /// at `[anchor + GUEST_TPIDR_OFFSET]`, exactly as on Linux. Does not yet
+    /// virtualize guest `x18` uses — see this enum's doc comment.
+    MacOs,
 }
 
 impl Host {
@@ -492,6 +521,7 @@ impl Host {
     fn anchor_read(self, rd: u8) -> Insn {
         match self {
             Host::Linux => Insn::MrsTpidrEl0(rd),
+            Host::MacOs => Insn::MrsTpidrroEl0(rd),
         }
     }
 }
@@ -1126,6 +1156,10 @@ mod tests {
         assert_eq!(Insn::Br(16).encode().unwrap(), 0xD61F_0200);
         // TPIDR_EL0 accessor.
         assert_eq!(Insn::MrsTpidrEl0(9).encode().unwrap(), 0xD53B_D049);
+        // TPIDRRO_EL0 accessor (`Host::MacOs`'s anchor read). Cross-checked
+        // against a real toolchain: `cc -c` + `otool -tvV` on an Apple M3 Pro
+        // assembles `mrs x9, tpidrro_el0` to this exact word.
+        assert_eq!(Insn::MrsTpidrroEl0(9).encode().unwrap(), 0xD53B_D069);
         // `MSR TPIDR_EL0, X9` guest word (scanned, never emitted).
         assert_eq!(msr_tpidr_el0(9), 0xD51B_D049);
         // Scaled (×8) 64-bit load/store: `ldr x9,[x9,#16]` / `str x17,[x16,#16]`.
@@ -1348,6 +1382,57 @@ mod tests {
         assert_eq!(
             tramp.len(),
             GATES_START_OFFSET + MSR_GATE_SIZE + MRS_GATE_SIZE
+        );
+    }
+
+    #[test]
+    fn macos_host_anchors_gates_on_tpidrro_el0() {
+        // Same input as `msr_and_mrs_both_get_gates`, but hooked for
+        // `Host::MacOs`: both gates' anchor-read instruction must be
+        // `MRS X16, TPIDRRO_EL0`, not `TPIDR_EL0` -- real hardware (see this
+        // module's `Host` doc comment) confirmed `TPIDR_EL0` does not survive
+        // a host context switch on macOS.
+        let base = 0x1000;
+        let tramp_base = 0x300000;
+        let words = [msr_tpidr_el0(5), Insn::MrsTpidrEl0(9).encode().unwrap()];
+        let mut buf = Vec::new();
+        for w in words {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        let sections = vec![TextSectionInfo {
+            vaddr: base,
+            file_offset: 0,
+            size: buf.len() as u64,
+        }];
+        let outcome = hook_syscalls_aarch64(&mut buf, &sections, tramp_base, 0, Host::MacOs)
+            .unwrap()
+            .expect("expected a trampoline (input has patch sites)");
+        let tramp = outcome.trampoline;
+
+        // MSR gate: SubSp, Stp, StrUimm, <anchor into X16>, ... -- anchor is
+        // the 4th instruction (index 3), always X16 regardless of the guest's
+        // own register (it's scratch space the gate spilled).
+        let msr_anchor_off = GATES_START_OFFSET + 3 * 4;
+        assert_eq!(
+            word_at(&tramp, msr_anchor_off),
+            Insn::MrsTpidrroEl0(X16).encode().unwrap()
+        );
+        assert_ne!(
+            word_at(&tramp, msr_anchor_off),
+            Insn::MrsTpidrEl0(X16).encode().unwrap()
+        );
+
+        // MRS gate: <anchor>, LdrUimm, Br -- anchor is the 1st instruction,
+        // read directly into the guest's own destination register (X9 here,
+        // from `Insn::MrsTpidrEl0(9)` above) rather than a scratch register.
+        let mrs_anchor_off = GATES_START_OFFSET + MSR_GATE_SIZE;
+        assert_eq!(
+            word_at(&tramp, mrs_anchor_off),
+            Insn::MrsTpidrroEl0(9).encode().unwrap()
+        );
+        assert_ne!(
+            word_at(&tramp, mrs_anchor_off),
+            Insn::MrsTpidrEl0(9).encode().unwrap()
         );
     }
 

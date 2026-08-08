@@ -606,6 +606,21 @@ fn target_elf_machine() -> u16 {
     }
 }
 
+/// The syscall rewriter's AArch64 host anchor to target: whichever OS is
+/// actually going to run the packaged guest, which -- since packaging happens
+/// on that same host in this project's usage model -- is the OS this packager
+/// binary is itself running on. `TPIDR_EL0` (the `Host::Linux` anchor) does
+/// not survive a context switch on macOS, so packaging a Linux-anchored
+/// AArch64 binary there would silently produce gates that fault the guest the
+/// first time it's rescheduled.
+fn rewrite_host() -> litebox_syscall_rewriter::Host {
+    if cfg!(target_os = "macos") {
+        litebox_syscall_rewriter::Host::MacOs
+    } else {
+        litebox_syscall_rewriter::Host::Linux
+    }
+}
+
 /// Rewrite an ELF file's syscall instructions using the litebox syscall rewriter.
 ///
 /// Non-ELF files (shell scripts, data files with executable bits, etc.) are
@@ -636,7 +651,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
         return data.to_vec();
     }
 
-    match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
+    match litebox_syscall_rewriter::hook_syscalls_in_elf_for_host(data, None, rewrite_host()) {
         Ok(rewritten) => {
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
