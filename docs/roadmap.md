@@ -58,13 +58,14 @@ subsystem.
   silent corruption -- that is exactly what the new assertion is for), so
   this does not need the same "keep it out of anything that runs for real"
   mitigation the previous corruption bug did. But the feature does not work
-  yet. Real fix needs one of: empirically pin the actual slot number to the
-  actual runner binary and keep the rewriter and runtime in lockstep on it
-  (fragile -- breaks silently on any dependency change unless there's also a
-  build-time check), or a mechanism that doesn't require the AOT-rewritten
-  gates to predict a runtime-assigned number at all (e.g., discovering the
-  slot at guest-image load time and rewriting the gates' immediate then,
-  which is a materially bigger change to the rewriter's AOT-only model).
+  yet. **Real fix: load-time offset indirection (in progress).** Infrastructure
+  is now in place: a trampoline slot `HEADER_GUEST_TP_OFFSET_MACOS` holds the
+  guest-TP value at runtime, and new instruction encoders `LdrReg`/`StrReg`
+  enable register-indirect addressing. Remaining: wire these into `emit_msr_gate`
+  and `emit_mrs_gate` to load the offset from the trampoline slot and use it
+  for gate addressing, then update the platform's `run_thread_arch` to fill
+  the slot before guest entry. See `litebox_syscall_rewriter` arm64 module and
+  `litebox_platform_macos_userland` for the infrastructure.
 * **The platform's *own* per-thread context-switch bookkeeping** — a separate
   problem from the rewriter's guest slot above. Studying
   `litebox_platform_linux_userland`'s x86_64
