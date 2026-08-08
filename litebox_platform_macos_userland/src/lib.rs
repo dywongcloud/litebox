@@ -63,8 +63,8 @@ mod guest;
 mod net;
 
 use darwin::{
-    KERN_NO_SPACE, KERN_SUCCESS, MAP_JIT, VM_FLAGS_FIXED, mach_task_self, mach_vm_allocate,
-    mach_vm_region_iter, ulock_wait, ulock_wake,
+    MAP_JIT, ReservationError, mach_vm_region_iter, release_reservation, reserve_fixed, ulock_wait,
+    ulock_wake,
 };
 
 /// The host signal LiteBox reserves for interrupting a thread out of guest
@@ -89,6 +89,19 @@ pub struct MacOsUserland {
     stdio_is_tty: [bool; 3],
     /// The `utun` socket used for guest networking, if one was requested.
     tun: Option<std::os::fd::OwnedFd>,
+    /// CoW-eligible memory regions registered via [`Self::register_cow_region`].
+    /// Maps the start address of the static slice to the info needed to re-mmap
+    /// the backing file. Mirrors `litebox_platform_linux_userland`'s identical
+    /// mechanism.
+    cow_regions: std::sync::RwLock<alloc::collections::BTreeMap<usize, CowRegionInfo>>,
+}
+
+/// Information about a CoW-eligible memory region backed by a host file.
+struct CowRegionInfo {
+    /// The path to the backing file on the host filesystem.
+    file_path: std::path::PathBuf,
+    /// Length of the backing file's registered slice.
+    file_length: usize,
 }
 
 impl core::fmt::Debug for MacOsUserland {
@@ -124,6 +137,7 @@ impl MacOsUserland {
                 std::io::stderr().is_terminal(),
             ],
             tun,
+            cow_regions: std::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         };
 
         // A platform must outlive every guest thread that can reach it, and
@@ -151,6 +165,53 @@ impl MacOsUserland {
         // value.
         let _ = self.boot_id.set(uuid.into_bytes());
         Ok(())
+    }
+
+    /// Register a CoW-eligible memory region backed by a file.
+    ///
+    /// `data` must be a slice that was `mmap`'d in from `file_path` (typically
+    /// by the initial file system's static-backing-data loader). Once
+    /// registered, [`litebox::platform::PageManagementProvider::try_allocate_cow_pages`]
+    /// can remap any sub-slice of `data` into the guest's address space by
+    /// re-`mmap`ing the same file region `MAP_PRIVATE`, instead of allocating
+    /// fresh pages and copying `data` into them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an overlapping region is already registered.
+    pub fn register_cow_region(
+        &self,
+        data: &'static [u8],
+        file_path: impl Into<std::path::PathBuf>,
+    ) {
+        let start = data.as_ptr() as usize;
+        let info = CowRegionInfo {
+            file_path: file_path.into(),
+            file_length: data.len(),
+        };
+        let mut regions = self.cow_regions.write().unwrap();
+        assert!(
+            regions.range(start..start + data.len()).next().is_none(),
+            "attempting to register an overlapping CoW region"
+        );
+        let old = regions.insert(start, info);
+        assert!(old.is_none());
+    }
+
+    /// Looks up the file backing a static slice for CoW mapping.
+    ///
+    /// Returns `Some((file_path, offset_in_file))` if `source_data` falls
+    /// entirely within a registered region, `None` otherwise.
+    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(std::path::PathBuf, usize)> {
+        let slice_start = source_data.as_ptr() as usize;
+        let slice_end = slice_start.checked_add(source_data.len())?;
+
+        let regions = self.cow_regions.read().unwrap();
+        let (&region_start, info) = regions.range(..=slice_start).next_back()?;
+        let region_end = region_start.checked_add(info.file_length)?;
+
+        (slice_start >= region_start && slice_end <= region_end)
+            .then(|| (info.file_path.clone(), slice_start - region_start))
     }
 
     /// The task parameters a runner should start the initial guest thread with.
@@ -256,27 +317,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         }
 
         // `MAP_FIXED_NOREPLACE` has no Darwin equivalent, so claim the range
-        // through the Mach VM API first: `mach_vm_allocate` with `VM_FLAGS_FIXED`
-        // fails with `KERN_NO_SPACE` when any part of the range is already
-        // mapped, which is exactly the semantics being emulated. The `mmap`
-        // below then replaces the reservation in place.
-        if fixed_address_behavior == FixedAddressBehavior::NoReplace {
-            let mut addr = suggested_range.start as u64;
-            // SAFETY: `mach_task_self()` names this process and the range is
-            // page-aligned.
-            let kr = unsafe {
-                mach_vm_allocate(
-                    mach_task_self(),
-                    &raw mut addr,
-                    suggested_range.len() as u64,
-                    VM_FLAGS_FIXED,
-                )
-            };
-            match kr {
-                KERN_SUCCESS => {}
-                KERN_NO_SPACE => return Err(AllocationError::AddressInUse),
-                _ => return Err(AllocationError::OutOfMemory),
-            }
+        // through the Mach VM API first: this fails with `KERN_NO_SPACE` when
+        // any part of the range is already mapped, which is exactly the
+        // semantics being emulated. The `mmap` below then replaces the
+        // reservation in place; if it fails, the reservation is released so a
+        // failed allocation never permanently claims the range.
+        let reserved = fixed_address_behavior == FixedAddressBehavior::NoReplace;
+        if reserved {
+            reserve_fixed(&suggested_range).map_err(|e| match e {
+                ReservationError::AddressInUse => AllocationError::AddressInUse,
+                ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+            })?;
         }
 
         let mut flags = libc::MAP_PRIVATE | libc::MAP_ANON;
@@ -300,6 +351,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             )
         };
         if ptr == libc::MAP_FAILED {
+            if reserved {
+                release_reservation(&suggested_range);
+            }
             // `EINVAL` from `mmap` here means a misaligned address or length,
             // since every other argument is fixed by this function. Everything
             // else -- `ENOMEM` included -- is reported as exhaustion.
@@ -366,6 +420,94 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
         self.reserved_pages.iter()
+    }
+
+    /// Maps a registered CoW region straight from its backing file via
+    /// `mmap(MAP_PRIVATE)`, instead of the default (allocate-and-memcpy)
+    /// behavior. Mirrors `litebox_platform_linux_userland`'s implementation of
+    /// the same trait method; see [`Self::register_cow_region`] for how a
+    /// region becomes eligible.
+    fn try_allocate_cow_pages(
+        &self,
+        suggested_start: usize,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::CowAllocationError> {
+        use litebox::platform::page_mgmt::CowAllocationError;
+
+        let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
+            return Err(CowAllocationError::UnsupportedSourceRegion);
+        };
+        if !file_offset.is_multiple_of(ALIGN) || !suggested_start.is_multiple_of(ALIGN) {
+            return Err(CowAllocationError::Unaligned);
+        }
+        let mapped_range = suggested_start..suggested_start + source_data.len();
+
+        let reserved = fixed_address_behavior == FixedAddressBehavior::NoReplace;
+        if reserved && reserve_fixed(&mapped_range).is_err() {
+            return Err(CowAllocationError::InternalFailure);
+        }
+
+        let Ok(file_path_cstr) = std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes())
+        else {
+            if reserved {
+                release_reservation(&mapped_range);
+            }
+            return Err(CowAllocationError::InternalFailure);
+        };
+        // SAFETY: `file_path_cstr` is a live, NUL-terminated path.
+        let fd = unsafe { libc::open(file_path_cstr.as_ptr(), libc::O_RDONLY) };
+        if fd < 0 {
+            if reserved {
+                release_reservation(&mapped_range);
+            }
+            // The backing file changing out from under a running LiteBox
+            // instance is not a condition normal operation can recover from --
+            // matches `litebox_platform_linux_userland`'s identical assumption.
+            panic!(
+                "CoW-registered file should remain unchanged on host: {}",
+                file_path.display()
+            );
+        }
+
+        let Ok(offset) = libc::off_t::try_from(file_offset) else {
+            // SAFETY: `fd` is open and not used past this point.
+            unsafe { libc::close(fd) };
+            if reserved {
+                release_reservation(&mapped_range);
+            }
+            return Err(CowAllocationError::InternalFailure);
+        };
+
+        let mut flags = libc::MAP_PRIVATE;
+        if fixed_address_behavior != FixedAddressBehavior::Hint {
+            flags |= libc::MAP_FIXED;
+        }
+
+        // SAFETY: `fd` was just opened read-only from a path this platform
+        // itself registered, and `MAP_FIXED` only replaces a range the caller
+        // (or the reservation above) has claimed for this mapping.
+        let ptr = unsafe {
+            libc::mmap(
+                suggested_start as *mut libc::c_void,
+                source_data.len(),
+                prot_flags(permissions),
+                flags,
+                fd,
+                offset,
+            )
+        };
+        // SAFETY: `fd` is open and not used past this point.
+        unsafe { libc::close(fd) };
+
+        if ptr == libc::MAP_FAILED {
+            if reserved {
+                release_reservation(&mapped_range);
+            }
+            return Err(CowAllocationError::InternalFailure);
+        }
+        Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 }
 
@@ -489,8 +631,10 @@ impl litebox::platform::TimeProvider for MacOsUserland {
     type SystemTime = SystemTime;
 
     fn now(&self) -> Self::Instant {
-        // `CLOCK_MONOTONIC_RAW` is unaffected by NTP slewing and, like Linux's
-        // `CLOCK_MONOTONIC`, does not advance while the machine is asleep.
+        // `CLOCK_MONOTONIC_RAW` is unaffected by NTP slewing or wall-clock
+        // adjustment, which is all `Instant` requires: monotonic, with no
+        // particular relationship to wall time. (Its exact behavior across
+        // system sleep is a separate question the trait does not depend on.)
         Instant(darwin::clock_gettime_nanos(libc::CLOCK_MONOTONIC_RAW))
     }
 

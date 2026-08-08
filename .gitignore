@@ -1,6 +1,9 @@
 # Created by https://www.toptal.com/developers/gitignore/api/rust,linux,windows,macos,emacs,vim,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=rust,linux,windows,macos,emacs,vim,visualstudiocode
 
+### Local agent tooling ###
+/.gm/
+
 ### Emacs ###
 # -*- mode: gitignore; -*-
 *~

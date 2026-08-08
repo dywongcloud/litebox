@@ -48,6 +48,12 @@ unsafe extern "C" {
         flags: libc::c_int,
     ) -> KernReturn;
 
+    /// Releases a Mach VM allocation made by [`mach_vm_allocate`]. Used to undo
+    /// a `VM_FLAGS_FIXED` reservation when the `mmap` that was meant to replace
+    /// it fails, so a failed allocation never permanently reserves address
+    /// space.
+    pub(crate) fn mach_vm_deallocate(target: MachPort, address: u64, size: u64) -> KernReturn;
+
     fn mach_vm_region(
         target: MachPort,
         address: *mut u64,
@@ -80,6 +86,53 @@ unsafe extern "C" {
 pub(crate) fn mach_task_self() -> MachPort {
     // SAFETY: reading an immutable global libSystem publishes for this purpose.
     unsafe { mach_task_self_ }
+}
+
+/// The outcome of a failed [`reserve_fixed`] call.
+pub(crate) enum ReservationError {
+    /// Some part of the range is already mapped.
+    AddressInUse,
+    /// The reservation could not be made for any other reason.
+    OutOfMemory,
+}
+
+/// Claims `range` via `mach_vm_allocate(VM_FLAGS_FIXED)`.
+///
+/// This is Darwin's substitute for Linux's `MAP_FIXED_NOREPLACE`: unlike a
+/// plain `mmap(MAP_FIXED)`, it fails with `KERN_NO_SPACE` (reported here as
+/// [`ReservationError::AddressInUse`]) if any part of the range is already
+/// mapped, rather than silently replacing it. A caller that goes on to `mmap`
+/// over the reservation and finds that call itself fails must release the
+/// reservation via [`release_reservation`] -- otherwise the range is
+/// permanently claimed despite the overall allocation having failed.
+pub(crate) fn reserve_fixed(range: &core::ops::Range<usize>) -> Result<(), ReservationError> {
+    let mut addr = range.start as u64;
+    // SAFETY: `mach_task_self()` names this process, and the caller guarantees
+    // `range` is page-aligned (every [`PageManagementProvider`] entry point
+    // checks this before reaching here).
+    let kr = unsafe {
+        mach_vm_allocate(
+            mach_task_self(),
+            &raw mut addr,
+            range.len() as u64,
+            VM_FLAGS_FIXED,
+        )
+    };
+    match kr {
+        KERN_SUCCESS => Ok(()),
+        KERN_NO_SPACE => Err(ReservationError::AddressInUse),
+        _ => Err(ReservationError::OutOfMemory),
+    }
+}
+
+/// Releases a reservation made by [`reserve_fixed`].
+///
+/// Must be called only when nothing has since been mapped over `range` --
+/// deallocating a range that now holds a real mapping would unmap it instead.
+pub(crate) fn release_reservation(range: &core::ops::Range<usize>) {
+    // SAFETY: the caller guarantees `range` still holds exactly the reservation
+    // `reserve_fixed` made and nothing else has mapped over it.
+    unsafe { mach_vm_deallocate(mach_task_self(), range.start as u64, range.len() as u64) };
 }
 
 /// Walk every mapped region of this process, yielding its address range.

@@ -167,3 +167,55 @@ pub(crate) fn read_packet(fd: &OwnedFd, out: &mut [u8]) -> Option<usize> {
     let n = usize::try_from(n).ok()?;
     n.checked_sub(header.len()).filter(|len| *len > 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{address_family_header, parse_utun_unit};
+
+    #[test]
+    fn parses_utun_unit_from_name() {
+        assert_eq!(parse_utun_unit("utun0"), Some(0));
+        assert_eq!(parse_utun_unit("utun3"), Some(3));
+        assert_eq!(parse_utun_unit("utun42"), Some(42));
+    }
+
+    #[test]
+    fn rejects_names_that_are_not_utun_n() {
+        assert_eq!(parse_utun_unit("tun0"), None);
+        assert_eq!(parse_utun_unit("utun"), None);
+        assert_eq!(parse_utun_unit("utuno"), None);
+        assert_eq!(parse_utun_unit("en0"), None);
+        assert_eq!(parse_utun_unit(""), None);
+    }
+
+    #[test]
+    fn address_family_header_detects_ipv4() {
+        // High nibble 4 => IPv4.
+        let packet = [0x45, 0, 0, 0];
+        assert_eq!(
+            address_family_header(&packet),
+            u32::try_from(libc::AF_INET).unwrap().to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn address_family_header_detects_ipv6() {
+        // High nibble 6 => IPv6.
+        let packet = [0x60, 0, 0, 0];
+        assert_eq!(
+            address_family_header(&packet),
+            u32::try_from(libc::AF_INET6).unwrap().to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn address_family_header_defaults_to_ipv4_on_empty_packet() {
+        // An empty packet cannot carry a version nibble; defaulting to IPv4
+        // matches the common case and never misroutes an IPv6 packet (which is
+        // never empty -- it always has at least a 40-byte header).
+        assert_eq!(
+            address_family_header(&[]),
+            u32::try_from(libc::AF_INET).unwrap().to_be_bytes()
+        );
+    }
+}
