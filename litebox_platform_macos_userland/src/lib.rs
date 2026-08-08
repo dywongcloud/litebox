@@ -876,8 +876,31 @@ impl litebox::platform::SignalProvider for MacOsUserland {
 ///
 /// Darwin has neither POSIX `timer_create` nor more than one `setitimer` per
 /// process, so each timer owns a thread that sleeps until its deadline and then
-/// raises the signal. The thread is parked on a condition variable when no
-/// deadline is armed, so an idle timer costs nothing but its stack.
+/// fires. The thread is parked on a condition variable when no deadline is
+/// armed, so an idle timer costs nothing but its stack.
+///
+/// Firing has two jobs, and getting only one of them right is a bug that is
+/// easy not to notice: it must both (1) record the *guest*'s chosen signal as
+/// pending, and (2) actually wake the guest thread that may be blocked
+/// waiting on it (in [`litebox::event::wait::WaitContext::sleep`], backed by
+/// this platform's `RawMutex::block_or_timeout`). Recording the pending bit
+/// alone is not observable by a thread parked in `ulock_wait2` -- nothing
+/// re-evaluates its wait condition until something wakes it. So the timer
+/// thread also signals the thread that created it (captured at
+/// [`TimerProvider::create_timer`]-time) with `INTERRUPT_SIGNAL`, the same
+/// signal [`ThreadProvider::interrupt_thread`] uses purely to interrupt a
+/// blocking syscall with `EINTR` -- never `SIGALRM`, which would spuriously
+/// mark the *host's* SIGALRM as pending too, even for a timer configured for
+/// an unrelated guest signal.
+///
+/// This needs no OS-level timer or real signal payload to report which guest
+/// signal fired (contrast `litebox_platform_linux_userland`, which encodes it
+/// in `sigev_value` because its timer genuinely is external kernel state): the
+/// timer never leaves this process, so the firing thread can just write the
+/// pending-signals bitmap directly before waking the target.
+///
+/// [`TimerProvider::create_timer`]: litebox::platform::TimerProvider::create_timer
+/// [`ThreadProvider::interrupt_thread`]: litebox::platform::ThreadProvider::interrupt_thread
 pub struct TimerHandle {
     state: Arc<TimerState>,
 }
@@ -887,7 +910,13 @@ struct TimerState {
     /// whenever this changes.
     deadline: Mutex<TimerCommand>,
     changed: Condvar,
-    signal: libc::c_int,
+    /// The guest signal to record as pending when this timer fires.
+    signal: litebox_common_linux::signal::Signal,
+    /// The thread to wake on fire -- the one that called
+    /// [`TimerProvider::create_timer`](litebox::platform::TimerProvider::create_timer),
+    /// captured once so a guest that arms the timer and then blocks elsewhere
+    /// (the common case: `timer_create` then `nanosleep`) is still reached.
+    target: ThreadHandle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -905,14 +934,11 @@ impl litebox::platform::TimerProvider for MacOsUserland {
         &self,
         signal: Self::Signal,
     ) -> Result<Self::TimerHandle, litebox::platform::TimerCreationError> {
-        // Only the signals with a host handler installed can be raised this way.
-        if signal != litebox_common_linux::signal::Signal::SIGALRM {
-            return Err(litebox::platform::TimerCreationError::Unsupported);
-        }
         let state = Arc::new(TimerState {
             deadline: Mutex::new(TimerCommand::Disarmed),
             changed: Condvar::new(),
-            signal: libc::SIGALRM,
+            signal,
+            target: ThreadHandle::current(),
         });
         let thread_state = Arc::clone(&state);
         std::thread::Builder::new()
@@ -934,11 +960,14 @@ fn timer_thread(state: &TimerState) {
             TimerCommand::ArmedFor(deadline) => {
                 let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
                 else {
-                    // Fire, then disarm -- these timers are one-shot.
+                    // Fire, then disarm -- these timers are one-shot. Record the
+                    // configured guest signal, then wake the target thread; see
+                    // the `TimerHandle` docs for why both steps are required and
+                    // why the wakeup must not be `SIGALRM`.
                     *command = TimerCommand::Disarmed;
-                    // SAFETY: raising a signal at the process level is always
-                    // well-defined; the handler is already installed.
-                    unsafe { libc::raise(state.signal) };
+                    let bit = (state.signal.as_i32() - 1).cast_unsigned();
+                    PENDING_SIGNALS.fetch_or(1u64 << bit, Ordering::Relaxed);
+                    state.target.interrupt();
                     continue;
                 };
                 let (next, _) = state.changed.wait_timeout(command, remaining).unwrap();
