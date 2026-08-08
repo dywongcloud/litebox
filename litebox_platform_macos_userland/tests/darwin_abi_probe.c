@@ -23,44 +23,50 @@
 
 _Static_assert(sizeof(uint64_t) == 8, "sanity check: uint64_t is 8 bytes");
 
-// `ArmExceptionState64` <-> `_STRUCT_ARM_EXCEPTION_STATE64`
+// `ArmExceptionState64` <-> `_STRUCT_ARM_EXCEPTION_STATE64`. Confirmed
+// against a real SDK (`mach/arm/_structs.h`) that every field here is `__`-
+// prefixed (`__far`, not `far`) under `__DARWIN_UNIX03`, which is always
+// defined for any binary built with a normal Rust/Xcode toolchain.
 _Static_assert(sizeof(_STRUCT_ARM_EXCEPTION_STATE64) == 16,
                "ArmExceptionState64: size mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_EXCEPTION_STATE64, far) == 0,
+_Static_assert(offsetof(_STRUCT_ARM_EXCEPTION_STATE64, __far) == 0,
                "ArmExceptionState64::far: offset mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_EXCEPTION_STATE64, esr) == 8,
+_Static_assert(offsetof(_STRUCT_ARM_EXCEPTION_STATE64, __esr) == 8,
                "ArmExceptionState64::esr: offset mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_EXCEPTION_STATE64, exception) == 12,
+_Static_assert(offsetof(_STRUCT_ARM_EXCEPTION_STATE64, __exception) == 12,
                "ArmExceptionState64::exception: offset mismatch");
 
-// `ArmThreadState64` <-> `_STRUCT_ARM_THREAD_STATE64`
+// `ArmThreadState64` <-> `_STRUCT_ARM_THREAD_STATE64`. The SDK header defines
+// two variants of this struct behind an internal ptrauth-availability check:
+// one with `void *__opaque_fp/__opaque_lr/__opaque_sp/__opaque_pc` (arm64e),
+// one with plain `__uint64_t __fp/__lr/__sp/__pc` (every other build,
+// including a stock `aarch64-apple-darwin` Rust target, which is what
+// darwin.rs's own doc comment on `ArmThreadState64::pad` already documents).
+// This probe checks the plain-`__uint64_t` variant; if it fails to compile
+// with "no member named '__fp'" instead of a static-assert failure, this
+// process is being built against the opaque/arm64e variant and darwin.rs's
+// `pad` doc comment's caveat has become load-bearing.
 _Static_assert(sizeof(_STRUCT_ARM_THREAD_STATE64) == 29 * 8 + 4 * 8 + 8,
                "ArmThreadState64: size mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, x) == 0,
+_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, __x) == 0,
                "ArmThreadState64::x: offset mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, fp) == 29 * 8,
+_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, __fp) == 29 * 8,
                "ArmThreadState64::fp: offset mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, lr) == 30 * 8,
+_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, __lr) == 30 * 8,
                "ArmThreadState64::lr: offset mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, sp) == 31 * 8,
+_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, __sp) == 31 * 8,
                "ArmThreadState64::sp: offset mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, pc) == 32 * 8,
+_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, __pc) == 32 * 8,
                "ArmThreadState64::pc: offset mismatch");
-_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, cpsr) == 33 * 8,
+_Static_assert(offsetof(_STRUCT_ARM_THREAD_STATE64, __cpsr) == 33 * 8,
                "ArmThreadState64::cpsr: offset mismatch");
 _Static_assert(sizeof(_STRUCT_ARM_THREAD_STATE64) == 33 * 8 + 8,
                "ArmThreadState64: total size mismatch (includes trailing pad)");
 
 // `McontextPrefix64` <-> the leading two members of `_STRUCT_MCONTEXT64`
-// (`mcontext_t`'s pointee on this architecture). The exception-state member is
-// documented as `__es` and the thread-state member as `__ss` in XNU's
-// `osfmk/mach/arm/_structs.h`; unlike the two checks above, this one depends
-// on those exact field names, which were not independently re-fetched for
-// this probe. If *this* assertion is the one that fails to compile (a "no
-// member named '__es'/'__ss'" error, not a static-assert failure), the field
-// names moved -- open `<sys/ucontext.h>` / `<mach/arm/_structs.h>` on the
-// runner's SDK and update them here rather than assuming the Rust side is
-// wrong.
+// (`mcontext_t`'s pointee on this architecture), confirmed against a real SDK
+// (`arm/_mcontext.h`): the exception-state member is `__es` and the
+// thread-state member is `__ss`, in that order, under `__DARWIN_UNIX03`.
 _Static_assert(offsetof(struct __darwin_mcontext64, __es) == 0,
                "McontextPrefix64::exception_state: offset mismatch");
 _Static_assert(offsetof(struct __darwin_mcontext64, __ss) ==
