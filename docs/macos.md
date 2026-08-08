@@ -30,7 +30,12 @@ cargo build --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_s
 `litebox_runner_lvbs` and `litebox_runner_snp` are freestanding images for
 custom targets and are not built for a hosted target on any platform.
 
-CI covers this in the `Build and Test macOS (Apple Silicon)` job.
+CI covers this in the `Build and Test macOS (Apple Silicon)` job, which also
+compiles and runs `litebox_platform_macos_userland/tests/darwin_abi_probe.c`
+against the runner's real SDK headers -- the only check in this repo that
+verifies the crate's hand-written Mach/BSD struct layouts (used by the fault
+handler to read `ucontext_t::uc_mcontext`) against an actual Darwin toolchain,
+since nothing else in a Linux-hosted development loop can.
 
 ## What the host imposes
 
@@ -194,3 +199,22 @@ Three smaller gaps worth recording:
   signal-mask discipline Linux uses, or `pthread_sigqueue` if Darwin's payload
   delivery turns out to support it -- is worth doing before multi-threaded
   guest signal delivery is trusted.
+* **`jit_write_protect` is not called from anywhere that writes guest code.**
+  `litebox_shim_linux`'s ELF loader and the syscall rewriter's in-place
+  patching (`maybe_patch_exec_segment`, `apply_trap_fallback` in
+  `litebox_shim_linux/src/syscalls/mm.rs`) write into a mapping's bytes with
+  ordinary `copy_from_slice` calls, bracketed only by `sys_mprotect_raw`'s
+  `PROT_READ|PROT_WRITE` / `PROT_READ|PROT_EXEC` transitions -- the VM-level
+  permission, which is a different mechanism from the per-thread
+  `pthread_jit_write_protect_np` toggle a `MAP_JIT` mapping also requires (see
+  "Writes must be bracketed" above). On real Apple Silicon this is expected to
+  either fault on the write itself, or write successfully and then fault on
+  first execution with a stale write-protect state, since nothing in that path
+  calls `crate::jit_write_protect`. `litebox_shim_linux` is platform-agnostic
+  and has no business calling a macOS-specific FFI function directly, so the
+  real fix is a `PageManagementProvider` hook (no-op default, overridden by
+  `MacOsUserland`) that the loader and rewriter call around each write into a
+  page that may later execute. Not yet implemented, and like the two gaps
+  above, not reachable by anything today since guest entry itself isn't
+  implemented -- but it blocks trusting *any* JIT-written guest code once
+  guest entry lands, including the very first rewritten syscall stub.

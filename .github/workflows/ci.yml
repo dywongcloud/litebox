@@ -143,6 +143,13 @@ jobs:
       - run: cargo test --locked --verbose --doc -p litebox -p litebox_common_linux -p litebox_platform_macos_userland
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+      # Verifies litebox_platform_macos_userland's hand-written Mach/BSD struct
+      # layouts against the real SDK headers on this runner -- see the probe
+      # file for why this matters and what a failure here means.
+      - name: Verify hand-written Darwin struct layouts against the SDK
+        run: |
+          cc -Wall -Wextra -Werror -o /tmp/darwin_abi_probe litebox_platform_macos_userland/tests/darwin_abi_probe.c
+          /tmp/darwin_abi_probe
 
   miri:
     name: Miri (litebox core, asm-free logic)
@@ -163,7 +170,7 @@ jobs:
       # exception_table.rs's `search_in` (the exception-table lookup's pure
       # relocation/interval-comparison logic, split out from the asm-based
       # section lookup precisely so it has somewhere Miri-reachable to live).
-      - run: cargo +nightly miri test -p litebox --lib mm::
+      - run: cargo +nightly miri test -p litebox --lib "mm::"
 
   build_and_test_lvbs:
     name: Build and Test LVBS
