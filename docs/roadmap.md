@@ -84,70 +84,56 @@ subsystem.
     updated from normal (non-naked) Rust immediately around the naked-asm call
     sites rather than from inside the asm. Lower-risk than matching x86_64's
     raw-TLS-in-asm style, and independently buildable/unit-testable.
-* **The guest-entry context switch itself**, once the bookkeeping primitive
-  above lands. AArch64 guest entry (`run_thread_arch` / `switch_to_guest` in
-  the Linux terminology) is not implemented for *any* host in this repo yet,
-  macOS included -- `litebox_platform_linux_userland`'s version is entirely
-  `#[cfg(target_arch = "x86_64")]`, and LVBS's AArch64 scaffolding (the
-  `Exception`/`ExceptionInfo` types in `litebox/src/shim.rs` already have
-  AArch64 variants, which *is* directly reusable) stops short of a working
-  context switch too. There is no existing full AArch64 reference
-  implementation anywhere in the tree to adapt; a macOS implementation would
-  be pioneering this for the whole project, not porting an existing pattern.
-  This is the one seam standing between the current macOS port and actually
-  running a guest.
+## Guest-entry context switch — DONE (implemented and hardware-tested)
 
-  **A real finding worth recording before anyone attempts a hand-rolled
-  `switch_to_guest` here: at EL0 (userspace, which is all that's available --
-  `ERET` needs EL1+), there is no register-only solution to "restore all 31
-  guest GPRs plus PC plus SP and branch."** Working through it by hand: any
-  register used to carry the branch target (for `BR`/`RET`) still holds that
-  target's value immediately *after* the branch, not its own correct
-  `PtRegs` value, and `MOV SP, Xn` needs a GPR source too -- so entering the
-  guest always needs at least one GPR "sacrificed" for the transfer, with no
-  spare register left once all 31 are otherwise correct. Real kernels solve
-  this with `ERET`, which restores the whole register file including PC and
-  PSTATE atomically from memory with no GPR involved at all -- not available
-  here. **The userspace equivalent, and the actual way out, is Darwin's
-  `ucontext.h` API** (`getcontext`/`setcontext`): confirmed working on real
-  hardware this pass (a `getcontext`/`makecontext`/`swapcontext` round trip
-  ran correctly on this M3 Pro, macOS 26.3.1), despite `setcontext` and
-  friends carrying an "deprecated... no longer supported" compiler warning
-  since macOS 10.6 -- a real risk to weigh (Apple could remove it; "not
-  supported" may also mean undocumented edge-case gaps), but a working,
-  OS-verified atomic full-register-plus-PC restore beats a hand-derived
-  register-juggling sequence with no way to validate it short of a
-  debugger session this environment doesn't have. Also confirmed by direct
-  `offsetof` probing on this hardware: `ucontext_t` is self-contained
-  (`getcontext` links its embedded `uc_mcontext` pointer at a fixed offset,
-  56, into the same 880-byte object; no separate allocation needed), and its
-  `_STRUCT_MCONTEXT64` payload is byte-identical to the
-  `McontextPrefix64`/`ArmExceptionState64`/`ArmThreadState64` layout already
-  defined and verified in `litebox_platform_macos_userland/src/darwin.rs`
-  (`__es` at offset 0, `__ss` at offset 16, matching `ArmThreadState64`'s
-  272-byte size exactly against the measured `__ns` offset of 288) --
-  meaning entering the guest can reuse those exact, already-tested types
-  rather than defining new ones.
+AArch64 guest entry is implemented in `litebox_platform_macos_userland::guest`
+and validated by the crate test `runs_a_guest_through_two_syscalls_and_exit`,
+which drives a hand-assembled guest (reproducing the rewriter's exact `SVC`-gate
+output) through the real `run_thread` on an M3 Pro: `write` syscall, resume,
+`exit`, with every register faithfully round-tripped. There was no existing
+AArch64 reference anywhere in the tree (`litebox_platform_linux_userland`'s
+switch is entirely `#[cfg(target_arch = "x86_64")]`), so this pioneered it for
+the project.
 
-  The design this implies: call the real `getcontext` to get a
-  correctly-linked scratch `ucontext_t` (as the "return to host" point),
-  build a second one the same way and overwrite its `uc_mcontext->__ss`
-  fields directly from `PtRegs` (bypassing `makecontext`, which only accepts
-  a plain function pointer and int args, not arbitrary register state), then
-  `setcontext` into it. The *other* direction -- capturing a guest's full
-  register state when it re-enters the host via a syscall gate -- still needs
-  a short raw-asm save prologue (guest GPRs are live in registers at that
-  point, nothing else has them yet), but that direction is meaningfully
-  easier: it is a straight linear `STP` chain into a `PtRegs`-shaped buffer
-  with no restore-side register-scarcity conflict, and it is exactly the
-  shape the rewriter's own MSR/MRS gates already use successfully (spill
-  first, then use the freed register) -- see `emit_msr_gate` in
-  `litebox_syscall_rewriter/src/arm64.rs`.
+The mechanism, and why, established empirically on this hardware:
 
-  Not implemented this pass -- this is a precise, de-risked *design*, not
-  code, and the actual FFI bindings, `Ucontext64` struct, save-prologue
-  assembly, and `EnterShim` wiring are real, non-trivial work still ahead of
-  whoever picks this up next.
+* **No userland instruction atomically restores all GPRs + `PC`** (`ERET` is
+  EL1+), and every indirect branch (`BR`/`RET`) reads a GPR, so entry must
+  sacrifice exactly one register as the branch vehicle.
+* **`setcontext` (the `ucontext` API) was ruled out.** A probe showed Darwin's
+  `setcontext` resumes by `ret`-ing to `__ss.__lr` (its `__pc` stays 0),
+  forcing `X30 == PC` on arrival. glibc/musl keep a live `X30` across an `SVC`,
+  so that clobber breaks real guests — strictly worse than the chosen vehicle.
+  (It is also deprecated since macOS 10.6.) `getcontext`/`swapcontext` do work
+  (verified), but this property makes them unfit for *resume*.
+* **`setjmp`/`longjmp` is UB across Rust frames**, so the exit/return path uses
+  a normal Rust return instead.
+
+Implemented design (a hand-rolled `swapcontext`): `enter_guest_asm` restores
+all of `X0`-`X30`, `SP` and `NZCV` from `PtRegs` and branches through **`X16`**
+as the vehicle — safe because the rewriter's own `SVC` gate already treats
+`X16` as scratch and neither glibc nor musl keeps a live `X16`/`X17` across an
+`SVC`. `syscall_callback` captures the full guest file back into `PtRegs`
+(a straight `STP` chain, the same spill-then-reuse shape as `emit_msr_gate`),
+restores the host callee-saved state from a save area, and returns *normally*
+into the Rust run loop. The whole enter→SVC→gate→callback→resume→exit loop was
+prototyped in C on this hardware before porting, then re-proven by the crate
+test. `PtRegs` field offsets are pinned to the asm by `const` assertions.
+
+Remaining, smaller, follow-ups on top of the working switch:
+* Host bookkeeping (save area + live-`PtRegs` pointer) is process-global, so
+  **one guest thread at a time** (a second panics loudly). Per-thread needs the
+  same `TPIDRRO_EL0` direct-TSD reach the rewriter gates need (below).
+* Only the **syscall** event path is wired; guest hardware faults and the
+  `SIGUSR2` interrupt path are not yet routed to `EnterShim::exception`/
+  `interrupt`.
+* `enter_guest_asm` stages `PC`/`X0` in the 16 bytes below the guest `SP`
+  (AArch64 has no red zone), so guest-directed signals must stay on a
+  `sigaltstack`.
+
+These, plus the guest thread-pointer plumbing, are what stand between "a
+syscall-only guest runs end to end" (true today) and "an arbitrary unmodified
+Linux binary runs."
 * **The `jit_write_protect` bracketing gap** documented in
   [`docs/macos.md`](./macos.md#wx-map_jit-and-code-signing): nothing in
   `litebox_shim_linux`'s ELF loader or syscall-rewriter patching calls

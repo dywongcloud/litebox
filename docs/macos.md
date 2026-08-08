@@ -18,7 +18,7 @@ before a guest can actually execute.
 | `litebox_shim_linux` | The Linux "North" shim, ported to AArch64: signal frames, syscall entry/return, thread-pointer handling, `stat`/`uname` ABI, exception decoding. |
 | `litebox_syscall_rewriter` | Already had AArch64 support (`arm64.rs`) for rewriting `SVC` and `TPIDR_EL0` accesses in Linux ELF images. |
 | `litebox_packager` | OCI mode now pulls the image matching the host architecture, and builds on Apple Silicon. |
-| Guest entry | **Not implemented.** See [Remaining work](#remaining-work). |
+| Guest entry | **Implemented** (context switch + syscall dispatch), tested on real hardware. A syscall-only guest runs end to end; the guest thread-pointer plumbing and non-syscall event paths remain. See [Remaining work](#remaining-work). |
 
 ## Building
 
@@ -166,8 +166,12 @@ See also [`docs/roadmap.md`](./roadmap.md) for this and everything else
 outstanding across the tree, grouped by how much verification each item
 needs before it can land.
 
-Guest entry is the one seam that is not implemented. It lives in
-`litebox_platform_macos_userland::guest` and is documented there; the summary:
+Guest entry itself -- the context switch into guest code and back -- **is now
+implemented and tested on real hardware** (`litebox_platform_macos_userland::guest`;
+see [Guest entry](#guest-entry-implemented) below). What is left before an
+*arbitrary* guest runs unmodified is the guest thread-pointer plumbing (item 1)
+and the non-syscall event paths (the smaller gaps at the end); a guest that only
+issues syscalls already runs end to end. The pieces:
 
 1. **A host thread-pointer anchor.** **Resolved on real hardware (Apple M3
    Pro, macOS 26.3.1): `TPIDR_EL0` does *not* survive a context switch and
@@ -237,9 +241,38 @@ Guest entry is the one seam that is not implemented. It lives in
    at offset 0 of the trampoline it appends to the image; the loader must write
    `SystemInfoProvider::get_syscall_entry_point` there before any guest `SVC`
    runs.
-3. **The context switch itself** — save host state, load the guest's from
-   `PtRegs`, branch to `pc`, and reverse it in the callback. This is the
-   counterpart of the other platforms' `run_thread_arch`.
+3. **The context switch itself.** **Implemented** (see below).
+
+### Guest entry (implemented)
+
+`litebox_platform_macos_userland::guest` implements the context switch, and a
+crate test (`runs_a_guest_through_two_syscalls_and_exit`) drives a
+hand-assembled guest -- reproducing the rewriter's exact `SVC`-gate output --
+through the real `run_thread` on this Apple Silicon host: it makes a `write`
+syscall, resumes, then `exit`s, with every register faithfully round-tripped.
+
+The mechanism was chosen after ruling the alternatives out empirically on this
+M3 Pro:
+
+* There is **no userland instruction that atomically restores all GPRs plus
+  `PC`** (that is `ERET`, EL1+ only), and every indirect branch reads a GPR, so
+  entering the guest must sacrifice exactly one register as the branch vehicle.
+* `setcontext` (the `ucontext` API) resumes by `ret`-ing to `__lr`, i.e. it
+  forces `X30 == PC` -- confirmed by probing on this hardware. glibc/musl keep a
+  live `X30` across an `SVC`, so that clobber would break real guests. (It is
+  also deprecated since macOS 10.6.)
+* `setjmp`/`longjmp` is undefined behavior across Rust frames.
+
+Instead, `enter_guest_asm` hand-rolls the restore and uses **`X16`** as the
+branch vehicle. That is safe because the rewriter's own `SVC` gate already
+treats `X16` as scratch, and neither glibc nor musl keeps a live `X16`/`X17`
+across an `SVC`. `syscall_callback` captures the full guest register file back
+into `PtRegs`, restores the host's callee-saved state, and returns *normally*
+into the Rust run loop -- a hand-rolled `swapcontext`, no `longjmp`, no
+`ucontext`. See the module docs for the register-level contract and the
+documented limitations (one guest thread at a time via a process-global save
+area; only the syscall path is wired; below-`SP` staging needs a
+`sigaltstack`).
 
 Three smaller gaps worth recording:
 
