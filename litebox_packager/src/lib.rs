@@ -609,16 +609,26 @@ fn target_elf_machine() -> u16 {
 /// The syscall rewriter's AArch64 host anchor to target: whichever OS is
 /// actually going to run the packaged guest, which -- since packaging happens
 /// on that same host in this project's usage model -- is the OS this packager
-/// binary is itself running on. `TPIDR_EL0` (the `Host::Linux` anchor) does
-/// not survive a context switch on macOS, so packaging a Linux-anchored
-/// AArch64 binary there would silently produce gates that fault the guest the
-/// first time it's rescheduled.
+/// binary is itself running on.
+///
+/// This still returns `Host::Linux` unconditionally, on macOS included, even
+/// though `TPIDR_EL0` (its anchor) does not survive a context switch there
+/// (confirmed on real hardware -- see `docs/macos.md`). **`Host::MacOs` is not
+/// yet safe to select**: its gates address the guest thread-pointer slot at
+/// `[anchor + GUEST_TPIDR_OFFSET]`, an addressing scheme that assumes the
+/// anchor points at a block the *runtime* owns (true of `Host::Linux`'s
+/// `TPIDR_EL0`, which the runtime sets itself). `Host::MacOs`'s anchor,
+/// `TPIDRRO_EL0`, instead already points at Apple's own per-thread `pthread`
+/// structure -- writing the guest's thread pointer at a fixed offset from it
+/// would corrupt live libpthread state, not merely fail to work. Fixing this
+/// needs a genuinely LiteBox-owned per-thread slot reached through a
+/// documented-safe indirection from `TPIDRRO_EL0` (see `docs/roadmap.md`),
+/// which hasn't landed yet. Selecting `Host::MacOs` here today would silently
+/// package binaries carrying that corruption risk -- currently harmless only
+/// because guest entry itself isn't implemented on macOS, so nothing executes
+/// the gates yet.
 fn rewrite_host() -> litebox_syscall_rewriter::Host {
-    if cfg!(target_os = "macos") {
-        litebox_syscall_rewriter::Host::MacOs
-    } else {
-        litebox_syscall_rewriter::Host::Linux
-    }
+    litebox_syscall_rewriter::Host::Linux
 }
 
 /// Rewrite an ELF file's syscall instructions using the litebox syscall rewriter.

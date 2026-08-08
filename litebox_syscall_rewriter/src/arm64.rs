@@ -509,9 +509,25 @@ pub enum Host {
     Linux,
     /// macOS host (Apple Silicon). `TPIDR_EL0` does not survive a host
     /// transition (see above), so the anchor read uses the read-only
-    /// `TPIDRRO_EL0` instead; the guest thread-pointer slot is still reached
-    /// at `[anchor + GUEST_TPIDR_OFFSET]`, exactly as on Linux. Does not yet
-    /// virtualize guest `x18` uses — see this enum's doc comment.
+    /// `TPIDRRO_EL0` instead.
+    ///
+    /// **Not yet safe to select for real gate emission.** The guest
+    /// thread-pointer slot is still addressed at `[anchor +
+    /// GUEST_TPIDR_OFFSET]`, exactly as on Linux -- but that addressing
+    /// scheme assumes the anchor points at a block the *runtime* owns, which
+    /// is true of `Host::Linux`'s `TPIDR_EL0` (the runtime sets it itself)
+    /// and false here: `TPIDRRO_EL0` already points at Apple's own per-thread
+    /// `pthread` structure. A gate that stores the guest's thread pointer at
+    /// a fixed offset from it corrupts live libpthread state rather than
+    /// merely failing. This variant exists so the anchor *register* choice
+    /// (verified against real hardware and a real toolchain, see above and
+    /// this module's tests) is landed and testable in isolation; nothing in
+    /// this crate's callers selects it for real work yet (see
+    /// `litebox_packager::rewrite_host`). Also does not yet virtualize guest
+    /// `x18` uses — see this enum's doc comment. Fixing the slot-addressing
+    /// scheme needs a genuinely LiteBox-owned per-thread slot reached through
+    /// a documented-safe indirection from `TPIDRRO_EL0`; see
+    /// `docs/roadmap.md`.
     MacOs,
 }
 

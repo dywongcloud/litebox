@@ -198,6 +198,16 @@ Guest entry is the one seam that is not implemented. It lives in
    the whole reason `TPIDR_EL0` looked attractive originally was a
    single-instruction anchor, and a fast, inlined `TPIDRRO_EL0`-relative read
    is the only replacement that keeps that property.
+
+   `litebox_syscall_rewriter::Host::MacOs` implements the anchor-*register*
+   half of this (real, tested, using `MRS Xd, TPIDRRO_EL0`), but **the slot
+   addressing is not yet fixed and the variant is not selected anywhere real
+   work happens** (`litebox_packager::rewrite_host` still always returns
+   `Host::Linux`). Its gates currently store the guest thread pointer at
+   `[TPIDRRO_EL0-value + GUEST_TPIDR_OFFSET]` -- i.e. at a fixed offset into
+   Apple's own `pthread` structure, which `TPIDRRO_EL0` points at. That
+   corrupts live libpthread state; it does not merely fail. The pthread-TSD
+   design in the paragraph above is the fix, still to be implemented.
 2. **Filling the trampoline.** The rewriter writes the syscall-callback address
    at offset 0 of the trampoline it appends to the image; the loader must write
    `SystemInfoProvider::get_syscall_entry_point` there before any guest `SVC`

@@ -26,9 +26,35 @@ subsystem.
 
 ## Needs real Apple Silicon hardware (implementation, not open questions)
 
-* **`Host::MacOs` in `litebox_syscall_rewriter` and the guest-entry context
-  switch**, now that the anchor design above is settled. This is the one
-  seam standing between the current macOS port and actually running a guest.
+* **`Host::MacOs`'s guest-slot addressing is a live correctness bug, not just
+  an unfinished feature.** The anchor-register half landed
+  (`litebox_syscall_rewriter::Host::MacOs`, real `MRS Xd, TPIDRRO_EL0`,
+  tested), but its gates still address the guest thread-pointer slot at
+  `[TPIDRRO_EL0-value + GUEST_TPIDR_OFFSET]` -- the same scheme `Host::Linux`
+  uses, which only works there because the runtime owns the block
+  `TPIDR_EL0` points at. `TPIDRRO_EL0` instead already points at Apple's own
+  `pthread` structure, so that write corrupts live libpthread state rather
+  than merely failing. `litebox_packager::rewrite_host` was reverted to
+  always return `Host::Linux` (even on macOS) specifically to keep this out
+  of anything that runs for real, until the fix below lands. Needed: a
+  genuinely LiteBox-owned per-thread slot reached through a documented-safe
+  indirection from `TPIDRRO_EL0` -- reserve a slot with `pthread_key_create`
+  at platform-init time, `pthread_setspecific` the guest pointer into it once
+  per guest thread, and have gates read it back through the same
+  `TPIDRRO_EL0`-relative "direct TSD" sequence libSystem's own
+  `errno`/QoS-class accessors use (not a full `pthread_getspecific` call,
+  which would give up the single-instruction-anchor property that was the
+  entire point). See [`docs/macos.md`](./macos.md#remaining-work) for the
+  full writeup.
+* **The guest-entry context switch itself**, once the above is fixed. Also
+  discovered this pass: AArch64 guest entry (`run_thread_arch` /
+  `switch_to_guest` in the Linux terminology) is not implemented for *any*
+  host in this repo yet, macOS included -- `litebox_platform_linux_userland`'s
+  version is entirely `#[cfg(target_arch = "x86_64")]`. There is no existing
+  AArch64 reference implementation anywhere in the tree to adapt; a macOS
+  implementation would be pioneering this for the whole project, not porting
+  an existing pattern. This is the one seam standing between the current
+  macOS port and actually running a guest.
 * **The `jit_write_protect` bracketing gap** documented in
   [`docs/macos.md`](./macos.md#wx-map_jit-and-code-signing): nothing in
   `litebox_shim_linux`'s ELF loader or syscall-rewriter patching calls
