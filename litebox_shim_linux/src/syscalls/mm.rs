@@ -27,6 +27,81 @@ compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is loss
 
 const ENDIAN: LittleEndian = LittleEndian;
 
+/// Makes freshly-written code visible to instruction fetch before it is
+/// executed.
+///
+/// x86-64 guarantees instruction/data cache coherency in hardware, so this is
+/// a no-op there. AArch64 does not: a core that just wrote through the data
+/// cache is not guaranteed to see those bytes if it (or another core) fetches
+/// the same address as an instruction, until the corresponding cache lines are
+/// explicitly cleaned and invalidated. Every write this module makes into
+/// guest-executed memory -- the rewriter's patched code, the trampoline stubs,
+/// the trap-fallback bytes -- needs this called over the written range before
+/// the mapping goes back to executable, or the guest can intermittently
+/// execute stale (pre-patch, or partially-written) instructions.
+///
+/// This runs the same `dc cvau`/`ic ivau`/barrier sequence
+/// `__builtin___clear_cache` generates on AArch64 (see LLVM compiler-rt's
+/// `clear_cache.c`), reading the actual cache line sizes from `CTR_EL0` rather
+/// than assuming a fixed one. These instructions are permitted from EL0
+/// (unprivileged) code on Linux, which sets `SCTLR_EL1.UCI` for exactly this
+/// purpose -- every userspace AArch64 JIT relies on the same permission.
+#[cfg(target_arch = "aarch64")]
+fn clear_icache_range(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = start + len;
+
+    // SAFETY: `ctr_el0` is always readable from EL0.
+    let ctr_el0: u64;
+    unsafe {
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr_el0, options(nomem, nostack, preserves_flags));
+    }
+    // CTR_EL0.DminLine (bits [19:16]) / IminLine (bits [3:0]): log2 of the
+    // minimum cache line, in words. A line is therefore `4 << field` bytes.
+    let dcache_line = 4usize << ((ctr_el0 >> 16) & 0xF);
+    let icache_line = 4usize << (ctr_el0 & 0xF);
+
+    // Clean each dirty D-cache line covering the range to the point of
+    // unification, so the I-cache fetch below can see the new bytes.
+    let mut addr = start & !(dcache_line - 1);
+    while addr < end {
+        // SAFETY: `addr` is a valid address within the caller's own writable
+        // mapping (the range just written); `dc cvau` only cleans a cache
+        // line, it cannot fault or corrupt memory.
+        unsafe {
+            core::arch::asm!("dc cvau, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += dcache_line;
+    }
+    // SAFETY: a data synchronization barrier with no other preconditions.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+
+    // Invalidate each I-cache line covering the range to the point of
+    // unification, forcing the next fetch to reload from memory.
+    let mut addr = start & !(icache_line - 1);
+    while addr < end {
+        // SAFETY: as above, for the instruction cache.
+        unsafe {
+            core::arch::asm!("ic ivau, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += icache_line;
+    }
+    // SAFETY: a data synchronization barrier followed by an instruction
+    // synchronization barrier, ensuring the invalidation is complete and any
+    // speculatively-fetched stale instructions are discarded before this
+    // function returns.
+    unsafe {
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn clear_icache_range(_start: usize, _len: usize) {}
+
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
@@ -432,6 +507,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Raw mprotect without exec interception — used internally by the
     /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
+    ///
+    /// This is the single choke point every transition to `PROT_EXEC` passes
+    /// through — the public [`Self::sys_mprotect`] included, via the call at
+    /// the end of that function — so it is also where instruction-cache
+    /// maintenance belongs: whatever was just written (loaded segments, the
+    /// rewriter's patches) has to be flushed to the point where the CPU's
+    /// instruction fetch path can see it before anything branches into the
+    /// range.
     #[inline]
     fn sys_mprotect_raw(
         &self,
@@ -439,7 +522,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot)
+        let is_exec = prot.contains(ProtFlags::PROT_EXEC);
+        let result = litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot);
+        if result.is_ok() && is_exec {
+            clear_icache_range(addr.as_usize(), len);
+        }
+        result
     }
 
     #[inline]

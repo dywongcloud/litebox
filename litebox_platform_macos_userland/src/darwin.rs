@@ -27,6 +27,26 @@ pub(crate) const KERN_NO_SPACE: libc::c_int = 3;
 /// `KERN_NO_SPACE` rather than relocating.
 pub(crate) const VM_FLAGS_FIXED: libc::c_int = 0x0000;
 
+/// `VM_FLAGS_OVERWRITE`: for [`mach_vm_remap`], replace whatever is already
+/// mapped at the destination instead of failing if it's occupied.
+///
+/// TODO: this value (0x4000, matching XNU's `osfmk/mach/vm_statistics.h`
+/// layout of the `VM_FLAGS_*` bit space as of this writing) was not
+/// independently re-verified against a fetched copy of that header the way
+/// the rest of this file's constants were -- confirm it before relying on
+/// [`remap_to_fixed`] for anything beyond a best-effort implementation. A
+/// wrong value fails safely (`mach_vm_remap` rejects an unrecognized flag
+/// combination with a `KERN_*` error rather than silently doing the wrong
+/// thing), but should still be pinned down precisely before guest entry
+/// depends on this path.
+const VM_FLAGS_OVERWRITE: libc::c_int = 0x4000;
+
+/// `VM_INHERIT_NONE`: the destination mapping [`mach_vm_remap`] creates is not
+/// inherited by a child process across `fork`. LiteBox does not implement
+/// `fork` today, so this is a documentation-accuracy choice more than a
+/// behavioral one, but it is the correct value regardless.
+const VM_INHERIT_NONE: libc::c_int = 2;
+
 /// `VM_REGION_BASIC_INFO_64` flavor selector for `mach_vm_region`.
 const VM_REGION_BASIC_INFO_64: libc::c_int = 9;
 
@@ -53,6 +73,32 @@ unsafe extern "C" {
     /// it fails, so a failed allocation never permanently reserves address
     /// space.
     pub(crate) fn mach_vm_deallocate(target: MachPort, address: u64, size: u64) -> KernReturn;
+
+    /// Moves or aliases an existing mapping to a new address, used here to
+    /// relocate a `MAP_JIT` mapping created at a kernel-chosen address (see
+    /// [`remap_to_fixed`] for why it cannot simply be `mmap(MAP_FIXED)`'d
+    /// there directly). `used_for_jit` is a property of the underlying VM map
+    /// entry that this preserves across the move; it is not re-derived from
+    /// flags passed here.
+    ///
+    /// # Safety
+    ///
+    /// `target_address` must point at a writable `u64` holding the requested
+    /// destination address; `cur_protection`/`max_protection` must point at
+    /// writable `vm_prot_t` (`c_int`) out-parameters.
+    fn mach_vm_remap(
+        target_task: MachPort,
+        target_address: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: libc::c_int,
+        src_task: MachPort,
+        src_address: u64,
+        copy: libc::c_int,
+        cur_protection: *mut libc::c_int,
+        max_protection: *mut libc::c_int,
+        inheritance: libc::c_int,
+    ) -> KernReturn;
 
     fn mach_vm_region(
         target: MachPort,
@@ -133,6 +179,59 @@ pub(crate) fn release_reservation(range: &core::ops::Range<usize>) {
     // SAFETY: the caller guarantees `range` still holds exactly the reservation
     // `reserve_fixed` made and nothing else has mapped over it.
     unsafe { mach_vm_deallocate(mach_task_self(), range.start as u64, range.len() as u64) };
+}
+
+/// Relocates the mapping at `src_addr` (of `len` bytes) to `dest`, unmapping
+/// whatever was previously at `dest`.
+///
+/// This exists for exactly one caller: placing a `MAP_JIT` mapping at a
+/// specific address. Darwin's `mmap` refuses to combine `MAP_FIXED` with
+/// `MAP_JIT` in one call -- real-world precedent (OpenJDK's fix for
+/// JDK-8234930, and V8's `OS::RemapPages` in
+/// `src/base/platform/platform-darwin.cc`, both of which use exactly this
+/// create-then-remap sequence on macOS/Apple Silicon) creates the JIT mapping
+/// at a kernel-chosen address first, then uses `mach_vm_remap` to move it. The
+/// destination mapping keeps the source's JIT-capable property: it lives on
+/// the underlying `vm_map_entry` (an internal `used_for_jit` bit), which
+/// `mach_vm_remap`'s entry-copy path explicitly preserves rather than
+/// re-deriving from the flags passed here.
+///
+/// # Safety
+///
+/// `src_addr` must be the base of a live mapping of exactly `len` bytes that
+/// the caller owns and is not otherwise using concurrently.
+pub(crate) unsafe fn remap_to_fixed(
+    src_addr: usize,
+    len: usize,
+    dest: usize,
+) -> Result<(), ReservationError> {
+    let mut target = dest as u64;
+    let mut cur_protection: libc::c_int = 0;
+    let mut max_protection: libc::c_int = 0;
+    // SAFETY: `mach_task_self()` names this process for both the source and
+    // destination (an intra-process move); `target`/`cur_protection`/
+    // `max_protection` are live local out-parameters; `src_addr`/`len` are the
+    // caller's obligation per this function's own safety doc.
+    let kr = unsafe {
+        mach_vm_remap(
+            mach_task_self(),
+            &raw mut target,
+            len as u64,
+            0,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            mach_task_self(),
+            src_addr as u64,
+            0, // copy = FALSE: alias the same object, don't duplicate it.
+            &raw mut cur_protection,
+            &raw mut max_protection,
+            VM_INHERIT_NONE,
+        )
+    };
+    match kr {
+        KERN_SUCCESS => Ok(()),
+        KERN_NO_SPACE => Err(ReservationError::AddressInUse),
+        _ => Err(ReservationError::OutOfMemory),
+    }
 }
 
 /// Walk every mapped region of this process, yielding its address range.
@@ -245,9 +344,14 @@ pub(crate) fn ulock_wait(
         // wakeups anyway, so this is indistinguishable from a real one.
         libc::EINTR => UlockWaitResult::Woken,
         libc::ETIMEDOUT => UlockWaitResult::TimedOut,
-        // `EAGAIN` means the compare failed, and any other error means the
-        // thread did not sleep either. Both are reported to the caller as "the
-        // value moved", which is the only non-sleeping outcome the trait models.
+        // An immediate compare-mismatch (the value had already changed) is not
+        // actually reported as a negative errno at all -- xnu's
+        // sys_ulock_wait2 takes that path through `rc >= 0` above, identically
+        // to a real wake, since the syscall never queued a waiter to begin
+        // with. Nothing else negative is documented to occur here, but any
+        // other error still means the thread did not sleep, so it is reported
+        // the same way: "the value moved", the only non-sleeping outcome the
+        // trait models.
         _ => UlockWaitResult::ValueChanged,
     }
 }
@@ -391,5 +495,15 @@ pub(crate) struct ArmThreadState64 {
     pub(crate) sp: u64,
     pub(crate) pc: u64,
     pub(crate) cpsr: u32,
+    /// Inert padding for the userspace, non-ptrauth ABI this crate targets
+    /// (built without `ptrauth_calls`, the only configuration a plain
+    /// `aarch64-apple-darwin` Rust toolchain produces). XNU's own header
+    /// documents this same offset differently under two other configurations
+    /// this crate does not use: as a real `flags` field with pointer-
+    /// authentication metadata (`NO_PTRAUTH`/`IB_SIGNED_LR`/etc.) in the
+    /// kernel-internal variant, and as opaque signed-pointer fields in place
+    /// of plain `pc`/`lr` under the arm64e ABI. If this platform ever needs
+    /// arm64e/PAC support, this field's meaning must be revisited alongside
+    /// `pc`/`lr`, not read as inert padding.
     pub(crate) pad: u32,
 }

@@ -527,12 +527,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.sys_read(fd, buf, Some(pos))
     }
 
-    /// Handle syscall `pwrite64`
-    pub fn sys_pwrite64(&self, fd: i32, buf: &[u8], offset: i64) -> Result<usize, Errno> {
-        let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
-        self.sys_write(fd, buf, Some(pos))
-    }
-
     fn rewind_sendfile_in_fd(&self, in_raw_fd: usize, unread_n: usize) -> Result<(), Errno> {
         if unread_n == 0 {
             return Ok(());

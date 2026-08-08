@@ -370,8 +370,14 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
         /// `<mach-o/getsect.h>`: yields the in-memory address (slide applied)
         /// and size of `segname,sectname` within the image at `mhp`, or null
         /// when the image has no such section.
+        ///
+        /// The real signature takes `mhp: *const mach_header_64`; it is opaque
+        /// here (never dereferenced, only its address is taken and passed
+        /// through) since a pointer is a single machine word at the FFI
+        /// boundary regardless of pointee type, and this crate has no need to
+        /// otherwise model the Mach-O header layout.
         fn getsectiondata(
-            mhp: *const u8,
+            mhp: *const core::ffi::c_void,
             segname: *const core::ffi::c_char,
             sectname: *const core::ffi::c_char,
             size: *mut core::ffi::c_ulong,
@@ -396,7 +402,7 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
     // commands. It reports a null base for an absent section.
     let start = unsafe {
         getsectiondata(
-            &raw const __dso_handle,
+            (&raw const __dso_handle).cast::<core::ffi::c_void>(),
             c"__TEXT".as_ptr(),
             c"__ex_table".as_ptr(),
             &raw mut size,
@@ -491,7 +497,18 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
 /// Search the exception table for a matching instruction address.
 /// If found, returns the corresponding recovery address.
 pub fn search_exception_tables(addr: usize) -> Option<usize> {
-    let table = exception_table();
+    search_in(exception_table(), addr)
+}
+
+/// The pure relocation/interval-comparison logic behind
+/// [`search_exception_tables`], parameterized on the table instead of reading
+/// it from the linker-defined section.
+///
+/// Split out so it can be exercised against a synthetic table in tests: the
+/// real [`exception_table`] involves an inline-asm section lookup that has no
+/// meaning outside a real process image, but the relocation arithmetic here is
+/// ordinary integer math with no such dependency.
+fn search_in(table: &[ExceptionTableEntry], addr: usize) -> Option<usize> {
     let reloc = |addr: &i32| -> usize {
         let base = &raw const *addr as usize;
         base.wrapping_add_signed(*addr as isize)
@@ -504,4 +521,97 @@ pub fn search_exception_tables(addr: usize) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod search_in_tests {
+    use super::{ExceptionTableEntry, search_in};
+
+    const ZERO_ENTRY: ExceptionTableEntry = ExceptionTableEntry {
+        start: 0,
+        stop: 0,
+        fixup: 0,
+    };
+
+    /// Rewrites `table[index]` in place to cover `[fault_addr, fault_addr + 1)`
+    /// with fixup `recovery_addr`, using the same self-relative encoding real
+    /// entries use (an `i32` offset from each field's own address).
+    ///
+    /// Must be called on a table that has already settled into its final
+    /// storage location and will not be moved again afterward -- the encoded
+    /// offsets are only valid relative to where the entry actually lives when
+    /// [`search_in`] later decodes them, exactly as for a real entry emitted by
+    /// the assembly macro into a fixed section.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test helper: callers keep fault_addr/recovery_addr within i32 range of the \
+                  table's own address, exactly as the real PC-relative encoding requires"
+    )]
+    fn encode_entry(
+        table: &mut [ExceptionTableEntry],
+        index: usize,
+        fault_addr: usize,
+        recovery_addr: usize,
+    ) {
+        let start_addr = core::ptr::addr_of!(table[index].start) as usize;
+        let stop_addr = core::ptr::addr_of!(table[index].stop) as usize;
+        let fixup_addr = core::ptr::addr_of!(table[index].fixup) as usize;
+        table[index].start = (fault_addr as isize - start_addr as isize) as i32;
+        // A one-instruction-wide range: [fault_addr, fault_addr + 1).
+        table[index].stop = (fault_addr as isize + 1 - stop_addr as isize) as i32;
+        table[index].fixup = (recovery_addr as isize - fixup_addr as isize) as i32;
+    }
+
+    // The real encoding is PC-relative with an `i32` (roughly +-2 GiB) range,
+    // which is always satisfied in a real binary (an entry and the code/data
+    // it refers to live in the same image). Synthetic fault/recovery
+    // addresses must respect the same constraint, so every test derives them
+    // as small offsets from the table's own real address rather than
+    // arbitrary constants -- an arbitrary constant like `0x1000` can be
+    // billions of bytes away from a real stack address and silently overflow
+    // the `i32` encoding.
+    fn addr_of_table(table: &[ExceptionTableEntry]) -> usize {
+        table.as_ptr() as usize
+    }
+
+    #[test]
+    fn finds_recovery_address_inside_range() {
+        let mut table = [ZERO_ENTRY];
+        let base = addr_of_table(&table);
+        encode_entry(&mut table, 0, base + 0x100, base + 0x200);
+        assert_eq!(search_in(&table, base + 0x100), Some(base + 0x200));
+    }
+
+    #[test]
+    fn misses_just_below_range() {
+        let mut table = [ZERO_ENTRY];
+        let base = addr_of_table(&table);
+        encode_entry(&mut table, 0, base + 0x100, base + 0x200);
+        assert_eq!(search_in(&table, base + 0x0ff), None);
+    }
+
+    #[test]
+    fn misses_at_the_exclusive_upper_bound() {
+        // The range is [start, stop), so stop itself (fault_addr + 1 here) is
+        // not covered.
+        let mut table = [ZERO_ENTRY];
+        let base = addr_of_table(&table);
+        encode_entry(&mut table, 0, base + 0x100, base + 0x200);
+        assert_eq!(search_in(&table, base + 0x101), None);
+    }
+
+    #[test]
+    fn empty_table_never_matches() {
+        assert_eq!(search_in(&[], 0x1000), None);
+    }
+
+    #[test]
+    fn later_entry_matches_when_earlier_entries_miss() {
+        let mut table = [ZERO_ENTRY, ZERO_ENTRY];
+        let base = addr_of_table(&table);
+        encode_entry(&mut table, 0, base + 0x100, base + 0xa000);
+        encode_entry(&mut table, 1, base + 0x200, base + 0xb000);
+        assert_eq!(search_in(&table, base + 0x200), Some(base + 0xb000));
+    }
 }

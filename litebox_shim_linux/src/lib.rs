@@ -595,6 +595,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(read_total)
     }
 
+    /// A wrapper around `sys_write`/`sys_pwrite64` that copies the guest buffer
+    /// in bounded chunks to avoid a single unbounded allocation for a huge
+    /// guest-supplied `count`, mirroring [`Self::pread_with_user_buf`].
+    ///
+    /// Unlike the read direction, a write is not itself retried past a short
+    /// result: `sys_write` may legitimately write fewer bytes than asked (a
+    /// pipe or socket at capacity), and real `write(2)` semantics leave
+    /// retrying a short write to the caller, not the kernel. So only the
+    /// copy-from-guest-memory step is chunked; a chunk that is not fully
+    /// consumed ends the loop, exactly as a single unchunked write to that
+    /// same destination would have.
+    fn write_with_user_buf(
+        &self,
+        fd: i32,
+        buf: UserPtr<u8>,
+        count: usize,
+        offset: Option<usize>,
+    ) -> Result<usize, Errno> {
+        let mut written_total = 0;
+        while written_total < count {
+            let to_write = (count - written_total).min(MAX_KERNEL_BUF_SIZE);
+            let chunk_ptr = UserPtr::<u8>::from_usize(buf.as_usize() + written_total);
+            let Some(chunk) = chunk_ptr.to_owned_slice::<Platform>(to_write) else {
+                return if written_total > 0 {
+                    Ok(written_total)
+                } else {
+                    Err(Errno::EFAULT)
+                };
+            };
+            match self.sys_write(fd, &chunk, offset.map(|o| o + written_total)) {
+                Ok(size) => {
+                    written_total += size;
+                    if size < to_write {
+                        // A short write: the destination could not currently
+                        // accept the full chunk. Stop here, matching what a
+                        // single unchunked write to the same destination
+                        // would have returned.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return if written_total > 0 {
+                        Ok(written_total)
+                    } else {
+                        Err(e)
+                    };
+                }
+            }
+        }
+        assert!(written_total <= count);
+        Ok(written_total)
+    }
+
     /// Handle Linux syscalls and dispatch them to LiteBox implementations.
     ///
     /// # Panics
@@ -692,11 +745,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                 }
             }
-            SyscallRequest::Write { fd, buf, count } => match buf.to_owned_slice::<Platform>(count)
-            {
-                Some(buf) => self.sys_write(fd, &buf, None),
-                None => Err(Errno::EFAULT),
-            },
+            SyscallRequest::Write { fd, buf, count } => {
+                self.write_with_user_buf(fd, buf, count, None)
+            }
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
@@ -741,10 +792,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 buf,
                 count,
                 offset,
-            } => match buf.to_owned_slice::<Platform>(count) {
-                Some(buf) => self.sys_pwrite64(fd, &buf, offset),
-                None => Err(Errno::EFAULT),
-            },
+            } => {
+                let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+                self.write_with_user_buf(fd, buf, count, Some(pos))
+            }
             SyscallRequest::Sendfile {
                 out_fd,
                 in_fd,

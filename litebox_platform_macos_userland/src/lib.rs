@@ -63,8 +63,8 @@ mod guest;
 mod net;
 
 use darwin::{
-    MAP_JIT, ReservationError, mach_vm_region_iter, release_reservation, reserve_fixed, ulock_wait,
-    ulock_wake,
+    MAP_JIT, ReservationError, mach_vm_region_iter, release_reservation, remap_to_fixed,
+    reserve_fixed, ulock_wait, ulock_wake,
 };
 
 /// The host signal LiteBox reserves for interrupting a thread out of guest
@@ -280,6 +280,94 @@ pub unsafe fn jit_write_protect(executable: bool) {
     unsafe { darwin::pthread_jit_write_protect_np(libc::c_int::from(executable)) }
 }
 
+/// Allocate a `MAP_JIT` mapping, honoring `fixed_address_behavior` despite
+/// Darwin refusing to combine `MAP_FIXED` with `MAP_JIT` in one `mmap` call.
+///
+/// The mapping is always created at a kernel-chosen address first. If no
+/// fixed address was requested, that address is the answer. Otherwise it is
+/// relocated to `suggested_range.start` with [`darwin::remap_to_fixed`],
+/// which preserves the mapping's JIT-capable property across the move (see
+/// that function's docs for the precedent this follows).
+fn allocate_jit_pages(
+    suggested_range: &core::ops::Range<usize>,
+    initial_permissions: MemoryRegionPermissions,
+    fixed_address_behavior: FixedAddressBehavior,
+) -> Result<*mut libc::c_void, AllocationError> {
+    // SAFETY: `MAP_JIT` cannot be combined with `MAP_FIXED`, so this always
+    // requests a kernel-chosen address; there is no caller-owned range to
+    // validate here beyond what `mmap` itself checks.
+    let kernel_chosen = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            suggested_range.len(),
+            prot_flags(initial_permissions),
+            libc::MAP_PRIVATE | libc::MAP_ANON | MAP_JIT,
+            -1,
+            0,
+        )
+    };
+    if kernel_chosen == libc::MAP_FAILED {
+        return Err(match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINVAL) => AllocationError::Unaligned,
+            _ => AllocationError::OutOfMemory,
+        });
+    }
+
+    if fixed_address_behavior == FixedAddressBehavior::Hint {
+        return Ok(kernel_chosen);
+    }
+
+    let reserved = fixed_address_behavior == FixedAddressBehavior::NoReplace;
+    if reserved {
+        // `remap_to_fixed`'s `VM_FLAGS_OVERWRITE` silently replaces whatever
+        // already occupies the destination, so `NoReplace` has to check
+        // first -- exactly like the non-JIT path below does with a plain
+        // `mmap(MAP_FIXED)`. The reservation itself then occupies the
+        // destination until the remap overwrites it.
+        if let Err(e) = reserve_fixed(suggested_range) {
+            // SAFETY: `kernel_chosen` is the mapping just created above,
+            // still solely owned by this function.
+            unsafe { libc::munmap(kernel_chosen, suggested_range.len()) };
+            return Err(match e {
+                ReservationError::AddressInUse => AllocationError::AddressInUse,
+                ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+            });
+        }
+    }
+
+    // SAFETY: `kernel_chosen` is a live mapping of exactly this length,
+    // created above and not otherwise in use yet.
+    let remap_result = unsafe {
+        remap_to_fixed(
+            kernel_chosen as usize,
+            suggested_range.len(),
+            suggested_range.start,
+        )
+    };
+
+    // `remap_to_fixed` aliases rather than moves: `kernel_chosen` is still a
+    // live mapping of the same pages after a successful remap, and a
+    // pointless one after a failed one either way. Drop it now so it never
+    // leaks.
+    // SAFETY: `kernel_chosen` is still a valid mapping owned by this
+    // function; the remap above only added a second reference to the same
+    // pages, it did not invalidate this one.
+    unsafe { libc::munmap(kernel_chosen, suggested_range.len()) };
+
+    match remap_result {
+        Ok(()) => Ok(suggested_range.start as *mut libc::c_void),
+        Err(e) => {
+            if reserved {
+                release_reservation(suggested_range);
+            }
+            Err(match e {
+                ReservationError::AddressInUse => AllocationError::AddressInUse,
+                ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+            })
+        }
+    }
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for MacOsUserland {
     /// The first 4 GiB of an arm64 Mach-O process is the `__PAGEZERO` segment:
     /// reserved, unmapped, and impossible to map over. Every guest address has
@@ -316,52 +404,63 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             return Err(AllocationError::Unaligned);
         }
 
-        // `MAP_FIXED_NOREPLACE` has no Darwin equivalent, so claim the range
-        // through the Mach VM API first: this fails with `KERN_NO_SPACE` when
-        // any part of the range is already mapped, which is exactly the
-        // semantics being emulated. The `mmap` below then replaces the
-        // reservation in place; if it fails, the reservation is released so a
-        // failed allocation never permanently claims the range.
-        let reserved = fixed_address_behavior == FixedAddressBehavior::NoReplace;
-        if reserved {
-            reserve_fixed(&suggested_range).map_err(|e| match e {
-                ReservationError::AddressInUse => AllocationError::AddressInUse,
-                ReservationError::OutOfMemory => AllocationError::OutOfMemory,
-            })?;
-        }
-
-        let mut flags = libc::MAP_PRIVATE | libc::MAP_ANON;
-        if fixed_address_behavior != FixedAddressBehavior::Hint {
-            flags |= libc::MAP_FIXED;
-        }
-        if needs_jit(initial_permissions) {
-            flags |= MAP_JIT;
-        }
-
-        // SAFETY: an anonymous mapping has no file backing to validate, and
-        // `MAP_FIXED` only replaces a range the caller has told us it owns.
-        let ptr = unsafe {
-            libc::mmap(
-                suggested_range.start as *mut libc::c_void,
-                suggested_range.len(),
-                prot_flags(initial_permissions),
-                flags,
-                -1,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
+        let ptr = if needs_jit(initial_permissions) {
+            // See `allocate_jit_pages`: `MAP_FIXED` and `MAP_JIT` cannot be
+            // combined in one `mmap` call on real Darwin.
+            allocate_jit_pages(
+                &suggested_range,
+                initial_permissions,
+                fixed_address_behavior,
+            )?
+        } else {
+            // `MAP_FIXED_NOREPLACE` has no Darwin equivalent, so claim the
+            // range through the Mach VM API first: this fails with
+            // `KERN_NO_SPACE` when any part of the range is already mapped,
+            // which is exactly the semantics being emulated. The `mmap` below
+            // then replaces the reservation in place; if it fails, the
+            // reservation is released so a failed allocation never
+            // permanently claims the range.
+            let reserved = fixed_address_behavior == FixedAddressBehavior::NoReplace;
             if reserved {
-                release_reservation(&suggested_range);
+                reserve_fixed(&suggested_range).map_err(|e| match e {
+                    ReservationError::AddressInUse => AllocationError::AddressInUse,
+                    ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+                })?;
             }
-            // `EINVAL` from `mmap` here means a misaligned address or length,
-            // since every other argument is fixed by this function. Everything
-            // else -- `ENOMEM` included -- is reported as exhaustion.
-            return Err(match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINVAL) => AllocationError::Unaligned,
-                _ => AllocationError::OutOfMemory,
-            });
-        }
+
+            let mut flags = libc::MAP_PRIVATE | libc::MAP_ANON;
+            if fixed_address_behavior != FixedAddressBehavior::Hint {
+                flags |= libc::MAP_FIXED;
+            }
+
+            // SAFETY: an anonymous mapping has no file backing to validate,
+            // and `MAP_FIXED` only replaces a range the caller has told us it
+            // owns.
+            let ptr = unsafe {
+                libc::mmap(
+                    suggested_range.start as *mut libc::c_void,
+                    suggested_range.len(),
+                    prot_flags(initial_permissions),
+                    flags,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                if reserved {
+                    release_reservation(&suggested_range);
+                }
+                // `EINVAL` from `mmap` here means a misaligned address or
+                // length, since every other argument is fixed by this
+                // function. Everything else -- `ENOMEM` included -- is
+                // reported as exhaustion.
+                return Err(match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINVAL) => AllocationError::Unaligned,
+                    _ => AllocationError::OutOfMemory,
+                });
+            }
+            ptr
+        };
 
         if populate_pages_immediately {
             // The closest Darwin has to `MAP_POPULATE`. It is advisory, so a

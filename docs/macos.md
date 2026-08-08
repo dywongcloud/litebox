@@ -62,8 +62,15 @@ refuses to add `PROT_EXEC` to anything that was ever writable. The supported
 escape hatch is `MAP_JIT`, which the platform passes whenever a mapping requests
 `EXEC`. Using it has two consequences:
 
-1. **The host binary must be signed with the JIT entitlement.** Create an
-   entitlements file:
+1. **The JIT entitlement is only load-bearing under the Hardened Runtime.**
+   Per Apple's own documentation, `com.apple.security.cs.allow-jit` is required
+   only when a binary has the Hardened Runtime enabled (`codesign --options
+   runtime`, which in turn is what notarization requires); without it,
+   `MAP_JIT` works with or without the entitlement present. The command below
+   ad-hoc-signs with the entitlement anyway -- it costs nothing and future-proofs
+   a later `--options runtime`, notarized build -- but for local development
+   outside Gatekeeper, neither the entitlement nor notarization is actually
+   required for `MAP_JIT` itself to work. Create an entitlements file:
 
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>
@@ -92,6 +99,35 @@ escape hatch is `MAP_JIT`, which the platform passes whenever a mapping requests
    A corollary for `update_permissions`: a region that has to become executable
    *later* must still be allocated with `EXEC` in its initial permissions, since
    only a `MAP_JIT` mapping can gain `PROT_EXEC`.
+
+3. **`MAP_JIT` cannot be combined with `MAP_FIXED`.** Real Darwin rejects an
+   `mmap` that requests both flags in one call, so a fixed-address allocation
+   that needs `EXEC` (`PageManagementProvider::allocate_pages`'s
+   `allocate_jit_pages` path) creates the mapping at a kernel-chosen address
+   first, then relocates it with `mach_vm_remap`
+   (`VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`, `copy = FALSE`). This is the same
+   create-then-remap sequence used by OpenJDK's fix for
+   [JDK-8234930](https://bugs.openjdk.org/browse/JDK-8234930) and by V8's
+   `OS::RemapPages`; `mach_vm_remap`'s entry-copy path preserves the mapping's
+   `used_for_jit` property across the move rather than re-deriving it from the
+   flags passed to the remap call itself.
+
+### Instruction-cache maintenance
+
+Apple Silicon does not keep the instruction cache coherent with the data
+cache automatically. Every write into memory that is about to execute --
+loading a segment, the rewriter patching syscall instructions or trampolines
+in place -- has to be followed by an explicit cache-maintenance sequence
+before the CPU can safely fetch from it, or a core can execute stale
+instructions left over from before the write. `litebox_shim_linux`'s
+`sys_mprotect_raw` is the single choke point every transition to `PROT_EXEC`
+passes through (the public `sys_mprotect`, the ELF loader, and the syscall
+rewriter's in-place patching all end up calling it), so that is where
+`clear_icache_range` runs: `dc cvau` over the range at the host's D-cache line
+size (read from `CTR_EL0`), a `dsb ish`, then `ic ivau` at the I-cache line
+size, and a final `dsb ish` + `isb`. This is AArch64-specific and a no-op on
+other architectures, where cache coherency between store and fetch is
+maintained by the hardware.
 
 ### Missing Linux primitives, and what replaces them
 
