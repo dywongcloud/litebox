@@ -132,7 +132,7 @@ Guest entry is the one seam that is not implemented. It lives in
    `PtRegs`, branch to `pc`, and reverse it in the callback. This is the
    counterpart of the other platforms' `run_thread_arch`.
 
-Two smaller gaps worth recording:
+Three smaller gaps worth recording:
 
 * `sa_restorer` is required. With no vDSO, a guest that registers a handler
   without `SA_RESTORER` has nowhere to return to, and delivery is refused rather
@@ -142,3 +142,19 @@ Two smaller gaps worth recording:
   reserved area is left zeroed, which is a well-formed empty record chain, but a
   handler that inspects or modifies vector state will not see it. The x86-64 path
   has the same gap with `fpstate`.
+* `SignalProvider`'s pending-signal bitmap (`PENDING_SIGNALS`) is process-wide,
+  not per-thread. A `TimerProvider::create_timer` timer always wakes the
+  specific thread that created it (see the `TimerHandle` docs in
+  `litebox_platform_macos_userland/src/lib.rs` for why, and why it deliberately
+  does *not* go through a real `SIGALRM`), so that path is correct even with a
+  single guest thread active. A genuinely external asynchronous signal (a real
+  host `SIGINT`/`SIGALRM` arriving from outside the process) instead relies on
+  whichever thread the kernel happens to deliver it to also being the one
+  that's actually blocked -- the same imprecision `litebox_platform_linux_userland`
+  has without its `SIGALRM`/`SIGINT`-blocked-on-non-guest-threads discipline
+  (see its `register_exception_handlers`). Neither of these is reachable by a
+  real multi-threaded guest yet, since guest entry itself isn't implemented
+  (above), but a proper fix -- per-thread pending-signal state plus the same
+  signal-mask discipline Linux uses, or `pthread_sigqueue` if Darwin's payload
+  delivery turns out to support it -- is worth doing before multi-threaded
+  guest signal delivery is trusted.
