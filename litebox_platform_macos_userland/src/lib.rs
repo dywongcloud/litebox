@@ -118,11 +118,14 @@ impl MacOsUserland {
     ///
     /// # Panics
     ///
-    /// Panics if the requested `utun` device cannot be opened, or if the fault
-    /// handlers that make guest-memory accesses fallible cannot be installed.
+    /// Panics if the requested `utun` device cannot be opened, if the fault
+    /// handlers that make guest-memory accesses fallible cannot be installed,
+    /// or if the guest thread-pointer TSD slot the rewriter's `Host::MacOs`
+    /// gates have baked in cannot be reserved (see `reserve_guest_tpidr_tsd_slot`).
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         install_fault_handlers();
         install_async_signal_handlers();
+        reserve_guest_tpidr_tsd_slot();
 
         let tun = tun_device_name.map(|name| {
             net::open_utun(name).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
@@ -1351,6 +1354,55 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
         };
         net::read_packet(tun, packet).ok_or(litebox::platform::ReceiveError::WouldBlock)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Guest thread pointer
+// ---------------------------------------------------------------------------
+
+/// Reserve the pthread TSD slot the rewriter's `Host::MacOs` gates read the
+/// guest thread pointer from.
+///
+/// `litebox_syscall_rewriter::arm64`'s `Host::MacOs` gates are emitted
+/// *ahead of time*, when a binary is packaged -- they have
+/// `litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT` (the first dynamic
+/// `pthread_key_create` key on macOS) baked in as a fixed byte offset from
+/// `TPIDRRO_EL0`. For that to be correct at guest-run time, this process's
+/// very first `pthread_key_create` call has to be this one -- if anything
+/// else in the process (another library's static initializer, for instance)
+/// claims a dynamic TSD key first, every already-rewritten guest binary's
+/// gates silently target the wrong slot. Asserting the returned key matches
+/// turns that mismatch into a loud, immediate failure instead of guest
+/// threads reading garbage out of some other TSD consumer's slot.
+///
+/// The reserved key's value once a guest thread starts is `pthread_setspecific`
+/// with that thread's `PtRegs`-relative guest thread pointer; that call is
+/// part of guest entry, not this reservation.
+///
+/// # Panics
+///
+/// Panics if `pthread_key_create` fails, or if it returns a key other than
+/// [`litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT`].
+fn reserve_guest_tpidr_tsd_slot() -> libc::pthread_key_t {
+    let mut key: libc::pthread_key_t = 0;
+    // SAFETY: `key` is a valid, uniquely-owned out-parameter; no destructor is
+    // needed since the platform (not pthread teardown) manages the guest
+    // thread pointer's lifetime.
+    let rc = unsafe { libc::pthread_key_create(&raw mut key, None) };
+    assert_eq!(
+        rc, 0,
+        "failed to reserve the guest thread-pointer TSD slot: pthread_key_create returned {rc}"
+    );
+    assert_eq!(
+        u16::try_from(key).ok(),
+        Some(litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT),
+        "pthread_key_create returned TSD slot {key}, but litebox_syscall_rewriter::Host::MacOs's \
+         gates have slot {} baked in at AOT-rewrite time -- something else in this process \
+         claimed a dynamic pthread key before LiteBox could reserve the first one. See \
+         docs/roadmap.md.",
+        litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT,
+    );
+    key
 }
 
 // ---------------------------------------------------------------------------

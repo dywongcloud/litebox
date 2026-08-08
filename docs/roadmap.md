@@ -26,17 +26,41 @@ subsystem.
 
 ## Needs real Apple Silicon hardware (implementation, not open questions)
 
-* **`Host::MacOs` in the rewriter is complete** (anchor register *and* slot
-  addressing). Gates anchor on `TPIDRRO_EL0` and address the guest
-  thread-pointer slot at pthread TSD slot `MACOS_GUEST_TPIDR_TSD_SLOT` (index
-  256, the first dynamic `pthread_key_create` key on macOS, verified against
-  apple-oss-distributions/libpthread) -- a LiteBox-owned slot, not a raw
-  offset into Apple's own pthread structure, so it does not corrupt libpthread
-  state. `litebox_packager::rewrite_host` selects it when packaging on macOS.
-  The remaining runtime obligation (reserve exactly slot 256 with
-  `pthread_key_create` at init and confirm it was handed that slot;
-  `pthread_setspecific` each guest thread's pointer) is part of guest entry,
-  below.
+* **`Host::MacOs`'s anchor register is right; the fixed TSD slot number is
+  not, and the whole "bake one number in at packaging time" approach has a
+  deeper problem than the number being wrong.** Gates anchor on `TPIDRRO_EL0`
+  (real, tested) and address the guest thread pointer at pthread TSD slot
+  `MACOS_GUEST_TPIDR_TSD_SLOT` (hardcoded to 256, sourced from
+  apple-oss-distributions/libpthread as "the first dynamic
+  `pthread_key_create` key") -- a LiteBox-owned slot rather than a raw offset
+  into Apple's own pthread structure, so it no longer risks corrupting
+  libpthread state the way the earlier design did.
+  
+  `litebox_platform_macos_userland::new` now (this pass) calls
+  `pthread_key_create` at startup and asserts the returned key matches --
+  **and that assertion currently always fails on real hardware.** Measured on
+  this M3 Pro (macOS 26.3.1): a minimal Rust binary's first
+  `pthread_key_create` call returns 259; a plain C `main`'s first call
+  returns 258. Neither is 256. Something in libSystem's startup path claims a
+  few dynamic keys before user code runs, undocumented and not guaranteed
+  stable across macOS versions or across binaries with different statically
+  linked dependencies (each with their own static initializers, potentially
+  claiming more). This means the actual slot a real runner binary gets is a
+  property of *that specific binary's* full startup sequence -- not knowable
+  by the rewriter, which runs separately, earlier, packaging the guest image
+  with no visibility into what the eventual runner process will look like.
+  
+  The failure mode is safe (a loud panic at `MacOsUserland::new()`, not
+  silent corruption -- that is exactly what the new assertion is for), so
+  this does not need the same "keep it out of anything that runs for real"
+  mitigation the previous corruption bug did. But the feature does not work
+  yet. Real fix needs one of: empirically pin the actual slot number to the
+  actual runner binary and keep the rewriter and runtime in lockstep on it
+  (fragile -- breaks silently on any dependency change unless there's also a
+  build-time check), or a mechanism that doesn't require the AOT-rewritten
+  gates to predict a runtime-assigned number at all (e.g., discovering the
+  slot at guest-image load time and rewriting the gates' immediate then,
+  which is a materially bigger change to the rewriter's AOT-only model).
 * **The platform's *own* per-thread context-switch bookkeeping** — a separate
   problem from the rewriter's guest slot above. Studying
   `litebox_platform_linux_userland`'s x86_64
