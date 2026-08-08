@@ -199,15 +199,18 @@ Guest entry is the one seam that is not implemented. It lives in
    single-instruction anchor, and a fast, inlined `TPIDRRO_EL0`-relative read
    is the only replacement that keeps that property.
 
-   `litebox_syscall_rewriter::Host::MacOs` implements the anchor-*register*
-   half of this (real, tested, using `MRS Xd, TPIDRRO_EL0`), but **the slot
-   addressing is not yet fixed and the variant is not selected anywhere real
-   work happens** (`litebox_packager::rewrite_host` still always returns
-   `Host::Linux`). Its gates currently store the guest thread pointer at
-   `[TPIDRRO_EL0-value + GUEST_TPIDR_OFFSET]` -- i.e. at a fixed offset into
-   Apple's own `pthread` structure, which `TPIDRRO_EL0` points at. That
-   corrupts live libpthread state; it does not merely fail. The pthread-TSD
-   design in the paragraph above is the fix, still to be implemented.
+   `litebox_syscall_rewriter::Host::MacOs` now implements **both** halves of
+   this: the anchor register (`MRS Xd, TPIDRRO_EL0`, real-toolchain verified)
+   and the slot addressing. Its gates address the guest thread pointer at
+   pthread TSD slot `MACOS_GUEST_TPIDR_TSD_SLOT` (index 256, the first dynamic
+   `pthread_key_create` key on macOS -- verified against
+   apple-oss-distributions/libpthread), i.e. `[TPIDRRO_EL0 + 256 * 8]`, **not**
+   a raw offset into Apple's own pthread structure, so it no longer risks
+   corrupting libpthread state. `litebox_packager::rewrite_host` selects it
+   when packaging on macOS. What remains before a guest actually runs is the
+   runtime side: the platform must `pthread_key_create` at init and confirm it
+   was handed exactly slot 256, then `pthread_setspecific` each guest thread's
+   pointer into it -- part of guest entry (item 3 below), still unimplemented.
 2. **Filling the trampoline.** The rewriter writes the syscall-callback address
    at offset 0 of the trampoline it appends to the image; the loader must write
    `SystemInfoProvider::get_syscall_entry_point` there before any guest `SVC`

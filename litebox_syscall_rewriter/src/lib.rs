@@ -89,6 +89,14 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
+/// The pthread thread-specific-data slot index at which the macOS runtime
+/// keeps each thread's guest thread pointer, as addressed by every gate a
+/// [`Host::MacOs`] rewrite emits (`[TPIDRRO_EL0 + slot * 8]`). The runtime
+/// reserves exactly this slot with `pthread_key_create` at platform init; see
+/// the `arm64` module's `GUEST_TPIDR_OFFSET_MACOS` docs for the verified
+/// Darwin TSD layout this rests on.
+pub const MACOS_GUEST_TPIDR_TSD_SLOT: u16 = arm64::MACOS_GUEST_TPIDR_TSD_SLOT;
+
 /// Rewrite a supported binary for LiteBox.
 ///
 /// ELF64 inputs are passed through [`hook_syscalls_in_elf`]. PE64 inputs have
@@ -179,8 +187,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 }
 
 /// As [`hook_syscalls_in_elf`], but selects the AArch64 host anchor explicitly
-/// instead of defaulting to [`Host::Linux`]. Ignored for x86-64 input, which
-/// has no per-host anchor concept.
+/// instead of defaulting to [`Host::Linux`]. A binary rewritten for one host
+/// will not run correctly under another. Ignored for x86-64 input, which has
+/// no per-host anchor concept (and no macOS host at all, by design).
 pub fn hook_syscalls_in_elf_for_host(
     input_binary: &[u8],
     trampoline: Option<u64>,
@@ -265,6 +274,12 @@ pub fn hook_syscalls_in_elf_for_host(
             trampoline.unwrap_or(0),
             host,
         );
+    }
+
+    if !matches!(host, Host::Linux) {
+        return Err(Error::UnsupportedExecutable(
+            "x86-64 guests only run under a Linux host".into(),
+        ));
     }
 
     let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;

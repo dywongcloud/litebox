@@ -26,65 +26,48 @@ subsystem.
 
 ## Needs real Apple Silicon hardware (implementation, not open questions)
 
-* **`Host::MacOs`'s guest-slot addressing is a live correctness bug, not just
-  an unfinished feature.** The anchor-register half landed
-  (`litebox_syscall_rewriter::Host::MacOs`, real `MRS Xd, TPIDRRO_EL0`,
-  tested), but its gates still address the guest thread-pointer slot at
-  `[TPIDRRO_EL0-value + GUEST_TPIDR_OFFSET]` -- the same scheme `Host::Linux`
-  uses, which only works there because the runtime owns the block
-  `TPIDR_EL0` points at. `TPIDRRO_EL0` instead already points at Apple's own
-  `pthread` structure, so that write corrupts live libpthread state rather
-  than merely failing. `litebox_packager::rewrite_host` was reverted to
-  always return `Host::Linux` (even on macOS) specifically to keep this out
-  of anything that runs for real, until the fix below lands. Needed: a
-  genuinely LiteBox-owned per-thread slot reached through a documented-safe
-  indirection from `TPIDRRO_EL0` -- reserve a slot with `pthread_key_create`
-  at platform-init time, `pthread_setspecific` the guest pointer into it once
-  per guest thread, and have gates read it back through the same
-  `TPIDRRO_EL0`-relative "direct TSD" sequence libSystem's own
-  `errno`/QoS-class accessors use (not a full `pthread_getspecific` call,
-  which would give up the single-instruction-anchor property that was the
-  entire point). See [`docs/macos.md`](./macos.md#remaining-work) for the
-  full writeup.
-* **The actual next primitive to build: a Darwin per-thread runtime-owned
-  slot, reusable by both the rewriter's gates and the platform's own
-  context-switch bookkeeping.** Studying `litebox_platform_linux_userland`'s
-  x86_64 `run_thread_arch`/`switch_to_guest`/`syscall_callback` (the closest
-  thing to a template) surfaced why this is more foundational than it looked:
-  that code doesn't only virtualize the *guest's* thread pointer -- it also
-  stashes its own bookkeeping (`host_sp`, `host_bp`, `guest_context_top`,
-  `in_guest`) in `fs:`-relative (i.e. anchor-relative) TLS slots, because by
-  the time `syscall_callback` runs, every general-purpose register holds live
+* **`Host::MacOs` in the rewriter is complete** (anchor register *and* slot
+  addressing). Gates anchor on `TPIDRRO_EL0` and address the guest
+  thread-pointer slot at pthread TSD slot `MACOS_GUEST_TPIDR_TSD_SLOT` (index
+  256, the first dynamic `pthread_key_create` key on macOS, verified against
+  apple-oss-distributions/libpthread) -- a LiteBox-owned slot, not a raw
+  offset into Apple's own pthread structure, so it does not corrupt libpthread
+  state. `litebox_packager::rewrite_host` selects it when packaging on macOS.
+  The remaining runtime obligation (reserve exactly slot 256 with
+  `pthread_key_create` at init and confirm it was handed that slot;
+  `pthread_setspecific` each guest thread's pointer) is part of guest entry,
+  below.
+* **The platform's *own* per-thread context-switch bookkeeping** — a separate
+  problem from the rewriter's guest slot above. Studying
+  `litebox_platform_linux_userland`'s x86_64
+  `run_thread_arch`/`switch_to_guest`/`syscall_callback` (the closest thing to
+  a template) surfaced why: that code doesn't only virtualize the *guest's*
+  thread pointer -- it also stashes its own bookkeeping (`host_sp`, `host_bp`,
+  `guest_context_top`, `in_guest`) in `fs:`-relative TLS slots, because by the
+  time `syscall_callback` runs, every general-purpose register holds live
   guest state and there is nothing else durable to read "where was the host
-  stack" from. A macOS port needs the equivalent for its own bookkeeping, not
-  just for `Host::MacOs`'s guest slot -- and `x86_64`'s raw `@tpoff`-relative
-  asm syntax is ELF/Linux-specific and has no Mach-O equivalent to copy
-  directly.
-  
-  Two different pieces end up needing two different solutions to
-  "per-thread state reachable without a function call, on Darwin":
-  - The rewriter's gates are raw bytes patched into an arbitrary guest
-    binary; they cannot call into Rust. They need the real fix above --
-    a reserved, verified-safe direct-TSD offset from `TPIDRRO_EL0`.
-  - The *platform's own* `run_thread_arch`/`switch_to_guest`/
-    `syscall_callback` equivalent is code LiteBox writes and compiles itself,
-    so it isn't bound by "no function calls": it can safely use an ordinary
-    Rust `thread_local!` static (Darwin's TLV-based thread-local mechanism is
-    mature, compiler- and OS-verified, and does not need to be hand-rolled)
-    for `host_sp`/`host_fp`/`host_lr`/`in_guest`-equivalent bookkeeping,
-    updated from normal (non-naked) Rust immediately around the naked-asm
-    call sites rather than from inside the naked asm itself. This is a
-    materially lower-risk design than matching x86_64's raw-TLS-in-asm style,
-    and is real, buildable, unit-testable work independent of the harder
-    rewriter-side fix above.
-* **The guest-entry context switch itself**, once the above land. Also
-  discovered this pass: AArch64 guest entry (`run_thread_arch` /
-  `switch_to_guest` in the Linux terminology) is not implemented for *any*
-  host in this repo yet, macOS included -- `litebox_platform_linux_userland`'s
-  version is entirely `#[cfg(target_arch = "x86_64")]`, and LVBS's AArch64
-  scaffolding (the `Exception`/`ExceptionInfo` types in `litebox/src/shim.rs`
-  already have AArch64 variants, which *is* directly reusable) stops short of
-  a working context switch too. There is no existing full AArch64 reference
+  stack" from. A macOS port needs the equivalent, and `x86_64`'s raw
+  `@tpoff`-relative asm syntax is ELF/Linux-specific with no Mach-O equivalent
+  to copy directly. The two pieces need *different* Darwin solutions:
+  - The rewriter's gates are raw bytes patched into an arbitrary guest binary
+    and cannot call into Rust — hence the reserved direct-TSD slot above (now
+    done).
+  - The platform's own `run_thread_arch`/`switch_to_guest`/`syscall_callback`
+    equivalent is code LiteBox writes and compiles itself, so it isn't bound
+    by "no function calls": it can use an ordinary Rust `thread_local!` static
+    (Darwin's TLV-based thread-locals are mature and compiler/OS-verified) for
+    its `host_sp`/`host_fp`/`host_lr`/`in_guest`-equivalent bookkeeping,
+    updated from normal (non-naked) Rust immediately around the naked-asm call
+    sites rather than from inside the asm. Lower-risk than matching x86_64's
+    raw-TLS-in-asm style, and independently buildable/unit-testable.
+* **The guest-entry context switch itself**, once the bookkeeping primitive
+  above lands. AArch64 guest entry (`run_thread_arch` / `switch_to_guest` in
+  the Linux terminology) is not implemented for *any* host in this repo yet,
+  macOS included -- `litebox_platform_linux_userland`'s version is entirely
+  `#[cfg(target_arch = "x86_64")]`, and LVBS's AArch64 scaffolding (the
+  `Exception`/`ExceptionInfo` types in `litebox/src/shim.rs` already have
+  AArch64 variants, which *is* directly reusable) stops short of a working
+  context switch too. There is no existing full AArch64 reference
   implementation anywhere in the tree to adapt; a macOS implementation would
   be pioneering this for the whole project, not porting an existing pattern.
   This is the one seam standing between the current macOS port and actually

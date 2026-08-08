@@ -164,7 +164,11 @@ const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
 /// exactly [`MRS_TPIDR_EL0_BITS`] with that bit set. Confirmed against a real
 /// toolchain (`cc`/`otool -tvV` on an Apple M3 Pro): `mrs x9, TPIDR_EL0` and
 /// `mrs x9, TPIDRRO_EL0` assemble to `0xD53BD049` and `0xD53BD069`
-/// respectively.
+/// respectively. This is the EL0-*read-only* companion register, which Darwin
+/// keeps pointing at the current pthread's thread-specific-data base; it is an
+/// emitted-gate anchor only, never a scanned patch pattern (a Linux guest
+/// image has no reason to contain it, and rewriting one would be wrong
+/// anyway).
 const MRS_TPIDRRO_EL0_BITS: u32 = 0xD53B_D060;
 
 /// `BRK` immediate planted at a patch site whose gate lies outside the `B`
@@ -211,6 +215,35 @@ const XZR: u8 = 31;
 /// binaries, this value is part of the rewriter/runtime ABI and must match the
 /// runtime's block layout.
 const GUEST_TPIDR_OFFSET: u16 = 16;
+
+/// [`Host::MacOs`]'s counterpart of [`GUEST_TPIDR_OFFSET`]: the byte offset
+/// from the macOS anchor (`TPIDRRO_EL0`) of the guest thread-pointer slot.
+///
+/// On Darwin the anchor register is *kernel-owned*: `TPIDRRO_EL0` points at
+/// the current pthread's thread-specific-data array (TSD slot `N` lives at
+/// `[TPIDRRO_EL0 + N*8]`, with no low-bit masking on arm64 — verified against
+/// xnu's `libsyscall/os/tsd.h` `_os_tsd_get_base`), so the runtime cannot
+/// point it at a block of its own the way the Linux runtime does with
+/// `TPIDR_EL0`. Instead the guest thread-pointer slot is a pthread TSD slot:
+/// index [`MACOS_GUEST_TPIDR_TSD_SLOT`], i.e. byte offset `256 * 8`.
+///
+/// Slot 256 is the *first dynamic key* on macOS (`pthread_key_create` hands
+/// out keys 256..768 there; 0..255 are reserved static keys — values verified
+/// against apple-oss-distributions/libpthread `pthread_tsd.c` and
+/// `types_internal.h`). The runtime owns it by calling `pthread_key_create`
+/// during platform init, before anything else in the process creates a
+/// dynamic key, and verifying it was handed exactly this slot; reading and
+/// writing the slot directly off `TPIDRRO_EL0` is then the same "direct TSD"
+/// fast path libSystem's own `errno` accessor and WebKit's `FastTLS`
+/// (`_pthread_getspecific_direct`) use. Like [`GUEST_TPIDR_OFFSET`], this is
+/// rewriter/runtime ABI: statically rewritten binaries bake the scaled
+/// immediate in.
+const GUEST_TPIDR_OFFSET_MACOS: u16 = MACOS_GUEST_TPIDR_TSD_SLOT * 8;
+
+/// The pthread TSD slot index backing [`GUEST_TPIDR_OFFSET_MACOS`]. Exported
+/// (via the crate root) so the macOS runtime reserves exactly the slot the
+/// emitted gates address, rather than the two ever drifting apart.
+pub(crate) const MACOS_GUEST_TPIDR_TSD_SLOT: u16 = 256;
 
 // --- SVC gate stack frame ---
 //
@@ -418,7 +451,8 @@ enum Insn {
     },
     /// `MRS Xt, TPIDR_EL0` (read thread pointer).
     MrsTpidrEl0(u8),
-    /// `MRS Xt, TPIDRRO_EL0` — [`Host::MacOs`]'s anchor read.
+    /// `MRS Xt, TPIDRRO_EL0` (read the EL0-read-only thread register — the
+    /// Darwin pthread TSD base; [`Host::MacOs`]'s anchor read).
     MrsTpidrroEl0(u8),
     /// `BRK #imm16` — software breakpoint raising a synchronous debug exception.
     Brk(u16),
@@ -478,24 +512,9 @@ impl Insn {
 /// `Host::anchor_read` rather than hardcoding a system register. Adding a host
 /// is a new variant plus its anchor-read arm.
 ///
-/// Other host OSes need a different stable anchor register (a future variant
-/// supplying its own `Host::anchor_read`), and beyond that a host-specific
-/// shared SVC handler — not just a different trampoline base address:
+/// A host OS beyond these two needs a different stable anchor register (a
+/// future variant supplying its own `anchor_read` and `guest_tp_offset`):
 ///
-/// * **Linux-on-macOS** (Apple Silicon): confirmed on real hardware (Apple M3
-///   Pro, macOS 26.3.1) that XNU clobbers `TPIDR_EL0` across both a voluntary
-///   context switch and a signal-handler invocation — not merely leaves it
-///   stale, but overwrites it with its own per-thread value — so it cannot
-///   anchor the guest thread pointer. The stable anchor is the read-only
-///   `TPIDRRO_EL0`, confirmed stable across a reschedule and distinct per
-///   thread on the same hardware, matching Apple's documented pthread-self-
-///   pointer use. [`Host::MacOs`] below implements the anchor-read half of
-///   this. XNU also zeroes `x18` on every exception entry, which the anchor
-///   swap alone does not address: **`x18` still needs to be fully virtualized
-///   via per-site gates before `Host::MacOs` is safe to use on a guest that
-///   touches `x18`** (uncommon in ordinary AAPCS64-compiled code, since `x18`
-///   is the reserved "platform register", but not guaranteed absent). See
-///   `docs/roadmap.md`.
 /// * **Linux-on-Windows** (Windows on ARM64): Windows does not preserve
 ///   `TPIDR_EL0` across context switches and reserves `x18` as the TEB pointer
 ///   (always valid). The TEB is the stable anchor: the per-thread TLS state is
@@ -507,27 +526,30 @@ pub enum Host {
     /// host keeps its anchor there and the guest thread-pointer slot lives beside
     /// it; the anchor read is `MRS Xd, TPIDR_EL0`.
     Linux,
-    /// macOS host (Apple Silicon). `TPIDR_EL0` does not survive a host
-    /// transition (see above), so the anchor read uses the read-only
-    /// `TPIDRRO_EL0` instead.
+    /// macOS host (Apple Silicon). Confirmed on real hardware (Apple M3 Pro,
+    /// macOS 26.3.1): XNU clobbers `TPIDR_EL0` across both a voluntary
+    /// context switch and a signal-handler invocation — not merely leaves it
+    /// stale, but overwrites it with its own per-thread value — so it cannot
+    /// anchor the guest thread pointer. The anchor is the EL0-read-only
+    /// `TPIDRRO_EL0` (confirmed stable across a reschedule and distinct per
+    /// thread on the same hardware), which Darwin keeps pointing at the
+    /// current pthread's TSD base. The runtime cannot repoint a read-only,
+    /// kernel-owned register at a block of its own the way the Linux runtime
+    /// does with `TPIDR_EL0` — addressing a fixed raw offset into the pthread
+    /// structure it points at would corrupt live libpthread state — so the
+    /// guest thread-pointer slot is instead a *runtime-reserved pthread TSD
+    /// slot*, addressed at `GUEST_TPIDR_OFFSET_MACOS`; see that constant
+    /// for the verified TSD layout and how the runtime reserves the slot.
     ///
-    /// **Not yet safe to select for real gate emission.** The guest
-    /// thread-pointer slot is still addressed at `[anchor +
-    /// GUEST_TPIDR_OFFSET]`, exactly as on Linux -- but that addressing
-    /// scheme assumes the anchor points at a block the *runtime* owns, which
-    /// is true of `Host::Linux`'s `TPIDR_EL0` (the runtime sets it itself)
-    /// and false here: `TPIDRRO_EL0` already points at Apple's own per-thread
-    /// `pthread` structure. A gate that stores the guest's thread pointer at
-    /// a fixed offset from it corrupts live libpthread state rather than
-    /// merely failing. This variant exists so the anchor *register* choice
-    /// (verified against real hardware and a real toolchain, see above and
-    /// this module's tests) is landed and testable in isolation; nothing in
-    /// this crate's callers selects it for real work yet (see
-    /// `litebox_packager::rewrite_host`). Also does not yet virtualize guest
-    /// `x18` uses — see this enum's doc comment. Fixing the slot-addressing
-    /// scheme needs a genuinely LiteBox-owned per-thread slot reached through
-    /// a documented-safe indirection from `TPIDRRO_EL0`; see
-    /// `docs/roadmap.md`.
+    /// Caveat, deliberate and documented rather than silently wrong: XNU also
+    /// zeroes `x18` on every return to EL0 for ordinary (non-Rosetta,
+    /// non-entitled) processes, so a guest binary that uses `x18` as a live
+    /// general-purpose register cannot run correctly under this host. `x18`
+    /// uses cannot be found reliably without full disassembly (any operand
+    /// field of any instruction can name it), so they are not scanned or
+    /// gated; guests should be built with `-ffixed-x18`. Linux AArch64
+    /// distro binaries generally treat `x18` as allocatable, so this is a
+    /// real restriction, not a formality.
     MacOs,
 }
 
@@ -538,6 +560,16 @@ impl Host {
         match self {
             Host::Linux => Insn::MrsTpidrEl0(rd),
             Host::MacOs => Insn::MrsTpidrroEl0(rd),
+        }
+    }
+
+    /// The byte offset from this host's anchor at which the runtime keeps the
+    /// guest thread-pointer slot. Baked into every emitted gate's scaled
+    /// `LDR`/`STR`, so it is rewriter/runtime ABI per host.
+    fn guest_tp_offset(self) -> u16 {
+        match self {
+            Host::Linux => GUEST_TPIDR_OFFSET,
+            Host::MacOs => GUEST_TPIDR_OFFSET_MACOS,
         }
     }
 }
@@ -941,7 +973,7 @@ fn emit_msr_gate(
     asm.emit(Insn::StrUimm {
         rt: X17,
         rn: X16,
-        imm_bytes: GUEST_TPIDR_OFFSET,
+        imm_bytes: host.guest_tp_offset(),
     });
 
     // Restore: LDP X16, X17, [SP] ; ADD SP, SP, #32.
@@ -982,7 +1014,7 @@ fn emit_mrs_gate(
     asm.emit(Insn::LdrUimm {
         rt: rd,
         rn: rd,
-        imm_bytes: GUEST_TPIDR_OFFSET,
+        imm_bytes: host.guest_tp_offset(),
     });
     if !asm.branch_to(checked_add_u64(site.vaddr, 4, "MRS return")?)? {
         return Ok(GateBuild::Unreachable);
@@ -1270,6 +1302,16 @@ mod tests {
     /// Like [`hook_words`] but returns the raw `Option` outcome so callers can
     /// assert the "no patch sites" (`None`) sentinel and trapped-site cases.
     fn hook_words_opt(words: &[u32], base: u64, tramp_base: u64) -> (Vec<u8>, Option<HookOutcome>) {
+        hook_words_host(words, base, tramp_base, Host::Linux)
+    }
+
+    /// Like [`hook_words_opt`] with an explicit [`Host`].
+    fn hook_words_host(
+        words: &[u32],
+        base: u64,
+        tramp_base: u64,
+        host: Host,
+    ) -> (Vec<u8>, Option<HookOutcome>) {
         let mut buf = Vec::new();
         for w in words {
             buf.extend_from_slice(&w.to_le_bytes());
@@ -1279,8 +1321,7 @@ mod tests {
             file_offset: 0,
             size: buf.len() as u64,
         }];
-        let outcome =
-            hook_syscalls_aarch64(&mut buf, &sections, tramp_base, 0, Host::Linux).unwrap();
+        let outcome = hook_syscalls_aarch64(&mut buf, &sections, tramp_base, 0, host).unwrap();
         (buf, outcome)
     }
 
@@ -1528,6 +1569,82 @@ mod tests {
             );
             assert_eq!(word_at(gate, 8) & OPCODE_TOP6_MASK, Opcode::B.bits());
         }
+    }
+
+    #[test]
+    fn macos_host_gates_anchor_on_tpidrro_at_tsd_slot() {
+        // Under `Host::MacOs` the same guest instructions produce gates that
+        // anchor on `TPIDRRO_EL0` (Darwin's pthread TSD base) and address the
+        // guest thread-pointer slot at the reserved TSD offset — never the
+        // Linux anchor or block offset.
+        let base = 0x1000;
+        let tramp_base = 0x300000;
+        let words = [msr_tpidr_el0(5), Insn::MrsTpidrEl0(9).encode().unwrap()];
+        let (patched, outcome) = hook_words_host(&words, base, tramp_base, Host::MacOs);
+        let tramp = outcome.expect("both sites must be gated").trampoline;
+        assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+        assert_eq!(word_at(&patched, 4) & OPCODE_TOP6_MASK, Opcode::B.bits());
+
+        // MSR gate: the anchor read is `MRS X16, TPIDRRO_EL0`, the store hits
+        // the TSD slot, and the Linux anchor read never appears.
+        let msr_gate = &tramp[GATES_START_OFFSET..GATES_START_OFFSET + MSR_GATE_SIZE];
+        let anchor = Insn::MrsTpidrroEl0(X16).encode().unwrap();
+        assert!(
+            (0..MSR_GATE_INSNS).any(|i| word_at(msr_gate, i * 4) == anchor),
+            "MSR gate must read TPIDRRO_EL0 as the anchor"
+        );
+        let store = Insn::StrUimm {
+            rt: X17,
+            rn: X16,
+            imm_bytes: GUEST_TPIDR_OFFSET_MACOS,
+        }
+        .encode()
+        .unwrap();
+        assert!(
+            (0..MSR_GATE_INSNS).any(|i| word_at(msr_gate, i * 4) == store),
+            "MSR gate must store to the macOS TSD slot"
+        );
+        let linux_anchor = Insn::MrsTpidrEl0(X16).encode().unwrap();
+        assert!(
+            (0..MSR_GATE_INSNS).all(|i| word_at(msr_gate, i * 4) != linux_anchor),
+            "the Linux anchor read must not appear in a macOS gate"
+        );
+
+        // MRS gate: `MRS X9, TPIDRRO_EL0 ; LDR X9, [X9, #slot] ; B`.
+        let mrs_gate = &tramp[GATES_START_OFFSET + MSR_GATE_SIZE..][..MRS_GATE_SIZE];
+        assert_eq!(
+            word_at(mrs_gate, 0),
+            Insn::MrsTpidrroEl0(9).encode().unwrap()
+        );
+        assert_eq!(
+            word_at(mrs_gate, 4),
+            Insn::LdrUimm {
+                rt: 9,
+                rn: 9,
+                imm_bytes: GUEST_TPIDR_OFFSET_MACOS
+            }
+            .encode()
+            .unwrap()
+        );
+        assert_eq!(word_at(mrs_gate, 8) & OPCODE_TOP6_MASK, Opcode::B.bits());
+    }
+
+    #[test]
+    fn macos_tsd_slot_offset_is_stable_abi_and_encodable() {
+        // Slot 256 is the first dynamic pthread key on macOS; the byte offset
+        // is baked into statically rewritten binaries, so it must never move,
+        // and it must stay encodable as a scaled LDR/STR immediate.
+        assert_eq!(MACOS_GUEST_TPIDR_TSD_SLOT, 256);
+        assert_eq!(GUEST_TPIDR_OFFSET_MACOS, 2048);
+        assert!(
+            Insn::LdrUimm {
+                rt: 0,
+                rn: 0,
+                imm_bytes: GUEST_TPIDR_OFFSET_MACOS
+            }
+            .encode()
+            .is_some()
+        );
     }
 
     #[test]
