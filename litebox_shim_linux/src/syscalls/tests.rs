@@ -44,6 +44,28 @@ pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatf
     })
 }
 
+/// Serializes tests that map guest memory.
+///
+/// Each test builds its own task with its own virtual-memory manager, but every
+/// task in this binary maps into the one host address space, and a VMM models
+/// only its own mappings. Two tests running at once therefore pick addresses
+/// without seeing each other's, and the loser gets a collision. Holding this for
+/// the duration of a mapping test makes the placement search meaningful again.
+///
+/// This is only reliably visible on a host whose guest range overlaps the host's
+/// own: arm64 macOS puts both above the 4 GiB `__PAGEZERO` floor, so collisions
+/// are routine there and rare elsewhere.
+static ADDRESS_SPACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the guest-address-space lock for the rest of the current test. A
+/// poisoned lock is not a failure here: it only means some earlier test panicked
+/// while holding it, and the address space is no less usable for that.
+pub(crate) fn address_space_guard() -> std::sync::MutexGuard<'static, ()> {
+    ADDRESS_SPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[must_use]
 pub(crate) fn init_platform(
     tun_device_name: Option<&str>,

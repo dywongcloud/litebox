@@ -46,14 +46,44 @@ const ENDIAN: LittleEndian = LittleEndian;
 /// than assuming a fixed one. These instructions are permitted from EL0
 /// (unprivileged) code on Linux, which sets `SCTLR_EL1.UCI` for exactly this
 /// purpose -- every userspace AArch64 JIT relies on the same permission.
-#[cfg(target_arch = "aarch64")]
+///
+/// Darwin is the exception, and it is not a matter of degree: `SCTLR_EL1.UCI`
+/// is set there too, so `dc cvau`/`ic ivau` run fine, but `SCTLR_EL1.UCT` is
+/// *not*, so reading `CTR_EL0` raises an illegal-instruction trap. Measured on
+/// an Apple M3 Pro: a bare C program doing `mrs x0, ctr_el0` dies with `SIGILL`,
+/// while the same program's `dc cvau`/`ic ivau` sequence returns normally.
+/// Since this function is the choke point every transition to `PROT_EXEC`
+/// passes through, that trap made it impossible to give a guest an executable
+/// page at all. Darwin therefore goes through `sys_icache_invalidate`, Apple's
+/// own supported entry point for this, which performs the same sequence (plus
+/// any chip-specific work) without needing the line sizes in userspace.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn clear_icache_range(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: `start` addresses `len` bytes of the caller's own mapping, which
+    // is what this call requires; invalidation cannot fault or alter contents.
+    unsafe { sys_icache_invalidate(start as *mut core::ffi::c_void, len) };
+}
+
+// Instruction-cache invalidation from Darwin's `libkern/OSCacheControl.h`.
+// Declared here rather than reused from the macOS platform crate because that
+// crate is a dev-dependency of this one, reachable only from tests.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+unsafe extern "C" {
+    fn sys_icache_invalidate(start: *mut core::ffi::c_void, len: usize);
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
 fn clear_icache_range(start: usize, len: usize) {
     if len == 0 {
         return;
     }
     let end = start + len;
 
-    // SAFETY: `ctr_el0` is always readable from EL0.
+    // SAFETY: `ctr_el0` is readable from EL0 on every host reaching this arm;
+    // the one that traps instead (Darwin) is handled above.
     let ctr_el0: u64;
     unsafe {
         core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr_el0, options(nomem, nostack, preserves_flags));
@@ -1233,7 +1263,6 @@ mod tests {
     use litebox::fs::{Mode, OFlags};
     // Only `test_collision_with_global_allocator` needs these, and it is gated to
     // the hosts whose allocator layout it knows.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox::platform::PageManagementProvider;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox_common_linux::MRemapFlags;
@@ -1242,8 +1271,16 @@ mod tests {
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
 
+    /// The host's page size. Sizes and addresses below are written as multiples
+    /// of this rather than as literals: `mmap`/`mprotect`/`mremap` reject a
+    /// length that is not a whole number of pages, and Apple Silicon's page is
+    /// 16 KiB, so a literal `0x1000` is not a page there and every such call
+    /// fails before reaching the behaviour under test.
+    use super::PAGE_SIZE;
+
     #[test]
     fn test_anonymous_mmap() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let addr = task
@@ -1264,6 +1301,7 @@ mod tests {
 
     #[test]
     fn test_file_backed_mmap() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let content = b"Hello, world!";
@@ -1294,12 +1332,13 @@ mod tests {
 
     #[test]
     fn test_mremap() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let addr = task
             .sys_mmap(
                 0,
-                0x2000,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
                 -1,
@@ -1307,11 +1346,13 @@ mod tests {
             )
             .unwrap();
 
+        // Growing the first page in place would run into the second, which this
+        // same mapping already occupies, so it fails without `MREMAP_MAYMOVE`.
         assert!(matches!(
             task.sys_mremap(
                 addr,
-                0x1000,
-                0x2000,
+                PAGE_SIZE,
+                2 * PAGE_SIZE,
                 litebox_common_linux::MRemapFlags::empty(),
                 0
             ),
@@ -1320,26 +1361,32 @@ mod tests {
         let new_addr = task
             .sys_mremap(
                 addr,
-                0x1000,
-                0x2000,
+                PAGE_SIZE,
+                2 * PAGE_SIZE,
                 litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE,
                 0,
             )
             .unwrap();
-        task.sys_munmap(addr, 0x2000).unwrap();
-        task.sys_munmap(new_addr, 0x2000).unwrap();
+        task.sys_munmap(addr, 2 * PAGE_SIZE).unwrap();
+        task.sys_munmap(new_addr, 2 * PAGE_SIZE).unwrap();
     }
 
     #[test]
     fn test_mmap_fixed_noreplace() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         // First, create an initial mapping at a specific address away from boundaries
-        let base_addr = 0x1000_0000usize; // 256 MiB - safe middle ground
+        // Well clear of the host's lowest mappable address: an arm64 Mach-O
+        // process reserves the first 4 GiB as `__PAGEZERO`, so a literal low
+        // address is not mappable there. Test 5 maps one page below this, so
+        // leave room for that too.
+        let base_addr =
+            <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN + 0x1000_0000usize;
         let addr1 = task
             .sys_mmap(
                 base_addr,
-                0x2000,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1356,7 +1403,7 @@ mod tests {
         let err = task
             .sys_mmap(
                 addr1.as_usize(),
-                0x1000,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1366,11 +1413,11 @@ mod tests {
         assert_eq!(err, Errno::EEXIST);
 
         // Test 2: Partial overlap at end - should fail with EEXIST
-        // Existing: [addr1, addr1 + 0x2000), New: [addr1 + 0x1000, addr1 + 0x3000)
+        // Existing: [addr1, addr1 + 2 * PAGE_SIZE), New: [addr1 + PAGE_SIZE, addr1 + 0x3000)
         let err = task
             .sys_mmap(
-                addr1.as_usize() + 0x1000,
-                0x2000,
+                addr1.as_usize() + PAGE_SIZE,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1380,11 +1427,11 @@ mod tests {
         assert_eq!(err, Errno::EEXIST);
 
         // Test 3: Partial overlap at start - should fail with EEXIST
-        // Existing: [addr1, addr1 + 0x2000), New: [addr1 - 0x1000, addr1 + 0x1000)
+        // Existing: [addr1, addr1 + 2 * PAGE_SIZE), New: [addr1 - PAGE_SIZE, addr1 + PAGE_SIZE)
         let err = task
             .sys_mmap(
-                addr1.as_usize() - 0x1000,
-                0x2000,
+                addr1.as_usize() - PAGE_SIZE,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1396,35 +1443,35 @@ mod tests {
         // Test 4: Adjacent mapping (right after) - should succeed
         let addr2 = task
             .sys_mmap(
-                addr1.as_usize() + 0x2000,
-                0x1000,
+                addr1.as_usize() + 2 * PAGE_SIZE,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
                 0,
             )
             .unwrap();
-        assert_eq!(addr2.as_usize(), addr1.as_usize() + 0x2000);
+        assert_eq!(addr2.as_usize(), addr1.as_usize() + 2 * PAGE_SIZE);
 
         // Test 5: Adjacent mapping (right before) - should succeed
         let addr3 = task
             .sys_mmap(
-                addr1.as_usize() - 0x1000,
-                0x1000,
+                addr1.as_usize() - PAGE_SIZE,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
                 0,
             )
             .unwrap();
-        assert_eq!(addr3.as_usize(), addr1.as_usize() - 0x1000);
+        assert_eq!(addr3.as_usize(), addr1.as_usize() - PAGE_SIZE);
 
         // Test 6: Zero address with MAP_FIXED_NOREPLACE - should fail with EPERM
         // (matches Linux behavior where vm.mmap_min_addr prevents mapping at address 0)
         let err = task
             .sys_mmap(
                 0,
-                0x1000,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1434,14 +1481,15 @@ mod tests {
         assert_eq!(err, Errno::EPERM);
 
         // Clean up
-        task.sys_munmap(addr3, 0x1000).unwrap();
-        task.sys_munmap(addr1, 0x2000).unwrap();
-        task.sys_munmap(addr2, 0x1000).unwrap();
+        task.sys_munmap(addr3, PAGE_SIZE).unwrap();
+        task.sys_munmap(addr1, 2 * PAGE_SIZE).unwrap();
+        task.sys_munmap(addr2, PAGE_SIZE).unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_collision_with_global_allocator() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
         let platform = task.global.platform;
         let mut data = alloc::vec::Vec::new();
@@ -1536,13 +1584,14 @@ mod tests {
 
     #[test]
     fn test_map_shared_anonymous() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         // MAP_SHARED | MAP_ANON with PROT_READ should succeed
         let addr = task
             .sys_mmap(
                 0,
-                0x2000,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_SHARED,
                 -1,
@@ -1554,23 +1603,28 @@ mod tests {
         let _val: u8 = addr.read_at_offset::<Platform>(0).unwrap();
 
         // Anonymous shared mappings allow permission changes including write
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
-            .unwrap();
+        task.sys_mprotect(
+            addr,
+            2 * PAGE_SIZE,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+        )
+        .unwrap();
         addr.write_slice_at_offset::<Platform>(0, &[0xab; 0x10])
             .unwrap();
         assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
 
         // mprotect to read-only or read-exec should also succeed
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ)
+        task.sys_mprotect(addr, 2 * PAGE_SIZE, ProtFlags::PROT_READ)
             .unwrap();
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ_EXEC)
+        task.sys_mprotect(addr, 2 * PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
             .unwrap();
 
-        task.sys_munmap(addr, 0x2000).unwrap();
+        task.sys_munmap(addr, 2 * PAGE_SIZE).unwrap();
     }
 
     #[test]
     fn test_map_shared_anonymous_writable() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         // MAP_SHARED | MAP_ANON with PROT_WRITE should succeed
@@ -1594,6 +1648,7 @@ mod tests {
 
     #[test]
     fn test_map_shared_readonly_file() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let content = b"Hello, shared!";
@@ -1605,7 +1660,14 @@ mod tests {
 
         // MAP_SHARED with PROT_READ on a file should succeed
         let addr = task
-            .sys_mmap(0, 0x1000, ProtFlags::PROT_READ, MapFlags::MAP_SHARED, fd, 0)
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
             .unwrap();
 
         // Data should match
@@ -1618,16 +1680,21 @@ mod tests {
 
         // mprotect to add write permission should fail
         let err = task
-            .sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+            .sys_mprotect(
+                addr,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            )
             .unwrap_err();
         assert_eq!(err, Errno::EACCES);
 
-        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_munmap(addr, PAGE_SIZE).unwrap();
         task.sys_close(fd).unwrap();
     }
 
     #[test]
     fn test_madvise() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let addr = task

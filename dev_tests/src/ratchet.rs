@@ -58,7 +58,9 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_windows_userland/", 8),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
-            ("litebox_shim_linux/", 1),
+            // 2 includes the test-only `ADDRESS_SPACE` mutex that serializes tests
+            // mapping guest memory; see `address_space_guard`.
+            ("litebox_shim_linux/", 2),
             // 5, not 4: `static INIT_FUNC` arrived with the OP-TEE syscall
             // support in 071841e and the table was never updated, so this count
             // has been stale since well before the macOS work.

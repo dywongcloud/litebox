@@ -382,12 +382,32 @@ mod tests {
     const PROGRAM_HEADER_SIZE_U16: u16 = 56;
     const ET_EXEC: u16 = 2;
     const ET_DYN: u16 = 3;
-    const EM_X86_64: u16 = 62;
+    /// The synthetic ELFs below must claim the host's own machine, because the
+    /// loader rejects any other with `UnsupportedType` before it reaches the
+    /// placement logic under test.
+    const EM_HOST: u16 = if cfg!(target_arch = "x86_64") {
+        62 // EM_X86_64
+    } else {
+        183 // EM_AARCH64
+    };
     const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
     const PF_X: u32 = 1;
     const PF_R: u32 = 4;
-    const EXEC_LOAD_ADDR: u64 = 0x400000;
+    /// Where the synthetic `ET_EXEC` asks to be loaded.
+    ///
+    /// Linux's customary `0x400000` is not usable on every host: an arm64 Mach-O
+    /// process reserves the first 4 GiB as `__PAGEZERO`, so a fixed mapping
+    /// there is refused outright. Anchoring to the host's own floor is still not
+    /// enough, because the host binary is itself mapped just above that floor --
+    /// this test process's own code sits within the first few MiB of it -- so a
+    /// small offset lands inside the running image and the fixed mapping fails.
+    /// The gap below is therefore large enough to clear any plausible host
+    /// image, while staying far below `TASK_ADDR_MAX` on every host, since what
+    /// this test asserts is that the *interpreter* lands in the high half.
+    const EXEC_LOAD_ADDR: u64 =
+        <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MIN as u64
+            + 0x8_0000_0000;
     const INTERP_PATH_OFFSET: usize = 0x200;
     const INTERP_PATH: &[u8] = b"/ld.so\0";
 
@@ -419,7 +439,7 @@ mod tests {
         buf.extend_from_slice(&[2, 1, 1, 0]);
         buf.extend_from_slice(&[0; 8]);
         push_u16(buf, elf_type);
-        push_u16(buf, EM_X86_64);
+        push_u16(buf, EM_HOST);
         push_u32(buf, 1);
         push_u64(buf, entry);
         push_u64(buf, u64::from(ELF_HEADER_SIZE_U16));
@@ -508,6 +528,7 @@ mod tests {
 
     #[test]
     fn et_exec_interpreter_loads_top_down_above_low_heap() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = crate::syscalls::tests::init_platform(None);
         write_file(&task, "/main", &minimal_elf(ET_EXEC, Some(INTERP_PATH)));
         write_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
@@ -541,5 +562,21 @@ mod tests {
             crate::loader::DEFAULT_LOW_ADDR,
             addr_max / 2,
         );
+
+        // Release both images before returning. Every test in this binary shares
+        // one host address space, but each builds its own task with its own VMM,
+        // and a VMM models only its own mappings -- so anything this test leaves
+        // mapped is invisible to the next test's placement search and collides
+        // with whatever it picks. That is easy to miss on a host whose guest
+        // range sits well clear of the host's own image; on arm64 macOS both
+        // live above the 4 GiB `__PAGEZERO` floor, so the collision is routine.
+        let exec_start = usize::try_from(EXEC_LOAD_ADDR).expect("load address fits usize");
+        task.sys_munmap(UserPtrMut::from_usize(exec_start), main.brk - exec_start)
+            .expect("main image should unmap");
+        task.sys_munmap(
+            UserPtrMut::from_usize(interp.base_addr),
+            interp.brk - interp.base_addr,
+        )
+        .expect("interpreter image should unmap");
     }
 }

@@ -204,16 +204,33 @@ rather than in the code they cover. Three are fixed; one is not.
   server, packaged for Linux only, and panicked on the missing binary rather than
   testing anything -- they are gated to Linux.
 
-* **Not fixed: `litebox_shim_linux`'s mm tests assume 4 KiB pages.**
-  `test_mremap` and five neighbours pass literal `0x1000`/`0x2000` sizes, which
-  are page-sized only where `PAGE_SIZE` is 4096. Apple Silicon's is 16384, so the
-  arithmetic these assertions encode does not hold and six tests fail
-  deterministically. The fix is to derive each size from `PAGE_SIZE` rather than
-  to adjust the literals, since the same tests must keep passing on both hosts.
-  A further one or two failures on top of those six are *flaky*, not
-  page-size-related: repeated runs of an unchanged tree produced 6, 7 and 8
-  failures, and each extra test passes in isolation, so something in that module
-  shares process-wide address-space state across concurrently running tests.
+* **Fixed since:** `litebox_shim_linux` now passes in full on this host. Its mm
+  tests had written sizes as literal `0x1000`/`0x2000`, which are page-sized only
+  where `PAGE_SIZE` is 4096; they derive from `PAGE_SIZE` now. The ELF loader
+  test built a synthetic image claiming `EM_X86_64` and asking to load at
+  `0x400000` -- rejected outright on this host, the first for the wrong machine
+  and the second for sitting under `__PAGEZERO`. Both derive from the host now,
+  and it releases its images before returning.
+
+* **The remaining flakiness is two timer tests, and it is a real property of the
+  host.** `test_timer_delivers_correct_signal` and `test_alarm_with_sigign` pass
+  every time alone and fail intermittently under a loaded parallel run. Darwin
+  has no POSIX timers, so the platform runs a thread per timer parked on a
+  condition variable (see `docs/macos.md`); that is inherently more
+  schedule-sensitive than a kernel timer, and a busy test binary can miss the
+  window. Worth deciding whether the tests should assert a looser bound or the
+  platform should hold a deadline more firmly -- not worth papering over with a
+  retry.
+
+* **A per-task VMM does not model the host's own mappings.** Every task maps into
+  one host address space while its virtual-memory manager tracks only what it
+  allocated, so two tasks in a process place addresses without seeing each other.
+  This is invisible where the guest range sits clear of the host's own image, and
+  routine on arm64 macOS where both live above the 4 GiB floor -- the loader test
+  leaked two images and broke five later tests that way. Serializing the mapping
+  tests (`address_space_guard`) makes the suite deterministic, but the underlying
+  gap is real: `test_collision_with_global_allocator` covers exactly this and is
+  still gated to Linux and Windows, so macOS has never been checked for it.
 
 ## Needs a real multi-threaded guest to exercise
 
