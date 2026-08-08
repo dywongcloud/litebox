@@ -72,6 +72,58 @@ subsystem.
   be pioneering this for the whole project, not porting an existing pattern.
   This is the one seam standing between the current macOS port and actually
   running a guest.
+
+  **A real finding worth recording before anyone attempts a hand-rolled
+  `switch_to_guest` here: at EL0 (userspace, which is all that's available --
+  `ERET` needs EL1+), there is no register-only solution to "restore all 31
+  guest GPRs plus PC plus SP and branch."** Working through it by hand: any
+  register used to carry the branch target (for `BR`/`RET`) still holds that
+  target's value immediately *after* the branch, not its own correct
+  `PtRegs` value, and `MOV SP, Xn` needs a GPR source too -- so entering the
+  guest always needs at least one GPR "sacrificed" for the transfer, with no
+  spare register left once all 31 are otherwise correct. Real kernels solve
+  this with `ERET`, which restores the whole register file including PC and
+  PSTATE atomically from memory with no GPR involved at all -- not available
+  here. **The userspace equivalent, and the actual way out, is Darwin's
+  `ucontext.h` API** (`getcontext`/`setcontext`): confirmed working on real
+  hardware this pass (a `getcontext`/`makecontext`/`swapcontext` round trip
+  ran correctly on this M3 Pro, macOS 26.3.1), despite `setcontext` and
+  friends carrying an "deprecated... no longer supported" compiler warning
+  since macOS 10.6 -- a real risk to weigh (Apple could remove it; "not
+  supported" may also mean undocumented edge-case gaps), but a working,
+  OS-verified atomic full-register-plus-PC restore beats a hand-derived
+  register-juggling sequence with no way to validate it short of a
+  debugger session this environment doesn't have. Also confirmed by direct
+  `offsetof` probing on this hardware: `ucontext_t` is self-contained
+  (`getcontext` links its embedded `uc_mcontext` pointer at a fixed offset,
+  56, into the same 880-byte object; no separate allocation needed), and its
+  `_STRUCT_MCONTEXT64` payload is byte-identical to the
+  `McontextPrefix64`/`ArmExceptionState64`/`ArmThreadState64` layout already
+  defined and verified in `litebox_platform_macos_userland/src/darwin.rs`
+  (`__es` at offset 0, `__ss` at offset 16, matching `ArmThreadState64`'s
+  272-byte size exactly against the measured `__ns` offset of 288) --
+  meaning entering the guest can reuse those exact, already-tested types
+  rather than defining new ones.
+
+  The design this implies: call the real `getcontext` to get a
+  correctly-linked scratch `ucontext_t` (as the "return to host" point),
+  build a second one the same way and overwrite its `uc_mcontext->__ss`
+  fields directly from `PtRegs` (bypassing `makecontext`, which only accepts
+  a plain function pointer and int args, not arbitrary register state), then
+  `setcontext` into it. The *other* direction -- capturing a guest's full
+  register state when it re-enters the host via a syscall gate -- still needs
+  a short raw-asm save prologue (guest GPRs are live in registers at that
+  point, nothing else has them yet), but that direction is meaningfully
+  easier: it is a straight linear `STP` chain into a `PtRegs`-shaped buffer
+  with no restore-side register-scarcity conflict, and it is exactly the
+  shape the rewriter's own MSR/MRS gates already use successfully (spill
+  first, then use the freed register) -- see `emit_msr_gate` in
+  `litebox_syscall_rewriter/src/arm64.rs`.
+
+  Not implemented this pass -- this is a precise, de-risked *design*, not
+  code, and the actual FFI bindings, `Ucontext64` struct, save-prologue
+  assembly, and `EnterShim` wiring are real, non-trivial work still ahead of
+  whoever picks this up next.
 * **The `jit_write_protect` bracketing gap** documented in
   [`docs/macos.md`](./macos.md#wx-map_jit-and-code-signing): nothing in
   `litebox_shim_linux`'s ELF loader or syscall-rewriter patching calls
