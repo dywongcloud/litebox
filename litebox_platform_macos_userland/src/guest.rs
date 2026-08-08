@@ -280,6 +280,11 @@ mod tests {
     use core::cell::RefCell;
     use litebox::shim::{EnterShim, ExceptionInfo};
 
+    /// Only one guest thread may run at a time (see [`GUEST_ACTIVE`]), so the
+    /// guest-entry tests must not run concurrently with each other under the
+    /// parallel test harness.
+    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A stub shim that records the syscalls a guest makes. `write` (nr 64)
     /// returns its length and resumes; `exit` (nr 93) terminates.
     struct RecordingShim {
@@ -350,6 +355,9 @@ mod tests {
 
     #[test]
     fn runs_a_guest_through_two_syscalls_and_exit() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stack = vec![0u8; 1 << 16];
         let top = stack.as_mut_ptr() as usize + stack.len();
         let sp = (top - 256) & !15;
@@ -371,5 +379,140 @@ mod tests {
             vec![(64, 1, 0xABC), (93, 42, 0xABC)],
             "guest should have made write(1,0xABC,..) then exit(42)"
         );
+    }
+
+    /// A shim that captures the full register file at the first syscall and the
+    /// first argument at the second, to check context-switch fidelity.
+    struct FidelityShim {
+        first: RefCell<Option<[usize; 31]>>,
+        second_x1: core::cell::Cell<usize>,
+        calls: core::cell::Cell<u32>,
+    }
+
+    impl EnterShim for FidelityShim {
+        type ExecutionContext = PtRegs;
+        fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Resume
+        }
+        fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            match n {
+                0 => {
+                    *self.first.borrow_mut() = Some(ctx.regs);
+                    ctx.regs[0] = 0;
+                    ContinueOperation::Resume
+                }
+                1 => {
+                    self.second_x1.set(ctx.regs[1]);
+                    ctx.regs[0] = 0;
+                    ContinueOperation::Resume
+                }
+                _ => ContinueOperation::Terminate,
+            }
+        }
+        fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+        fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+    }
+
+    /// A guest that seeds sentinels into a spread of callee- and caller-saved
+    /// registers, makes a syscall (so the callback captures them), then -- after
+    /// resuming -- passes the callee-saved `x19` sentinel as a syscall argument
+    /// (so we can confirm it survived the enter/capture/resume round trip),
+    /// then exits.
+    #[unsafe(naked)]
+    unsafe extern "C" fn fidelity_guest() {
+        core::arch::naked_asm!(
+            // Seed sentinels: x19 = 0x2222_1111 (callee-saved), x20/x28
+            // (callee-saved), x9 (caller-saved).
+            "movz x19, #0x1111",
+            "movk x19, #0x2222, lsl #16",
+            "movz x20, #0xBEEF",
+            "movz x9,  #0xCAFE",
+            "movz x28, #0xF00D",
+            // syscall 1: write(1, 0xABC, 7)
+            "movz x8, #64",
+            "movz x0, #1",
+            "movz x1, #0xABC",
+            "movz x2, #7",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 30f@PAGE",
+            "add  x16, x16, 30f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "br   x16",
+            "30:",
+            // syscall 2: write(2, x19, 0) -- x19 must still hold its sentinel.
+            "movz x8, #64",
+            "movz x0, #2",
+            "mov  x1, x19",
+            "movz x2, #0",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 31f@PAGE",
+            "add  x16, x16, 31f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "br   x16",
+            "31:",
+            // exit(0)
+            "movz x8, #93",
+            "movz x0, #0",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 32f@PAGE",
+            "add  x16, x16, 32f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "br   x16",
+            "32:",
+            "brk  #0",
+            cb = sym syscall_callback,
+        )
+    }
+
+    #[test]
+    fn preserves_registers_across_capture_and_resume() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stack = vec![0u8; 1 << 16];
+        let top = stack.as_mut_ptr() as usize + stack.len();
+        let sp = (top - 256) & !15;
+
+        let mut ctx = PtRegs {
+            pc: fidelity_guest as *const () as usize,
+            sp,
+            ..Default::default()
+        };
+        let shim = FidelityShim {
+            first: RefCell::new(None),
+            second_x1: core::cell::Cell::new(0),
+            calls: core::cell::Cell::new(0),
+        };
+        run_thread(&shim, &mut ctx);
+
+        let first = shim.first.into_inner().expect("first syscall not seen");
+        // Capture fidelity: every seeded register reached the callback intact.
+        assert_eq!(first[19], 0x2222_1111, "x19 (callee-saved) captured");
+        assert_eq!(first[20], 0xBEEF, "x20 (callee-saved) captured");
+        assert_eq!(first[9], 0xCAFE, "x9 (caller-saved) captured");
+        assert_eq!(first[28], 0xF00D, "x28 (callee-saved) captured");
+        // Resume fidelity: x19 still held its sentinel after resuming, and the
+        // guest passed it as the second syscall's x1.
+        assert_eq!(
+            shim.second_x1.get(),
+            0x2222_1111,
+            "x19 survived the enter/capture/resume round trip"
+        );
+        assert_eq!(shim.calls.get(), 3, "expected write, write, exit");
     }
 }
