@@ -147,6 +147,18 @@ into the Rust run loop. The whole enter→SVC→gate→callback→resume→exit 
 prototyped in C on this hardware before porting, then re-proven by the crate
 test. `PtRegs` field offsets are pinned to the asm by `const` assertions.
 
+The switch also carries the guest's FP/SIMD state. `PtRegs` has nowhere to put
+it -- it mirrors Linux's `struct pt_regs`, which has no FP fields because the
+kernel is built without them -- so `GUEST_FP` holds the full `v0`-`v31` plus
+`FPCR`/`FPSR` beside it, and `HOST_SAVE` gained the host's callee-saved `d8`-`d15`
+and its own `FPCR`/`FPSR`. This was missing when the switch first landed, and
+nothing caught it: the register-fidelity test checked only general-purpose
+registers, so a guest holding live vector state across its `SVC` -- which Linux
+permits, and which glibc's and musl's string routines actually do -- got host
+garbage back, while host code lost `d8`-`d15` to the guest.
+`preserves_fp_state_across_capture_and_resume` covers it now; removing the
+restore makes that test fail on hardware while the two older ones still pass.
+
 Remaining, smaller, follow-ups on top of the working switch:
 * Host bookkeeping (save area + live-`PtRegs` pointer) is process-global, so
   **one guest thread at a time** (a second panics loudly). Per-thread needs the

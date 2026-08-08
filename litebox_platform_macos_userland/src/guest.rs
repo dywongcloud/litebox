@@ -22,6 +22,13 @@
 //! and the `NZCV` flags from a [`PtRegs`], then branches through `X16` to the
 //! guest `PC`.
 //!
+//! The vector registers travel separately, in [`GUEST_FP`], because [`PtRegs`]
+//! has nowhere to put them: it mirrors Linux's `struct pt_regs`, which carries
+//! no FP state because the kernel is built without it. Leaving them in the
+//! hardware would not work either -- the shim is ordinary Rust and uses vector
+//! registers freely -- and Linux preserves user FPSIMD across a syscall, so a
+//! guest may hold live values in any of them across its `SVC`.
+//!
 //! Coming back is the reverse. A rewritten guest `SVC` branches (via its gate
 //! and the shared handler) to [`syscall_callback`], which captures the full
 //! guest register file into the run loop's `PtRegs`, restores the host's
@@ -82,10 +89,65 @@ struct RawCell<T>(UnsafeCell<T>);
 // `GUEST_ACTIVE`; there is no concurrent reader/writer.
 unsafe impl<T> Sync for RawCell<T> {}
 
-/// Host callee-saved registers, `LR` and `SP`, saved by [`enter_guest_asm`] and
-/// restored by [`syscall_callback`]. Layout (u64 indices): `x19..x28` at 0..72,
-/// `x29` at 80, `lr` at 88, `sp` at 96.
-static HOST_SAVE: RawCell<[u64; 13]> = RawCell(UnsafeCell::new([0; 13]));
+/// Host callee-saved state, saved by [`enter_guest_asm`] and restored by
+/// [`syscall_callback`]. Byte layout: `x19..x28` at 0..72, `x29` at 80, `lr` at
+/// 88, `sp` at 96, `d8..d15` at 104..160, `FPCR` at 168, `FPSR` at 176.
+///
+/// `d8`-`d15` are here because AAPCS makes their low 64 bits callee-saved, so
+/// `run_thread`'s caller is entitled to find them intact; the guest is free to
+/// write every vector register.
+static HOST_SAVE: RawCell<[u64; HOST_SAVE_SLOTS]> = RawCell(UnsafeCell::new([0; HOST_SAVE_SLOTS]));
+
+/// `u64` slots in [`HOST_SAVE`]; see its layout.
+const HOST_SAVE_SLOTS: usize = 23;
+/// Byte offsets the naked assembly hard-codes. `HOST_SAVE` is a flat array
+/// rather than a struct, so there is no `offset_of!` to check these against;
+/// the assertions below check instead that the regions are contiguous and that
+/// the last one ends exactly at the end of the array, which is what would break
+/// if a slot were added without resizing it.
+const HOST_SAVE_OFF_D8: usize = 104;
+const HOST_SAVE_OFF_FPCR: usize = 168;
+const HOST_SAVE_OFF_FPSR: usize = 176;
+/// `d8`-`d15`, eight 64-bit slots, run from `HOST_SAVE_OFF_D8` up to `FPCR`.
+const _: () = assert!(HOST_SAVE_OFF_D8 + 8 * 8 == HOST_SAVE_OFF_FPCR);
+const _: () = assert!(HOST_SAVE_OFF_FPCR + 8 == HOST_SAVE_OFF_FPSR);
+const _: () = assert!(HOST_SAVE_OFF_FPSR + 8 == HOST_SAVE_SLOTS * 8);
+
+/// The guest's floating-point and SIMD state, held across a syscall.
+///
+/// The guest's own registers cannot stay in the hardware while the host runs:
+/// the shim is ordinary Rust and uses the vector registers freely, so anything
+/// left live would be destroyed. [`PtRegs`] cannot carry this state -- it mirrors
+/// Linux's `struct pt_regs`, which has no FP fields because the kernel is built
+/// without them and manages user FPSIMD out of band -- so it lives beside it.
+///
+/// The whole file is preserved, not just the callee-saved half, because Linux
+/// preserves user FPSIMD across a syscall: a guest is entitled to hold live
+/// values in *any* vector register across its `SVC`, and glibc's and musl's
+/// string and memory routines do exactly that.
+#[repr(C, align(16))]
+struct GuestFpState {
+    /// `v0`-`v31`, full 128 bits each.
+    v: [u128; 32],
+    fpcr: u64,
+    fpsr: u64,
+}
+
+/// The live guest's FP/SIMD state while the host runs. Restored by
+/// [`enter_guest_asm`], captured by [`syscall_callback`]. Zero is the correct
+/// initial value: a fresh guest thread starts with a cleared vector file and the
+/// default rounding mode, which is what `FPCR == 0` means.
+static GUEST_FP: RawCell<GuestFpState> = RawCell(UnsafeCell::new(GuestFpState {
+    v: [0; 32],
+    fpcr: 0,
+    fpsr: 0,
+}));
+
+const GUEST_FP_OFF_FPCR: usize = 512;
+const GUEST_FP_OFF_FPSR: usize = 520;
+const _: () = assert!(core::mem::offset_of!(GuestFpState, v) == 0);
+const _: () = assert!(core::mem::offset_of!(GuestFpState, fpcr) == GUEST_FP_OFF_FPCR);
+const _: () = assert!(core::mem::offset_of!(GuestFpState, fpsr) == GUEST_FP_OFF_FPSR);
 
 /// Pointer to the run loop's live [`PtRegs`], stashed by [`enter_guest_asm`] so
 /// [`syscall_callback`] can write the captured guest state back into it.
@@ -125,6 +187,39 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) {
         "str  x30, [x1, #88]",
         "mov  x2, sp",
         "str  x2, [x1, #96]",
+        // Save the host's callee-saved FP registers and its FP control/status.
+        "stp  d8,  d9,  [x1, #104]",
+        "stp  d10, d11, [x1, #120]",
+        "stp  d12, d13, [x1, #136]",
+        "stp  d14, d15, [x1, #152]",
+        "mrs  x2, fpcr",
+        "str  x2, [x1, #168]",
+        "mrs  x2, fpsr",
+        "str  x2, [x1, #176]",
+        // Restore the guest's whole vector file and FP control/status. Done here,
+        // while x1 is still scratch and before any guest GPR is live.
+        "adrp x1, {guest_fp}@PAGE",
+        "add  x1, x1, {guest_fp}@PAGEOFF",
+        "ldp  q0,  q1,  [x1, #0]",
+        "ldp  q2,  q3,  [x1, #32]",
+        "ldp  q4,  q5,  [x1, #64]",
+        "ldp  q6,  q7,  [x1, #96]",
+        "ldp  q8,  q9,  [x1, #128]",
+        "ldp  q10, q11, [x1, #160]",
+        "ldp  q12, q13, [x1, #192]",
+        "ldp  q14, q15, [x1, #224]",
+        "ldp  q16, q17, [x1, #256]",
+        "ldp  q18, q19, [x1, #288]",
+        "ldp  q20, q21, [x1, #320]",
+        "ldp  q22, q23, [x1, #352]",
+        "ldp  q24, q25, [x1, #384]",
+        "ldp  q26, q27, [x1, #416]",
+        "ldp  q28, q29, [x1, #448]",
+        "ldp  q30, q31, [x1, #480]",
+        "ldr  x2, [x1, #512]",
+        "msr  fpcr, x2",
+        "ldr  x2, [x1, #520]",
+        "msr  fpsr, x2",
         // Record the live PtRegs pointer for the callback.
         "adrp x2, {live}@PAGE",
         "add  x2, x2, {live}@PAGEOFF",
@@ -161,6 +256,7 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) {
         "br   x16",
         host_save = sym HOST_SAVE,
         live = sym LIVE_PTREGS,
+        guest_fp = sym GUEST_FP,
     )
 }
 
@@ -207,6 +303,30 @@ pub(crate) unsafe extern "C" fn syscall_callback() {
         "str  x9, [sp, #248]",
         "mrs  x9, nzcv",
         "str  x9, [sp, #264]",       // pstate
+        // Capture the guest's whole vector file and FP control/status before any
+        // host code runs, since the host is free to use every vector register.
+        "adrp x9, {guest_fp}@PAGE",
+        "add  x9, x9, {guest_fp}@PAGEOFF",
+        "stp  q0,  q1,  [x9, #0]",
+        "stp  q2,  q3,  [x9, #32]",
+        "stp  q4,  q5,  [x9, #64]",
+        "stp  q6,  q7,  [x9, #96]",
+        "stp  q8,  q9,  [x9, #128]",
+        "stp  q10, q11, [x9, #160]",
+        "stp  q12, q13, [x9, #192]",
+        "stp  q14, q15, [x9, #224]",
+        "stp  q16, q17, [x9, #256]",
+        "stp  q18, q19, [x9, #288]",
+        "stp  q20, q21, [x9, #320]",
+        "stp  q22, q23, [x9, #352]",
+        "stp  q24, q25, [x9, #384]",
+        "stp  q26, q27, [x9, #416]",
+        "stp  q28, q29, [x9, #448]",
+        "stp  q30, q31, [x9, #480]",
+        "mrs  x10, fpcr",
+        "str  x10, [x9, #512]",
+        "mrs  x10, fpsr",
+        "str  x10, [x9, #520]",
         // Copy the captured PtRegs into the run loop's live buffer.
         "adrp x9, {live}@PAGE",
         "add  x9, x9, {live}@PAGEOFF",
@@ -229,11 +349,21 @@ pub(crate) unsafe extern "C" fn syscall_callback() {
         "ldp  x27, x28, [x1, #64]",
         "ldr  x29, [x1, #80]",
         "ldr  x30, [x1, #88]",
+        // Hand the host back its callee-saved FP registers and FP control/status.
+        "ldp  d8,  d9,  [x1, #104]",
+        "ldp  d10, d11, [x1, #120]",
+        "ldp  d12, d13, [x1, #136]",
+        "ldp  d14, d15, [x1, #152]",
+        "ldr  x9, [x1, #168]",
+        "msr  fpcr, x9",
+        "ldr  x9, [x1, #176]",
+        "msr  fpsr, x9",
         "ldr  x2, [x1, #96]",
         "mov  sp, x2",
         "ret",
         live = sym LIVE_PTREGS,
         host_save = sym HOST_SAVE,
+        guest_fp = sym GUEST_FP,
     )
 }
 
@@ -477,6 +607,150 @@ mod tests {
             "brk  #0",
             cb = sym syscall_callback,
         )
+    }
+
+    /// A guest that leaves a sentinel in `v8` and a non-default rounding mode in
+    /// `FPCR` across a syscall, then reports both back through a second syscall.
+    ///
+    /// Linux preserves user FPSIMD across an `SVC`, so a real guest is entitled
+    /// to do exactly this -- glibc's and musl's string routines hold live vector
+    /// values across calls that may syscall.
+    #[unsafe(naked)]
+    unsafe extern "C" fn fp_fidelity_guest() {
+        core::arch::naked_asm!(
+            // v8 = 0x5555_4444, FPCR = round-toward-plus-infinity (RMode = 0b01).
+            "movz x3, #0x4444",
+            "movk x3, #0x5555, lsl #16",
+            "fmov d8, x3",
+            "movz x3, #0x40, lsl #16",
+            "msr  fpcr, x3",
+            // syscall 1: write(1, 0, 0) -- just a trip through the host.
+            "movz x8, #64",
+            "movz x0, #1",
+            "movz x1, #0",
+            "movz x2, #0",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 40f@PAGE",
+            "add  x16, x16, 40f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "br   x16",
+            "40:",
+            // syscall 2: write(2, v8_low, fpcr) -- both must have survived.
+            "movz x8, #64",
+            "movz x0, #2",
+            "fmov x1, d8",
+            "mrs  x2, fpcr",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 41f@PAGE",
+            "add  x16, x16, 41f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "br   x16",
+            "41:",
+            // exit(0)
+            "movz x8, #93",
+            "movz x0, #0",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 42f@PAGE",
+            "add  x16, x16, 42f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "br   x16",
+            "42:",
+            "brk  #0",
+            cb = sym syscall_callback,
+        )
+    }
+
+    /// Scribble over the FP state a guest might be holding, the way ordinary
+    /// host code does incidentally. Explicit here so the test proves the switch
+    /// protects the guest rather than depending on whether this build's shim
+    /// happened to touch a vector register.
+    fn clobber_host_fp() {
+        // SAFETY: writes only scratch FP state, all of it declared clobbered.
+        unsafe {
+            core::arch::asm!(
+                "movi v8.16b, #0xFF",
+                "msr  fpcr, xzr",
+                out("v8") _,
+                options(nostack),
+            );
+        }
+    }
+
+    /// The guest's FP/SIMD state must survive a syscall, because Linux's does.
+    /// Before the switch saved it, the host's own use of the vector registers
+    /// destroyed whatever the guest was holding.
+    #[test]
+    fn preserves_fp_state_across_capture_and_resume() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stack = vec![0u8; 1 << 16];
+        let top = stack.as_mut_ptr() as usize + stack.len();
+        let sp = (top - 256) & !15;
+
+        let mut ctx = PtRegs {
+            pc: fp_fidelity_guest as *const () as usize,
+            sp,
+            ..Default::default()
+        };
+        let shim = FpFidelityShim {
+            reported: core::cell::Cell::new(None),
+            calls: core::cell::Cell::new(0),
+        };
+        run_thread(&shim, &mut ctx);
+
+        let (v8_low, fpcr) = shim.reported.get().expect("second syscall not seen");
+        assert_eq!(v8_low, 0x5555_4444, "v8 survived the round trip");
+        assert_eq!(
+            fpcr, 0x40_0000,
+            "FPCR rounding mode survived the round trip"
+        );
+        assert_eq!(shim.calls.get(), 3, "expected write, write, exit");
+    }
+
+    struct FpFidelityShim {
+        reported: core::cell::Cell<Option<(usize, usize)>>,
+        calls: core::cell::Cell<u32>,
+    }
+
+    impl litebox::shim::EnterShim for FpFidelityShim {
+        type ExecutionContext = PtRegs;
+        fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Resume
+        }
+        fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            // Stand in for the ordinary host code that runs between guest entries.
+            clobber_host_fp();
+            match n {
+                0 => {
+                    ctx.regs[0] = 0;
+                    ContinueOperation::Resume
+                }
+                1 => {
+                    self.reported.set(Some((ctx.regs[1], ctx.regs[2])));
+                    ctx.regs[0] = 0;
+                    ContinueOperation::Resume
+                }
+                _ => ContinueOperation::Terminate,
+            }
+        }
+        fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+        fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
     }
 
     #[test]

@@ -48,7 +48,12 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_linux_kernel/", 6),
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 24),
-            ("litebox_platform_macos_userland/", 10),
+            // 11 includes `GUEST_FP`, the guest's vector-register file held
+            // across a syscall. It is process-global for the same reason the
+            // rest of the guest-entry save area is: a naked callback running on
+            // the guest stack cannot reach a `thread_local!` without a call.
+            // Lifting the single-guest-thread limit retires all of them together.
+            ("litebox_platform_macos_userland/", 11),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
             ("litebox_runner_lvbs/", 5),
