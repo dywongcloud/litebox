@@ -228,13 +228,25 @@ issues syscalls already runs end to end. The pieces:
    a hard panic at `MacOsUserland::new()`, which made the platform
    unconstructable and blocked everything else; it is now a loud warning that
    leaves construction working (a syscall-only guest is unaffected; a
-   `TPIDR_EL0`-using guest is unsupported until the fix). The real fix is
-   load-time offset indirection -- the gate loads its guest-TP byte offset
-   from a trampoline slot the loader fills from the runtime-reserved key,
-   addressing `[TPIDRRO_EL0 + offset_reg]` -- tracked as
-   `macos-guest-tp-runtime-offset` in `docs/roadmap.md`. What remains before a
-   `TPIDR_EL0`-using guest runs also includes `pthread_setspecific`-ing each
-   guest thread's pointer into whichever slot is actually reserved.
+   `TPIDR_EL0`-using guest is unsupported until the fix).
+
+   **The rewriter half of the fix has landed.** `Host::MacOs` gates no longer
+   bake the slot number in: they load a byte offset from the trampoline header
+   slot `HEADER_GUEST_TP_OFFSET_MACOS` and address `[TPIDRRO_EL0 + offset_reg]`.
+   The slot holds an offset rather than a thread-pointer value because the loader
+   flips the trampoline to read+execute once it is filled, so nothing may write
+   it again while a guest runs; the per-thread part comes from `TPIDRRO_EL0`
+   itself. `Host::Linux` still bakes its immediate, since that offset is genuine
+   compile-time ABI — `GuestTpAddressing` now names the distinction.
+
+   What remains is the loader half, tracked as `macos-guest-tp-runtime-offset` in
+   `docs/roadmap.md`: writing `guest_tp_slot_byte_offset()` (the reserved
+   `pthread_key_create` key scaled by 8) into that header slot, the way
+   `load_trampoline` already writes the syscall entry point at offset 0. Until
+   then the rewriter's packaging-time seed stands, so gates behave exactly as the
+   old baked-immediate ones did. What remains before a `TPIDR_EL0`-using guest
+   runs also includes `pthread_setspecific`-ing each guest thread's pointer into
+   whichever slot is actually reserved.
 2. **Filling the trampoline.** The rewriter writes the syscall-callback address
    at offset 0 of the trampoline it appends to the image; the loader must write
    `SystemInfoProvider::get_syscall_entry_point` there before any guest `SVC`

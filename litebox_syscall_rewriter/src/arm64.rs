@@ -66,10 +66,14 @@
 //! no free scratch register on entry. The SVC and MSR gates therefore spill their
 //! scratch registers (and, for SVC, the computed return address the callback
 //! reads back) to a frame carved out of the guest stack with `SUB SP, SP, #frame`
-//! / `ADD SP, SP, #frame`. The MRS gate needs no frame: it reuses its own
-//! destination register as scratch and never touches the stack.
+//! / `ADD SP, SP, #frame`. The MRS gate normally needs no frame: it reuses its own
+//! destination register as scratch and never touches the stack. It does take one
+//! when the host reads its guest thread-pointer offset at run time
+//! (`GuestTpAddressing::RuntimeSlot`), because holding that offset costs a second
+//! register that the guest may still be using — X16/X17 are reserved for linker
+//! veneers, not dead at an arbitrary instruction the way they are at an `SVC`.
 //!
-//! Consequently the SVC and MSR gates **require `SP` to hold a valid, writable,
+//! Consequently those gates **require `SP` to hold a valid, writable,
 //! 16-byte-aligned stack at the patched site** — the same condition the kernel
 //! relies on when it writes a signal frame below `SP`, and which every conforming
 //! AArch64 caller already satisfies at a syscall boundary. The gate decrements
@@ -270,17 +274,45 @@ const MSR_FRAME_OFF_X16: u16 = 0;
 /// still pristine.
 const MSR_FRAME_OFF_VALUE: u16 = 16;
 
+// --- MRS gate stack frame ---
+//
+// Only the `GuestTpAddressing::RuntimeSlot` form needs a frame, to borrow one
+// scratch register for the loaded offset. The baked form touches only `Rd` and
+// emits no frame at all.
+
+/// MRS gate frame size (`SUB/ADD SP, SP, #MRS_FRAME_BYTES`). 16-byte aligned:
+/// AArch64 requires `SP` to stay 16-byte aligned on every access that uses it as
+/// a base, so 16 is the smallest legal frame even though one register is spilled.
+const MRS_FRAME_BYTES: u16 = 16;
+/// Saved scratch register.
+const MRS_FRAME_OFF_SCRATCH: u16 = 0;
+
 // --- Trampoline layout offsets (all in bytes) ---
 
 /// Callback address slot.
 const HEADER_CALLBACK_OFFSET: usize = 0;
 
-/// Guest thread-pointer value slot (macOS single-guest-thread model). The platform
-/// writes the guest's TPIDR_EL0 value here when entering a guest; the rewriter's
-/// `Host::MacOs` gates read/write from this slot instead of using the runtime-offset
-/// TSD slot, avoiding the startup-dependent pthread_key_create mismatch (see
-/// `docs/roadmap.md`, `macos-guest-tp-runtime-offset`). Must be filled by the
-/// loader before any guest entry.
+/// Guest thread-pointer *byte offset* slot, read by [`Host::MacOs`] gates.
+///
+/// Holds the byte offset from the host anchor at which the runtime keeps the
+/// guest thread pointer — never the thread pointer itself. A `Host::MacOs` gate
+/// loads this word and addresses `[TPIDRRO_EL0 + offset]`, so the number the
+/// gates use is settled when the image is loaded rather than when it is
+/// packaged. That is the whole point of the slot: the TSD key a macOS runtime
+/// gets from `pthread_key_create` is a property of the runner binary's own
+/// startup sequence, which the ahead-of-time rewriter cannot know.
+///
+/// A thread-pointer *value* could not live here. The loader maps the trampoline
+/// writable, fills the header, then flips it to read+execute
+/// (`litebox_common_linux`'s `load_trampoline`), so nothing may write this word
+/// again once a guest runs — and one word cannot serve two threads anyway. An
+/// offset is constant for the process; the per-thread part comes from
+/// `TPIDRRO_EL0`, which is already per-thread.
+///
+/// The rewriter seeds it with [`GUEST_TPIDR_OFFSET_MACOS`], so an image whose
+/// loader does not fill the slot keeps the exact behaviour of the earlier
+/// baked-immediate gates instead of addressing offset zero — which would be
+/// pthread TSD slot 0, live libpthread state.
 const HEADER_GUEST_TP_OFFSET_MACOS: usize = HEADER_CALLBACK_OFFSET + 8;
 
 /// Shared SVC handler, placed just past the trampoline header slots. Per-site gates
@@ -320,10 +352,14 @@ enum Opcode {
     AddImm = 0x9100_0000,
     StrUimm = 0xF900_0000,
     LdrUimm = 0xF940_0000,
-    /// STR with register offset (LSL #3).
-    StrReg = 0xF8000000,
-    /// LDR with register offset (LSL #3).
-    LdrReg = 0xF8400000,
+    /// `LDR Xt, [Xn, Xm]` — register offset, `option=LSL`, `S=0`, so `Xm` is a
+    /// byte offset rather than an element index. The base word already carries
+    /// bit 21 and `bits[11:10]=0b10`; those two fields are what select the
+    /// register-offset class at all, and clearing either one decodes as an
+    /// `LDUR` with a garbage immediate rather than failing.
+    LdrReg = 0xF860_6800,
+    /// `ADD Xd, Xn, Xm` — shifted register, `LSL #0`.
+    AddReg = 0x8B00_0000,
     Stp = 0xA900_0000,
     Ldp = 0xA940_0000,
     MrsTpidrEl0 = MRS_TPIDR_EL0_BITS,
@@ -400,10 +436,17 @@ fn ldst_uimm12(op: Opcode, rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
     Some(op.bits() | (u32::from(imm12) << 10) | (u32::from(rn) << 5) | u32::from(rt))
 }
 
-/// `op | rm<<16 | 0x6000 | rn<<5 | rt` — register offset (LSL #3) 64-bit load/store
-/// (`STR`/`LDR [Xn, Xm, LSL #3]`). The LSL #3 is implicit for 64-bit register offsets.
+/// `op | rm<<16 | rn<<5 | rt` — register-offset 64-bit load
+/// (`LDR Xt, [Xn, Xm]`). Every fixed field, including the `option`, `S` and
+/// bit-21 bits that select the register-offset class, is already part of `op`.
 fn ldst_reg_offset(op: Opcode, rt: u8, rn: u8, rm: u8) -> u32 {
-    op.bits() | (u32::from(rm) << 16) | 0x6000 | (u32::from(rn) << 5) | u32::from(rt)
+    op.bits() | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rt)
+}
+
+/// `op | rm<<16 | rn<<5 | rd` — three-register data-processing form
+/// (`ADD Xd, Xn, Xm`).
+fn data_reg(op: Opcode, rd: u8, rn: u8, rm: u8) -> u32 {
+    op.bits() | (u32::from(rm) << 16) | (u32::from(rn) << 5) | u32::from(rd)
 }
 
 /// `op | imm7<<15 | rt2<<10 | rn<<5 | rt` — signed scaled (×8) 64-bit load/store
@@ -453,10 +496,10 @@ enum Insn {
     StrUimm { rt: u8, rn: u8, imm_bytes: u16 },
     /// `LDR Xt, [Xn, #imm_bytes]` (unsigned scaled; `imm_bytes` multiple of 8).
     LdrUimm { rt: u8, rn: u8, imm_bytes: u16 },
-    /// `STR Xt, [Xn, Xm]` (register offset, LSL #3).
-    StrReg { rt: u8, rn: u8, rm: u8 },
-    /// `LDR Xt, [Xn, Xm]` (register offset, LSL #3).
+    /// `LDR Xt, [Xn, Xm]` — register offset, unscaled, so `Xm` is a byte offset.
     LdrReg { rt: u8, rn: u8, rm: u8 },
+    /// `ADD Xd, Xn, Xm`.
+    AddReg { rd: u8, rn: u8, rm: u8 },
     /// `STP Xt, Xt2, [Xn, #imm_bytes]` (signed scaled; `imm_bytes` multiple of 8).
     Stp {
         rt: u8,
@@ -503,8 +546,8 @@ impl Insn {
             Insn::AddImm { rd, rn, imm12 } => data_imm12(Opcode::AddImm, rd, rn, imm12),
             Insn::StrUimm { rt, rn, imm_bytes } => ldst_uimm12(Opcode::StrUimm, rt, rn, imm_bytes),
             Insn::LdrUimm { rt, rn, imm_bytes } => ldst_uimm12(Opcode::LdrUimm, rt, rn, imm_bytes),
-            Insn::StrReg { rt, rn, rm } => Some(ldst_reg_offset(Opcode::StrReg, rt, rn, rm)),
             Insn::LdrReg { rt, rn, rm } => Some(ldst_reg_offset(Opcode::LdrReg, rt, rn, rm)),
+            Insn::AddReg { rd, rn, rm } => Some(data_reg(Opcode::AddReg, rd, rn, rm)),
             Insn::Stp {
                 rt,
                 rt2,
@@ -587,15 +630,32 @@ impl Host {
         }
     }
 
-    /// The byte offset from this host's anchor at which the runtime keeps the
-    /// guest thread-pointer slot. Baked into every emitted gate's scaled
-    /// `LDR`/`STR`, so it is rewriter/runtime ABI per host.
-    fn guest_tp_offset(self) -> u16 {
+    /// How a gate on this host reaches the guest thread-pointer slot.
+    fn guest_tp_addressing(self) -> GuestTpAddressing {
         match self {
-            Host::Linux => GUEST_TPIDR_OFFSET,
-            Host::MacOs => GUEST_TPIDR_OFFSET_MACOS,
+            Host::Linux => GuestTpAddressing::Baked(GUEST_TPIDR_OFFSET),
+            Host::MacOs => GuestTpAddressing::RuntimeSlot,
         }
     }
+}
+
+/// How a gate obtains the byte offset from the host anchor to the guest
+/// thread-pointer slot.
+///
+/// The hosts differ in *when* that number is knowable, not in what it means, so
+/// the choice is spelled out here rather than left implicit in each emitter.
+#[derive(Clone, Copy)]
+enum GuestTpAddressing {
+    /// Rewriter/runtime ABI, fixed at packaging time and baked into each gate's
+    /// scaled `LDR`/`STR` immediate. Linux qualifies: its runtime owns
+    /// `TPIDR_EL0` outright and puts the slot at a compile-time offset beside its
+    /// own block.
+    Baked(u16),
+    /// Read at run time from [`HEADER_GUEST_TP_OFFSET_MACOS`], because the
+    /// packaging-time rewriter cannot know it. macOS qualifies: the anchor is
+    /// kernel-owned and the slot is a pthread TSD key whose number depends on the
+    /// runner binary's own startup sequence.
+    RuntimeSlot,
 }
 
 // ============================================================
@@ -809,9 +869,11 @@ fn emit_shared_prologue(
     // Offset 0: callback address.
     trampoline_data.extend_from_slice(&callback.to_le_bytes());
 
-    // Offset 8: guest thread-pointer value (macOS single-guest-thread model).
-    // Placeholder value; the platform fills this at runtime before any guest entry.
-    trampoline_data.extend_from_slice(&0u64.to_le_bytes());
+    // Offset 8: guest thread-pointer byte offset, seeded with the packaging-time
+    // default so a loader that does not fill it leaves the gates behaving exactly
+    // as the earlier baked-immediate ones did. Zero would mean pthread TSD slot 0
+    // on macOS, which is live libpthread state.
+    trampoline_data.extend_from_slice(&u64::from(GUEST_TPIDR_OFFSET_MACOS).to_le_bytes());
 
     emit_shared_svc_handler(
         trampoline_data,
@@ -988,21 +1050,55 @@ fn emit_msr_gate(
         imm_bytes: MSR_FRAME_OFF_VALUE,
     });
 
-    // MRS X16, <host anchor> — read the host anchor.
-    asm.emit(host.anchor_read(X16));
-
-    // LDR X17, [SP, #16] ; STR X17, [X16, #GUEST_TPIDR_OFFSET] — store the guest
-    // value into its slot off the host anchor.
-    asm.emit(Insn::LdrUimm {
-        rt: X17,
-        rn: SP,
-        imm_bytes: MSR_FRAME_OFF_VALUE,
-    });
-    asm.emit(Insn::StrUimm {
-        rt: X17,
-        rn: X16,
-        imm_bytes: host.guest_tp_offset(),
-    });
+    // Put the slot's address in X16, then store the captured guest value through
+    // it. Under `Baked` the address is anchor + immediate, so the immediate rides
+    // on the store itself; under `RuntimeSlot` the offset is a loaded value, so it
+    // has to be folded into the base first — a register-offset store would need
+    // three live registers (value, base, offset) and this gate has only X16/X17.
+    match host.guest_tp_addressing() {
+        GuestTpAddressing::Baked(offset) => {
+            // MRS X16, <anchor> ; LDR X17, [SP, #16] ; STR X17, [X16, #offset].
+            asm.emit(host.anchor_read(X16));
+            asm.emit(Insn::LdrUimm {
+                rt: X17,
+                rn: SP,
+                imm_bytes: MSR_FRAME_OFF_VALUE,
+            });
+            asm.emit(Insn::StrUimm {
+                rt: X17,
+                rn: X16,
+                imm_bytes: offset,
+            });
+        }
+        GuestTpAddressing::RuntimeSlot => {
+            // LDR X16, <offset slot> ; MRS X17, <anchor> ; ADD X16, X17, X16
+            // ; LDR X17, [SP, #16] ; STR X17, [X16].
+            let slot_vaddr = checked_add_u64(
+                trampoline_base_addr,
+                HEADER_GUEST_TP_OFFSET_MACOS as u64,
+                "MSR guest-TP offset slot",
+            )?;
+            if !asm.ldr_literal_reachable(X16, slot_vaddr)? {
+                return Ok(GateBuild::Unreachable);
+            }
+            asm.emit(host.anchor_read(X17));
+            asm.emit(Insn::AddReg {
+                rd: X16,
+                rn: X17,
+                rm: X16,
+            });
+            asm.emit(Insn::LdrUimm {
+                rt: X17,
+                rn: SP,
+                imm_bytes: MSR_FRAME_OFF_VALUE,
+            });
+            asm.emit(Insn::StrUimm {
+                rt: X17,
+                rn: X16,
+                imm_bytes: 0,
+            });
+        }
+    }
 
     // Restore: LDP X16, X17, [SP] ; ADD SP, SP, #32.
     asm.emit(Insn::Ldp {
@@ -1022,12 +1118,25 @@ fn emit_msr_gate(
     Ok(GateBuild::Emitted)
 }
 
-/// Per-site MRS gate (3 instructions, 12 bytes).
+/// Per-site MRS gate (3 instructions baked, 8 with a runtime offset).
 ///
 /// Virtualizes a guest `MRS Xd, TPIDR_EL0` read. The hardware register holds the
 /// host anchor, so the gate reads the anchor and then loads the guest thread
-/// pointer from its slot, reusing `Xd` as scratch (no frame needed):
+/// pointer from its slot.
+///
+/// Under [`GuestTpAddressing::Baked`] the offset is an immediate, so `Xd` — which
+/// the guest's own `MRS` was about to overwrite anyway — is the only register
+/// touched and no frame is needed:
 /// `MRS Xd, TPIDR_EL0 ; LDR Xd, [Xd, #GUEST_TPIDR_OFFSET] ; B <site+4>`.
+///
+/// Under [`GuestTpAddressing::RuntimeSlot`] the offset arrives in a register, so
+/// the gate needs a second one and must give it back untouched: an `MRS` site is
+/// an ordinary instruction in the middle of a function, not a call boundary, and
+/// X16/X17 are only reserved for linker veneers — a compiler is free to keep a
+/// live value in either across it. The gate therefore spills its scratch to a
+/// 16-byte frame, which makes this variant share the SVC and MSR gates'
+/// requirement that `SP` address a valid writable stack at the site (see the
+/// module docs, "Gate scratch storage and the stack invariant").
 fn emit_mrs_gate(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
@@ -1038,12 +1147,56 @@ fn emit_mrs_gate(
 ) -> Result<GateBuild> {
     let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "MRS gate")?;
     let mut asm = Asm::new(gate_vaddr);
-    asm.emit(host.anchor_read(rd));
-    asm.emit(Insn::LdrUimm {
-        rt: rd,
-        rn: rd,
-        imm_bytes: host.guest_tp_offset(),
-    });
+
+    match host.guest_tp_addressing() {
+        GuestTpAddressing::Baked(offset) => {
+            asm.emit(host.anchor_read(rd));
+            asm.emit(Insn::LdrUimm {
+                rt: rd,
+                rn: rd,
+                imm_bytes: offset,
+            });
+        }
+        GuestTpAddressing::RuntimeSlot => {
+            // The scratch register must not be `rd`: the anchor read lands in `rd`
+            // and would destroy a loaded offset held there.
+            let scratch = if rd == X16 { X17 } else { X16 };
+
+            let slot_vaddr = checked_add_u64(
+                trampoline_base_addr,
+                HEADER_GUEST_TP_OFFSET_MACOS as u64,
+                "MRS guest-TP offset slot",
+            )?;
+
+            // SUB SP, SP, #16 ; STR Xs, [SP] — spill the borrowed scratch.
+            asm.emit(Insn::SubSp(MRS_FRAME_BYTES));
+            asm.emit(Insn::StrUimm {
+                rt: scratch,
+                rn: SP,
+                imm_bytes: MRS_FRAME_OFF_SCRATCH,
+            });
+
+            // LDR Xs, <offset slot> ; MRS Xd, <anchor> ; LDR Xd, [Xd, Xs].
+            if !asm.ldr_literal_reachable(scratch, slot_vaddr)? {
+                return Ok(GateBuild::Unreachable);
+            }
+            asm.emit(host.anchor_read(rd));
+            asm.emit(Insn::LdrReg {
+                rt: rd,
+                rn: rd,
+                rm: scratch,
+            });
+
+            // LDR Xs, [SP] ; ADD SP, SP, #16 — hand the scratch back.
+            asm.emit(Insn::LdrUimm {
+                rt: scratch,
+                rn: SP,
+                imm_bytes: MRS_FRAME_OFF_SCRATCH,
+            });
+            asm.emit(Insn::AddSp(MRS_FRAME_BYTES));
+        }
+    }
+
     if !asm.branch_to(checked_add_u64(site.vaddr, 4, "MRS return")?)? {
         return Ok(GateBuild::Unreachable);
     }
@@ -1061,11 +1214,14 @@ fn emit_mrs_gate(
 /// instruction counting.
 ///
 /// Branches and loads to an absolute target ([`Asm::branch_to`],
-/// [`Asm::ldr_literal`], [`Asm::adrp`]) resolve immediately against
-/// [`Asm::here`]. The per-site branches ([`Asm::branch_to`], [`Asm::adrp`])
-/// report an out-of-range target by emitting nothing and returning `false`, so
-/// the caller can trap the site; [`Asm::ldr_literal`] (used only by the fixed
-/// prologue) instead errors, since a prologue that cannot be placed is fatal.
+/// [`Asm::ldr_literal`], [`Asm::ldr_literal_reachable`], [`Asm::adrp`]) resolve
+/// immediately against [`Asm::here`]. Everything a *per-site gate* emits
+/// ([`Asm::branch_to`], [`Asm::ldr_literal_reachable`], [`Asm::adrp`]) reports an
+/// out-of-range target by emitting nothing and returning `false`, so the caller
+/// can trap that one site and keep rewriting; [`Asm::ldr_literal`], used by the
+/// fixed prologue, instead errors, since a prologue that cannot be placed is
+/// fatal. A gate reaching for the fatal variant would turn one unreachable site
+/// into a failed rewrite of the whole image.
 struct Asm {
     base_vaddr: u64,
     code: Vec<u8>,
@@ -1108,6 +1264,19 @@ impl Asm {
     fn branch_to(&mut self, target_vaddr: u64) -> Result<bool> {
         let offset = self.delta_to(target_vaddr)?;
         let Some(word) = Insn::B(offset).encode() else {
+            return Ok(false);
+        };
+        self.push_word(word);
+        Ok(true)
+    }
+
+    /// `LDR Xt, <target>` — PC-relative literal load that reports reach instead
+    /// of failing. An out-of-range target emits nothing and yields `false`, so a
+    /// per-site gate can trap its own site and leave the rest of the rewrite
+    /// intact. [`Asm::ldr_literal`] is the fatal variant, for the fixed prologue.
+    fn ldr_literal_reachable(&mut self, rt: u8, target_vaddr: u64) -> Result<bool> {
+        let offset = self.delta_to(target_vaddr)?;
+        let Some(word) = (Insn::LdrLiteral { rt, off: offset }).encode() else {
             return Ok(false);
         };
         self.push_word(word);
@@ -1176,6 +1345,12 @@ mod tests {
     const MSR_GATE_SIZE: usize = MSR_GATE_INSNS * 4;
     const MRS_GATE_INSNS: usize = 3;
     const MRS_GATE_SIZE: usize = MRS_GATE_INSNS * 4;
+    // `GuestTpAddressing::RuntimeSlot` sizes: the MSR gate gains the offset load
+    // and the fold into the base; the MRS gate gains those plus its spill pair.
+    const MSR_GATE_INSNS_RUNTIME_SLOT: usize = MSR_GATE_INSNS + 2;
+    const MSR_GATE_SIZE_RUNTIME_SLOT: usize = MSR_GATE_INSNS_RUNTIME_SLOT * 4;
+    const MRS_GATE_INSNS_RUNTIME_SLOT: usize = MRS_GATE_INSNS + 5;
+    const MRS_GATE_SIZE_RUNTIME_SLOT: usize = MRS_GATE_INSNS_RUNTIME_SLOT * 4;
     const GATES_START_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE;
 
     /// Top-6 opcode bits, isolating the `B`/`BL` major opcode for read-back checks.
@@ -1238,6 +1413,35 @@ mod tests {
         assert_eq!(Insn::MrsTpidrroEl0(9).encode().unwrap(), 0xD53B_D069);
         // `MSR TPIDR_EL0, X9` guest word (scanned, never emitted).
         assert_eq!(msr_tpidr_el0(9), 0xD51B_D049);
+        // Register-offset load and three-register add, cross-checked against a
+        // real toolchain (`clang -arch arm64` + `otool -t` on an Apple M3 Pro):
+        // `ldr x0,[x1,x2]` and `add x0,x1,x2`.
+        //
+        // These two words are worth pinning exactly. The register-offset class is
+        // selected by bit 21 together with `bits[11:10]=0b10`; drop either and the
+        // word silently decodes as an `LDUR` with an unrelated immediate rather
+        // than failing to encode, so a mask-based check can pass on an encoding
+        // that addresses the wrong memory.
+        assert_eq!(
+            Insn::LdrReg {
+                rt: 0,
+                rn: 1,
+                rm: 2
+            }
+            .encode()
+            .unwrap(),
+            0xF862_6820
+        );
+        assert_eq!(
+            Insn::AddReg {
+                rd: 0,
+                rn: 1,
+                rm: 2
+            }
+            .encode()
+            .unwrap(),
+            0x8B02_0020
+        );
         // Scaled (×8) 64-bit load/store: `ldr x9,[x9,#16]` / `str x17,[x16,#16]`.
         assert_eq!(
             Insn::LdrUimm {
@@ -1494,23 +1698,23 @@ mod tests {
             .expect("expected a trampoline (input has patch sites)");
         let tramp = outcome.trampoline;
 
-        // MSR gate: SubSp, Stp, StrUimm, <anchor into X16>, ... -- anchor is
-        // the 4th instruction (index 3), always X16 regardless of the guest's
-        // own register (it's scratch space the gate spilled).
-        let msr_anchor_off = GATES_START_OFFSET + 3 * 4;
+        // MSR gate: SubSp, Stp, StrUimm, LdrLiteral, <anchor into X17>, ... --
+        // anchor is the 5th instruction (index 4). It lands in X17 rather than
+        // X16 because X16 already holds the offset loaded from the header slot.
+        let msr_anchor_off = GATES_START_OFFSET + 4 * 4;
         assert_eq!(
             word_at(&tramp, msr_anchor_off),
-            Insn::MrsTpidrroEl0(X16).encode().unwrap()
+            Insn::MrsTpidrroEl0(X17).encode().unwrap()
         );
         assert_ne!(
             word_at(&tramp, msr_anchor_off),
-            Insn::MrsTpidrEl0(X16).encode().unwrap()
+            Insn::MrsTpidrEl0(X17).encode().unwrap()
         );
 
-        // MRS gate: <anchor>, LdrUimm, Br -- anchor is the 1st instruction,
-        // read directly into the guest's own destination register (X9 here,
-        // from `Insn::MrsTpidrEl0(9)` above) rather than a scratch register.
-        let mrs_anchor_off = GATES_START_OFFSET + MSR_GATE_SIZE;
+        // MRS gate: SubSp, StrUimm, LdrLiteral, <anchor>, ... -- anchor is the
+        // 4th instruction (index 3), read directly into the guest's own
+        // destination register (X9 here, from `Insn::MrsTpidrEl0(9)` above).
+        let mrs_anchor_off = GATES_START_OFFSET + MSR_GATE_SIZE_RUNTIME_SLOT + 3 * 4;
         assert_eq!(
             word_at(&tramp, mrs_anchor_off),
             Insn::MrsTpidrroEl0(9).encode().unwrap()
@@ -1613,15 +1817,51 @@ mod tests {
         assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
         assert_eq!(word_at(&patched, 4) & OPCODE_TOP6_MASK, Opcode::B.bits());
 
-        // MSR gate: the anchor read is `MRS X16, TPIDRRO_EL0`, the store hits
-        // the TSD slot, and the Linux anchor read never appears.
-        let msr_gate = &tramp[GATES_START_OFFSET..GATES_START_OFFSET + MSR_GATE_SIZE];
-        let anchor = Insn::MrsTpidrroEl0(X16).encode().unwrap();
+        // The offset the gates use is no longer an immediate: it is read from the
+        // header slot, so neither gate may contain the baked macOS offset and the
+        // slot itself must carry it as the packaging-time seed.
+        let seeded = u64::from_le_bytes(
+            tramp[HEADER_GUEST_TP_OFFSET_MACOS..HEADER_GUEST_TP_OFFSET_MACOS + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            seeded,
+            u64::from(GUEST_TPIDR_OFFSET_MACOS),
+            "the header slot must be seeded with the packaging-time default"
+        );
+
+        // MSR gate: LdrLiteral(X16), MRS X17 anchor, ADD X16, X17, X16,
+        // LDR X17, [SP,#16], STR X17, [X16]. The Linux anchor never appears.
+        let msr_gate = &tramp[GATES_START_OFFSET..GATES_START_OFFSET + MSR_GATE_SIZE_RUNTIME_SLOT];
+        let anchor = Insn::MrsTpidrroEl0(X17).encode().unwrap();
         assert!(
-            (0..MSR_GATE_INSNS).any(|i| word_at(msr_gate, i * 4) == anchor),
+            (0..MSR_GATE_INSNS_RUNTIME_SLOT).any(|i| word_at(msr_gate, i * 4) == anchor),
             "MSR gate must read TPIDRRO_EL0 as the anchor"
         );
+        let fold = Insn::AddReg {
+            rd: X16,
+            rn: X17,
+            rm: X16,
+        }
+        .encode()
+        .unwrap();
+        assert!(
+            (0..MSR_GATE_INSNS_RUNTIME_SLOT).any(|i| word_at(msr_gate, i * 4) == fold),
+            "MSR gate must fold the loaded offset into the anchor"
+        );
         let store = Insn::StrUimm {
+            rt: X17,
+            rn: X16,
+            imm_bytes: 0,
+        }
+        .encode()
+        .unwrap();
+        assert!(
+            (0..MSR_GATE_INSNS_RUNTIME_SLOT).any(|i| word_at(msr_gate, i * 4) == store),
+            "MSR gate must store the guest value through the folded slot address"
+        );
+        let baked_store = Insn::StrUimm {
             rt: X17,
             rn: X16,
             imm_bytes: GUEST_TPIDR_OFFSET_MACOS,
@@ -1629,32 +1869,106 @@ mod tests {
         .encode()
         .unwrap();
         assert!(
-            (0..MSR_GATE_INSNS).any(|i| word_at(msr_gate, i * 4) == store),
-            "MSR gate must store to the macOS TSD slot"
+            (0..MSR_GATE_INSNS_RUNTIME_SLOT).all(|i| word_at(msr_gate, i * 4) != baked_store),
+            "the baked offset must not survive in a runtime-slot gate"
         );
-        let linux_anchor = Insn::MrsTpidrEl0(X16).encode().unwrap();
-        assert!(
-            (0..MSR_GATE_INSNS).all(|i| word_at(msr_gate, i * 4) != linux_anchor),
-            "the Linux anchor read must not appear in a macOS gate"
-        );
+        for linux_anchor in [
+            Insn::MrsTpidrEl0(X16).encode().unwrap(),
+            Insn::MrsTpidrEl0(X17).encode().unwrap(),
+        ] {
+            assert!(
+                (0..MSR_GATE_INSNS_RUNTIME_SLOT).all(|i| word_at(msr_gate, i * 4) != linux_anchor),
+                "the Linux anchor read must not appear in a macOS gate"
+            );
+        }
 
-        // MRS gate: `MRS X9, TPIDRRO_EL0 ; LDR X9, [X9, #slot] ; B`.
-        let mrs_gate = &tramp[GATES_START_OFFSET + MSR_GATE_SIZE..][..MRS_GATE_SIZE];
+        // MRS gate: SUB SP ; STR X16,[SP] ; LDR X16,<slot> ; MRS X9, TPIDRRO_EL0
+        // ; LDR X9,[X9,X16] ; LDR X16,[SP] ; ADD SP ; B.
+        let mrs_gate =
+            &tramp[GATES_START_OFFSET + MSR_GATE_SIZE_RUNTIME_SLOT..][..MRS_GATE_SIZE_RUNTIME_SLOT];
         assert_eq!(
             word_at(mrs_gate, 0),
-            Insn::MrsTpidrroEl0(9).encode().unwrap()
+            Insn::SubSp(MRS_FRAME_BYTES).encode().unwrap()
         );
         assert_eq!(
             word_at(mrs_gate, 4),
-            Insn::LdrUimm {
-                rt: 9,
-                rn: 9,
-                imm_bytes: GUEST_TPIDR_OFFSET_MACOS
+            Insn::StrUimm {
+                rt: X16,
+                rn: SP,
+                imm_bytes: MRS_FRAME_OFF_SCRATCH
             }
             .encode()
             .unwrap()
         );
-        assert_eq!(word_at(mrs_gate, 8) & OPCODE_TOP6_MASK, Opcode::B.bits());
+        assert_eq!(
+            word_at(mrs_gate, 12),
+            Insn::MrsTpidrroEl0(9).encode().unwrap()
+        );
+        assert_eq!(
+            word_at(mrs_gate, 16),
+            Insn::LdrReg {
+                rt: 9,
+                rn: 9,
+                rm: X16
+            }
+            .encode()
+            .unwrap()
+        );
+        assert_eq!(
+            word_at(mrs_gate, 20),
+            Insn::LdrUimm {
+                rt: X16,
+                rn: SP,
+                imm_bytes: MRS_FRAME_OFF_SCRATCH
+            }
+            .encode()
+            .unwrap(),
+            "the borrowed scratch register must be handed back"
+        );
+        assert_eq!(
+            word_at(mrs_gate, 24),
+            Insn::AddSp(MRS_FRAME_BYTES).encode().unwrap()
+        );
+        assert_eq!(word_at(mrs_gate, 28) & OPCODE_TOP6_MASK, Opcode::B.bits());
+    }
+
+    #[test]
+    fn macos_mrs_gate_scratch_never_collides_with_the_destination() {
+        // The anchor read lands in the guest's own destination register, so the
+        // borrowed scratch holding the loaded offset must never be that register
+        // -- otherwise the anchor would overwrite the offset before it is used.
+        for d in [5u8, 16, 17, 30] {
+            let (_p, outcome) = hook_words_host(
+                &[Insn::MrsTpidrEl0(d).encode().unwrap()],
+                0x1000,
+                0x300000,
+                Host::MacOs,
+            );
+            let tramp = outcome.expect("site must be gated").trampoline;
+            let gate = &tramp[GATES_START_OFFSET..][..MRS_GATE_SIZE_RUNTIME_SLOT];
+            let scratch = if d == X16 { X17 } else { X16 };
+            assert_ne!(scratch, d, "scratch must differ from the destination");
+            assert_eq!(
+                word_at(gate, 4),
+                Insn::StrUimm {
+                    rt: scratch,
+                    rn: SP,
+                    imm_bytes: MRS_FRAME_OFF_SCRATCH
+                }
+                .encode()
+                .unwrap()
+            );
+            assert_eq!(
+                word_at(gate, 16),
+                Insn::LdrReg {
+                    rt: d,
+                    rn: d,
+                    rm: scratch
+                }
+                .encode()
+                .unwrap()
+            );
+        }
     }
 
     #[test]

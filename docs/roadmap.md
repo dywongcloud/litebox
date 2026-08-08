@@ -54,18 +54,37 @@ subsystem.
   by the rewriter, which runs separately, earlier, packaging the guest image
   with no visibility into what the eventual runner process will look like.
   
-  The failure mode is safe (a loud panic at `MacOsUserland::new()`, not
-  silent corruption -- that is exactly what the new assertion is for), so
-  this does not need the same "keep it out of anything that runs for real"
-  mitigation the previous corruption bug did. But the feature does not work
-  yet. **Real fix: load-time offset indirection (in progress).** Infrastructure
-  is now in place: a trampoline slot `HEADER_GUEST_TP_OFFSET_MACOS` holds the
-  guest-TP value at runtime, and new instruction encoders `LdrReg`/`StrReg`
-  enable register-indirect addressing. Remaining: wire these into `emit_msr_gate`
-  and `emit_mrs_gate` to load the offset from the trampoline slot and use it
-  for gate addressing, then update the platform's `run_thread_arch` to fill
-  the slot before guest entry. See `litebox_syscall_rewriter` arm64 module and
-  `litebox_platform_macos_userland` for the infrastructure.
+  The failure mode is safe (a loud warning at `MacOsUserland::new()`, not
+  silent corruption), so this does not need the same "keep it out of anything
+  that runs for real" mitigation the previous corruption bug did.
+
+  **The rewriter half of the fix has landed; the loader half has not.**
+  `Host::MacOs` gates no longer bake the slot number in. They read a byte offset
+  from the trampoline header slot `HEADER_GUEST_TP_OFFSET_MACOS` and address
+  `[TPIDRRO_EL0 + offset]`, which is what makes the number a load-time rather
+  than a packaging-time decision. `Host::Linux` is untouched and still bakes its
+  immediate, since its offset is genuine compile-time ABI; the two are now
+  distinguished explicitly by `GuestTpAddressing`.
+
+  The slot holds an *offset*, never a thread-pointer value. The loader maps the
+  trampoline writable, fills the header, then flips it to read+execute
+  (`litebox_common_linux`'s `load_trampoline`), so nothing can rewrite that word
+  once a guest is running -- and one word could not serve two threads anyway. The
+  per-thread part comes from `TPIDRRO_EL0`, which is already per-thread, so this
+  design stays compatible with per-thread guest TPs rather than foreclosing them.
+
+  What remains: a macOS loader must write `guest_tp_slot_byte_offset()` (the
+  reserved `pthread_key_create` key scaled by 8, exposed by
+  `litebox_platform_macos_userland`) into that header slot, the same way
+  `load_trampoline` already writes the syscall entry point at offset 0. Until it
+  does, the rewriter's packaging-time seed stands, so gates behave exactly as the
+  old baked-immediate ones did rather than addressing offset 0 -- which would be
+  pthread TSD slot 0, live libpthread state. Nothing reaches this path in
+  production today: no macOS runner wires `MacOsUserland` into
+  `litebox_shim_linux` yet.
+
+  Also still needed for a `TPIDR_EL0`-using guest: `pthread_setspecific` of each
+  guest thread's pointer into the reserved key.
 * **The platform's *own* per-thread context-switch bookkeeping** — a separate
   problem from the rewriter's guest slot above. Studying
   `litebox_platform_linux_userland`'s x86_64

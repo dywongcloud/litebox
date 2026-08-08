@@ -1364,16 +1364,6 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
 /// `u32::MAX` before [`reserve_guest_tpidr_tsd_slot`] has run.
 static GUEST_TP_TSD_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// The current guest thread-pointer value for the single-guest-thread model.
-/// When a guest enters, this is set to the guest's thread-pointer value.
-/// The rewriter's `Host::MacOs` gates read and write the guest-TP through the
-/// trampoline's HEADER_GUEST_TP_OFFSET_MACOS slot (filled by the loader before
-/// guest entry), avoiding the runtime TSD offset mismatch (see `docs/roadmap.md`,
-/// `macos-guest-tp-runtime-offset`). This approach matches the context switch's
-/// existing single-thread limitation.
-#[allow(non_upper_case_globals)]
-pub static GUEST_TP_VALUE: AtomicU64 = AtomicU64::new(0);
-
 /// Reserve the pthread TSD slot the rewriter's `Host::MacOs` gates read the
 /// guest thread pointer from, recording it in [`GUEST_TP_TSD_KEY`].
 ///
@@ -1392,14 +1382,21 @@ pub static GUEST_TP_VALUE: AtomicU64 = AtomicU64::new(0);
 /// is load-time offset indirection (see the `macos-guest-tp-runtime-offset`
 /// roadmap item and `docs/roadmap.md`).
 ///
-/// Until that lands, this reserves a key and records it, but does **not** hard
-/// fail on a mismatch: panicking here made the whole platform unconstructable
-/// on real hardware, blocking everything else (memory, syscalls, the context
-/// switch) that does not touch the guest thread pointer at all. Instead it
-/// warns loudly. A guest that never reads/writes `TPIDR_EL0` is unaffected; a
-/// guest that does would target the stale baked slot and is **not supported**
-/// until the load-time fix -- no macOS runner loads guests yet, so nothing hits
-/// this path in production today.
+/// The rewriter half of that fix has landed: `Host::MacOs` gates no longer bake
+/// the slot number in, they read a byte offset from the trampoline header at run
+/// time ([`guest_tp_slot_byte_offset`] is what a loader writes there). Until a
+/// macOS loader fills that word, the rewriter's own packaging-time seed stands,
+/// so the gates still address the baked slot and the mismatch below is still
+/// worth warning about.
+///
+/// This reserves a key and records it, but does **not** hard fail on a mismatch:
+/// panicking here made the whole platform unconstructable on real hardware,
+/// blocking everything else (memory, syscalls, the context switch) that does not
+/// touch the guest thread pointer at all. Instead it warns loudly. A guest that
+/// never reads/writes `TPIDR_EL0` is unaffected; a guest that does would target
+/// the stale baked slot and is **not supported** until a loader fills the header
+/// slot -- no macOS runner loads guests yet, so nothing hits this path in
+/// production today.
 ///
 /// # Panics
 ///
@@ -1428,6 +1425,40 @@ fn reserve_guest_tpidr_tsd_slot() -> libc::pthread_key_t {
         );
     }
     key
+}
+
+/// The byte offset a `Host::MacOs` gate must add to `TPIDRRO_EL0` to reach this
+/// process's guest thread-pointer slot, or `None` before
+/// [`reserve_guest_tpidr_tsd_slot`] has run.
+///
+/// This is the number a loader writes into the trampoline's guest-TP header slot
+/// so the ahead-of-time gates address the key this process actually reserved,
+/// rather than the one the rewriter guessed at packaging time. Darwin's TSD array
+/// is indexed by key with 8-byte elements and no low-bit masking on arm64
+/// (verified against xnu's `libsyscall/os/tsd.h` `_os_tsd_get_base`), so the
+/// offset is simply the key scaled by the element size.
+pub fn guest_tp_slot_byte_offset() -> Option<usize> {
+    let key = GUEST_TP_TSD_KEY.load(Ordering::Relaxed);
+    if key == u32::MAX {
+        return None;
+    }
+    Some(key as usize * size_of::<usize>())
+}
+
+/// The reserved key must convert into a byte offset the gates can actually use:
+/// non-zero (offset zero is pthread TSD slot 0, live libpthread state) and scaled
+/// by the 8-byte TSD element size.
+#[cfg(test)]
+#[test]
+fn the_guest_tp_slot_offset_is_a_scaled_nonzero_byte_offset() {
+    let key = reserve_guest_tpidr_tsd_slot();
+    let offset = guest_tp_slot_byte_offset().expect("the key is recorded by now");
+    assert_eq!(
+        offset,
+        usize::try_from(key).unwrap() * 8,
+        "offset is the key scaled by 8"
+    );
+    assert_ne!(offset, 0, "offset zero would address live libpthread state");
 }
 
 /// Reserving the guest thread-pointer TSD slot must not panic on real hardware

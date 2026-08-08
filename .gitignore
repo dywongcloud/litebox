@@ -203,3 +203,6 @@ dev_bench/unixbench/*.zip
 ### Direnv ###
 .direnv
 .envrc
+
+# agentplug tooling spill
+.agentplug-kv/
