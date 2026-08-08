@@ -368,6 +368,106 @@ fn allocate_jit_pages(
     }
 }
 
+/// Move `range`'s contents onto a fresh `MAP_JIT` mapping so the range can
+/// gain `PROT_EXEC`, then apply `new_permissions`.
+///
+/// See `update_permissions` for why this exists: `MAP_JIT`-ness is decided at
+/// mapping creation, so an ordinary mapping that later needs `EXEC` has to be
+/// replaced, not re-protected. The replacement preserves contents (copied
+/// under a temporary read-only view of the old mapping) and address (via
+/// `remap_to_fixed`), which together make it look like the `mprotect` simply
+/// succeeded.
+///
+/// On failure the range may be left readable-only rather than with its
+/// original permissions -- the original protection is not known here, and
+/// every failure below is one the caller treats as the mapping being gone.
+///
+/// # Safety
+///
+/// As for `update_permissions`: the caller guarantees `range` is a live
+/// mapping whose contents are not concurrently in use, and that the
+/// permission change does not conflict with any active use.
+unsafe fn migrate_range_to_jit(
+    range: &core::ops::Range<usize>,
+    new_permissions: MemoryRegionPermissions,
+) -> Result<(), PermissionUpdateError> {
+    // The old contents have to be readable to copy out. The caller asked for
+    // this range's permissions to change anyway, so a temporary read-only
+    // view is within its guarantee.
+    // SAFETY: forwarded caller guarantee, per this function's safety doc.
+    let rc = unsafe {
+        libc::mprotect(
+            range.start as *mut libc::c_void,
+            range.len(),
+            libc::PROT_READ,
+        )
+    };
+    if rc != 0 {
+        return Err(PermissionUpdateError::Unallocated);
+    }
+
+    // SAFETY: an anonymous mapping at a kernel-chosen address has nothing to
+    // validate beyond what `mmap` itself checks.
+    let jit = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            range.len(),
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANON | MAP_JIT,
+            -1,
+            0,
+        )
+    };
+    if jit == libc::MAP_FAILED {
+        return Err(PermissionUpdateError::Unallocated);
+    }
+
+    // SAFETY: no code is executed out of a JIT mapping between the toggles;
+    // the copy below runs ordinary host code.
+    unsafe { jit_write_protect(false) };
+    // SAFETY: `jit` was just mapped with exactly this length, `range` is
+    // readable per the mprotect above, and the two cannot overlap (`jit` is
+    // fresh kernel-chosen pages).
+    unsafe {
+        core::ptr::copy_nonoverlapping(range.start as *const u8, jit.cast::<u8>(), range.len());
+    }
+    // SAFETY: write access was only needed for the copy above.
+    unsafe { jit_write_protect(true) };
+
+    // SAFETY: `jit` is a live mapping of exactly this length that only this
+    // function references.
+    let remapped = unsafe { remap_to_fixed(jit as usize, range.len(), range.start) };
+    // A successful remap leaves `jit` as a second, now-redundant alias of the
+    // same pages; a failed one leaves it as the only copy. Either way it must
+    // not leak.
+    // SAFETY: still a live mapping owned by this function.
+    unsafe { libc::munmap(jit, range.len()) };
+    if remapped.is_err() {
+        return Err(PermissionUpdateError::Unallocated);
+    }
+
+    // SAFETY: forwarded caller guarantee, per this function's safety doc.
+    let rc = unsafe {
+        libc::mprotect(
+            range.start as *mut libc::c_void,
+            range.len(),
+            prot_flags(new_permissions),
+        )
+    };
+    if rc != 0 {
+        return Err(PermissionUpdateError::Unallocated);
+    }
+
+    // The bytes now executable at `range` were written through a different
+    // virtual address (the `jit` alias), so the instruction cache has no
+    // reason to be coherent for them. Invalidate here rather than relying on
+    // a caller: not every path that lands in `update_permissions` goes
+    // through a shim-level choke point that flushes.
+    // SAFETY: the range was just made executable and is mapped.
+    unsafe { darwin::sys_icache_invalidate(range.start as *mut libc::c_void, range.len()) };
+    Ok(())
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for MacOsUserland {
     /// The first 4 GiB of an arm64 Mach-O process is the `__PAGEZERO` segment:
     /// reserved, unmapped, and impossible to map over. Every guest address has
@@ -496,11 +596,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         if !range.start.is_multiple_of(ALIGN) || !range.len().is_multiple_of(ALIGN) {
             return Err(PermissionUpdateError::Unaligned);
         }
-        // NOTE: adding `PROT_EXEC` here succeeds only for a mapping that was
-        // created with `MAP_JIT`. A region that has to become executable later
-        // must therefore be allocated with `EXEC` in its initial permissions,
-        // even if it is not executable yet.
-        //
         // SAFETY: the caller guarantees the new permissions do not conflict with
         // any active use of the range.
         let rc = unsafe {
@@ -511,14 +606,32 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             )
         };
         if rc == 0 {
-            Ok(())
-        } else {
-            Err(PermissionUpdateError::Unallocated)
+            return Ok(());
         }
+        if new_permissions.contains(MemoryRegionPermissions::EXEC) {
+            // Adding `PROT_EXEC` to an ordinary mapping is exactly the case
+            // Darwin's W^X policy refuses: only a `MAP_JIT` mapping may become
+            // executable, and `MAP_JIT`-ness can only be chosen at creation.
+            // Every RW-then-RX code path in LiteBox (`create_executable_pages`
+            // allocates RW and flips to RX after the loader writes the bytes,
+            // and a JIT-ing guest's own mmap(RW)/mprotect(RX) does the same)
+            // lands here, so this is the load-bearing path for executable
+            // pages on this host, not an obscure fallback.
+            //
+            // SAFETY: forwarded caller guarantee, as above.
+            return unsafe { migrate_range_to_jit(&range, new_permissions) };
+        }
+        Err(PermissionUpdateError::Unallocated)
     }
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
         self.reserved_pages.iter()
+    }
+
+    unsafe fn jit_write_protect(&self, executable: bool) {
+        // SAFETY: forwarded caller guarantee; see the trait method's docs,
+        // which describe exactly this platform's `MAP_JIT` semantics.
+        unsafe { darwin::pthread_jit_write_protect_np(libc::c_int::from(executable)) }
     }
 
     /// Maps a registered CoW region straight from its backing file via
@@ -534,6 +647,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::CowAllocationError> {
         use litebox::platform::page_mgmt::CowAllocationError;
+
+        if permissions.contains(MemoryRegionPermissions::EXEC) {
+            // A file-backed `PROT_EXEC` mapping on Apple Silicon must pass
+            // code-signature validation, which an unsigned Linux guest image
+            // cannot. The memcpy fallback path handles executable segments
+            // instead: it allocates anonymous pages (which become `MAP_JIT`
+            // when they gain `EXEC`) and copies the bytes in.
+            return Err(CowAllocationError::UnsupportedSourceRegion);
+        }
 
         let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
             return Err(CowAllocationError::UnsupportedSourceRegion);

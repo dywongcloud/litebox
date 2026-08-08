@@ -117,6 +117,14 @@ unsafe extern "C" {
     /// machine.
     pub(crate) fn pthread_jit_write_protect_np(enabled: libc::c_int);
 
+    /// Instruction-cache invalidation from `libkern/OSCacheControl.h`: makes
+    /// writes to `[start, start + len)` visible to instruction fetch,
+    /// performing the full AArch64 `dc cvau`/`ic ivau`/barrier sequence (and,
+    /// per Apple's header, any chip-specific extra work) on the caller's
+    /// behalf. Required after writing code that will be executed; Apple
+    /// Silicon does not keep I-cache and D-cache coherent automatically.
+    pub(crate) fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
+
     fn __ulock_wait2(
         operation: u32,
         addr: *mut libc::c_void,

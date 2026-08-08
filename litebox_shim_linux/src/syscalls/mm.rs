@@ -803,6 +803,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         (true, file_offset, vaddr, trampoline_size)
     }
 
+    /// Write `bytes` at `ptr`, which points into a mapping that is — or is
+    /// about to become — executable.
+    ///
+    /// On hosts with per-thread code write protection (Darwin's `MAP_JIT`), a
+    /// write into such a mapping faults unless this thread first enables write
+    /// access, page permissions notwithstanding; see
+    /// `litebox::platform::PageManagementProvider::jit_write_protect`. This
+    /// helper brackets the copy accordingly; on every other host the bracket
+    /// is a no-op, so all code writes in this module go through it
+    /// unconditionally.
+    fn write_code_bytes(&self, ptr: UserPtrMut<u8>, bytes: &[u8]) -> Option<()> {
+        // SAFETY: nothing on this thread executes out of a JIT mapping
+        // between the toggles — the copy below is ordinary host code, and
+        // guest code is only re-entered long after the closing toggle.
+        unsafe { self.global.platform.jit_write_protect(false) };
+        let result = ptr.copy_from_slice::<Platform>(0, bytes);
+        // SAFETY: restores the executable state guest code requires.
+        unsafe { self.global.platform.jit_write_protect(true) };
+        result
+    }
+
     /// Apply the trap fallback to a mapped code segment: replace all `syscall`
     /// instructions with traps (`ICEBP;HLT`), then restore RX.
     ///
@@ -837,9 +858,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
         assert!(
-            mapped_addr
-                .copy_from_slice::<Platform>(0, &code_buf)
-                .is_some(),
+            self.write_code_bytes(mapped_addr, &code_buf).is_some(),
             "fatal: failed to write trap bytes back to code segment"
         );
 
@@ -931,10 +950,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
 
                 // Write to the mapped region.
-                if tramp_ptr
-                    .copy_from_slice::<Platform>(0, &tramp_data)
-                    .is_none()
-                {
+                if self.write_code_bytes(tramp_ptr, &tramp_data).is_none() {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                     return false;
                 }
@@ -1011,8 +1027,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
             // Write the 8-byte syscall entry point at the start.
             let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
-            if entry_ptr
-                .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
+            if self
+                .write_code_bytes(entry_ptr, &syscall_entry.to_le_bytes())
                 .is_none()
             {
                 litebox_util_log::warn!("failed to write syscall entry point to trampoline");
@@ -1136,10 +1152,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // never target an uninitialized trampoline.
                 let tramp_write_ptr =
                     UserPtrMut::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
-                if tramp_write_ptr
-                    .copy_from_slice::<Platform>(0, &stubs)
-                    .is_none()
-                {
+                if self.write_code_bytes(tramp_write_ptr, &stubs).is_none() {
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
@@ -1150,11 +1163,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
 
                 // Write patched code back to the mapped region.
-                if mapped_addr
-                    .copy_from_slice::<Platform>(0, &code_buf)
-                    .is_none()
-                {
-                    let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
+                if self.write_code_bytes(mapped_addr, &code_buf).is_none() {
+                    let _ = self.write_code_bytes(mapped_addr, &original_code);
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
@@ -1171,11 +1181,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // have replaced unpatchable syscalls with trap instructions.
                 // Write back the modified code if it changed.
                 if code_buf != original_code
-                    && mapped_addr
-                        .copy_from_slice::<Platform>(0, &code_buf)
-                        .is_none()
+                    && self.write_code_bytes(mapped_addr, &code_buf).is_none()
                 {
-                    let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
+                    let _ = self.write_code_bytes(mapped_addr, &original_code);
                     panic!("fatal: failed to write trap bytes back to code segment");
                 }
                 // Fall through to restore RX protections below.

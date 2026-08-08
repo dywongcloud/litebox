@@ -192,6 +192,28 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
+
+    /// Toggle this thread's write access to code pages whose writability is
+    /// gated *per thread* by the platform, on top of ordinary page permissions.
+    ///
+    /// Darwin's `MAP_JIT` is the motivating case: an executable mapping there
+    /// is writable *or* executable per thread, never both at once, switched by
+    /// `pthread_jit_write_protect_np`. Any code that writes into a mapping
+    /// that is (or has ever been) executable — loading guest segments,
+    /// patching syscall sites in place, writing trampoline stubs — must
+    /// bracket the write between `jit_write_protect(false)` and
+    /// `jit_write_protect(true)`, in addition to whatever `update_permissions`
+    /// calls it makes. Platforms without per-thread code write protection keep
+    /// this default no-op, so callers may bracket unconditionally.
+    ///
+    /// # Safety
+    ///
+    /// While write access is enabled (`executable == false`), no code may be
+    /// executed from any per-thread-protected code mapping on this thread; the
+    /// caller must restore `executable == true` before returning to any such
+    /// code (including guest code).
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    unsafe fn jit_write_protect(&self, executable: bool) {}
 }
 
 /// Behavior when allocating pages at a fixed address.

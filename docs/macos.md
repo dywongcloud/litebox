@@ -96,16 +96,24 @@ escape hatch is `MAP_JIT`, which the platform passes whenever a mapping requests
    ```
 
 2. **Writes must be bracketed.** A `MAP_JIT` mapping is writable *or* executable
-   per thread, never both. `litebox_platform_macos_userland::jit_write_protect`
-   wraps `pthread_jit_write_protect_np`; every write into guest code pages —
-   loading segments, applying the rewriter's patches — has to sit between
-   `jit_write_protect(false)` and `jit_write_protect(true)`.
+   per thread, never both. The platform exposes this through
+   `PageManagementProvider::jit_write_protect` (a no-op on every other host),
+   and `litebox_shim_linux` routes all of its code writes — the rewriter's
+   patches, trampoline stubs, trap fallback — through a `write_code_bytes`
+   helper that brackets each one with it.
 
-   A corollary for `update_permissions`: a region that has to become executable
-   *later* must still be allocated with `EXEC` in its initial permissions, since
-   only a `MAP_JIT` mapping can gain `PROT_EXEC`.
+3. **A mapping only becomes `MAP_JIT` by being created that way**, but LiteBox's
+   universal pattern for code pages is allocate-RW, write, then flip to RX
+   (`create_executable_pages`), and a JIT-ing guest's own
+   `mmap(RW)`/`mprotect(RX)` is the same shape. `update_permissions` therefore
+   treats a refused `mprotect(+EXEC)` as the signal to *migrate*: it copies the
+   contents to a fresh `MAP_JIT` mapping, moves it over the original range with
+   `mach_vm_remap`, applies the requested protection, and invalidates the
+   instruction cache for the range (`sys_icache_invalidate`) — after which it
+   looks as if the `mprotect` simply succeeded. This is the load-bearing path
+   for all executable guest pages on this host.
 
-3. **`MAP_JIT` cannot be combined with `MAP_FIXED`.** Real Darwin rejects an
+4. **`MAP_JIT` cannot be combined with `MAP_FIXED`.** Real Darwin rejects an
    `mmap` that requests both flags in one call, so a fixed-address allocation
    that needs `EXEC` (`PageManagementProvider::allocate_pages`'s
    `allocate_jit_pages` path) creates the mapping at a kernel-chosen address
@@ -224,22 +232,9 @@ Three smaller gaps worth recording:
   signal-mask discipline Linux uses, or `pthread_sigqueue` if Darwin's payload
   delivery turns out to support it -- is worth doing before multi-threaded
   guest signal delivery is trusted.
-* **`jit_write_protect` is not called from anywhere that writes guest code.**
-  `litebox_shim_linux`'s ELF loader and the syscall rewriter's in-place
-  patching (`maybe_patch_exec_segment`, `apply_trap_fallback` in
-  `litebox_shim_linux/src/syscalls/mm.rs`) write into a mapping's bytes with
-  ordinary `copy_from_slice` calls, bracketed only by `sys_mprotect_raw`'s
-  `PROT_READ|PROT_WRITE` / `PROT_READ|PROT_EXEC` transitions -- the VM-level
-  permission, which is a different mechanism from the per-thread
-  `pthread_jit_write_protect_np` toggle a `MAP_JIT` mapping also requires (see
-  "Writes must be bracketed" above). On real Apple Silicon this is expected to
-  either fault on the write itself, or write successfully and then fault on
-  first execution with a stale write-protect state, since nothing in that path
-  calls `crate::jit_write_protect`. `litebox_shim_linux` is platform-agnostic
-  and has no business calling a macOS-specific FFI function directly, so the
-  real fix is a `PageManagementProvider` hook (no-op default, overridden by
-  `MacOsUserland`) that the loader and rewriter call around each write into a
-  page that may later execute. Not yet implemented, and like the two gaps
-  above, not reachable by anything today since guest entry itself isn't
-  implemented -- but it blocks trusting *any* JIT-written guest code once
-  guest entry lands, including the very first rewritten syscall stub.
+* ~~`jit_write_protect` is not called from anywhere that writes guest code.~~
+  Closed: `PageManagementProvider::jit_write_protect` (no-op default,
+  `MacOsUserland` override) now brackets every code write in
+  `litebox_shim_linux` via its `write_code_bytes` helper, and
+  `update_permissions`' migrate-to-`MAP_JIT` path brackets its own copy.
+  Still unverified on real hardware, like everything else on this list.
