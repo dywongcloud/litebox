@@ -196,13 +196,30 @@ same North shim through `litebox_platform_macos_userland::run_thread`. Feeding i
 a rewritten guest gets as far as the ELF loader, which is where the remaining
 blocker is, and it is the documented one rather than a defect:
 
+**A Linux guest now loads and executes.** `litebox_packager --oci-image
+docker.io/library/alpine:latest` runs on this host (OCI mode is enabled for Apple
+Silicon on purpose -- see the `cfg` on the OCI dependency block, whose comment
+explains that `native-tls` is backed by Security.framework there), pulls the
+arm64 image, and rewrites its 327 executables for `Host::MacOs`. The runner then
+loads `/bin/busybox` out of that tar and reaches real syscall dispatch: the trace
+shows the guest issuing `io_setup`, which the shim answers.
+
 * **A guest image must be position-independent.** `hello-aarch64`, the fixture in
-  `litebox_syscall_rewriter/tests`, is a static `ET_EXEC` linked at `0x400000`.
-  An arm64 Mach-O process reserves the first 4 GiB as `__PAGEZERO`, so that
-  fixed mapping is refused and the load fails with `EPERM` -- exactly what
-  `docs/macos.md` says will happen. Demonstrating a guest end to end needs a
-  `ET_DYN`/PIE AArch64 Linux binary, which this repo has no fixture for and
-  which a macOS host has no toolchain to build. That is the next piece of work.
+  `litebox_syscall_rewriter/tests`, is a static `ET_EXEC` linked at `0x400000`;
+  an arm64 Mach-O process reserves the first 4 GiB as `__PAGEZERO`, so that fixed
+  mapping is refused with `EPERM`. The OCI images are PIE and load fine.
+
+* **`x18` is what stops an off-the-shelf distro binary, and it is a host
+  property rather than a defect.** After a few syscalls the guest's syscall
+  numbers turn to garbage (`3349`, then `0xFFFF_FFFF_FFFD_F800`) and it dies with
+  `SIGSEGV`. XNU zeroes `x18` on every return to EL0 for an ordinary process, and
+  Alpine's musl `busybox` references `x18`/`w18` at 91 sites, so the guest loses a
+  live register at every host round trip. `litebox_syscall_rewriter`'s `Host`
+  documentation already states this and that such uses "cannot be found reliably
+  without full disassembly … so they are not scanned or gated"; a guest has to be
+  built with `-ffixed-x18`. What is missing is not a fix but a *diagnosis*: the
+  packager could scan for `x18` and refuse, or warn, instead of producing an
+  image that fails this obscurely.
 
 Three things had to be fixed to get that far, each of which would have stopped
 any guest:
@@ -215,16 +232,36 @@ any guest:
   AArch64 64 KiB, the maximum page size AArch64 ELF images are conventionally
   linked for anyway, and leaves x86-64 at 4 KiB. The file offset carries the same
   alignment, since the trampoline is mapped straight out of the file.
-* **`litebox_packager` refuses to run on macOS.** Host mode bails with "only
-  supported on Linux" because it shells out to `ldd` for dependency discovery.
-  That is unnecessary for a statically linked guest, which needs no discovery at
-  all, and it means the documented packaging path does not exist on this host --
-  the rewriter has to be driven directly.
-* **`TarRo` accepts only GNU-format archives.** macOS's `tar` is bsdtar, which
-  writes POSIX ustar (`ustar\0` + `00`) rather than GNU (`ustar  \0`), and also
-  prepends `._name` AppleDouble entries for extended attributes. An archive built
-  with the host's own `tar` therefore does not load. `COPYFILE_DISABLE=1` removes
-  the AppleDouble entries, but the format itself still has to be GNU.
+* **`litebox_packager`'s *host* mode refuses to run on macOS**, bailing with
+  "only supported on Linux" because it shells out to `ldd` for dependency
+  discovery. OCI mode works and is the supported path here, so this is a gap
+  rather than a blocker: packaging a local, statically linked binary needs no
+  dependency discovery at all and could be allowed.
+
+* **The loader asked for an address below the host's floor.**
+  `DEFAULT_LOW_ADDR` was a bare `0x1000_0000`, which is under `__PAGEZERO`, so
+  every image -- including a position-independent one, which is otherwise free to
+  land anywhere -- failed with `EPERM` before any guest code ran. It is raised to
+  the platform's `TASK_ADDR_MIN` now.
+
+* **The public `run_thread` did not establish a thread handle.**
+  `EnterShim::init` attaches an interrupt handle, which reads `current_thread()`,
+  which panics on a thread that `run_with_handle` was never called on --
+  `spawn_thread` wraps its entry for exactly this reason and the new initial-thread
+  entry did not. It was latent only because the load failure above happened first.
+* **An archive built with the host's own `tar` does not load**, because macOS's
+  bsdtar puts a metadata entry first. By default that is `._name`, an AppleDouble
+  entry carrying extended attributes; with `COPYFILE_DISABLE=1` it is instead
+  `PaxHeader/name`, a pax extended header. `tar_no_std`, which backs
+  `litebox::fs::tar_ro`, handles neither, so the real file is never reached.
+
+  The archive *format* is not the problem, though it is an easy thing to blame:
+  measured on this host, bsdtar's default, its `COPYFILE_DISABLE=1` output, and
+  both of Python's `USTAR_FORMAT` and `GNU_FORMAT` all carry identical magic at
+  offset 257, and both Python archives load while both bsdtar ones fail. The
+  distinguishing factor is the leading metadata entry, not `ustar` versus GNU.
+  `litebox_packager` sidesteps this by writing `Header::new_ustar()` itself; a
+  hand-built archive needs a writer that emits no extended headers.
 
 ## The test suite's own macOS gaps
 

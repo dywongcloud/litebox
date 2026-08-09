@@ -1472,7 +1472,11 @@ pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    guest::run_thread(&shim, ctx);
+    // The handle has to exist before the shim runs, not merely before the guest
+    // does: `EnterShim::init` attaches an interrupt handle to the thread, which
+    // reads `current_thread()`, and that panics on a thread this was never
+    // called on. `spawn_thread` wraps its own entry the same way.
+    ThreadHandle::run_with_handle(|| guest::run_thread(&shim, ctx));
 }
 
 /// The reserved key must convert into a byte offset the gates can actually use:

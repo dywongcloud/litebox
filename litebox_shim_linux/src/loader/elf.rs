@@ -107,7 +107,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             // platform honoring an out-of-range hint.
             0
         } else {
-            super::DEFAULT_LOW_ADDR
+            super::default_low_addr::<Platform>()
         };
         let mapping_ptr = self
             .task
