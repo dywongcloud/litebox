@@ -265,7 +265,7 @@ pub fn hook_syscalls_in_elf_for_host(
             return Ok(input_binary.to_vec());
         }
 
-        let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
+        let trampoline_base_addr = find_addr_for_trampoline_code(&file, arch.trampoline_align())?;
 
         (arch, text_sections, trampoline_base_addr)
     };
@@ -317,7 +317,13 @@ pub fn hook_syscalls_in_elf_for_host(
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
     let mut out = buf.to_vec();
-    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr, false);
+    append_trampoline_footer(
+        &mut out,
+        &mut trampoline_data,
+        trampoline_base_addr,
+        false,
+        Arch::X86_64.trampoline_align(),
+    );
 
     if !patch_result.skipped_addrs.is_empty() {
         return Err(Error::UnpatchableSyscalls(format!(
@@ -418,7 +424,13 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
     }
 
     let mut out = buf.to_vec();
-    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_rva, true);
+    append_trampoline_footer(
+        &mut out,
+        &mut trampoline_data,
+        trampoline_base_rva,
+        true,
+        Arch::X86_64.trampoline_align(),
+    );
 
     if !patch_result.skipped_addrs.is_empty() {
         return Err(Error::UnpatchableSyscalls(format!(
@@ -783,13 +795,18 @@ fn append_trampoline_footer(
     trampoline_data: &mut Vec<u8>,
     header_vaddr: u64,
     align_trampoline_size: bool,
+    align: u64,
 ) {
-    let remain = out.len() % 0x1000;
-    out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
+    // The file offset has to carry the same alignment as the virtual address:
+    // the loader maps the trampoline straight out of the file at that offset,
+    // and a page-granular file mapping cannot start part-way into a page.
+    let align = usize::try_from(align).expect("trampoline alignment fits a pointer");
+    let remain = out.len() % align;
+    out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { align - remain }]);
 
     let trampoline_file_offset = out.len() as u64;
     if align_trampoline_size {
-        let trampoline_size = trampoline_data.len().next_multiple_of(0x1000);
+        let trampoline_size = trampoline_data.len().next_multiple_of(align);
         trampoline_data.extend_from_slice(&vec![0; trampoline_size - trampoline_data.len()]);
     }
     let trampoline_size = trampoline_data.len();
@@ -842,7 +859,13 @@ fn hook_aarch64_elf(
     // Build output: [patched ELF][padding to page boundary][trampoline][header].
     let mut trampoline_data = outcome.trampoline;
     let mut out = buf.to_vec();
-    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr, false);
+    append_trampoline_footer(
+        &mut out,
+        &mut trampoline_data,
+        trampoline_base_addr,
+        false,
+        Arch::Aarch64.trampoline_align(),
+    );
 
     if !outcome.trapped_sites.is_empty() {
         return Err(Error::UnpatchableSyscalls(format!(
@@ -931,6 +954,27 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
 enum Arch {
     X86_64,
     Aarch64,
+}
+
+impl Arch {
+    /// Alignment for the appended trampoline's virtual address, file offset and
+    /// size.
+    ///
+    /// The loader maps the trampoline as its own page-granular mapping and
+    /// rejects a header whose `vaddr` is not aligned to the *host's* page size,
+    /// so this has to satisfy every host the image might be loaded on, not the
+    /// one that rewrote it. x86-64 pages are always 4 KiB. AArch64's are not:
+    /// Apple Silicon uses 16 KiB, and Linux can be built for 16 KiB or 64 KiB,
+    /// so a 4 KiB-aligned trampoline is unloadable on most of them. 64 KiB
+    /// covers all three, and is the maximum page size AArch64 ELF images are
+    /// conventionally linked for anyway (see `docs/macos.md`), so it costs
+    /// address space that the layout already assumed.
+    const fn trampoline_align(self) -> u64 {
+        match self {
+            Arch::X86_64 => 0x1000,
+            Arch::Aarch64 => 0x1_0000,
+        }
+    }
 }
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
@@ -1456,7 +1500,7 @@ pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usi
     Ok(count)
 }
 
-fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
+fn find_addr_for_trampoline_code(file: &object::File<'_>, align: u64) -> Result<u64> {
     // Find the highest virtual address among all PT_LOAD segments
     let max_virtual_addr = match file {
         object::File::Elf64(elf) => max_load_segment_end(elf),
@@ -1464,8 +1508,7 @@ fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
     }
     .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
 
-    // Round up to the nearest page (assume 0x1000 page size)
-    checked_add_u64(max_virtual_addr, 0xFFF, "trampoline base").map(|addr| addr & !0xFFF)
+    checked_add_u64(max_virtual_addr, align - 1, "trampoline base").map(|addr| addr & !(align - 1))
 }
 
 /// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.

@@ -20,6 +20,7 @@ members = [
     "litebox_platform_lvbs",
     "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
+    "litebox_runner_linux_on_macos_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_runner_windows_on_linux_userland",
     "litebox_runner_windows_userland",

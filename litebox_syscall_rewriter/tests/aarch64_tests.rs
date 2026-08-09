@@ -132,13 +132,21 @@ fn aarch64_hello_world_is_hooked() {
     let tramp = &out[file_offset as usize..(file_offset + size) as usize];
     // Offset 0: callback slot holds the value we passed in.
     assert_eq!(read_u64(tramp, 0), callback, "callback slot");
-    // Offset 8: the shared SVC handler — LDR X16,<callback@0>; BR X16.
+    // Offset 8: the guest thread-pointer byte offset, seeded by the rewriter so
+    // that a loader which does not fill it leaves the gates behaving as the
+    // earlier baked-immediate ones did rather than addressing offset zero.
     assert_eq!(
-        read_u32(tramp, 8),
-        0x58FF_FFD0,
-        "LDR X16, <callback> (pcrel -8)"
+        read_u64(tramp, 8),
+        u64::from(litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT) * 8,
+        "guest thread-pointer offset slot"
     );
-    assert_eq!(read_u32(tramp, 12), 0xD61F_0200, "BR X16");
+    // Offset 16: the shared SVC handler — LDR X16,<callback@0>; BR X16.
+    assert_eq!(
+        read_u32(tramp, 16),
+        0x58FF_FF90,
+        "LDR X16, <callback> (pcrel -16)"
+    );
+    assert_eq!(read_u32(tramp, 20), 0xD61F_0200, "BR X16");
 
     // --- Every SVC became a branch into the trampoline region ---
     let tramp_range = vaddr..(vaddr + size);

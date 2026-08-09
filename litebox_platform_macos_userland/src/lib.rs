@@ -1453,6 +1453,28 @@ pub fn guest_tp_slot_byte_offset() -> Option<usize> {
     Some(key as usize * size_of::<usize>())
 }
 
+/// Runs a guest thread with the given shim and initial context, returning when
+/// the thread terminates.
+///
+/// This is how a runner starts the *initial* guest thread; every thread the
+/// guest creates afterwards arrives through
+/// [`litebox::platform::ThreadProvider::spawn_thread`] instead. It mirrors
+/// `litebox_platform_linux_userland::run_thread`, so a runner reads the same on
+/// either host.
+///
+/// # Safety
+///
+/// `ctx` must describe a runnable guest context: a valid entry `pc`, and an `sp`
+/// addressing a guest stack with at least 16 usable bytes below it (see the
+/// `guest` module's below-`SP` staging note). Only one guest thread may run at a
+/// time on this platform; a second is a loud panic rather than corruption.
+pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
+where
+    T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+{
+    guest::run_thread(&shim, ctx);
+}
+
 /// The reserved key must convert into a byte offset the gates can actually use:
 /// non-zero (offset zero is pthread TSD slot 0, live libpthread state) and scaled
 /// by the 8-byte TSD element size.

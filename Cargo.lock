@@ -1774,6 +1774,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_linux_on_macos_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_macos_userland",
+ "litebox_shim_linux",
+ "litebox_util_log",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "litebox_runner_linux_on_windows_userland"
 version = "0.1.0"
 dependencies = [

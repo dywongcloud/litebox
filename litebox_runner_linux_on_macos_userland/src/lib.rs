@@ -1,0 +1,152 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Runs an AArch64 Linux guest on an unmodified Apple Silicon macOS host.
+//!
+//! There is deliberately no x86-64 variant. LiteBox runs guest instructions
+//! natively and virtualizes only the system interface, so an x86-64 guest here
+//! would need instruction emulation -- the thing the design exists to avoid. An
+//! AArch64 guest on an AArch64 host needs none.
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
+extern crate alloc;
+
+use anyhow::{Result, anyhow};
+use clap::Parser;
+use litebox_platform_macos_userland::MacOsUserland as Platform;
+use std::path::PathBuf;
+
+/// Run Linux programs with LiteBox on unmodified macOS.
+///
+/// The program binary and all its dependencies must be provided inside a tar
+/// archive via `--initial-files`. The program path refers to a path inside the
+/// tar archive.
+#[derive(Parser, Debug)]
+pub struct CliArgs {
+    /// The program and arguments passed to it (e.g., `/bin/ls --color`).
+    ///
+    /// The program path refers to a path inside the tar archive provided via
+    /// `--initial-files`. All binaries must be pre-rewritten with the syscall
+    /// rewriter.
+    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    pub program_and_arguments: Vec<String>,
+    /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
+    #[arg(long = "env")]
+    pub environment_variables: Vec<String>,
+    /// Forward the existing environment variables
+    #[arg(long = "forward-env")]
+    pub forward_environment_variables: bool,
+    /// Tar archive containing the program and its shared libraries.
+    ///
+    /// All ELF binaries should be pre-rewritten with the syscall rewriter
+    /// (e.g., via `litebox-packager`), for `Host::MacOs`.
+    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
+    pub initial_files: PathBuf,
+    /// Allow using unstable options
+    #[arg(short = 'Z', long = "unstable")]
+    pub unstable: bool,
+    /// Connect to a `utun` device with this name (e.g. `utun4`).
+    ///
+    /// Creating the interface needs root on this host, so the guest has no
+    /// network unless one is named.
+    #[arg(
+        long = "tun-device-name",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub tun_device_name: Option<String>,
+}
+
+/// Run a Linux program with LiteBox on unmodified macOS.
+///
+/// # Errors
+///
+/// Returns an error when the tar archive cannot be read, or when the shim
+/// cannot load the requested program out of it.
+///
+/// # Panics
+///
+/// Panics if the host is not set up as expected -- notably if a second guest
+/// thread starts, which this platform's process-global guest-entry save area
+/// does not yet support (see `docs/roadmap.md`).
+pub fn run(cli_args: CliArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var("LITEBOX_LOG")
+                .from_env_lossy(),
+        )
+        .init();
+
+    let tar_file = &cli_args.initial_files;
+    if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
+        anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
+    }
+    let tar_data = std::fs::read(tar_file)
+        .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
+
+    let platform = Platform::new(cli_args.tun_device_name.as_deref());
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+    let litebox = shim_builder.litebox();
+
+    // The program path is a Unix-style path inside the tar archive.
+    let prog_path = &cli_args.program_and_arguments[0];
+
+    let initial_file_system = {
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        in_mem.with_root_privileges(|fs| {
+            use litebox::fs::FileSystem as _;
+            fs.mkdir(
+                "/tmp",
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            )
+            .unwrap();
+            fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
+        });
+
+        shim_builder.default_fs(in_mem, tar_data.into())
+    };
+    let initial_file_system = std::sync::Arc::new(initial_file_system);
+
+    let shim = shim_builder.build();
+    let argv = cli_args
+        .program_and_arguments
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+    let envp: Vec<_> = cli_args
+        .environment_variables
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+    let envp = if cli_args.forward_environment_variables {
+        envp.into_iter()
+            .chain(std::env::vars().map(|(k, v)| {
+                std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
+                    .unwrap()
+            }))
+            .collect()
+    } else {
+        envp
+    };
+
+    let program = shim.load_program(
+        initial_file_system,
+        platform.init_task(),
+        prog_path,
+        argv,
+        envp,
+    )?;
+
+    // SAFETY: `load_program` produced the entry context, so its `pc` and `sp`
+    // describe a loaded, runnable guest image.
+    unsafe {
+        litebox_platform_macos_userland::run_thread(
+            program.entrypoints,
+            &mut litebox_common_linux::PtRegs::default(),
+        );
+    }
+    std::process::exit(program.process.wait())
+}

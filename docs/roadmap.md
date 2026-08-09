@@ -188,6 +188,44 @@ Linux binary runs."
   else hand-written against Darwin/Mach headers in the future should get the
   same treatment rather than trusting a one-time reading of the headers.
 
+## Running a guest on macOS: what works, and the one thing left
+
+`litebox_runner_linux_on_macos_userland` exists now, modelled on the
+Windows-host runner: it builds, links and runs on Apple Silicon, and drives the
+same North shim through `litebox_platform_macos_userland::run_thread`. Feeding it
+a rewritten guest gets as far as the ELF loader, which is where the remaining
+blocker is, and it is the documented one rather than a defect:
+
+* **A guest image must be position-independent.** `hello-aarch64`, the fixture in
+  `litebox_syscall_rewriter/tests`, is a static `ET_EXEC` linked at `0x400000`.
+  An arm64 Mach-O process reserves the first 4 GiB as `__PAGEZERO`, so that
+  fixed mapping is refused and the load fails with `EPERM` -- exactly what
+  `docs/macos.md` says will happen. Demonstrating a guest end to end needs a
+  `ET_DYN`/PIE AArch64 Linux binary, which this repo has no fixture for and
+  which a macOS host has no toolchain to build. That is the next piece of work.
+
+Three things had to be fixed to get that far, each of which would have stopped
+any guest:
+
+* **The rewriter aligned the appended trampoline to 4 KiB.** The loader maps the
+  trampoline as its own page-granular mapping and rejects a header whose `vaddr`
+  is not aligned to the *host's* page size, so a 4 KiB-aligned trampoline is
+  unloadable wherever the page is larger -- every Apple Silicon host, and any
+  Linux built for 16 KiB or 64 KiB pages. `Arch::trampoline_align` now gives
+  AArch64 64 KiB, the maximum page size AArch64 ELF images are conventionally
+  linked for anyway, and leaves x86-64 at 4 KiB. The file offset carries the same
+  alignment, since the trampoline is mapped straight out of the file.
+* **`litebox_packager` refuses to run on macOS.** Host mode bails with "only
+  supported on Linux" because it shells out to `ldd` for dependency discovery.
+  That is unnecessary for a statically linked guest, which needs no discovery at
+  all, and it means the documented packaging path does not exist on this host --
+  the rewriter has to be driven directly.
+* **`TarRo` accepts only GNU-format archives.** macOS's `tar` is bsdtar, which
+  writes POSIX ustar (`ustar\0` + `00`) rather than GNU (`ustar  \0`), and also
+  prepends `._name` AppleDouble entries for extended attributes. An archive built
+  with the host's own `tar` therefore does not load. `COPYFILE_DISABLE=1` removes
+  the AppleDouble entries, but the format itself still has to be GNU.
+
 ## The test suite's own macOS gaps
 
 Running `cargo test` on an Apple Silicon machine surfaced defects in the tests
