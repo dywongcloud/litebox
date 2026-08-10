@@ -6,7 +6,7 @@
 use core::{
     ffi::CStr,
     mem::{offset_of, size_of},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 
 use alloc::string::ToString;
@@ -122,6 +122,41 @@ impl From<SocketAddrV4> for CSockInetAddr {
             port: addr.port().to_be(),
             addr: addr.ip().octets(),
             __pad: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[repr(C, packed)]
+struct CSockInet6Addr {
+    family: i16,
+    port: u16,
+    flowinfo: u32,
+    addr: [u8; 16],
+    scope_id: u32,
+}
+
+impl From<CSockInet6Addr> for SocketAddrV6 {
+    fn from(c_addr: CSockInet6Addr) -> Self {
+        SocketAddrV6::new(
+            Ipv6Addr::from(c_addr.addr),
+            u16::from_be(c_addr.port),
+            u32::from_be(c_addr.flowinfo),
+            // scope_id is a local interface index, not a wire quantity, so unlike
+            // port/flowinfo it is never byte-swapped (see Linux's `struct sockaddr_in6`).
+            c_addr.scope_id,
+        )
+    }
+}
+
+impl From<SocketAddrV6> for CSockInet6Addr {
+    fn from(addr: SocketAddrV6) -> Self {
+        CSockInet6Addr {
+            family: AddressFamily::INET6 as i16,
+            port: addr.port().to_be(),
+            flowinfo: addr.flowinfo().to_be(),
+            addr: addr.ip().octets(),
+            scope_id: addr.scope_id(),
         }
     }
 }
@@ -350,9 +385,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     }
                     (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
                         opt.broadcast = val != 0;
-                        if val == 0 {
-                            todo!("disable SO_BROADCAST");
-                        }
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
@@ -378,9 +410,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     litebox::net::errors::SetTcpOptionError::InvalidFd => {
                         return Err(Errno::EBADF);
                     }
-                    litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                        unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
-                    }
+                    // Linux keeps SO_KEEPALIVE as a generic per-socket flag; only TCP's
+                    // keepalive timer ever reads it, so UDP/raw sockets accept the call
+                    // and it stays inert, same as on real Linux.
+                    litebox::net::errors::SetTcpOptionError::NotTcpSocket => {}
                     _ => unimplemented!(),
                 }
             }
@@ -1199,7 +1232,14 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
                 }
             }
         }
-        SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
+        SocketAddress::Inet(SocketAddr::V6(v6_addr)) => {
+            let addrlen_val = size_of::<CSockInet6Addr>().min(addrlen_val as usize);
+            let c_addr: CSockInet6Addr = v6_addr.into();
+            let bytes: &[u8] = c_addr.as_bytes();
+            addr.write_slice_at_offset::<Platform>(0, &bytes[..addrlen_val])
+                .ok_or(Errno::EFAULT)?;
+            size_of::<CSockInet6Addr>()
+        }
     }
     .trunc();
     addrlen
@@ -2104,7 +2144,7 @@ mod tests {
     use crate::{
         UserPtr, UserPtrMut,
         syscalls::{
-            net::{CSockInetAddr, read_sockaddr_from_user},
+            net::{CSockInet6Addr, CSockInetAddr, read_sockaddr_from_user, write_sockaddr_to_user},
             tests::init_platform,
         },
     };
@@ -2846,6 +2886,148 @@ mod tests {
             .unwrap();
         close_socket(&task, socket_fd);
         close_socket(&task, socket_fd2);
+    }
+
+    #[test]
+    fn test_setsockopt_broadcast_disable() {
+        let task = init_platform(None);
+        let sockfd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .expect("failed to create socket");
+
+        let val: u32 = 1;
+        let optval = UserPtr::from_usize((&raw const val).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::BROADCAST),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("failed to enable SO_BROADCAST");
+
+        let val: u32 = 0;
+        let optval = UserPtr::from_usize((&raw const val).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::BROADCAST),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("disabling SO_BROADCAST should succeed, not just enabling it");
+
+        let mut result: u32 = 0xDEAD;
+        let optval_out = UserPtrMut::from_usize((&raw mut result).cast::<u8>() as usize);
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::BROADCAST),
+                optval_out,
+                core::mem::size_of::<u32>().trunc(),
+            )
+            .expect("failed to get SO_BROADCAST");
+        assert_eq!(len, core::mem::size_of::<u32>());
+        assert_eq!(result, 0, "SO_BROADCAST should reflect the disabled value");
+
+        close_socket(&task, sockfd);
+    }
+
+    #[test]
+    fn test_setsockopt_keepalive_udp_is_accepted_noop() {
+        let task = init_platform(None);
+        let sockfd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .expect("failed to create socket");
+
+        let val: u32 = 1;
+        let optval = UserPtr::from_usize((&raw const val).cast::<u8>() as usize);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::Socket(SocketOption::KEEPALIVE),
+            optval,
+            core::mem::size_of::<u32>(),
+        )
+        .expect("SO_KEEPALIVE on a UDP socket should be accepted, like real Linux");
+
+        let mut result: u32 = 0xDEAD;
+        let optval_out = UserPtrMut::from_usize((&raw mut result).cast::<u8>() as usize);
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::KEEPALIVE),
+                optval_out,
+                core::mem::size_of::<u32>().trunc(),
+            )
+            .expect("failed to get SO_KEEPALIVE");
+        assert_eq!(len, core::mem::size_of::<u32>());
+        assert_eq!(result, 1, "the accepted value should still read back");
+
+        close_socket(&task, sockfd);
+    }
+
+    #[test]
+    fn test_write_sockaddr_to_user_ipv6() {
+        let addr = core::net::SocketAddrV6::new(
+            core::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+            8080,
+            0x1234_5678,
+            7,
+        );
+
+        let mut buf = [0u8; 32];
+        let mut addrlen: u32 = buf.len().trunc();
+        write_sockaddr_to_user::<crate::syscalls::tests::TestPlatform>(
+            SocketAddress::Inet(SocketAddr::V6(addr)),
+            UserPtrMut::from_usize(buf.as_mut_ptr() as usize),
+            UserPtrMut::from_usize((&raw mut addrlen) as usize),
+        )
+        .expect("write_sockaddr_to_user for IPv6 should succeed");
+
+        assert_eq!(
+            addrlen,
+            u32::try_from(core::mem::size_of::<CSockInet6Addr>()).unwrap()
+        );
+        assert_eq!(
+            u16::from_ne_bytes([buf[0], buf[1]]),
+            AddressFamily::INET6 as u16
+        );
+        assert_eq!(u16::from_be_bytes([buf[2], buf[3]]), 8080);
+        assert_eq!(
+            u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            0x1234_5678
+        );
+        assert_eq!(&buf[8..24], &addr.ip().octets());
+        assert_eq!(
+            u32::from_ne_bytes([buf[24], buf[25], buf[26], buf[27]]),
+            7,
+            "scope_id is a local interface index, not swapped to network byte order"
+        );
+
+        // A too-small buffer still succeeds, copies only what fits, and reports the
+        // true (untruncated) size back through addrlen -- mirroring the pre-existing
+        // IPv4 truncation behavior in this same function.
+        let mut small_buf = [0xAAu8; 10];
+        let mut small_addrlen: u32 = small_buf.len().trunc();
+        write_sockaddr_to_user::<crate::syscalls::tests::TestPlatform>(
+            SocketAddress::Inet(SocketAddr::V6(addr)),
+            UserPtrMut::from_usize(small_buf.as_mut_ptr() as usize),
+            UserPtrMut::from_usize((&raw mut small_addrlen) as usize),
+        )
+        .expect("truncated write_sockaddr_to_user for IPv6 should still succeed");
+        assert_eq!(
+            small_addrlen,
+            u32::try_from(core::mem::size_of::<CSockInet6Addr>()).unwrap()
+        );
+        assert_eq!(&small_buf[..], &buf[..10]);
     }
 }
 
