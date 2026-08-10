@@ -155,7 +155,7 @@ maintained by the hardware.
 | `/proc/sys/kernel/random/boot_id` | The `kern.bootsessionuuid` sysctl, used as the `DerivedKeyProvider` root key. |
 | `getrandom` | `arc4random_buf`, a direct pass-through to the platform CSPRNG. |
 | `__start_ex_table` / `__stop_ex_table` | `getsectiondata` over `__TEXT,__ex_table` via `__dso_handle`. Mach-O has no linker-synthesized bounds for arbitrary sections, so the table is found from the image headers, the same way the Windows platform finds its PE section. |
-| vDSO | None. `get_vdso_address` reports `None`, so a guest signal handler must supply its own `sa_restorer` — the kernel's fallback trampoline lives in the vDSO. |
+| vDSO | None. `get_vdso_address` reports `None`, so a guest signal handler must supply its own `sa_restorer` — the kernel's fallback trampoline lives in the vDSO. A handler that doesn't supply one no longer has nowhere to go, though: `get_sigreturn_trampoline_address` reports LiteBox's own runtime-built trampoline (`guest::sigreturn_trampoline`) as a fallback -- see "Remaining work" below. |
 
 The host reserves `SIGUSR2` for interrupting a thread out of guest execution;
 Darwin has no realtime signals to take it from instead.
@@ -298,14 +298,35 @@ area; only the syscall path is wired; below-`SP` staging needs a
 
 Three smaller gaps worth recording:
 
-* `sa_restorer` is required. With no vDSO, a guest that registers a handler
+* ~~`sa_restorer` is required. With no vDSO, a guest that registers a handler
   without `SA_RESTORER` has nowhere to return to, and delivery is refused rather
   than entering the handler with a wild `x30`. AArch64 glibc relies on the vDSO
-  trampoline, so a runtime-provided sigreturn trampoline is the real fix.
-* FP/SIMD state is not saved into or restored from the signal frame. The
+  trampoline, so a runtime-provided sigreturn trampoline is the real fix.~~
+  Closed: `guest::sigreturn_trampoline` is that runtime-provided trampoline --
+  `SystemInfoProvider::get_sigreturn_trampoline_address` reports its address
+  (default `None` on every other platform, so this is additive), and
+  `write_signal_frame` installs it as `x30` instead of refusing delivery. It
+  never touches guest memory: `sys_rt_sigreturn` takes no register arguments
+  and locates its frame from `ctx.sp` alone, so the trampoline only captures
+  `sp` and forces `syscallno` to `139` before handing off to the normal
+  syscall-dispatch path -- no exception-table entry needed. Hardware-verified:
+  `guest::tests::a_guest_signal_handler_without_sa_restorer_resumes_correctly_via_the_sigreturn_trampoline`.
+* ~~FP/SIMD state is not saved into or restored from the signal frame. The
   reserved area is left zeroed, which is a well-formed empty record chain, but a
   handler that inspects or modifies vector state will not see it. The x86-64 path
-  has the same gap with `fpstate`.
+  has the same gap with `fpstate`.~~
+  Closed for aarch64 (the x86-64 `fpstate` gap remains, unverifiable on this
+  Apple Silicon hardware and out of scope here): `darwin::ArmNeonState64` models
+  Darwin's real `__darwin_arm_neon_state64` (field-for-field verified against
+  this machine's own SDK headers), `prepare_exception_delivery` refreshes
+  `GUEST_FP` from it at fault time, and a new `ThreadProvider::get_fp_state`/
+  `set_fp_state` pair (default zeroed/no-op elsewhere) lets
+  `write_signal_frame`/`restore_sigcontext` round-trip real vector state
+  through a genuine aarch64 Linux `fpsimd_context` record -- field order
+  (`fpsr`/`fpcr` *before* `vregs`) verified against the kernel's own
+  `sigcontext.h`, not assumed from Darwin's opposite-order struct. Hardware-
+  verified:
+  `guest::tests::captures_real_vector_register_state_from_the_darwin_mcontext_on_a_guest_fault`.
 * `SignalProvider`'s pending-signal bitmap (`PENDING_SIGNALS`) is process-wide,
   not per-thread. A `TimerProvider::create_timer` timer always wakes the
   specific thread that created it (see the `TimerHandle` docs in

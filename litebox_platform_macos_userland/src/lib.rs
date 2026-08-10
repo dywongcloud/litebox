@@ -1009,6 +1009,14 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
         // rewriter that packaged the image.
         guest_tp_slot_byte_offset()
     }
+
+    fn get_sigreturn_trampoline_address(&self) -> Option<usize> {
+        // See `get_vdso_address`: this platform has no vDSO to fall back to for
+        // a guest handler installed without `SA_RESTORER`, so it provides its
+        // own trampoline instead -- `guest::sigreturn_trampoline`'s own doc
+        // comment covers why this is safe despite there being no vDSO.
+        Some(guest::sigreturn_trampoline as *const () as usize)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,6 +1493,14 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         ThreadHandle::run_with_handle(f)
     }
+
+    fn get_fp_state(&self) -> litebox::platform::FpSimdState64 {
+        guest::guest_fp_state()
+    }
+
+    fn set_fp_state(&self, state: &litebox::platform::FpSimdState64) {
+        guest::set_guest_fp_state(state);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1847,10 +1863,11 @@ unsafe extern "C" fn fault_handler(
         // `EnterShim::exception` instead of taking the process down.
         //
         // SAFETY: checked non-null just above.
-        let (thread_state, exception_state) = unsafe {
+        let (thread_state, exception_state, neon_state) = unsafe {
             (
                 &(*machine_context).thread_state,
                 &(*machine_context).exception_state,
+                &(*machine_context).neon_state,
             )
         };
         let esr = u64::from(exception_state.esr);
@@ -1866,7 +1883,7 @@ unsafe extern "C" fn fault_handler(
         };
         // SAFETY: `GUEST_OWNS_CPU.load` just returned true, this function's
         // own documented precondition.
-        let recovery = unsafe { guest::prepare_exception_delivery(thread_state, info) };
+        let recovery = unsafe { guest::prepare_exception_delivery(thread_state, neon_state, info) };
         // SAFETY: checked non-null just above.
         unsafe { (*machine_context).thread_state.pc = recovery as u64 };
         return;

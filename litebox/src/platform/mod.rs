@@ -18,6 +18,8 @@ pub(crate) mod mock;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+#[cfg(target_arch = "aarch64")]
+pub use arch::FpSimdState64;
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
 
@@ -91,6 +93,33 @@ pub trait ThreadProvider: RawPointerProvider {
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         f()
     }
+
+    /// Reads the current guest thread's FP/SIMD register file, in the shape a
+    /// delivered signal frame's vector-state area needs.
+    ///
+    /// The default reports an all-zero file: a platform with no FP-state
+    /// plumbing wired up leaves a delivered guest signal frame's vector-state
+    /// area zeroed -- a well-formed but inaccurate empty record (the same
+    /// zeroed-but-valid shape the frame already used before any platform
+    /// implemented this), never a memory-safety issue. Override once the
+    /// platform can report the guest's real vector state.
+    #[cfg(target_arch = "aarch64")]
+    fn get_fp_state(&self) -> crate::platform::arch::FpSimdState64 {
+        crate::platform::arch::FpSimdState64::default()
+    }
+
+    /// Writes the guest thread's FP/SIMD register file back, e.g. restoring
+    /// whatever a signal handler left in its frame on `rt_sigreturn`.
+    ///
+    /// The default does nothing, matching [`Self::get_fp_state`]'s default: a
+    /// platform that never reports real vector state has nothing meaningful to
+    /// restore either.
+    #[cfg(target_arch = "aarch64")]
+    #[expect(
+        unused_variables,
+        reason = "no-op by default; a real implementation consumes `state`"
+    )]
+    fn set_fp_state(&self, state: &crate::platform::arch::FpSimdState64) {}
 }
 
 #[non_exhaustive]
@@ -534,6 +563,25 @@ pub trait SystemInfoProvider {
     /// own startup sequence. A loader writes it into the trampoline so the gates
     /// read the slot the runtime actually reserved.
     fn get_guest_tp_slot_offset(&self) -> Option<usize> {
+        None
+    }
+
+    /// The address of a runtime-owned trampoline the shim can install as a
+    /// guest signal handler's return address when the guest registered the
+    /// handler without `SA_RESTORER`.
+    ///
+    /// Real Linux falls back to a vDSO-resident `sigtramp` for this case; a
+    /// host with no vDSO ([`Self::get_vdso_address`] returns `None`) has
+    /// nothing at a guest-reachable address to fall back to unless it builds
+    /// one itself. Returns `None` by default, matching every platform's
+    /// current behavior: a handler registered without `SA_RESTORER` has
+    /// nowhere to return to, so signal delivery is refused rather than
+    /// entering the handler with a wild return address. A platform that
+    /// implements the trampoline overrides this to report its address --
+    /// exactly the pattern [`Self::get_syscall_entry_point`] already
+    /// establishes for handing a host code address to guest-reachable
+    /// register state.
+    fn get_sigreturn_trampoline_address(&self) -> Option<usize> {
         None
     }
 }

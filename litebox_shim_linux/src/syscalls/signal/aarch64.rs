@@ -24,11 +24,83 @@ use litebox_common_linux::{
     AARCH64_GENERAL_REGISTER_COUNT, PtRegs,
     signal::{SaFlags, SigAction, SigSet, Siginfo, Signal, Ucontext, aarch64::Sigcontext},
 };
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// `pt_regs::syscallno` value meaning "no syscall is in flight", matching the
 /// kernel's `NO_SYSCALL`.
 const NO_SYSCALL: i32 = -1;
+
+/// The kernel's `struct _aarch64_ctx`: the common header on every extension
+/// record in `sigcontext.__reserved`'s chain, terminated by a record with
+/// `magic == 0`.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
+struct Aarch64CtxHeader {
+    magic: u32,
+    size: u32,
+}
+
+/// The kernel's `struct fpsimd_context`
+/// (`arch/arm64/include/uapi/asm/sigcontext.h`): `fpsr`/`fpcr` come *before*
+/// `vregs` -- verified against the kernel header directly (fetched from
+/// `torvalds/linux` `master`), not assumed from Darwin's own
+/// `__darwin_arm_neon_state64` putting them in the opposite order.
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
+struct FpsimdContext {
+    head: Aarch64CtxHeader,
+    fpsr: u32,
+    fpcr: u32,
+    vregs: [u128; 32],
+}
+
+/// `FPSIMD_MAGIC` from `arch/arm64/include/uapi/asm/sigcontext.h`.
+const FPSIMD_MAGIC: u32 = 0x4650_8001;
+
+const _: () = assert!(size_of::<FpsimdContext>() == 528);
+const _: () = assert!(size_of::<FpsimdContext>() <= 4096);
+
+/// Builds `sigcontext.__reserved`'s context-record chain holding `fp`'s state
+/// as a single `fpsimd_context` record, followed by nothing but zero bytes --
+/// a well-formed zero-`magic` terminator immediately after it, identical in
+/// spirit to leaving the whole area zeroed (a well-formed *empty* chain).
+fn fpsimd_reserved(fp: &litebox::platform::FpSimdState64) -> [u8; 4096] {
+    let record = FpsimdContext {
+        head: Aarch64CtxHeader {
+            magic: FPSIMD_MAGIC,
+            size: u32::try_from(size_of::<FpsimdContext>())
+                .expect("FpsimdContext's fixed 528-byte size fits comfortably in a u32"),
+        },
+        fpsr: fp.fpsr,
+        fpcr: fp.fpcr,
+        vregs: fp.v,
+    };
+    let mut reserved = [0u8; 4096];
+    reserved[..size_of::<FpsimdContext>()].copy_from_slice(record.as_bytes());
+    reserved
+}
+
+/// Reads an `fpsimd_context` record back out of `sigcontext.__reserved`, if
+/// the chain's first record is genuinely one (checked by `magic`, matching
+/// how a real kernel walks this chain). A guest that never touched this area,
+/// or a handler that reconstructed its own frame without one, leaves no valid
+/// record here -- reporting `None` rather than faulting keeps `rt_sigreturn`
+/// tolerant of both, exactly as leaving the guest's FP state alone (neither
+/// restored nor cleared) would be if this platform had never modelled FP
+/// state at all.
+fn parse_fpsimd_reserved(reserved: &[u8; 4096]) -> Option<litebox::platform::FpSimdState64> {
+    let header =
+        Aarch64CtxHeader::read_from_bytes(&reserved[..size_of::<Aarch64CtxHeader>()]).ok()?;
+    if header.magic != FPSIMD_MAGIC || (header.size as usize) < size_of::<FpsimdContext>() {
+        return None;
+    }
+    let record = FpsimdContext::read_from_bytes(&reserved[..size_of::<FpsimdContext>()]).ok()?;
+    Some(litebox::platform::FpSimdState64 {
+        v: record.vregs,
+        fpsr: record.fpsr,
+        fpcr: record.fpcr,
+    })
+}
 
 /// The kernel's `struct rt_sigframe` for aarch64.
 #[repr(C)]
@@ -116,19 +188,26 @@ fn frame_record_addr(frame_addr: usize) -> usize {
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(super) fn write_signal_frame(
         &self,
+        platform: &Platform,
         frame_addr: usize,
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
     ) -> Result<(), DeliverFault> {
-        // The kernel falls back to the vDSO's `sigtramp` when the guest supplies
-        // no `sa_restorer` -- but LiteBox exposes no vDSO to the guest, so a
-        // handler registered without a restorer has nowhere to return to.
-        // Refusing delivery is better than entering the handler with a wild
-        // `x30`, and it is what the x86-64 path already does.
-        if !action.flags.contains(SaFlags::RESTORER) {
-            return Err(DeliverFault);
-        }
+        // The kernel falls back to the vDSO's `sigtramp` when the guest
+        // supplies no `sa_restorer`. LiteBox exposes no vDSO to the guest, but
+        // a platform can provide its own equivalent trampoline (see
+        // `SystemInfoProvider::get_sigreturn_trampoline_address`'s doc
+        // comment) -- fall back to that, and only refuse delivery (better
+        // than entering the handler with a wild `x30`, matching the x86-64
+        // path) when the platform has no trampoline to offer either.
+        let restorer = if action.flags.contains(SaFlags::RESTORER) {
+            action.restorer
+        } else {
+            platform
+                .get_sigreturn_trampoline_address()
+                .ok_or(DeliverFault)?
+        };
 
         let mut regs = [0u64; AARCH64_GENERAL_REGISTER_COUNT];
         for (slot, value) in regs.iter_mut().zip(ctx.regs.iter()) {
@@ -152,12 +231,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                     pc: ctx.pc as u64,
                     pstate: ctx.pstate,
                     __reserved_pad: [0; 8],
-                    // The reserved area holds a chain of context records
-                    // terminated by a zeroed header, so leaving it zeroed is a
-                    // well-formed empty chain. FP/SIMD state is not yet saved
-                    // or restored here (the same gap the x86-64 path has with
-                    // `fpstate`).
-                    __reserved: [0; 4096],
+                    // A real `fpsimd_context` record holding the guest's
+                    // current vector state, followed by a well-formed
+                    // zero-`magic` terminator (see `fpsimd_reserved`).
+                    __reserved: fpsimd_reserved(&platform.get_fp_state()),
                 },
             },
         };
@@ -187,12 +264,16 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             ctx.regs[2] = frame_addr.wrapping_add(offset_of!(SignalFrame, ucontext));
         }
         ctx.regs[29] = record_addr;
-        ctx.regs[30] = action.restorer;
+        ctx.regs[30] = restorer;
         Ok(())
     }
 }
 
-pub(super) fn restore_sigcontext(ctx: &mut PtRegs, sigctx: &Sigcontext) -> usize {
+pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
+    platform: &Platform,
+    ctx: &mut PtRegs,
+    sigctx: &Sigcontext,
+) -> usize {
     let Sigcontext {
         fault_address: _,
         ref regs,
@@ -200,9 +281,18 @@ pub(super) fn restore_sigcontext(ctx: &mut PtRegs, sigctx: &Sigcontext) -> usize
         pc,
         pstate,
         __reserved_pad: _,
-        // FP/SIMD state is not restored; see `write_signal_frame`.
-        __reserved: _,
+        ref __reserved,
     } = *sigctx;
+
+    // A handler may have inspected or modified its frame's vector state
+    // before calling `sigreturn` (e.g. fixing up an FP exception); restore
+    // whatever is genuinely there. A frame with no valid `fpsimd_context`
+    // record (never written by `write_signal_frame`, or a handler that built
+    // its own frame from scratch) leaves the guest's FP state untouched,
+    // matching this platform's behavior before any of this was modelled.
+    if let Some(fp) = parse_fpsimd_reserved(__reserved) {
+        platform.set_fp_state(&fp);
+    }
 
     for (slot, value) in ctx.regs.iter_mut().zip(regs.iter()) {
         *slot = (*value).trunc();

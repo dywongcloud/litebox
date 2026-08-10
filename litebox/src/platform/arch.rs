@@ -58,6 +58,39 @@ pub enum ArchSpecificRegister {
     TpidrEl0,
 }
 
+/// The guest's whole FPSIMD register file: `v0`-`v31` plus `FPSR`/`FPCR`.
+///
+/// Exchanged between [`super::ThreadProvider::get_fp_state`]/
+/// [`super::ThreadProvider::set_fp_state`] and the shim's signal-frame code, so
+/// the shim can populate/restore a guest signal frame's vector-state area
+/// without knowing which platform it runs on. This is a value type, not an ABI
+/// layout: the guest-facing aarch64 Linux `fpsimd_context` record puts
+/// `fpsr`/`fpcr` *before* `vregs`, while Darwin's own `__darwin_arm_neon_state64`
+/// puts them *after* -- callers map by field name into whichever on-the-wire
+/// shape they need, never by reinterpreting these bytes directly.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct FpSimdState64 {
+    /// `v0`-`v31`, full 128 bits each.
+    pub v: [u128; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Default for FpSimdState64 {
+    /// An all-zero file: a fresh guest thread's vector state, and also what a
+    /// platform with no FP-state plumbing wired up reports (see
+    /// [`super::ThreadProvider::get_fp_state`]'s default).
+    fn default() -> Self {
+        Self {
+            v: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+        }
+    }
+}
+
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.
 #[non_exhaustive]
 #[derive(Error, Debug)]

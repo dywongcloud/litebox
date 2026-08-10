@@ -476,15 +476,22 @@ pub(crate) fn reraise_fatally(signum: libc::c_int) {
     }
 }
 
-/// The leading fields of Darwin's `_STRUCT_MCONTEXT64` for arm64.
-///
-/// Only the exception and thread states are declared; the NEON state that
-/// follows them is never touched, and a pointer to a prefix of the real struct
-/// is all the fault handler needs.
+/// Darwin's `_STRUCT_MCONTEXT64` for arm64: exception state, thread state, then
+/// NEON state, with no padding between them -- verified directly against
+/// `arm/_mcontext.h` and `mach/arm/_structs.h` in this machine's real SDK
+/// (`xcrun --show-sdk-path`), not assumed. `exception_state` is 16 bytes and
+/// `thread_state` is 272 bytes, so `neon_state` (which needs 16-byte alignment
+/// for its `__uint128_t` array) already lands on a 16-byte boundary (288 is a
+/// multiple of 16) without an explicit padding field.
 #[repr(C)]
+// The shared `_state` postfix mirrors the real struct's own field names
+// (`__es`/`__ss`/`__ns` all name Mach "thread state" flavors); renaming would
+// make this struct harder to cross-check against the SDK header, not easier.
+#[allow(clippy::struct_field_names)]
 pub(crate) struct McontextPrefix64 {
     pub(crate) exception_state: ArmExceptionState64,
     pub(crate) thread_state: ArmThreadState64,
+    pub(crate) neon_state: ArmNeonState64,
 }
 
 /// Darwin's `_STRUCT_ARM_EXCEPTION_STATE64`.
@@ -522,3 +529,30 @@ pub(crate) struct ArmThreadState64 {
     /// `pc`/`lr`, not read as inert padding.
     pub(crate) pad: u32,
 }
+
+/// Darwin's `_STRUCT_ARM_NEON_STATE64`: `v: [__uint128_t; 32]`, then `fpsr`,
+/// then `fpcr` (in that order -- verified against `mach/arm/_structs.h` in
+/// this machine's real SDK; note the aarch64 Linux ABI's own `fpsimd_context`
+/// puts `fpsr`/`fpcr` *before* its vector array instead, so the two are not
+/// byte-for-byte interchangeable despite being the same overall size).
+#[repr(C)]
+pub(crate) struct ArmNeonState64 {
+    /// `v0`-`v31`, full 128 bits each.
+    pub(crate) v: [u128; 32],
+    pub(crate) fpsr: u32,
+    pub(crate) fpcr: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<ArmExceptionState64>() == 16);
+const _: () = assert!(core::mem::size_of::<ArmThreadState64>() == 272);
+const _: () = assert!(core::mem::offset_of!(McontextPrefix64, exception_state) == 0);
+const _: () = assert!(core::mem::offset_of!(McontextPrefix64, thread_state) == 16);
+const _: () = assert!(core::mem::offset_of!(McontextPrefix64, neon_state) == 288);
+const _: () = assert!(core::mem::offset_of!(ArmNeonState64, v) == 0);
+const _: () = assert!(core::mem::offset_of!(ArmNeonState64, fpsr) == 512);
+const _: () = assert!(core::mem::offset_of!(ArmNeonState64, fpcr) == 516);
+// 520 logical bytes (512 + 4 + 4), but `#[repr(C)]` rounds the overall size up
+// to a multiple of the struct's own 16-byte alignment (forced by the
+// `__uint128_t` array) -- 8 bytes of trailing padding, exactly matching the
+// real Darwin struct's own C layout, not a Rust-specific quirk.
+const _: () = assert!(core::mem::size_of::<ArmNeonState64>() == 528);

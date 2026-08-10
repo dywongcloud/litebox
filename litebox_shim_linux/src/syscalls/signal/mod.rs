@@ -332,6 +332,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     fn deliver_signal(
         &self,
+        platform: &Platform,
         signal: Signal,
         siginfo: &Siginfo,
         action: &SigAction,
@@ -355,7 +356,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             return Err(DeliverFault);
         }
 
-        self.write_signal_frame(frame_addr, siginfo, action, ctx)?;
+        self.write_signal_frame(platform, frame_addr, siginfo, action, ctx)?;
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -463,7 +464,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.signals.set_signal_mask(uctx.sigmask);
 
-        Ok(arch::restore_sigcontext(ctx, &uctx.mcontext))
+        Ok(arch::restore_sigcontext(
+            self.global.platform,
+            ctx,
+            &uctx.mcontext,
+        ))
     }
 
     pub(crate) fn sys_rt_sigaction(
@@ -601,9 +606,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 SIG_IGN => {}
                 _ => {
-                    if let Err(DeliverFault) =
-                        self.signals.deliver_signal(signal, &siginfo, &action, ctx)
-                    {
+                    if let Err(DeliverFault) = self.signals.deliver_signal(
+                        self.global.platform,
+                        signal,
+                        &siginfo,
+                        &action,
+                        ctx,
+                    ) {
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
                         // a SIGSEGV).

@@ -74,8 +74,13 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
+    /// `_platform` matches aarch64's signature so `mod.rs`'s single generic
+    /// call site works for both; unused here -- x86-64's `SA_RESTORER`-less
+    /// and FP/SIMD-state gaps (`fpstate: 0` below) are unrelated, unverified-
+    /// on-this-hardware gaps this pass deliberately leaves alone.
     pub(super) fn write_signal_frame(
         &self,
+        _platform: &Platform,
         frame_addr: usize,
         siginfo: &Siginfo,
         action: &SigAction,
@@ -143,7 +148,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     }
 }
 
-pub(super) fn restore_sigcontext(
+/// `_platform`/`Platform` match aarch64's signature so `mod.rs`'s single
+/// generic call site works for both; unused here -- see `write_signal_frame`.
+pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
+    _platform: &Platform,
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::x86_64::Sigcontext,
 ) -> usize {

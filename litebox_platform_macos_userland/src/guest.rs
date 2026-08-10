@@ -171,6 +171,38 @@ const _: () = assert!(core::mem::offset_of!(GuestFpState, v) == 0);
 const _: () = assert!(core::mem::offset_of!(GuestFpState, fpcr) == GUEST_FP_OFF_FPCR);
 const _: () = assert!(core::mem::offset_of!(GuestFpState, fpsr) == GUEST_FP_OFF_FPSR);
 
+/// Reads [`GUEST_FP`] in the shim-facing shape, for `lib.rs`'s
+/// `ThreadProvider::get_fp_state` implementation.
+///
+/// Callable any time no guest is concurrently mutating [`GUEST_FP`] via
+/// `enter_guest_asm`/`syscall_callback`/`exception_callback` -- i.e. whenever an
+/// `EnterShim` method is running, which is the only time the shim can call
+/// this, since [`GUEST_OWNS_CPU`] is false throughout.
+pub(crate) fn guest_fp_state() -> litebox::platform::FpSimdState64 {
+    // SAFETY: single-guest-thread invariant (`GUEST_ACTIVE`), as for every
+    // other `GUEST_FP` access in this file; not concurrently written while an
+    // `EnterShim` method (and therefore this function) can run.
+    let fp = unsafe { &*GUEST_FP.0.get() };
+    litebox::platform::FpSimdState64 {
+        v: fp.v,
+        fpsr: fp.fpsr.trunc(),
+        fpcr: fp.fpcr.trunc(),
+    }
+}
+
+/// Writes [`GUEST_FP`] from the shim-facing shape, for `lib.rs`'s
+/// `ThreadProvider::set_fp_state` implementation (e.g. restoring what a guest
+/// signal handler left in its frame on `rt_sigreturn`).
+///
+/// Same calling window as [`guest_fp_state`].
+pub(crate) fn set_guest_fp_state(state: &litebox::platform::FpSimdState64) {
+    // SAFETY: as `guest_fp_state`.
+    let fp = unsafe { &mut *GUEST_FP.0.get() };
+    fp.v = state.v;
+    fp.fpcr = u64::from(state.fpcr);
+    fp.fpsr = u64::from(state.fpsr);
+}
+
 /// Pointer to the run loop's live [`PtRegs`], stashed by [`enter_guest_asm`] so
 /// [`syscall_callback`] can write the captured guest state back into it.
 static LIVE_PTREGS: RawCell<*mut PtRegs> = RawCell(UnsafeCell::new(core::ptr::null_mut()));
@@ -557,6 +589,110 @@ unsafe extern "C" fn exception_callback() {
     )
 }
 
+/// aarch64 Linux's `__NR_rt_sigreturn`, hardcoded into [`sigreturn_trampoline`]
+/// because the guest never sets `x8` on the way in (there is no real `SVC`,
+/// so no C library gets a chance to). Verified against the vendored
+/// `syscalls-0.6.18` crate source
+/// (`src/arch/aarch64.rs:286`, `rt_sigreturn = 139`) -- the same crate
+/// `litebox_common_linux::SyscallRequest::try_from_raw` decodes `PtRegs::syscallno`
+/// through, so this is guaranteed to route to `Sysno::rt_sigreturn` there.
+const AARCH64_RT_SIGRETURN: u32 = 139;
+
+/// This platform's own sigreturn trampoline: what
+/// [`litebox::platform::SystemInfoProvider::get_sigreturn_trampoline_address`]
+/// reports, and what `litebox_shim_linux` installs as a guest signal handler's
+/// return address (`x30`) when the guest registered the handler without
+/// `SA_RESTORER`. There is no vDSO on macOS to fall back to the way a real
+/// Linux kernel does (see `darwin.rs`'s and `lib.rs`'s `get_vdso_address`
+/// docs), so this *is* the fallback -- reached the same way
+/// [`syscall_callback`] is, by handing a host code address to a
+/// guest-controlled register (there `x16` via the rewriter's gate, here `x30`
+/// via the signal frame `litebox_shim_linux` builds), an "absolute address"
+/// reachable from any guest regardless of branch-range limits (see
+/// `litebox_syscall_rewriter::arm64`'s "Signal returns" module-doc section,
+/// which anticipated exactly this).
+///
+/// Unlike [`syscall_callback`], this never touches guest memory at all, and
+/// needs no exception-table entry: a real `SVC` gate stashes the guest's `x16`
+/// and a return address below `sp` because it has no free register to carry
+/// them in, but this trampoline is reached directly by `RET` (no gate ran),
+/// so nothing needs recovering from the guest stack. It captures only `sp`
+/// (via the real `SP` register, exactly as the guest's `ret` left it) and sets
+/// `syscallno` to [`AARCH64_RT_SIGRETURN`] -- deliberately capturing *no other
+/// register*, unlike every other guest-exit path in this file. This is safe
+/// only because of what `sys_rt_sigreturn`/`restore_sigcontext`
+/// (`litebox_shim_linux/src/syscalls/signal/{mod.rs,aarch64.rs}`) actually do
+/// with the `PtRegs` this hands them: `Sysno::rt_sigreturn` takes no register
+/// arguments (confirmed against `SyscallRequest::try_from_raw`'s dispatch, which
+/// extracts zero fields for it), the frame is located purely from `ctx.sp`, and
+/// every other field (`regs`, `pc`, `pstate`) is overwritten wholesale from the
+/// frame's saved `sigcontext` before anything downstream reads it -- including
+/// `regs[0]`, which the generic "write the syscall result into `x0`" step then
+/// re-writes with the exact value `restore_sigcontext` just placed there,
+/// making that generic step a no-op for this syscall specifically. A stale
+/// `pc`/`regs`/`pstate` left over from whatever this `PtRegs` last held is
+/// therefore never observed.
+///
+/// # Safety
+///
+/// Reached only via a guest `RET` with `x30` holding this function's own
+/// address (installed by `litebox_shim_linux` as a signal frame's return
+/// slot) and [`GUEST_OWNS_CPU`] genuinely true; not callable as an ordinary
+/// function.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn sigreturn_trampoline() {
+    core::arch::naked_asm!(
+        // Clear ownership before touching anything else -- see
+        // GUEST_OWNS_CPU's doc comment; same first-instruction placement and
+        // reasoning as syscall_callback.
+        "adrp x9, {owns}@PAGE",
+        "add  x9, x9, {owns}@PAGEOFF",
+        "strb wzr, [x9]",
+        // Load the destination PtRegs (host-owned, set by enter_guest_asm).
+        "adrp x9, {live}@PAGE",
+        "add  x9, x9, {live}@PAGEOFF",
+        "ldr  x9, [x9]",
+        // sp: the guest's real SP, exactly as its own `ret` left it (SP
+        // cannot be a direct STR source operand, hence the mov through x10).
+        "mov  x10, sp",
+        "str  x10, [x9, #248]",
+        // syscallno: force dispatch to sys_rt_sigreturn regardless of
+        // whatever this guest's x8 last held (no real SVC ran).
+        "movz w10, #{rt_sigreturn}",
+        "str  w10, [x9, #280]",
+        // Restore host state and return reporting a syscall (0), exactly like
+        // syscall_callback's own tail, so run_thread's loop calls
+        // shim.syscall -- which dispatches sys_rt_sigreturn purely from the
+        // sp/syscallno just written (see this function's own doc comment for
+        // why nothing else needs capturing).
+        "adrp x1, {host_save}@PAGE",
+        "add  x1, x1, {host_save}@PAGEOFF",
+        "ldp  x19, x20, [x1, #0]",
+        "ldp  x21, x22, [x1, #16]",
+        "ldp  x23, x24, [x1, #32]",
+        "ldp  x25, x26, [x1, #48]",
+        "ldp  x27, x28, [x1, #64]",
+        "ldr  x29, [x1, #80]",
+        "ldr  x30, [x1, #88]",
+        "ldp  d8,  d9,  [x1, #104]",
+        "ldp  d10, d11, [x1, #120]",
+        "ldp  d12, d13, [x1, #136]",
+        "ldp  d14, d15, [x1, #152]",
+        "ldr  x9, [x1, #168]",
+        "msr  fpcr, x9",
+        "ldr  x9, [x1, #176]",
+        "msr  fpsr, x9",
+        "ldr  x2, [x1, #96]",
+        "mov  sp, x2",
+        "mov  x0, #0",
+        "ret",
+        host_save = sym HOST_SAVE,
+        live = sym LIVE_PTREGS,
+        owns = sym GUEST_OWNS_CPU,
+        rt_sigreturn = const AARCH64_RT_SIGRETURN,
+    )
+}
+
 /// Reached only via one of the exception-table entries emitted inline within
 /// [`enter_guest_asm`] and [`syscall_callback`]: a fault at one of the handful
 /// of instructions where this platform's own switch code must still touch the
@@ -612,17 +748,20 @@ extern "C" fn abort_boundary_stack_fault() -> ! {
 /// from the guest's own stack, unlike `syscall_callback` -- the kernel already
 /// captured the true hardware state into `thread_state` at the moment of the
 /// fault, a strictly more trustworthy source than anything this function could
-/// read back off guest memory), records `info` for [`exception_callback`] to
-/// hand to the run loop, clears the ownership flag, and returns the address
+/// read back off guest memory), refreshes [`GUEST_FP`] from `neon_state` for
+/// the same reason (the kernel's own capture, not whatever `GUEST_FP` held
+/// from the guest's last syscall), records `info` for [`exception_callback`]
+/// to hand to the run loop, clears the ownership flag, and returns the address
 /// the caller should redirect the faulting `pc` to.
 ///
 /// # Safety
 ///
-/// Must be called with [`GUEST_OWNS_CPU`] genuinely true and `thread_state`
-/// genuinely describing the interrupted guest, per the caller's own
-/// exception-table-then-flag check.
+/// Must be called with [`GUEST_OWNS_CPU`] genuinely true and `thread_state`/
+/// `neon_state` genuinely describing the interrupted guest, per the caller's
+/// own exception-table-then-flag check.
 pub(crate) unsafe fn prepare_exception_delivery(
     thread_state: &crate::darwin::ArmThreadState64,
+    neon_state: &crate::darwin::ArmNeonState64,
     info: litebox::shim::ExceptionInfo,
 ) -> usize {
     // SAFETY: `GUEST_OWNS_CPU` was true (the caller's precondition), so
@@ -641,6 +780,12 @@ pub(crate) unsafe fn prepare_exception_delivery(
     // No syscall is in flight at a hardware fault, matching the kernel's own
     // `NO_SYSCALL` convention `litebox_shim_linux` relies on elsewhere.
     live.syscallno = -1;
+
+    // SAFETY: single-guest-thread invariant, as for HOST_SAVE/GUEST_FP/LIVE_PTREGS.
+    let fp = unsafe { &mut *GUEST_FP.0.get() };
+    fp.v = neon_state.v;
+    fp.fpsr = u64::from(neon_state.fpsr);
+    fp.fpcr = u64::from(neon_state.fpcr);
 
     // SAFETY: single-guest-thread invariant, as for HOST_SAVE/GUEST_FP/LIVE_PTREGS.
     unsafe { *PENDING_EXCEPTION_INFO.0.get() = info };
@@ -1306,5 +1451,202 @@ mod tests {
             "x19 survived the enter/capture/resume round trip"
         );
         assert_eq!(shim.calls.get(), 3, "expected write, write, exit");
+    }
+
+    /// A shim that captures [`guest_fp_state`] the instant a fault is
+    /// delivered -- the same accessor `lib.rs`'s `ThreadProvider::get_fp_state`
+    /// exposes to the shim, so this is exactly what a real signal-frame build
+    /// would see if it ran at this point.
+    struct FpFaultShim {
+        delivered: RefCell<Option<litebox::platform::FpSimdState64>>,
+    }
+
+    impl EnterShim for FpFaultShim {
+        type ExecutionContext = PtRegs;
+        fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Resume
+        }
+        fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+        fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+            *self.delivered.borrow_mut() = Some(guest_fp_state());
+            ContinueOperation::Terminate
+        }
+        fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+    }
+
+    /// A guest that broadcasts three distinct sentinel patterns into `v0`
+    /// (first vector register), `v15` (middle), and `v31` (last) -- so a
+    /// capture that silently only covered a subrange of the file would still
+    /// be caught -- then genuinely faults through a null-pointer load, exactly
+    /// like [`faulting_guest`]. `dup Vd.2d, Xn` broadcasts one sentinel into
+    /// *both* 64-bit lanes of a register, which is what lets the test's
+    /// expected value stay agnostic to which lane the capture code treats as
+    /// low/high: both lanes are identical, so there is only one possible
+    /// 128-bit result regardless.
+    #[unsafe(naked)]
+    unsafe extern "C" fn fp_faulting_guest() {
+        core::arch::naked_asm!(
+            "movz x9, #0xBEEF",
+            "movk x9, #0xCAFE, lsl #16",
+            "movk x9, #0xF00D, lsl #32",
+            "movk x9, #0xFACE, lsl #48",
+            "dup  v0.2d, x9",
+            "movz x9, #0x1111",
+            "movk x9, #0x2222, lsl #16",
+            "movk x9, #0x3333, lsl #32",
+            "movk x9, #0x4444, lsl #48",
+            "dup  v15.2d, x9",
+            "movz x9, #0xAAAA",
+            "movk x9, #0xBBBB, lsl #16",
+            "movk x9, #0xCCCC, lsl #32",
+            "movk x9, #0xDDDD, lsl #48",
+            "dup  v31.2d, x9",
+            "movz x4, #0",
+            "ldr  x3, [x4]", // deliberate fault: load through a null pointer
+            "brk  #0",       // unreachable
+        )
+    }
+
+    /// The Darwin-specific half of the FP/SIMD signal-frame gap this module's
+    /// doc comment used to describe as open: a delivered exception's vector
+    /// state must be the guest's own real state *at the moment of the fault*,
+    /// read from the kernel's own `mcontext` (`darwin::ArmNeonState64`), not
+    /// whatever [`GUEST_FP`] happened to hold from the guest's last syscall.
+    /// If [`prepare_exception_delivery`] ever again skipped refreshing
+    /// [`GUEST_FP`] from `neon_state`, this test would still pass by
+    /// accident only if the guest's last syscall (there is none here) had
+    /// coincidentally left the same sentinels -- it does not, so a regression
+    /// here is a hard failure, not a flake.
+    #[test]
+    fn captures_real_vector_register_state_from_the_darwin_mcontext_on_a_guest_fault() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::install_fault_handlers();
+        let mut stack = vec![0u8; 1 << 16];
+        let top = stack.as_mut_ptr() as usize + stack.len();
+        let sp = (top - 256) & !15;
+
+        let mut ctx = PtRegs {
+            pc: fp_faulting_guest as *const () as usize,
+            sp,
+            ..Default::default()
+        };
+        let shim = FpFaultShim {
+            delivered: RefCell::new(None),
+        };
+        run_thread(&shim, &mut ctx);
+
+        let fp = shim
+            .delivered
+            .into_inner()
+            .expect("EnterShim::exception was never invoked");
+
+        let expect_broadcast = |sentinel: u128| sentinel | (sentinel << 64);
+        assert_eq!(
+            fp.v[0],
+            expect_broadcast(0xFACE_F00D_CAFE_BEEF),
+            "v0 (first register) must be the guest's real pre-fault state"
+        );
+        assert_eq!(
+            fp.v[15],
+            expect_broadcast(0x4444_3333_2222_1111),
+            "v15 (middle register) must be the guest's real pre-fault state"
+        );
+        assert_eq!(
+            fp.v[31],
+            expect_broadcast(0xDDDD_CCCC_BBBB_AAAA),
+            "v31 (last register) must be the guest's real pre-fault state"
+        );
+    }
+
+    /// A shim that records the syscall a guest reaches, to check what
+    /// [`sigreturn_trampoline`] hands off to the run loop.
+    struct SigreturnRecordingShim {
+        seen: RefCell<Option<(i32, usize)>>, // (syscallno, sp)
+    }
+
+    impl EnterShim for SigreturnRecordingShim {
+        type ExecutionContext = PtRegs;
+        fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Resume
+        }
+        fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
+            *self.seen.borrow_mut() = Some((ctx.syscallno, ctx.sp));
+            ContinueOperation::Terminate
+        }
+        fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+        fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+    }
+
+    /// A guest that branches straight into [`sigreturn_trampoline`] -- exactly
+    /// what a real guest signal handler installed *without* `SA_RESTORER`
+    /// does when it `ret`s, since `litebox_shim_linux`'s `write_signal_frame`
+    /// installs this trampoline's address as `x30` in that case. A plain `B`
+    /// (not `BL`) matches `RET`'s semantics: no return address is pushed,
+    /// `SP` is left completely untouched, which is exactly the property the
+    /// test below checks.
+    #[unsafe(naked)]
+    unsafe extern "C" fn returns_via_sigreturn_trampoline_guest() {
+        core::arch::naked_asm!(
+            "b {tramp}",
+            tramp = sym sigreturn_trampoline,
+        )
+    }
+
+    /// The no-`SA_RESTORER` half of the signal-delivery gap this module's doc
+    /// comment used to describe as open: macOS has no vDSO to fall back to,
+    /// so [`sigreturn_trampoline`] is LiteBox's own replacement -- reached the
+    /// same way a real guest's `ret` from a handler would reach it, and
+    /// proven here to hand off to `sys_rt_sigreturn`'s dispatch (syscall 139)
+    /// with the guest's real, untouched `sp` -- never a guest-memory read (see
+    /// the trampoline's own doc comment for why none of its other registers
+    /// need to be captured for this specific syscall to dispatch correctly).
+    /// If this ever crashed the host process instead of reaching
+    /// `EnterShim::syscall`, this test would take the whole process down with
+    /// it, the same proof-by-survival property
+    /// [`delivers_a_genuine_guest_fault_to_the_shim_without_leaking_host_state`]
+    /// relies on.
+    #[test]
+    fn a_guest_signal_handler_without_sa_restorer_resumes_correctly_via_the_sigreturn_trampoline() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut stack = vec![0u8; 1 << 16];
+        let top = stack.as_mut_ptr() as usize + stack.len();
+        let sp = (top - 256) & !15;
+
+        let mut ctx = PtRegs {
+            pc: returns_via_sigreturn_trampoline_guest as *const () as usize,
+            sp,
+            ..Default::default()
+        };
+        let shim = SigreturnRecordingShim {
+            seen: RefCell::new(None),
+        };
+        run_thread(&shim, &mut ctx);
+
+        let (syscallno, reported_sp) = shim
+            .seen
+            .into_inner()
+            .expect("EnterShim::syscall was never invoked");
+        assert_eq!(
+            syscallno,
+            AARCH64_RT_SIGRETURN.cast_signed(),
+            "trampoline must dispatch rt_sigreturn regardless of the guest's x8"
+        );
+        assert_eq!(
+            reported_sp, sp,
+            "trampoline must report the guest's real sp, unmoved by the \
+             trampoline itself (RET touches no memory and no SP)"
+        );
     }
 }

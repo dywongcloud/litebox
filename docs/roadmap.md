@@ -298,6 +298,12 @@ Known gaps a real guest hits now:
   resumes at all, so it is a new, narrow rough edge on newly-added behavior,
   never a regression of anything that worked before.
 
+  **Resolved in a later pass:** `darwin::McontextPrefix64` now carries the real
+  `ArmNeonState64`, and `prepare_exception_delivery` refreshes `GUEST_FP` from
+  it, so a delivered exception's vector state is the guest's genuine
+  pre-fault state, not stale syscall-boundary content. See "`sa_restorer` and
+  FP/SIMD signal-frame state" below for the hardware-verified detail.
+
 * **The interrupt path (`SIGUSR2`) is not routed to `EnterShim::interrupt`
   either -- and it is a different problem from the fault one above, not the
   same one.** `litebox::event::wait::ThreadHandle::interrupt` only calls
@@ -453,6 +459,54 @@ rather than in the code they cover. Three are fixed; one is not.
   vDSO means a guest handler without `SA_RESTORER` has nowhere to return to,
   and the signal frame's vector-state area is zeroed rather than populated.
   Both are inert until a guest actually installs a handler and executes.
+
+  **Both resolved this pass, verified on real M3 Pro hardware.** The FP/SIMD
+  half: `darwin::ArmNeonState64` now models Darwin's `__darwin_arm_neon_state64`
+  (verified field-for-field against this machine's own SDK headers --
+  `mach/arm/_structs.h`, `arm/_mcontext.h` -- not assumed), and
+  `guest::prepare_exception_delivery` refreshes `GUEST_FP` from it at fault
+  time instead of leaving it stale from the guest's last syscall.
+  `litebox_shim_linux`'s `write_signal_frame`/`restore_sigcontext` now round-trip
+  real vector state through a new `ThreadProvider::get_fp_state`/`set_fp_state`
+  pair (default zeroed/no-op on every other platform, so this is additive, not
+  a behavior change elsewhere) into a real aarch64 Linux `fpsimd_context`
+  record -- verified field-for-field against the kernel's own
+  `arch/arm64/include/uapi/asm/sigcontext.h` (`fpsr`/`fpcr` *before* `vregs`,
+  the opposite order from Darwin's struct -- confirmed by fetching the header
+  directly rather than assumed from the two structs' surface similarity).
+  Hardware-run test:
+  `guest::tests::captures_real_vector_register_state_from_the_darwin_mcontext_on_a_guest_fault`
+  seeds three distinct sentinels into `v0`/`v15`/`v31`, faults, and asserts the
+  delivered state matches exactly.
+
+  The `sa_restorer` half: `guest::sigreturn_trampoline` is LiteBox's own
+  replacement for the vDSO `sigtramp` a real Linux kernel would fall back to --
+  exactly the mechanism `litebox_syscall_rewriter::arm64`'s "Signal returns"
+  module doc already anticipated ("The runtime installs its own sigreturn
+  trampoline address..."), now actually implemented. `SystemInfoProvider::
+  get_sigreturn_trampoline_address` reports its host address (default `None`
+  everywhere else, preserving every other platform's current refuse-delivery
+  behavior byte-for-byte), and `write_signal_frame` falls back to it instead of
+  refusing delivery when `SA_RESTORER` is absent. Unlike `syscall_callback`,
+  the trampoline never touches guest memory at all: `sys_rt_sigreturn` takes no
+  register arguments and locates its frame purely from `ctx.sp`, so the
+  trampoline only needs to capture the real `SP` register and set `syscallno`
+  to `139` (verified against the vendored `syscalls` crate's own aarch64 table,
+  not assumed) before handing off -- no exception-table entry needed, since
+  there is no guest-memory access left to fault. Hardware-run test:
+  `guest::tests::a_guest_signal_handler_without_sa_restorer_resumes_correctly_via_the_sigreturn_trampoline`
+  branches straight into the trampoline (as a guest's `ret` would) and asserts
+  the shim receives exactly `rt_sigreturn` with the guest's real, untouched
+  `sp`.
+
+  Scope note: this closes the two gaps as stated above (both are about the
+  *macOS platform's own* contribution -- Darwin state capture and the
+  trampoline). It does not touch x86-64's parallel, structurally identical
+  `fpstate: 0 // TODO` gap in `litebox_shim_linux/src/syscalls/signal/x86_64.rs`
+  -- unverifiable on this Apple Silicon hardware and out of this pass's scope.
+  The `write_signal_frame`/`restore_sigcontext` signatures gained a `platform`
+  parameter on x86-64 too, purely for the two architectures' call sites in
+  `mod.rs` to share one signature; its behavior is untouched.
 
 ## Needs a design decision, not just an errno swap
 
