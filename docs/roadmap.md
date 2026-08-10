@@ -833,6 +833,30 @@ any guest:
   `litebox_packager` sidesteps this by writing `Header::new_ustar()` itself; a
   hand-built archive needs a writer that emits no extended headers.
 
+## Failures unmasked by fixing the `litebox_shim_linux` test compile error
+
+`litebox_shim_linux`'s test target did not compile (`E0793`: a reference to a
+packed `stat` field inside `assert_eq!`), so CI stopped at the clippy step and
+every test in that crate was unreachable. With the compile error fixed, two
+genuine failures surfaced. Both reproduce at the commit before that fix once
+the same one-line change is applied, so neither is a regression from it.
+
+* **`loader::elf::tests::et_exec_interpreter_loads_top_down_above_low_heap`
+  panics in `sys_munmap`.** On Linux the platform's `munmap` returns `EINVAL`
+  (`litebox_platform_linux_userland/src/lib.rs:1661`); on Windows the same test
+  trips `litebox_platform_windows_userland`'s "Trying to deallocate a free
+  region" assertion. The two platforms disagreeing about the same unmap points
+  at the loader's top-down interpreter placement releasing a range it does not
+  own, rather than at either platform's allocator.
+
+* **`test_runner_broker_integration_with_rewriter` exits with status 14.**
+  The runner-under-broker path with the syscall rewriter enabled fails during
+  the integration run; the exit status is the guest's, not a harness error.
+
+Both need a real diagnosis rather than a test adjustment: an unmap of an
+unowned range is exactly the class of bug the platform assertions exist to
+catch.
+
 ## The test suite's own macOS gaps
 
 Running `cargo test` on an Apple Silicon machine surfaced defects in the tests
