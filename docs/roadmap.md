@@ -406,10 +406,113 @@ Known gaps a real guest hits now:
   invocations this session -- but 5 concurrent runs of each were clean every
   time, it reproduces with no `/proc`-specific error in the trace, and
   `busybox cat` on an unrelated file flaked identically once in the same
-  session. This matches the guest-entry scheduling sensitivity this doc
-  already documents (see the flaky-timer-tests entry under "The test suite's
-  own macOS gaps"), not a new defect in this change; noted here rather than
-  silently dropped.
+  session. **This was later shown (`macos-concurrent-guest-entry-sigsegv`,
+  below) to be at least partly a real, root-caused platform bug, not merely
+  scheduling sensitivity** -- see that entry for what was actually found and
+  fixed, and what remains open.
+
+* **A real guest-entry `SIGSEGV` under concurrent invocation, confirmed and
+  partially root-caused (`macos-concurrent-guest-entry-sigsegv`).** The
+  intermittent `SIGSEGV` noted above turned out to reproduce far more
+  reliably under genuine concurrent invocation (12 real, separate
+  `litebox_runner_linux_on_macos_userland` processes launched at once against
+  the same packaged image): roughly 30-50% of concurrent runs failed on this
+  Apple M3 Pro, versus 0-1 in 30 sequential runs, for a completely trivial
+  guest (`busybox pwd`) with no relation to `/proc`. It is a genuine guest
+  hardware fault, correctly routed through the fault-delivery path
+  `73e5071847` added (`SIGSEGV`, `Signal(11)`, exit code 11 is
+  `signal.as_i32() + 256`, truncated to a `u8` by `std::process::exit` --
+  not a raw host crash), so `RUST_LOG=trace` (the env var an earlier
+  investigation used) never showed anything: this crate's tracing is gated on
+  `LITEBOX_LOG`, not `RUST_LOG`.
+
+  Two distinct bugs were found investigating this, addressed with different
+  confidence:
+
+  1. **Root-caused and fixed.** Darwin's `mmap(addr, ...)` without
+     `MAP_FIXED` does not reliably honor `addr` as a hint the way this
+     platform's `FixedAddressBehavior::Hint` assumed. Traced on real
+     hardware: a `Hint` request for the initial guest stack (8 MiB, hinted at
+     `TASK_ADDR_MAX - 8 MiB` by `Vmem::get_unmmaped_area`'s top-down search)
+     was silently placed by the kernel at a different, kernel-chosen address
+     instead -- consistently just under the real top of the process's usable
+     address space, which put the *end* of the 8 MiB stack mapping several
+     MiB *above* `TASK_ADDR_MAX`, an invariant the rest of this platform (and
+     `Vmem`'s own address-space bookkeeping) assumes always holds. A second,
+     compounding bug in `Vmem::get_unmmaped_area`'s top-down fast path meant
+     that once *one* allocation (e.g. the `ET_EXEC` interpreter's own
+     "load high" placement) ended up above `TASK_ADDR_MAX` this way, later
+     placements didn't reliably avoid it either: the fast path deliberately
+     skips tracked ranges that start above `high_limit` (added by
+     `17a5b14` to stop a host mapping entirely above `TASK_ADDR_MAX`, such as
+     the dyld shared cache, from shadowing this path), but that skip isn't
+     sound when the "range above `high_limit`" is a *guest* mapping that
+     landed there because of the same Darwin quirk. Fixed in both places:
+     `allocate_pages`/`allocate_jit_pages`/`try_allocate_cow_pages` now
+     retry a `Hint` placement that lands outside
+     `[TASK_ADDR_MIN, TASK_ADDR_MAX)` with an exact `mach_vm_allocate
+     (VM_FLAGS_FIXED)` reservation at the originally-requested address (the
+     same mechanism `NoReplace` already used, applied only on the
+     already-provably-broken path so the common case is untouched), and
+     `get_unmmaped_area`'s fast path now also checks
+     `!vmas.overlaps(high_limit..TASK_ADDR_MAX)` directly instead of trusting
+     the `r.start <= high_limit` proxy. Verified on real hardware: the
+     stack/interpreter placement is now deterministic and in-bounds on every
+     run observed (dozens of runs, both sequential and concurrent), where it
+     previously varied and regularly exceeded `TASK_ADDR_MAX` by several MiB
+     under concurrent load.
+
+     The exact-reservation retry deliberately only fires when the bare
+     `Hint` `mmap` already produced an out-of-range result, not
+     unconditionally: attempting the exact reservation *first* for every
+     `Hint` (tried during this investigation) regressed a previously-working
+     case -- `mach_vm_allocate(VM_FLAGS_FIXED)` refuses exactly
+     `TASK_ADDR_MIN` itself (`KERN_INVALID_ADDRESS`, not `KERN_NO_SPACE`;
+     that address is real, ASLR-slid, host-reserved space this platform's
+     conservative `TASK_ADDR_MIN` doesn't and can't statically account for),
+     and an attempted-but-refused reservation there measurably perturbed
+     Darwin's own address-hint state for the *next* `mmap` call in a way that
+     made it land inside an already-live mapping instead of a free gap.
+
+  2. **Found, precisely characterized, and deliberately *not* fixed here --
+     root cause still unconfirmed.** Even with the placement bug above fixed
+     (stack and interpreter verified in-bounds and at deterministic
+     addresses), guest processes still crash under concurrent invocation, at
+     a rate not meaningfully lower than before the fix (comparable
+     30-50%-of-12-concurrent-runs range on this hardware). Every occurrence
+     observed had an identical, deterministic signature: `fault_address =
+     0` (a `NULL` dereference), `ESR_EL1` decoding to a stage-1 translation
+     fault (`DFSC = 0b000110`), and a `PC` exactly 832 bytes into
+     `ld-musl-aarch64.so.1`'s entry point (`_dlstart+0x340`, disassembled
+     from the packaged Alpine image as `ldrb w4, [x3, x1]` -- the byte-name
+     comparison loop of a symbol-hash-table lookup, part of musl's static-PIE
+     self-bootstrap, *after* the address-independent (`ADRP`-relative)
+     self-relocation loop earlier in `_dlstart` has already run). The crash
+     site itself never varies; only whether it happens does, and -- like the
+     placement bug -- it is concurrency/scheduling-sensitive (0 failures in
+     30 sequential runs, roughly 40-50% of 12-16 concurrent runs, on
+     identical inputs). This is consistent with, but not confirmed to be,
+     the already-tracked `macos-guest-tp-runtime-offset` limitation (item 1
+     under "Remaining work" in `docs/macos.md`): `ld-musl`'s bootstrap is a
+     plausible place to read `TPIDR_EL0` early (stack-protector setup), and
+     that read is documented to land in the wrong pthread TSD slot on this
+     platform today, which would read whatever unrelated state libSystem
+     happens to keep in slot 256 rather than the guest's own value --
+     content that could plausibly vary with host process/thread state and
+     therefore with concurrency, matching what was observed. This was not
+     pursued further under this investigation's scope (a real fix for
+     `macos-guest-tp-runtime-offset` needs load-time offset indirection, a
+     substantially larger change spanning the rewriter and the loader, not a
+     small platform-level correction) -- confirming or ruling this out, and
+     fixing it if confirmed, is follow-up work.
+
+  Reproduced and verified with the real `litebox_packager --oci-image
+  public.ecr.aws/docker/library/alpine:latest` / `busybox pwd` pipeline
+  (`docker.io`'s auth endpoint was unreachable from this host, as in the
+  `/proc` entry above) via a shell loop backgrounding N real, separate
+  `litebox_runner_linux_on_macos_userland` invocations against the same
+  packaged tar and waiting on all of them, run repeatedly at N=12-24 both
+  before and after the fix.
 
 * `setuid`/`setgid` are unimplemented, but that is *not* why `id` was failing --
   an earlier revision of this file said so and was wrong. `getgroups` was the

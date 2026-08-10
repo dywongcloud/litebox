@@ -283,14 +283,31 @@ pub unsafe fn jit_write_protect(executable: bool) {
     unsafe { darwin::pthread_jit_write_protect_np(libc::c_int::from(executable)) }
 }
 
+/// Mirrors `<MacOsUserland as PageManagementProvider<ALIGN>>::TASK_ADDR_MIN`
+/// (the trait impl's associated const is defined in terms of this, not the
+/// other way around) so free functions outside that `impl` block --
+/// `allocate_jit_pages`'s and `try_allocate_cow_pages`'s `Hint`-correction
+/// bounds checks -- can see it without a `Self` to qualify through (`Self`
+/// would need `ALIGN` pinned to a concrete value, which these call sites
+/// have no reason to do). The value genuinely does not depend on `ALIGN`, so
+/// one constant correctly serves both the associated const and these.
+const GUEST_ADDR_MIN: usize = 0x1_0000_0000;
+/// See [`GUEST_ADDR_MIN`]; mirrors `TASK_ADDR_MAX` the same way.
+const GUEST_ADDR_MAX: usize = 0x0000_4000_0000_0000;
+
 /// Allocate a `MAP_JIT` mapping, honoring `fixed_address_behavior` despite
 /// Darwin refusing to combine `MAP_FIXED` with `MAP_JIT` in one `mmap` call.
 ///
 /// The mapping is always created at a kernel-chosen address first. If no
-/// fixed address was requested, that address is the answer. Otherwise it is
-/// relocated to `suggested_range.start` with [`darwin::remap_to_fixed`],
-/// which preserves the mapping's JIT-capable property across the move (see
-/// that function's docs for the precedent this follows).
+/// fixed address was requested, that address is the answer -- *unless* it
+/// falls outside `[TASK_ADDR_MIN, TASK_ADDR_MAX)` for a [`FixedAddressBehavior::Hint`]
+/// request, in which case it is relocated to `suggested_range.start` with
+/// [`darwin::remap_to_fixed`] the same way [`FixedAddressBehavior::NoReplace`]
+/// always is. See the matching comment in [`MacOsUserland::allocate_pages`]'s
+/// non-JIT branch for why `Hint` needs this correction (real Darwin does not
+/// reliably honor an advisory hint near the top of the guest's address
+/// range) and why it is applied only when the kernel-chosen address is
+/// actually out of range rather than unconditionally.
 fn allocate_jit_pages(
     suggested_range: &core::ops::Range<usize>,
     initial_permissions: MemoryRegionPermissions,
@@ -316,26 +333,43 @@ fn allocate_jit_pages(
         });
     }
 
-    if fixed_address_behavior == FixedAddressBehavior::Hint {
-        return Ok(kernel_chosen);
-    }
-
-    let reserved = fixed_address_behavior == FixedAddressBehavior::NoReplace;
-    if reserved {
+    let must_be_exact = fixed_address_behavior == FixedAddressBehavior::NoReplace;
+    let needs_correction = fixed_address_behavior == FixedAddressBehavior::Hint && {
+        let start = kernel_chosen as usize;
+        let end = start + suggested_range.len();
+        start < GUEST_ADDR_MIN || end > GUEST_ADDR_MAX
+    };
+    let reserved = if must_be_exact || needs_correction {
         // `remap_to_fixed`'s `VM_FLAGS_OVERWRITE` silently replaces whatever
         // already occupies the destination, so `NoReplace` has to check
-        // first -- exactly like the non-JIT path below does with a plain
+        // first -- exactly like the non-JIT path does with a plain
         // `mmap(MAP_FIXED)`. The reservation itself then occupies the
         // destination until the remap overwrites it.
-        if let Err(e) = reserve_fixed(suggested_range) {
-            // SAFETY: `kernel_chosen` is the mapping just created above,
-            // still solely owned by this function.
-            unsafe { libc::munmap(kernel_chosen, suggested_range.len()) };
-            return Err(match e {
-                ReservationError::AddressInUse => AllocationError::AddressInUse,
-                ReservationError::OutOfMemory => AllocationError::OutOfMemory,
-            });
+        match reserve_fixed(suggested_range) {
+            Ok(()) => true,
+            Err(e) if must_be_exact => {
+                // SAFETY: `kernel_chosen` is the mapping just created above,
+                // still solely owned by this function.
+                unsafe { libc::munmap(kernel_chosen, suggested_range.len()) };
+                return Err(match e {
+                    ReservationError::AddressInUse => AllocationError::AddressInUse,
+                    ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+                });
+            }
+            // `needs_correction`: the exact candidate is refused too (see the
+            // matching comment in `allocate_pages`'s non-JIT branch) --
+            // `kernel_chosen` is the only address left to offer, out-of-range
+            // as it is; a caller that cannot use it will find out from a real
+            // fault at first access rather than this function inventing a
+            // further fallback that has never been exercised.
+            Err(_) => false,
         }
+    } else {
+        false
+    };
+
+    if !reserved {
+        return Ok(kernel_chosen);
     }
 
     // SAFETY: `kernel_chosen` is a live mapping of exactly this length,
@@ -360,9 +394,7 @@ fn allocate_jit_pages(
     match remap_result {
         Ok(()) => Ok(suggested_range.start as *mut libc::c_void),
         Err(e) => {
-            if reserved {
-                release_reservation(suggested_range);
-            }
+            release_reservation(suggested_range);
             Err(match e {
                 ReservationError::AddressInUse => AllocationError::AddressInUse,
                 ReservationError::OutOfMemory => AllocationError::OutOfMemory,
@@ -477,14 +509,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
     /// to start above it, which is a real constraint on guest images -- an
     /// `ET_EXEC` binary linked at the customary `0x400000` cannot be loaded at
     /// its preferred address on this host.
-    const TASK_ADDR_MIN: usize = 0x1_0000_0000;
+    const TASK_ADDR_MIN: usize = GUEST_ADDR_MIN;
 
     /// Deliberately conservative. The user half of an Apple Silicon address
     /// space is 47 bits wide, but the exact ceiling is a kernel implementation
     /// detail (`MACH_VM_MAX_ADDRESS`) rather than a stable interface, so this
     /// stops a bit below 2^46 -- 64 TiB of guest address space, comfortably
     /// inside any plausible limit.
-    const TASK_ADDR_MAX: usize = 0x0000_4000_0000_0000;
+    const TASK_ADDR_MAX: usize = GUEST_ADDR_MAX;
 
     fn allocate_pages(
         &self,
@@ -562,7 +594,84 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     _ => AllocationError::OutOfMemory,
                 });
             }
-            ptr
+
+            // `Hint`'s bare, unenforced `mmap(addr)` above is not reliable on
+            // real Darwin: observed on real Apple Silicon hardware, a hint
+            // near the top of the guest's address range (e.g. the initial
+            // stack, hinted at `TASK_ADDR_MAX - 8 MiB`) is silently placed by
+            // the kernel at an unrelated, kernel-chosen address instead
+            // (consistently `TASK_ADDR_MAX`-relative but off by several
+            // MiB) -- routinely landing the mapping *above* `TASK_ADDR_MAX`,
+            // an invariant every other part of this platform and the shim
+            // above it assumes holds. This is the confirmed mechanism behind
+            // `macos-concurrent-guest-entry-sigsegv`'s intermittent real
+            // guest `SIGSEGV`s (worse under concurrent host memory pressure,
+            // which shifts exactly which address Darwin's own chooser picks)
+            // -- the crash lands in a dynamic linker's own self-relocation
+            // bootstrap, exactly the code most sensitive to its own placement
+            // being wrong.
+            //
+            // Every caller in this tree reaches `Hint` only after
+            // `Vmem::get_unmmaped_area` has already searched for and vetted
+            // `suggested_range` against this process's own address-space
+            // bookkeeping (see `litebox::mm::linux::Vmem::create_mapping`,
+            // whose non-fixed path always resolves a concrete candidate
+            // *before* calling down here), so when the address Darwin
+            // actually chose disagrees with that already-vetted candidate,
+            // retrying with an exact reservation is not a reinterpretation of
+            // `Hint` -- it is honoring what the caller already committed to.
+            // This retry is intentionally the exception rather than the
+            // default: attempting it unconditionally regressed the common
+            // case instead of only fixing the broken one -- observed on the
+            // same hardware, `mach_vm_allocate(VM_FLAGS_FIXED)` refuses
+            // exactly `TASK_ADDR_MIN` (the address immediately above
+            // `__PAGEZERO`, where the main executable's own low-address image
+            // is conventionally placed) with `KERN_INVALID_ADDRESS`, and an
+            // *attempted-but-refused* fixed reservation there measurably
+            // perturbs Darwin's own address-hint state for the *following*
+            // hint-based `mmap` (real, reproduced on this hardware: the very
+            // next allocation then lands *inside* an already-live mapping
+            // instead of a free gap next to it, something no other observed
+            // sequence produced) -- so the exact-reservation path below only
+            // ever runs when the bare attempt already provably failed, never
+            // speculatively ahead of it.
+            if fixed_address_behavior == FixedAddressBehavior::Hint {
+                let start = ptr as usize;
+                let end = start + suggested_range.len();
+                if start < GUEST_ADDR_MIN || end > GUEST_ADDR_MAX {
+                    // SAFETY: `ptr` is the mapping just created above, still
+                    // solely owned by this function.
+                    unsafe { libc::munmap(ptr, suggested_range.len()) };
+                    reserve_fixed(&suggested_range).map_err(|e| match e {
+                        ReservationError::AddressInUse => AllocationError::AddressInUse,
+                        ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+                    })?;
+                    // SAFETY: `reserve_fixed` just confirmed `suggested_range`
+                    // is free, so `MAP_FIXED` only replaces that reservation.
+                    let fixed_ptr = unsafe {
+                        libc::mmap(
+                            suggested_range.start as *mut libc::c_void,
+                            suggested_range.len(),
+                            prot_flags(initial_permissions),
+                            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                            -1,
+                            0,
+                        )
+                    };
+                    if fixed_ptr == libc::MAP_FAILED {
+                        release_reservation(&suggested_range);
+                        return Err(match std::io::Error::last_os_error().raw_os_error() {
+                            Some(libc::EINVAL) => AllocationError::Unaligned,
+                            _ => AllocationError::OutOfMemory,
+                        });
+                    }
+                    fixed_ptr
+                } else {
+                    ptr
+                }
+            } else {
+                ptr
+            }
         };
 
         if populate_pages_immediately {
@@ -722,15 +831,57 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 offset,
             )
         };
-        // SAFETY: `fd` is open and not used past this point.
-        unsafe { libc::close(fd) };
-
         if ptr == libc::MAP_FAILED {
+            // SAFETY: `fd` is open and not used past this point.
+            unsafe { libc::close(fd) };
             if reserved {
                 release_reservation(&mapped_range);
             }
             return Err(CowAllocationError::InternalFailure);
         }
+
+        // See the matching comment in `MacOsUserland::allocate_pages`'s
+        // non-JIT branch for why a `Hint` result that landed outside the
+        // guest's range gets one corrective retry at the exact candidate,
+        // applied only when the bare attempt already provably produced an
+        // out-of-range address (not unconditionally, and not speculatively
+        // ahead of it).
+        if fixed_address_behavior == FixedAddressBehavior::Hint {
+            let start = ptr as usize;
+            let end = start + source_data.len();
+            if start < GUEST_ADDR_MIN || end > GUEST_ADDR_MAX {
+                // SAFETY: `ptr` is the mapping just created above, still
+                // solely owned by this function.
+                unsafe { libc::munmap(ptr, source_data.len()) };
+                if reserve_fixed(&mapped_range).is_err() {
+                    // SAFETY: `fd` is open and not used past this point.
+                    unsafe { libc::close(fd) };
+                    return Err(CowAllocationError::InternalFailure);
+                }
+                // SAFETY: `reserve_fixed` just confirmed `mapped_range` is
+                // free, `fd` is still the same read-only file opened above,
+                // and `MAP_FIXED` only replaces that fresh reservation.
+                let fixed_ptr = unsafe {
+                    libc::mmap(
+                        suggested_start as *mut libc::c_void,
+                        source_data.len(),
+                        prot_flags(permissions),
+                        libc::MAP_PRIVATE | libc::MAP_FIXED,
+                        fd,
+                        offset,
+                    )
+                };
+                // SAFETY: `fd` is open and not used past this point.
+                unsafe { libc::close(fd) };
+                if fixed_ptr == libc::MAP_FAILED {
+                    release_reservation(&mapped_range);
+                    return Err(CowAllocationError::InternalFailure);
+                }
+                return Ok(UserMutPtr::from_ptr(fixed_ptr.cast::<u8>()));
+            }
+        }
+        // SAFETY: `fd` is open and not used past this point.
+        unsafe { libc::close(fd) };
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 }

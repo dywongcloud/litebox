@@ -955,7 +955,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .rev()
             .find(|(r, _)| r.start <= high_limit)
             .map_or(low_limit, |(r, _)| r.end);
-        if last_end <= high_limit {
+        // `last_end <= high_limit` alone is not sufficient: it only rules out
+        // a tracked range that starts at or below `high_limit` extending past
+        // it, not a tracked range that starts *above* `high_limit` (which the
+        // `find` above deliberately skips, per this function's own doc
+        // comment, so that a host mapping entirely above `TASK_ADDR_MAX`
+        // doesn't shadow this fast path). That skip is only sound when
+        // nothing tracked actually falls inside `[high_limit, TASK_ADDR_MAX)`
+        // itself -- true for a host mapping genuinely entirely above the
+        // guest's ceiling, but not for a *guest* mapping that (on a platform
+        // whose `allocate_pages` cannot always place a `Hint` at the exact
+        // address requested) ended up landing inside this exact window
+        // despite `Vmem` believing the window was free when it computed
+        // `high_limit` for it. `overlaps` re-derives the true answer directly
+        // from the candidate range instead of trusting the `r.start <=
+        // high_limit` proxy.
+        if last_end <= high_limit && !self.vmas.overlaps(&(high_limit..Platform::TASK_ADDR_MAX)) {
             return Some(high_limit);
         }
 
