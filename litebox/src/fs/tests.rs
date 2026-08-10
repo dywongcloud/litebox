@@ -2274,4 +2274,66 @@ mod layered_stdio {
             "File should not exist"
         );
     }
+
+    // Regression test: under `LowerLayerWritableFiles` (used by every real Linux guest's
+    // rootfs, e.g. `litebox_shim_linux`), `chmod`/`chown`/`utimensat` on a file that exists
+    // only in the lower layer (i.e. any unmodified file straight from the OCI image) used to
+    // unconditionally call `migrate_file_up`, which panics under this semantics -- crashing
+    // the whole guest. Reproduced live on real hardware via `busybox chmod` on a stock Alpine
+    // image file. These metadata calls must instead apply directly to the lower layer, exactly
+    // like `write`/`truncate` already do.
+    #[test]
+    fn layered_chmod_chown_utimensat_on_lower_only_file_does_not_panic() {
+        // Each op gets its own lower-only file so chmod/chown changing the caller's effective
+        // permissions on one file can't spuriously break a later assertion on another.
+        fn build_fs_with_lower_only_file(
+            path: &str,
+        ) -> layered::FileSystem<MockPlatform, in_mem::FileSystem<MockPlatform>, in_mem::FileSystem<MockPlatform>>
+        {
+            let litebox = LiteBox::new(MockPlatform::new());
+            let lower = {
+                let mut lower = in_mem::FileSystem::new(&litebox);
+                lower.with_root_privileges(|fs| {
+                    fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+                });
+                // Populate the lower layer directly, exactly as an OCI image's rootfs is
+                // already fully populated before the layered FS (and thus the guest) ever
+                // touches it.
+                let fd = lower
+                    .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RUSR | Mode::WUSR)
+                    .expect("Failed to create lower-layer file");
+                lower.close(&fd).expect("Failed to close lower-layer file");
+                lower
+            };
+            let upper = {
+                let mut upper = in_mem::FileSystem::new(&litebox);
+                upper.with_root_privileges(|fs| {
+                    fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+                });
+                upper
+            };
+            layered::FileSystem::new(&litebox, upper, lower, LayeringSemantics::LowerLayerWritableFiles)
+        }
+
+        let fs = build_fs_with_lower_only_file("/motd");
+        fs.chmod("/motd", Mode::RUSR)
+            .expect("chmod on a lower-only file must not panic under LowerLayerWritableFiles");
+        assert_eq!(
+            fs.file_status("/motd").unwrap().mode,
+            Mode::RUSR,
+            "chmod must actually take effect"
+        );
+
+        let fs = build_fs_with_lower_only_file("/motd");
+        fs.chown("/motd", Some(42), Some(43))
+            .expect("chown on a lower-only file must not panic under LowerLayerWritableFiles");
+        let status = fs.file_status("/motd").unwrap();
+        assert_eq!(status.owner.user, 42);
+        assert_eq!(status.owner.group, 43);
+
+        let fs = build_fs_with_lower_only_file("/motd");
+        fs.utimensat("/motd", None, None).expect(
+            "utimensat on a lower-only file must not panic under LowerLayerWritableFiles",
+        );
+    }
 }

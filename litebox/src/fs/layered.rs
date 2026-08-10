@@ -183,22 +183,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// makes the upper file empty (similar to a truncate). Generally speaking, you want to use
     /// `true` for `copy_data`.
     fn migrate_file_up(&self, path: &str, copy_data: bool) -> Result<(), MigrationError> {
-        match self.layering_semantics {
-            LayeringSemantics::LowerLayerReadOnly => {
-                // fallthrough
-            }
-            LayeringSemantics::LowerLayerWritableFiles => {
-                // If this is ever hit, then that specific layered function calling this
-                // `migrate_file_up` function needs to be looked at to make sure that it is
-                // implemented correctly and update its semantics if necessary. The
-                // `migrate_file_up` functionality was implemented when there was only one set of
-                // semantics for layered file systems (namely `LowerLayerReadOnly`), thus the file
-                // system may not correctly account for other situations just yet (specifically,
-                // some situations might attempt to migrate files when they shouldn't). This
-                // particular panic is simply to catch such cases.
-                unreachable!()
-            }
-        }
+        // This runs under both semantics: under `LowerLayerReadOnly` it is the only way to
+        // make a lower-only file writable; under `LowerLayerWritableFiles` it is the fallback
+        // for when `self.lower` is itself a composite (e.g. a nested `layered::FileSystem`)
+        // rather than a flat, directly-writable backend, so a caller's attempt to write
+        // straight through to `self.lower` cannot succeed. Either way, this function only ever
+        // reads from `self.lower` and writes to `self.upper`, so it is correct regardless of
+        // how deeply `self.lower` is itself composed.
 
         // We first open the file up at the lower level for reading
         let lower_fd = match self.lower.open(path, OFlags::RDONLY, Mode::empty()) {
@@ -231,7 +222,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         // First, we make sure we've set up the ancestor directories.
                         match self.mkdir_migrating_ancestor_dirs(path) {
                             Ok(()) => {}
-                            Err(e) => unimplemented!("{e} when setting up ancestor dirs"),
+                            Err(MkdirError::ReadOnlyFileSystem | MkdirError::NoWritePerms) => {
+                                // The upper layer cannot hold this file at all (e.g. it is a
+                                // virtual filesystem like a `/dev`+`/proc` resolver, not a
+                                // general-purpose writable backend). Report this cleanly so the
+                                // caller can decide what to do, instead of panicking.
+                                return Err(MigrationError::UpperCannotHoldFile);
+                            }
+                            Err(MkdirError::Io) => return Err(MigrationError::Io),
+                            Err(MkdirError::PathError(path_error)) => return Err(path_error)?,
+                            Err(MkdirError::AlreadyExists) => unreachable!(
+                                "mkdir_migrating_ancestor_dirs already handles AlreadyExists internally"
+                            ),
                         }
                         // Now we can actually open the file.
                         upper_fd = Some(
@@ -428,6 +430,8 @@ pub enum MigrationError {
     NotAFile,
     #[error("no read access permissions")]
     NoReadPerms,
+    #[error("the upper layer cannot hold migrated files (e.g. it is a virtual filesystem)")]
+    UpperCannotHoldFile,
     #[error("I/O error")]
     Io,
     #[error(transparent)]
@@ -563,7 +567,18 @@ impl<
                     let dirname = path.rsplit_once('/').unwrap().0;
                     if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
                         // We must migrate the directories above, and then re-trigger the open
-                        self.mkdir_migrating_ancestor_dirs(&path).unwrap();
+                        match self.mkdir_migrating_ancestor_dirs(&path) {
+                            Ok(()) => {}
+                            Err(MkdirError::NoWritePerms) => return Err(OpenError::NoWritePerms),
+                            Err(MkdirError::ReadOnlyFileSystem) => {
+                                return Err(OpenError::ReadOnlyFileSystem);
+                            }
+                            Err(MkdirError::Io) => return Err(OpenError::Io),
+                            Err(MkdirError::PathError(path_error)) => return Err(path_error)?,
+                            Err(MkdirError::AlreadyExists) => unreachable!(
+                                "mkdir_migrating_ancestor_dirs already handles AlreadyExists internally"
+                            ),
+                        }
                         return self.open(path, flags, mode);
                     }
                     // Otherwise, handle-able by a lower level, fallthrough
@@ -828,7 +843,9 @@ impl<
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => return Err(WriteError::NotAFile),
-            Err(MigrationError::Io) => return Err(WriteError::Io),
+            Err(MigrationError::UpperCannotHoldFile | MigrationError::Io) => {
+                return Err(WriteError::Io);
+            }
             Err(MigrationError::PathError(_e)) => unreachable!(),
         }
         // As a sanity check, in debug mode, confirm that it is now an upper file
@@ -913,10 +930,21 @@ impl<
                                             descriptor.entry.path.clone()
                                         })
                                         .ok_or(TruncateError::ClosedFd)?;
-                                    self.migrate_file_up(&path, false)
-                                        .expect("this migration should always succeed");
-
-                                    Ok(())
+                                    match self.migrate_file_up(&path, false) {
+                                        Ok(()) => Ok(()),
+                                        Err(
+                                            MigrationError::UpperCannotHoldFile
+                                            | MigrationError::Io,
+                                        ) => Err(TruncateError::Io),
+                                        Err(
+                                            MigrationError::NoReadPerms
+                                            | MigrationError::NotAFile
+                                            | MigrationError::PathError(_),
+                                        ) => unreachable!(
+                                            "the fd was already open for reading at the lower \
+                                             level via an already-resolved path"
+                                        ),
+                                    }
                                 }
                                 Err(TruncateError::Io) => Err(TruncateError::Io),
                             }
@@ -969,6 +997,7 @@ impl<
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
+            Err(MigrationError::UpperCannotHoldFile) => return Err(ChmodError::ReadOnlyFileSystem),
             Err(MigrationError::Io) => return Err(ChmodError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
         }
@@ -1027,6 +1056,7 @@ impl<
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
+            Err(MigrationError::UpperCannotHoldFile) => return Err(ChownError::ReadOnlyFileSystem),
             Err(MigrationError::Io) => return Err(ChownError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
         }
@@ -1078,6 +1108,7 @@ impl<
             Ok(()) => {}
             Err(MigrationError::NoReadPerms) => unimplemented!(),
             Err(MigrationError::NotAFile) => unimplemented!(),
+            Err(MigrationError::UpperCannotHoldFile) => return Err(UtimeError::ReadOnlyFileSystem),
             Err(MigrationError::Io) => return Err(UtimeError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
         }
