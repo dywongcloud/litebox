@@ -164,4 +164,9 @@ const SKIP_DIRS: &[&str] = &[
     // against it. Its ~135 files are TypeScript, TSX and JavaScript, none of
     // which the header table above describes.
     "tencent-bd-dashboard/",
+    // A locally-patched copy of the `tar-no-std` crate (MIT-licensed, upstream
+    // https://github.com/phip1611/tar-no-std), vendored via `[patch.crates-io]`
+    // in the workspace `Cargo.toml` to fix a real end-of-archive parsing bug.
+    // Its own LICENSE file already names its actual copyright holder.
+    "vendor/",
 ];

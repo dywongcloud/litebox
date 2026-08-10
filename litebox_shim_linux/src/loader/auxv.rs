@@ -81,6 +81,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
         }
 
+        let (hwcap, hwcap2) = self.global.platform.get_hwcap();
+        // `AT_HWCAP`/`AT_HWCAP2` are each a 32-bit-wide Linux kernel ABI concept (the value a
+        // 32-bit ARM `getauxval` caller would also see); every bit `SystemInfoProvider::get_hwcap`
+        // implementations set is below bit 32, so this never actually truncates even on a
+        // 32-bit-`usize` target.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            aux.insert(AuxKey::AT_HWCAP, hwcap as usize);
+            aux.insert(AuxKey::AT_HWCAP2, hwcap2 as usize);
+        }
+
         aux
     }
 }

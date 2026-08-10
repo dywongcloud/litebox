@@ -1495,6 +1495,121 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
         // comment covers why this is safe despite there being no vDSO.
         Some(guest::sigreturn_trampoline as *const () as usize)
     }
+
+    fn get_hwcap(&self) -> (u64, u64) {
+        arm_hwcap()
+    }
+}
+
+/// Darwin `hw.optional.*` sysctl name, and the Linux `AT_HWCAP`/`AT_HWCAP2` bit it maps to.
+///
+/// `true` selects `AT_HWCAP2`; `false` selects `AT_HWCAP`. Only features that (a) the CPU
+/// genuinely implements and (b) do not change how guest code is expected to run (unlike, say,
+/// pointer authentication or branch-target identification, which could interact with this
+/// platform's own guest-entry control flow) are included -- see [`SystemInfoProvider::get_hwcap`]'s
+/// doc comment for why any *included* bit is always safe to report.
+const HWCAP_SYSCTLS: &[(&str, u8, bool)] = &[
+    ("hw.optional.floatingpoint", 0, false), // HWCAP_FP
+    ("hw.optional.neon", 1, false),          // HWCAP_ASIMD
+    ("hw.optional.arm.FEAT_AES", 3, false),  // HWCAP_AES
+    ("hw.optional.arm.FEAT_PMULL", 4, false), // HWCAP_PMULL
+    ("hw.optional.arm.FEAT_SHA1", 5, false), // HWCAP_SHA1
+    ("hw.optional.arm.FEAT_SHA256", 6, false), // HWCAP_SHA2
+    ("hw.optional.arm.FEAT_CRC32", 7, false), // HWCAP_CRC32
+    ("hw.optional.arm.FEAT_LSE", 8, false),  // HWCAP_ATOMICS
+    ("hw.optional.arm.FEAT_FP16", 9, false), // HWCAP_FPHP
+    ("hw.optional.neon_hpfp", 10, false),    // HWCAP_ASIMDHP
+    ("hw.optional.arm.FEAT_RDM", 12, false), // HWCAP_ASIMDRDM
+    ("hw.optional.arm.FEAT_JSCVT", 13, false), // HWCAP_JSCVT
+    ("hw.optional.arm.FEAT_FCMA", 14, false), // HWCAP_FCMA
+    ("hw.optional.arm.FEAT_LRCPC", 15, false), // HWCAP_LRCPC
+    ("hw.optional.arm.FEAT_DPB", 16, false), // HWCAP_DCPOP
+    ("hw.optional.arm.FEAT_SHA3", 17, false), // HWCAP_SHA3
+    ("hw.optional.arm.FEAT_DotProd", 20, false), // HWCAP_ASIMDDP
+    ("hw.optional.arm.FEAT_SHA512", 21, false), // HWCAP_SHA512
+    ("hw.optional.arm.FEAT_FHM", 23, false), // HWCAP_ASIMDFHM
+    ("hw.optional.arm.FEAT_DIT", 24, false), // HWCAP_DIT
+    ("hw.optional.arm.FEAT_LSE2", 25, false), // HWCAP_USCAT
+    ("hw.optional.arm.FEAT_LRCPC2", 26, false), // HWCAP_ILRCPC
+    ("hw.optional.arm.FEAT_FlagM", 27, false), // HWCAP_FLAGM
+    ("hw.optional.arm.FEAT_SSBS", 28, false), // HWCAP_SSBS
+    ("hw.optional.arm.FEAT_SB", 29, false),  // HWCAP_SB
+    ("hw.optional.arm.FEAT_DPB2", 0, true),  // HWCAP2_DCPODP
+    ("hw.optional.arm.FEAT_FlagM2", 7, true), // HWCAP2_FLAGM2
+    ("hw.optional.arm.FEAT_FRINTTS", 8, true), // HWCAP2_FRINT
+    ("hw.optional.arm.FEAT_I8MM", 13, true), // HWCAP2_I8MM
+    ("hw.optional.arm.FEAT_BF16", 14, true), // HWCAP2_BF16
+    ("hw.optional.arm.FEAT_ECV", 19, true),  // HWCAP2_ECV
+    ("hw.optional.arm.FEAT_AFP", 20, true),  // HWCAP2_AFP
+    ("hw.optional.arm.FEAT_RPRES", 21, true), // HWCAP2_RPRES
+];
+
+/// Queries this host's real ARM64 feature set via Darwin's `hw.optional.*` sysctls and
+/// translates it into the `(AT_HWCAP, AT_HWCAP2)` bitmasks a real Linux kernel would report
+/// for the same CPU. Missing/unreadable sysctls are treated as unsupported (bit left clear),
+/// matching a real kernel's own behavior for a feature it does not detect.
+fn arm_hwcap() -> (u64, u64) {
+    let mut hwcap: u64 = 0;
+    let mut hwcap2: u64 = 0;
+    for &(name, bit, is_hwcap2) in HWCAP_SYSCTLS {
+        if sysctl_bool(name) {
+            if is_hwcap2 {
+                hwcap2 |= 1 << bit;
+            } else {
+                hwcap |= 1 << bit;
+            }
+        }
+    }
+    (hwcap, hwcap2)
+}
+
+/// Reads a Darwin `hw.optional.*`-style boolean sysctl (a 32-bit int, nonzero meaning present),
+/// returning `false` if the sysctl does not exist on this host or the read otherwise fails.
+fn sysctl_bool(name: &str) -> bool {
+    // SAFETY: `c_name` is a valid, NUL-terminated C string for the duration of the call, and
+    // `value`/`len` are valid, uniquely-owned out-parameters matching what `sysctlbyname`
+    // expects for reading a fixed-size (4-byte) integer sysctl.
+    unsafe {
+        let Ok(c_name) = std::ffi::CString::new(name) else {
+            return false;
+        };
+        let mut value: libc::c_int = 0;
+        let mut len = core::mem::size_of::<libc::c_int>();
+        let rc = libc::sysctlbyname(
+            c_name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        );
+        rc == 0 && value != 0
+    }
+}
+
+/// `sysctl_bool` on a name no Darwin host defines must fail closed (`false`), not panic or
+/// report a false positive -- this is exactly what a genuinely-unsupported CPU feature looks
+/// like to [`arm_hwcap`], and it must never be mistaken for "supported".
+#[cfg(test)]
+#[test]
+fn sysctl_bool_is_false_for_a_nonexistent_sysctl() {
+    assert!(!sysctl_bool("hw.optional.litebox_does_not_define_this_sysctl"));
+}
+
+/// Every real Apple Silicon Mac (the only hardware this platform targets) implements
+/// floating point and NEON/ASIMD -- if `arm_hwcap` cannot even detect those two baseline,
+/// universally-present features via the real `hw.optional.*` sysctls, its sysctl-to-HWCAP-bit
+/// wiring is broken, not just conservatively reporting an optional feature as absent.
+#[cfg(test)]
+#[test]
+fn arm_hwcap_reports_the_real_hosts_baseline_features() {
+    const HWCAP_FP: u64 = 1 << 0;
+    const HWCAP_ASIMD: u64 = 1 << 1;
+    let (hwcap, _hwcap2) = arm_hwcap();
+    assert_eq!(
+        hwcap & (HWCAP_FP | HWCAP_ASIMD),
+        HWCAP_FP | HWCAP_ASIMD,
+        "every real Apple Silicon Mac has both FP and ASIMD"
+    );
 }
 
 // ---------------------------------------------------------------------------

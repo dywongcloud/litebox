@@ -74,6 +74,15 @@ default-members = [
 # We exclude `litebox_runner_lvbs` from `default-members` because it requires
 # a custom target and `-Z build-std`, which requires a nightly toolchain.
 
+# tar-no-std 0.3.5's ArchiveHeaderIterator parses a fully-zeroed block's NUL typeflag byte as
+# AREGTYPE (regular file) before its caller ever gets to run its own is_zero_block() check,
+# then fails to parse that block's (also all-zero) size field and aborts iteration -- silently
+# truncating every real file that follows an all-zero block anywhere in the archive, including
+# the standard double-zero-block end-of-archive marker every well-formed tar ends with. Patched
+# locally in vendor/tar-no-std-0.3.5 to check is_zero_block() first.
+[patch.crates-io]
+tar-no-std = { path = "vendor/tar-no-std-0.3.5" }
+
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy
 # but not _too_ ridiculous.

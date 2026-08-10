@@ -619,6 +619,20 @@ pub trait SystemInfoProvider {
     fn get_sigreturn_trampoline_address(&self) -> Option<usize> {
         None
     }
+
+    /// The `(AT_HWCAP, AT_HWCAP2)` values a real Linux kernel on this host's CPU would report.
+    ///
+    /// A guest's instructions execute directly on the host CPU (this is a syscall-translation
+    /// layer, not an instruction-level emulator), so any bit reported here is safe exactly when
+    /// the host CPU genuinely implements that feature -- there is no emulation gap to bridge.
+    /// Returns `(0, 0)` by default, matching every platform's current behavior (no host queries
+    /// its own CPU features yet): userspace software reading `getauxval(AT_HWCAP)` sees no
+    /// optional features and falls back to a baseline code path, which is always correct, only
+    /// potentially slower than reporting the host's real capabilities. A platform overrides this
+    /// to report accurately once it has a way to query its own CPU's feature set.
+    fn get_hwcap(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// A provider for thread-local storage.
