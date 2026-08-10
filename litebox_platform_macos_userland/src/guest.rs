@@ -781,6 +781,21 @@ pub(crate) unsafe fn prepare_exception_delivery(
     // `NO_SYSCALL` convention `litebox_shim_linux` relies on elsewhere.
     live.syscallno = -1;
 
+    // Logs the full guest register state whenever a hardware fault is
+    // delivered to the guest. Gated behind trace level
+    // (`LITEBOX_LOG=litebox_platform_macos_userland=trace`), so it is inert by
+    // default; kept as a permanent debug aid (originally added for the
+    // macos-concurrent-guest-entry-sigsegv investigation, see
+    // `docs/roadmap.md`) since a guest fault's registers are otherwise not
+    // observable without an attached debugger, and the previous investigation
+    // passes on that bug were slowed down by not having this.
+    litebox_util_log::trace!(
+        regs:? = &live.regs, sp:? = live.sp, pc:? = live.pc,
+        fault_address:? = info.fault_address, esr:? = info.esr,
+        exception:? = info.exception;
+        "guest fault: captured register state"
+    );
+
     // SAFETY: single-guest-thread invariant, as for HOST_SAVE/GUEST_FP/LIVE_PTREGS.
     let fp = unsafe { &mut *GUEST_FP.0.get() };
     fp.v = neon_state.v;

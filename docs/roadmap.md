@@ -474,37 +474,101 @@ Known gaps a real guest hits now:
      Darwin's own address-hint state for the *next* `mmap` call in a way that
      made it land inside an already-live mapping instead of a free gap.
 
-  2. **Found, precisely characterized, and deliberately *not* fixed here --
-     root cause still unconfirmed.** Even with the placement bug above fixed
-     (stack and interpreter verified in-bounds and at deterministic
-     addresses), guest processes still crash under concurrent invocation, at
-     a rate not meaningfully lower than before the fix (comparable
-     30-50%-of-12-concurrent-runs range on this hardware). Every occurrence
-     observed had an identical, deterministic signature: `fault_address =
-     0` (a `NULL` dereference), `ESR_EL1` decoding to a stage-1 translation
-     fault (`DFSC = 0b000110`), and a `PC` exactly 832 bytes into
-     `ld-musl-aarch64.so.1`'s entry point (`_dlstart+0x340`, disassembled
-     from the packaged Alpine image as `ldrb w4, [x3, x1]` -- the byte-name
-     comparison loop of a symbol-hash-table lookup, part of musl's static-PIE
-     self-bootstrap, *after* the address-independent (`ADRP`-relative)
-     self-relocation loop earlier in `_dlstart` has already run). The crash
-     site itself never varies; only whether it happens does, and -- like the
-     placement bug -- it is concurrency/scheduling-sensitive (0 failures in
-     30 sequential runs, roughly 40-50% of 12-16 concurrent runs, on
-     identical inputs). This is consistent with, but not confirmed to be,
-     the already-tracked `macos-guest-tp-runtime-offset` limitation (item 1
-     under "Remaining work" in `docs/macos.md`): `ld-musl`'s bootstrap is a
-     plausible place to read `TPIDR_EL0` early (stack-protector setup), and
-     that read is documented to land in the wrong pthread TSD slot on this
-     platform today, which would read whatever unrelated state libSystem
-     happens to keep in slot 256 rather than the guest's own value --
-     content that could plausibly vary with host process/thread state and
-     therefore with concurrency, matching what was observed. This was not
-     pursued further under this investigation's scope (a real fix for
-     `macos-guest-tp-runtime-offset` needs load-time offset indirection, a
-     substantially larger change spanning the rewriter and the loader, not a
-     small platform-level correction) -- confirming or ruling this out, and
-     fixing it if confirmed, is follow-up work.
+  2. **Found, precisely characterized, `TPIDR_EL0` hypothesis definitively
+     refuted by a third investigation pass -- exact host-level trigger still
+     unconfirmed, and deliberately not fixed here.** Even with the placement
+     bug above fixed (stack and interpreter verified in-bounds and at
+     deterministic addresses), guest processes still crash under concurrent
+     invocation, at a rate not meaningfully lower than before the fix
+     (30-50%-of-16-20-concurrent-runs range on this hardware, reproduced
+     fresh: 8/16, 10/16, 10/20 across independent campaigns). Every
+     occurrence observed had an identical, deterministic signature:
+     `fault_address = 0` (a `NULL` dereference), `ESR_EL1` decoding to a
+     stage-1 translation fault (`DFSC = 0b000110`), and a `PC` exactly 832
+     bytes into `ld-musl-aarch64.so.1`'s entry point (`_dlstart+0x340`,
+     disassembled from the packaged Alpine image as `ldrb w4, [x3, x1]`).
+
+     **The previous hypothesis linking this to `macos-guest-tp-runtime-offset`
+     (a `TPIDR_EL0` read landing in the wrong pthread TSD slot) is now
+     refuted, not merely unconfirmed.** Temporary trace-level instrumentation
+     added to `litebox_platform_macos_userland::guest::prepare_exception_delivery`
+     captured the real hardware register state at the fault
+     (`x1=0, x3=0, x4=<dso->syms>, ...`, identical across every capture), and
+     a full `objdump -d` of the actual packaged `ld-musl-aarch64.so.1`
+     confirms: (a) the crash site is not stack-protector or TLS setup as
+     previously guessed, but musl's dynamic-symbol relocation/hash-lookup
+     machinery -- `do_relocs` (resolving a non-`RELATIVE` relocation)
+     calling `find_sym`/`find_sym2`, which calls `gnu_hash_lookup` (or
+     `sysv_lookup`), whose byte-by-byte symbol-name-comparison loop is the
+     faulting `ldrb w4, [x3, x1]`; `x1` is simply the loop's own index
+     (`mov x1, #0` two instructions earlier -- expected and correct), and
+     `x3` is `dso->strings + sym->st_name`, i.e. the pointer to the symbol
+     name musl is looking up, computed entirely from ELF dynamic-linking
+     metadata; and (b) **`ld-musl-aarch64.so.1`'s entire ~801 KB image contains
+     exactly 33 `MRS`/`MSR` instructions, and every one of them targets
+     `FPCR`, `FPSR`, or `DCZID_EL0` -- none targets `TPIDR_EL0` or
+     `TPIDRRO_EL0`.** The crash's whole call path (`do_relocs` →
+     `find_sym`/`find_sym2` → `gnu_hash_lookup`/`sysv_lookup`) never reads the
+     thread pointer at all, so a wrong TSD slot cannot be the cause here,
+     confirmed rather than merely argued from the disassembly of the actual
+     faulting binary. This also rules out two other concrete candidate
+     mechanisms checked directly against the source: the main executable's
+     `AT_PHDR`/`base_addr` (`litebox_common_linux::loader::ElfParsedFile::load`,
+     `litebox_shim_linux::loader::elf::ElfFile::reserve`) is computed solely
+     from the real `sys_mmap` return value, never from the pre-flight
+     placement hint, so this is not a Bug-A-style "used the hint instead of
+     the actual address" bug; and the vDSO struct musl's loader would
+     populate from `AT_SYSINFO_EHDR` is unreachable, since
+     `MacOsUserland::get_vdso_address` unconditionally returns `None` on this
+     platform (`litebox_platform_macos_userland/src/lib.rs`), so
+     `AT_SYSINFO_EHDR` is never present in the guest's auxv.
+
+     What live-memory inspection (reading the guest's own `struct dso` fields
+     and stack directly out of host memory -- valid because this platform
+     runs the guest in-process) additionally showed: in the large majority of
+     captures, the `dso` being relocated is `&ldso` itself (`do_relocs`'s own
+     `dso` parameter matches the same address the hash lookup searches),
+     consistent with `ld-musl`'s very first `do_relocs(&ldso, ...)` call in
+     `__dls2`, immediately after its own address-independent self-relocation
+     -- i.e. this is `ld-musl` resolving its *own* remaining (non-`RELATIVE`)
+     relocations against itself, only a few hundred instructions into guest
+     execution. Reading `ldso.strings` directly out of guest memory
+     *after* the fault always shows the correct value (`base + 0xf810`,
+     matching the real `ld-musl-aarch64.so.1` `DT_STRTAB`), including in
+     `do_relocs`'s own stack-spilled cache of that same field -- so the
+     struct is not durably corrupted; the wrong (`NULL`) value was only
+     visible to the guest at the exact instant it was used. That is
+     consistent with a transient, host/Darwin-level write-visibility gap on
+     a freshly-populated page of the guest's own data segment under
+     concurrent system load (structurally the same category of "Darwin's
+     memory subsystem does not behave the same under concurrent load" as
+     Bug A, but a data-visibility anomaly rather than an address-placement
+     one) rather than any logic bug in musl or in how LiteBox computes
+     addresses -- but the exact host-level trigger for that gap was not
+     pinned down further (would need a live debugger attached across a real
+     concurrent crash, which this pass did not have set up); a minority of
+     captures instead showed `do_relocs`'s `dso` parameter pointing at a
+     *different* static `struct dso` a few hundred bytes away within the same
+     `ld-musl` image (plausibly `__dls3`'s local-static `app`, i.e. the same
+     failure recurring later, against the main executable's own relocations)
+     without changing the diagnosis above.
+
+     This was reproduced fresh on real hardware this pass (Apple M3 Pro) with
+     the exact `litebox_packager --oci-image
+     public.ecr.aws/docker/library/alpine:latest` / `busybox pwd` pipeline
+     before touching anything, confirming the same signature the previous
+     pass found. The diagnostic instrumentation used to capture the register
+     state was trimmed to a small, permanent, trace-gated addition (logs the
+     full guest `PtRegs` plus `ESR`/`FAR_EL1`/exception class whenever a
+     hardware fault is delivered to the guest, at
+     `litebox_platform_macos_userland::guest::prepare_exception_delivery`,
+     visible via `LITEBOX_LOG=litebox_platform_macos_userland=trace`); the
+     more speculative, `ld-musl`-struct-specific memory-dump diagnostics used
+     during the investigation were removed rather than kept, since they
+     hardcoded musl's internal `struct dso` layout and would not generalize.
+     Confirming the exact host-level write-visibility mechanism, and fixing
+     it if confirmed, remains follow-up work -- separate from, and no longer
+     entangled with, `macos-guest-tp-runtime-offset`.
 
   Reproduced and verified with the real `litebox_packager --oci-image
   public.ecr.aws/docker/library/alpine:latest` / `busybox pwd` pipeline
