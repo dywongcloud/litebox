@@ -209,17 +209,29 @@ shows the guest issuing `io_setup`, which the shim answers.
   an arm64 Mach-O process reserves the first 4 GiB as `__PAGEZERO`, so that fixed
   mapping is refused with `EPERM`. The OCI images are PIE and load fine.
 
-* **`x18` is what stops an off-the-shelf distro binary, and it is a host
-  property rather than a defect.** After a few syscalls the guest's syscall
-  numbers turn to garbage (`3349`, then `0xFFFF_FFFF_FFFD_F800`) and it dies with
-  `SIGSEGV`. XNU zeroes `x18` on every return to EL0 for an ordinary process, and
-  Alpine's musl `busybox` references `x18`/`w18` at 91 sites, so the guest loses a
-  live register at every host round trip. `litebox_syscall_rewriter`'s `Host`
-  documentation already states this and that such uses "cannot be found reliably
-  without full disassembly … so they are not scanned or gated"; a guest has to be
-  built with `-ffixed-x18`. What is missing is not a fix but a *diagnosis*: the
-  packager could scan for `x18` and refuse, or warn, instead of producing an
-  image that fails this obscurely.
+Real Alpine programs run. `busybox uname -a` prints
+`LiteBox litebox 5.11.0 5.11.0 aarch64 Linux`, `busybox cat /etc/alpine-release`
+reads `3.24.1` out of the tar filesystem, `busybox pwd` and `busybox id` are
+correct, and exit statuses propagate (a guest calling `exit(42)` gives the runner
+exit 42).
+
+**`x18` was not the blocker, contrary to what an earlier revision of this file
+said.** The garbage syscall numbers that made a distro binary die with `SIGSEGV`
+came from `syscall_callback` never filling `pt_regs::syscallno`: the shim reads
+the AArch64 syscall number from that field, not from `regs[8]`, so every guest
+syscall dispatched as whatever the guest stack happened to hold -- usually 0,
+which is `io_setup`. Filling it, and `orig_x0` beside it, fixed both the
+hand-written guest and Alpine. The 91 `x18`/`w18` references counted in `busybox`
+are real, but they were not what broke it; XNU's `x18` zeroing remains a
+documented restriction that has simply not bitten yet.
+
+Known gaps a real guest hits now:
+
+* **`ls` fails on every entry with `EINVAL`.** The shim rejects
+  `AT_SYMLINK_NOFOLLOW` on `fstatat` (`unsupported flags:
+  AtFlags(AT_SYMLINK_NOFOLLOW)`), which is how `ls` stats each name. Not
+  macOS-specific.
+* `setuid`/`setgid` are unsupported, so `busybox id` cannot report groups.
 
 Three things had to be fixed to get that far, each of which would have stopped
 any guest:

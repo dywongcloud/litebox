@@ -79,6 +79,8 @@ const _: () = assert!(core::mem::offset_of!(PtRegs, regs) == 0);
 const _: () = assert!(core::mem::offset_of!(PtRegs, sp) == 248);
 const _: () = assert!(core::mem::offset_of!(PtRegs, pc) == 256);
 const _: () = assert!(core::mem::offset_of!(PtRegs, pstate) == 264);
+const _: () = assert!(core::mem::offset_of!(PtRegs, orig_x0) == 272);
+const _: () = assert!(core::mem::offset_of!(PtRegs, syscallno) == 280);
 const _: () = assert!(core::mem::size_of::<PtRegs>() == 288);
 
 /// A `Sync` cell for state that only the single active guest thread touches,
@@ -303,6 +305,14 @@ pub(crate) unsafe extern "C" fn syscall_callback() {
         "str  x9, [sp, #248]",
         "mrs  x9, nzcv",
         "str  x9, [sp, #264]",       // pstate
+        // The shim reads the syscall number from `syscallno`, not from `regs[8]`
+        // -- that is where a Linux kernel entry path records it, and the shim is
+        // written against `pt_regs`. Likewise `orig_x0` keeps the first argument,
+        // which the return value overwrites in `regs[0]`. Neither is a copy of a
+        // register the guest can see, so both have to be filled here or the
+        // dispatcher reads whatever the guest stack happened to hold.
+        "str  x0, [sp, #272]",       // orig_x0
+        "str  w8, [sp, #280]",       // syscallno (32-bit field)
         // Capture the guest's whole vector file and FP control/status before any
         // host code runs, since the host is free to use every vector register.
         "adrp x9, {guest_fp}@PAGE",
