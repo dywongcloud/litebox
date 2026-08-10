@@ -1072,14 +1072,33 @@ impl litebox::platform::DerivedKeyProvider for MacOsUserland {
 // Signals
 // ---------------------------------------------------------------------------
 
-/// Asynchronous host signals observed since the guest last drained them.
-///
-/// Bit `n - 1` corresponds to signal number `n`, matching `SigSet`'s encoding.
-static PENDING_SIGNALS: AtomicU64 = AtomicU64::new(0);
+// Asynchronous host signals observed since the guest thread that owns this
+// pointer last drained them. Bit `n - 1` corresponds to signal number `n`,
+// matching `SigSet`'s encoding.
+//
+// The bitmap itself lives in that thread's `ThreadHandleInner`, not here --
+// `timer_thread` fires on its own dedicated thread and has to mark the
+// *target* thread's bit, and a bare `thread_local!` cannot be reached from
+// another thread. This cell just caches, on the owning thread, a pointer to
+// its own copy of that shared bitmap so `async_signal_handler` and
+// `take_pending_signals` can reach it without going through
+// `CURRENT_THREAD`'s `RefCell`, which is not safe to borrow from a signal
+// handler that might land mid-borrow. Null while the thread has no
+// `ThreadHandle::run_with_handle` registration.
+thread_local! {
+    static PENDING_SIGNALS: core::cell::Cell<*const AtomicU64> =
+        const { core::cell::Cell::new(core::ptr::null()) };
+}
 
 unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
     if let Ok(bit) = u32::try_from(signum - 1) {
-        PENDING_SIGNALS.fetch_or(1u64 << bit, Ordering::Relaxed);
+        let pending = PENDING_SIGNALS.get();
+        if !pending.is_null() {
+            // SAFETY: non-null only while `run_with_handle` has this thread
+            // registered, and cleared before that registration is torn down,
+            // so the `ThreadHandleInner` it points into is always live here.
+            unsafe { (*pending).fetch_or(1u64 << bit, Ordering::Relaxed) };
+        }
     }
 }
 
@@ -1100,11 +1119,36 @@ fn install_async_signal_handlers() {
     );
 }
 
+/// Blocks the two signals [`async_signal_handler`] tracks, for a thread that
+/// will never hold a [`ThreadHandle::run_with_handle`] registration -- such a
+/// thread has nowhere to record one, so a real `SIGINT`/`SIGALRM` the kernel
+/// happened to deliver here instead of to a guest thread would otherwise never
+/// reach any guest thread at all, with nothing to show for it. Mirrors
+/// `litebox_platform_linux_userland::block_guest_signals`, narrowed to the two
+/// real host signals this platform installs handlers for.
+fn block_guest_signals() {
+    // SAFETY: `set` is fully initialized by the `sigemptyset`/`sigaddset` calls
+    // before `pthread_sigmask` reads it; blocking a signal has no further
+    // precondition.
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGINT);
+        libc::sigaddset(&raw mut set, libc::SIGALRM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, core::ptr::null_mut());
+    }
+}
+
 impl litebox::platform::SignalProvider for MacOsUserland {
     type Signal = litebox_common_linux::signal::Signal;
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
-        let mut pending = PENDING_SIGNALS.swap(0, Ordering::Relaxed);
+        let pending_ptr = PENDING_SIGNALS.get();
+        if pending_ptr.is_null() {
+            return;
+        }
+        // SAFETY: see `async_signal_handler`.
+        let mut pending = unsafe { (*pending_ptr).swap(0, Ordering::Relaxed) };
         while pending != 0 {
             let bit = pending.trailing_zeros();
             pending &= !(1u64 << bit);
@@ -1201,6 +1245,7 @@ impl litebox::platform::TimerProvider for MacOsUserland {
 }
 
 fn timer_thread(state: &TimerState) {
+    block_guest_signals();
     let mut command = state.deadline.lock().unwrap();
     loop {
         match *command {
@@ -1217,7 +1262,7 @@ fn timer_thread(state: &TimerState) {
                     // why the wakeup must not be `SIGALRM`.
                     *command = TimerCommand::Disarmed;
                     let bit = (state.signal.as_i32() - 1).cast_unsigned();
-                    PENDING_SIGNALS.fetch_or(1u64 << bit, Ordering::Relaxed);
+                    state.target.record_pending_signal(bit);
                     state.target.interrupt();
                     continue;
                 };
@@ -1264,8 +1309,20 @@ unsafe impl Send for ThreadId {}
 // SAFETY: see the `Send` witness above.
 unsafe impl Sync for ThreadId {}
 
-/// A handle to a LiteBox-managed thread, used to interrupt it.
-pub struct ThreadHandle(Arc<Mutex<Option<ThreadId>>>);
+/// The state shared behind a [`ThreadHandle`].
+struct ThreadHandleInner {
+    id: Mutex<Option<ThreadId>>,
+    /// This thread's own pending-signals bitmap -- see [`PENDING_SIGNALS`] for
+    /// why it lives here, `Arc`-shared, rather than in a bare `thread_local!`.
+    /// Not gated by `id`: recording a bit into a since-exited thread's copy is
+    /// harmless (nothing will ever read it), unlike signalling a stale
+    /// `pthread_t`.
+    pending_signals: AtomicU64,
+}
+
+/// A handle to a LiteBox-managed thread, used to interrupt it and to record a
+/// pending signal on it from another thread (see [`ThreadHandle::record_pending_signal`]).
+pub struct ThreadHandle(Arc<ThreadHandleInner>);
 
 impl Clone for ThreadHandle {
     fn clone(&self) -> Self {
@@ -1283,9 +1340,13 @@ impl ThreadHandle {
     /// [`litebox::platform::ThreadProvider::current_thread`] works inside it.
     fn run_with_handle<R>(f: impl FnOnce() -> R) -> R {
         // SAFETY: `pthread_self` has no preconditions.
-        let handle = ThreadHandle(Arc::new(Mutex::new(Some(ThreadId(unsafe {
-            libc::pthread_self()
-        })))));
+        let handle = ThreadHandle(Arc::new(ThreadHandleInner {
+            id: Mutex::new(Some(ThreadId(unsafe { libc::pthread_self() }))),
+            pending_signals: AtomicU64::new(0),
+        }));
+        // Points into `handle`'s own heap allocation, not `handle` itself, so
+        // moving `handle` into `CURRENT_THREAD` below does not invalidate it.
+        PENDING_SIGNALS.set(&raw const handle.0.pending_signals);
         CURRENT_THREAD.with_borrow_mut(|current| {
             assert!(
                 current.is_none(),
@@ -1294,10 +1355,14 @@ impl ThreadHandle {
             *current = Some(handle);
         });
         let _guard = litebox::utils::defer(|| {
+            // Cleared before `CURRENT_THREAD`, and before the thread can exit,
+            // so `async_signal_handler` never dereferences it once the
+            // `ThreadHandleInner` it names may be on its way out.
+            PENDING_SIGNALS.set(core::ptr::null());
             let current = CURRENT_THREAD.take().expect("handle registered above");
             // Clearing before the thread exits is what makes signalling a stale
             // `pthread_t` impossible.
-            *current.0.lock().unwrap() = None;
+            *current.0.id.lock().unwrap() = None;
         });
         f()
     }
@@ -1311,11 +1376,75 @@ impl ThreadHandle {
     }
 
     fn interrupt(&self) {
-        if let Some(thread) = *self.0.lock().unwrap() {
+        if let Some(thread) = *self.0.id.lock().unwrap() {
             // SAFETY: the identifier is live for as long as this lock is held.
             unsafe { libc::pthread_kill(thread.0, INTERRUPT_SIGNAL) };
         }
     }
+
+    /// Records a pending host signal on this thread from anywhere --
+    /// in particular from [`timer_thread`], which fires on its own dedicated
+    /// thread and has to mark the thread it targets, not itself.
+    fn record_pending_signal(&self, bit: u32) {
+        self.0
+            .pending_signals
+            .fetch_or(1u64 << bit, Ordering::Relaxed);
+    }
+}
+
+/// Two threads' pending-signal bitmaps must stay disjoint -- the property that
+/// broke when this bitmap was a single process-wide `static`, which is what
+/// made the shared test-harness singleton race across concurrently-run tests.
+/// Each thread records a distinct signal via [`async_signal_handler`] (the
+/// same call a real signal delivery makes), a `Barrier` forces both writes to
+/// land before either reads back, and each must observe only its own bit.
+#[cfg(test)]
+#[test]
+fn pending_signals_are_disjoint_across_threads() {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let b1 = std::sync::Arc::clone(&barrier);
+    let t1 = std::thread::Builder::new()
+        .spawn(move || {
+            ThreadHandle::run_with_handle(|| {
+                // SAFETY: called from within `run_with_handle`, exactly as a
+                // real `SIGINT` delivered to this thread would invoke it.
+                unsafe { async_signal_handler(libc::SIGINT) };
+                b1.wait();
+                let ptr = PENDING_SIGNALS.get();
+                // SAFETY: still inside `run_with_handle` on the thread that
+                // owns this pointer.
+                let pending = unsafe { (*ptr).load(Ordering::Relaxed) };
+                let sigint_bit = 1u64 << u32::try_from(libc::SIGINT - 1).unwrap();
+                assert_eq!(
+                    pending, sigint_bit,
+                    "thread 1 must observe exactly its own SIGINT, not thread 2's SIGALRM"
+                );
+            });
+        })
+        .expect("failed to spawn thread 1");
+
+    let b2 = std::sync::Arc::clone(&barrier);
+    let t2 = std::thread::Builder::new()
+        .spawn(move || {
+            ThreadHandle::run_with_handle(|| {
+                // SAFETY: see thread 1.
+                unsafe { async_signal_handler(libc::SIGALRM) };
+                b2.wait();
+                let ptr = PENDING_SIGNALS.get();
+                // SAFETY: see thread 1.
+                let pending = unsafe { (*ptr).load(Ordering::Relaxed) };
+                let sigalrm_bit = 1u64 << u32::try_from(libc::SIGALRM - 1).unwrap();
+                assert_eq!(
+                    pending, sigalrm_bit,
+                    "thread 2 must observe exactly its own SIGALRM, not thread 1's SIGINT"
+                );
+            });
+        })
+        .expect("failed to spawn thread 2");
+
+    t1.join().expect("thread 1 panicked");
+    t2.join().expect("thread 2 panicked");
 }
 
 impl litebox::platform::ThreadProvider for MacOsUserland {

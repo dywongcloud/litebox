@@ -70,14 +70,16 @@ pub(crate) fn address_space_guard() -> std::sync::MutexGuard<'static, ()> {
 /// timers, and anything that ends up checking or draining pending signals.
 ///
 /// Each test builds its own task, but every task in this binary shares the one
-/// `TestPlatform`, and on `litebox_platform_macos_userland` that platform's
-/// pending-signal bitmap and real host signal handlers are process-wide by
-/// design -- correct for its actual one-host-process-per-guest deployment,
-/// where a single process-wide bitmap is exactly right for signals any thread
-/// of that one guest may handle. Two such tests running at once instead race
-/// to drain that one bitmap first, so whichever task's blocking wait checks it
-/// next steals or misattributes a signal that was never meant for it. Holding
-/// this for the duration of the test keeps each test's signal traffic its own.
+/// `TestPlatform`, and every `TestPlatform` installs the same real host signal
+/// handlers into this one process -- `SIGINT`/`SIGALRM` (and, on macOS, the
+/// timer-thread wakeup signal) land regardless of which test's task "owns"
+/// them. `litebox_platform_macos_userland`'s pending-signal bitmap is now
+/// per-thread rather than process-wide, so the specific race this guard was
+/// first added for (two tasks racing to drain one shared bitmap) no longer
+/// applies there; this mutex still serializes the coarser hazard of two tests'
+/// real host signals landing on whichever test happens to be blocked in a
+/// syscall at the time, which per-thread bitmap state does not by itself
+/// prevent.
 static ASYNC_SIGNAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take the async-signal lock for the rest of the current test. A poisoned
