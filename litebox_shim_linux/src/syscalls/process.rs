@@ -1281,6 +1281,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_getegid(&self) -> u32 {
         self.credentials.egid
     }
+
+    /// Handle syscall `getgroups`.
+    ///
+    /// A task here has a uid and a gid and no supplementary group list, so the
+    /// answer is always zero groups. That is a legitimate Linux state, not a
+    /// stub: a process whose supplementary set is empty gets exactly this reply,
+    /// and the alternative -- failing the call -- makes every caller that merely
+    /// wants to *ask* fail too. `busybox id` is one, and it reports "can't get
+    /// groups" rather than printing the uid and gid it did obtain.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` if `size` is negative, matching Linux. A positive `size` needs
+    /// no bounds check because nothing is written.
+    pub(crate) fn sys_getgroups(&self, size: i32, _list: UserPtrMut<u32>) -> Result<usize, Errno> {
+        if size < 0 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(0)
+    }
 }
 
 /// Number of CPUs
