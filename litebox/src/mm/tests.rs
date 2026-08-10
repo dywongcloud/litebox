@@ -308,3 +308,105 @@ fn test_vmm_mapping() {
         ]
     );
 }
+
+/// A backend whose `reserved_pages` includes a region entirely *above*
+/// `TASK_ADDR_MAX`, modeling a real host mapping that a platform's memory-map
+/// scan reports without clipping to the guest's own (deliberately
+/// conservative, on e.g. macOS) address ceiling -- see
+/// `litebox_platform_macos_userland::read_memory_maps`, which walks every
+/// `mach_vm_region` in the host process regardless of where it falls relative
+/// to `MacOsUserland::TASK_ADDR_MAX`.
+struct DummyVmemBackendWithHighReservedPage;
+
+impl crate::platform::RawPointerProvider for DummyVmemBackendWithHighReservedPage {
+    type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
+    type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
+}
+
+#[expect(unused_variables, reason = "dummy/mock backend")]
+impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackendWithHighReservedPage {
+    const TASK_ADDR_MIN: usize =
+        <DummyVmemBackend as crate::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN;
+    const TASK_ADDR_MAX: usize =
+        <DummyVmemBackend as crate::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX;
+
+    fn allocate_pages(
+        &self,
+        suggested_range: Range<usize>,
+        initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+        can_grow_down: bool,
+        populate_pages_immediately: bool,
+        fixed_address_behavior: crate::platform::page_mgmt::FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
+        Ok(TransparentMutPtr::from_usize(suggested_range.start))
+    }
+
+    unsafe fn deallocate_pages(
+        &self,
+        range: Range<usize>,
+    ) -> Result<(), crate::platform::page_mgmt::DeallocationError> {
+        Ok(())
+    }
+
+    unsafe fn remap_pages(
+        &self,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+        permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::RemapError> {
+        Ok(TransparentMutPtr::from_usize(new_range.start))
+    }
+
+    unsafe fn update_permissions(
+        &self,
+        range: Range<usize>,
+        new_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<(), crate::platform::page_mgmt::PermissionUpdateError> {
+        Ok(())
+    }
+
+    fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
+        // A host mapping entirely above `TASK_ADDR_MAX` -- e.g. the dyld
+        // shared cache or some other high host allocation that macOS's ASLR
+        // occasionally slides above litebox's conservative 2^46 ceiling even
+        // though the host's real address space extends further.
+        const HIGH_RANGE: Range<usize> = (<DummyVmemBackendWithHighReservedPage as crate::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX + PAGE_SIZE * 10)
+            ..(<DummyVmemBackendWithHighReservedPage as crate::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX + PAGE_SIZE * 20);
+        core::iter::once(&HIGH_RANGE)
+    }
+}
+
+/// Regression test for a top-down placement bug: when the *globally* highest
+/// tracked region sits above `TASK_ADDR_MAX` (always true for a `reserved_pages`
+/// entry the platform's memory-map scan picked up beyond the guest's own
+/// ceiling), `get_unmmaped_area`'s fast path used to key off that region's end
+/// unconditionally, see it exceed `high_limit`, and skip straight to the
+/// per-gap loop -- which never re-tries "the top of the eligible range" as a
+/// candidate, only the space immediately below each *tracked* region. With
+/// nothing else tracked below the ceiling, the loop then exhausts and the
+/// search fails outright, even though the entire guest range is free.
+#[test]
+fn test_top_down_search_ignores_reserved_page_above_ceiling() {
+    let mut vmm = Vmem::new(&DummyVmemBackendWithHighReservedPage);
+
+    let addr = unsafe {
+        vmm.create_mapping(
+            None,
+            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+            CreatePagesFlags::empty(),
+        )
+    }
+    .expect("the entire guest range below TASK_ADDR_MAX is free, so the top-down search should succeed rather than failing outright")
+    .as_usize();
+
+    assert_eq!(
+        addr,
+        <DummyVmemBackendWithHighReservedPage as crate::platform::PageManagementProvider<
+            PAGE_SIZE,
+        >>::TASK_ADDR_MAX
+            - PAGE_SIZE,
+        "the entire guest range below TASK_ADDR_MAX is free, so the top-down \
+         search should return the highest slot rather than some lower address",
+    );
+}

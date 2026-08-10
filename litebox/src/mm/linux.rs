@@ -934,7 +934,27 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         );
         debug_assert_eq!(Platform::TASK_ADDR_MIN % ALIGN, 0);
         debug_assert_eq!(Platform::TASK_ADDR_MAX % ALIGN, 0);
-        let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
+        // The globally last (highest-addressed) tracked range is not
+        // necessarily relevant here: as the loop below already accounts for,
+        // a platform's `reserved_pages` can report host mappings that sit
+        // entirely above `TASK_ADDR_MAX` (e.g. a `mach_vm_region` walk that
+        // finds the dyld shared cache, or some other host allocation,
+        // ASLR-slid above litebox's own deliberately conservative guest
+        // ceiling on macOS -- see `MacOsUserland::TASK_ADDR_MAX`'s doc
+        // comment). Keying this fast path off *that* range's end would make
+        // it report the very top of the guest range as occupied even when
+        // nothing below `high_limit` is, and -- since it never re-checks
+        // `high_limit` afterwards -- skip straight to the per-gap loop below,
+        // which only ever considers the gap immediately below a *tracked*
+        // range, not the gap between the ceiling and the highest range that
+        // is actually within bounds. So find the highest range that could
+        // actually collide with a placement ending at `high_limit`.
+        let last_end = self
+            .vmas
+            .iter()
+            .rev()
+            .find(|(r, _)| r.start <= high_limit)
+            .map_or(low_limit, |(r, _)| r.end);
         if last_end <= high_limit {
             return Some(high_limit);
         }
