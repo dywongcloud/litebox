@@ -379,6 +379,9 @@ jobs:
           # - `litebox_syscall_rewriter` is allowed to have `std` access since
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
           #
+          # - `boxer` is allowed to have `std` access since it is a host-side
+          #   build tool, not part of the guest-facing library OS.
+          #
           # - `litebox_packager` is allowed to have `std` access since it is a
           #   userland CLI tool that packages ELF programs for LiteBox.
           #
@@ -408,6 +411,7 @@ jobs:
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_shim_windows/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
+            -not -path './boxer/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \

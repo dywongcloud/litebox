@@ -1612,7 +1612,7 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
 ///    host code between guest entries, *and* the tail of
 ///    [`guest::syscall_callback`]/[`guest::sigreturn_trampoline`] once their
 ///    own first couple of instructions have already cleared the flag. Record
-///    [`guest::PENDING_INTERRUPT`] for [`guest::enter_guest_asm`] to re-check
+///    [`guest::PENDING_INTERRUPT`] for `guest::enter_guest_asm` to re-check
 ///    the next time it is about to hand control to the guest -- otherwise an
 ///    interrupt racing exactly this narrow window (the shim already decided
 ///    to signal a thread it saw as "running in guest," but the platform has
@@ -1628,7 +1628,7 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
 ///    [`litebox::shim::EnterShim::interrupt`]'s own doc comment says this is
 ///    fine ("the platform may just call the corresponding handler instead");
 ///    same handling as case 1 -- record and let it proceed.
-/// 3. **In guest, inside [`guest::enter_guest_asm`]'s own restore range**
+/// 3. **In guest, inside `guest::enter_guest_asm`'s own restore range**
 ///    (mid-restoring a [`litebox_common_linux::PtRegs`] that is still fully
 ///    authoritative -- nothing has consumed it yet): abandon this entry
 ///    attempt without capturing anything, since the existing `*ctx` already
@@ -1636,7 +1636,7 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
 /// 4. **Genuinely executing guest code** (flag true, PC outside every above
 ///    range): capture the interrupted `mcontext`'s general and vector
 ///    registers the same way [`guest::prepare_exception_delivery`] does for a
-///    hardware fault, and redirect to [`guest::interrupt_callback`].
+///    hardware fault, and redirect to `guest::interrupt_callback`.
 ///
 /// # Safety
 ///
@@ -1933,7 +1933,7 @@ struct ThreadHandleInner {
 }
 
 /// A handle to a LiteBox-managed thread, used to interrupt it and to record a
-/// pending signal on it from another thread (see [`ThreadHandle::record_pending_signal`]).
+/// pending signal on it from another thread (see `ThreadHandle::record_pending_signal`).
 pub struct ThreadHandle(Arc<ThreadHandleInner>);
 
 impl Clone for ThreadHandle {
@@ -2225,7 +2225,7 @@ fn guest_tp_tsd_key() -> Option<libc::pthread_key_t> {
 
 /// The byte offset a `Host::MacOs` gate must add to `TPIDRRO_EL0` to reach this
 /// process's guest thread-pointer slot, or `None` before
-/// [`reserve_guest_tpidr_tsd_slot`] has run.
+/// `reserve_guest_tpidr_tsd_slot` has run.
 ///
 /// This is the number a loader writes into the trampoline's guest-TP header slot
 /// so the ahead-of-time gates address the key this process actually reserved,
