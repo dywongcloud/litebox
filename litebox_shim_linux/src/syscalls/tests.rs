@@ -846,8 +846,10 @@ fn test_utimensat_futimens_round_trip() {
         before.as_secs(),
         after.as_secs()
     );
+    let resolved_access = stat.st_atime;
+    let resolved_modify = stat.st_mtime;
     assert_eq!(
-        stat.st_atime, stat.st_mtime,
+        resolved_access, resolved_modify,
         "UTIME_NOW applied to both fields should produce matching timestamps"
     );
 

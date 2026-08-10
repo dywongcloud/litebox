@@ -30,10 +30,10 @@ pub fn inspect(box_path: &Path) -> anyhow::Result<()> {
     if let Some(cmd) = &meta.cmd {
         println!("cmd:          {cmd:?}");
     }
-    if let Some(workdir) = &meta.working_dir {
+    if let Some(workdir) = meta.working_dir.as_deref().filter(|w| !w.is_empty()) {
         println!("workdir:      {workdir}");
     }
-    if let Some(user) = &meta.user {
+    if let Some(user) = meta.user.as_deref().filter(|u| !u.is_empty()) {
         println!("user:         {user}");
     }
     for env in &meta.env {

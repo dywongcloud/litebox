@@ -7,6 +7,16 @@ rootfs with every executable pre-rewritten by the LiteBox syscall rewriter.
 `boxer run` executes the workload under the LiteBox sandbox; any wasm runtime
 can load the artifact and print its self-description.
 
+## Install
+
+Boxer is a workspace member, so it builds with the rest of LiteBox:
+
+```sh
+cargo build --release -p boxer          # ./target/release/boxer
+cargo install --path boxer              # or put it on PATH
+cargo run -p boxer -- build -f Dockerfile   # or run without installing
+```
+
 ## Quickstart
 
 ```sh

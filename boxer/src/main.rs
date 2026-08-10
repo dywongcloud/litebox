@@ -88,7 +88,7 @@ struct BuildArgs {
     #[arg(long = "build-arg", value_name = "KEY=VALUE")]
     args: Vec<String>,
     /// Output path. With multiple platforms, the architecture is suffixed
-    /// before the extension. Defaults to <name>.box.wasm.
+    /// before the extension. Defaults to `<name>.box.wasm`.
     #[arg(short = 'o', long = "output", value_name = "PATH")]
     output: Option<PathBuf>,
     /// AArch64 syscall-rewrite anchor: the OS that will run arm64 boxes.
