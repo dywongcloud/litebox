@@ -48,14 +48,16 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_linux_kernel/", 6),
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 24),
-            // 12 includes `GUEST_FP`, the guest's vector-register file held
+            // 13, not 12: `GUEST_FP`, the guest's vector-register file held
             // across a syscall, and `GUEST_OWNS_CPU`/`PENDING_EXCEPTION_INFO`,
-            // added when guest hardware faults were routed to `EnterShim::exception`.
-            // All are process-global for the same reason the rest of the
-            // guest-entry save area is: a naked callback running on the guest
-            // stack cannot reach a `thread_local!` without a call. Lifting the
-            // single-guest-thread limit retires all of them together.
-            ("litebox_platform_macos_userland/", 12),
+            // added when guest hardware faults were routed to `EnterShim::exception`,
+            // plus `PENDING_INTERRUPT`, added when the SIGUSR2 interrupt path
+            // was routed to `EnterShim::interrupt`. All are process-global for
+            // the same reason the rest of the guest-entry save area is: a
+            // naked callback running on the guest stack cannot reach a
+            // `thread_local!` without a call. Lifting the single-guest-thread
+            // limit retires all of them together.
+            ("litebox_platform_macos_userland/", 13),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
             ("litebox_runner_lvbs/", 5),

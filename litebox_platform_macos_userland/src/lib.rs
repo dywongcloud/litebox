@@ -298,27 +298,44 @@ const GUEST_ADDR_MAX: usize = 0x0000_4000_0000_0000;
 /// Allocate a `MAP_JIT` mapping, honoring `fixed_address_behavior` despite
 /// Darwin refusing to combine `MAP_FIXED` with `MAP_JIT` in one `mmap` call.
 ///
-/// The mapping is always created at a kernel-chosen address first. If no
-/// fixed address was requested, that address is the answer -- *unless* it
-/// falls outside `[TASK_ADDR_MIN, TASK_ADDR_MAX)` for a [`FixedAddressBehavior::Hint`]
-/// request, in which case it is relocated to `suggested_range.start` with
-/// [`darwin::remap_to_fixed`] the same way [`FixedAddressBehavior::NoReplace`]
-/// always is. See the matching comment in [`MacOsUserland::allocate_pages`]'s
-/// non-JIT branch for why `Hint` needs this correction (real Darwin does not
-/// reliably honor an advisory hint near the top of the guest's address
-/// range) and why it is applied only when the kernel-chosen address is
-/// actually out of range rather than unconditionally.
+/// For a [`FixedAddressBehavior::Hint`] request, `suggested_range.start` is
+/// offered to `mmap` as an advisory address -- mirroring what
+/// [`MacOsUserland::allocate_pages`]'s non-JIT `Hint` branch does -- so Darwin
+/// gets a real chance to place the mapping there directly instead of this
+/// function relying solely on the correction below. `Replace`/`NoReplace`
+/// instead always request a kernel-chosen address here: both finish with an
+/// exact `reserve_fixed`+[`darwin::remap_to_fixed`] pass a few lines down, and
+/// if the hint got honored in this initial call, that reservation would
+/// collide with the very mapping this call just created at the same address.
+///
+/// Whatever address the kernel actually returns is the answer -- *unless* it
+/// falls outside `[TASK_ADDR_MIN, TASK_ADDR_MAX)` for a `Hint` request, in
+/// which case it is relocated to `suggested_range.start` with
+/// [`darwin::remap_to_fixed`] the same way `NoReplace` always is. See the
+/// matching comment in `allocate_pages`'s non-JIT branch for why `Hint` needs
+/// this correction (real Darwin does not reliably honor an advisory hint near
+/// the top of the guest's address range) and why it is applied only when the
+/// kernel-chosen address is actually out of range rather than
+/// unconditionally.
 fn allocate_jit_pages(
     suggested_range: &core::ops::Range<usize>,
     initial_permissions: MemoryRegionPermissions,
     fixed_address_behavior: FixedAddressBehavior,
 ) -> Result<*mut libc::c_void, AllocationError> {
-    // SAFETY: `MAP_JIT` cannot be combined with `MAP_FIXED`, so this always
-    // requests a kernel-chosen address; there is no caller-owned range to
-    // validate here beyond what `mmap` itself checks.
+    // Only `Hint` may offer the suggested address as a hint here -- see this
+    // function's doc comment for why `Replace`/`NoReplace` must not.
+    let hint = if fixed_address_behavior == FixedAddressBehavior::Hint {
+        suggested_range.start as *mut libc::c_void
+    } else {
+        core::ptr::null_mut()
+    };
+    // SAFETY: `MAP_JIT` cannot be combined with `MAP_FIXED`, so `hint` is only
+    // ever advisory -- Darwin remains free to place the mapping elsewhere --
+    // and there is no caller-owned range to validate here beyond what `mmap`
+    // itself checks.
     let kernel_chosen = unsafe {
         libc::mmap(
-            core::ptr::null_mut(),
+            hint,
             suggested_range.len(),
             prot_flags(initial_permissions),
             libc::MAP_PRIVATE | libc::MAP_ANON | MAP_JIT,
@@ -401,6 +418,158 @@ fn allocate_jit_pages(
             })
         }
     }
+}
+
+/// `allocate_jit_pages`'s `Hint` branch has to actually offer
+/// `suggested_range.start` to `mmap`, not silently discard it for a
+/// kernel-chosen address (`macos-allocate-jit-pages-hint-discarded`).
+///
+/// A single free candidate cannot distinguish "the hint was honored" from
+/// "the kernel's own unhinted choice happened to coincide with it": on this
+/// hardware a bare `mmap(NULL, ...)` deterministically reuses the
+/// most-recently-freed address of matching size, so a naive probe-then-free
+/// address would come back from an unhinted call too, passing regardless of
+/// whether the fix is present. Instead this creates two disjoint free
+/// candidates, `low` and `high` (kept apart by `spacer`, still mapped, so
+/// their free regions cannot coalesce), and confirms first that an unhinted
+/// `mmap` of this size lands at `low` -- the kernel's natural choice -- never
+/// `high`. Requesting `high` as the `Hint` must then still land exactly at
+/// `high`, which is only possible if the hint was actually passed through.
+#[cfg(test)]
+#[test]
+fn allocate_jit_pages_hint_honors_the_suggested_address() {
+    const MAX_ATTEMPTS: u32 = 25;
+
+    // This test's core guarantee -- `low`/`high` stay free across several
+    // mmap/munmap round trips -- cannot be made airtight against every
+    // possible source of host address-space churn: Rust's own parallel test
+    // harness spawns and joins OS threads for other, unrelated tests the
+    // whole time this one runs, and each thread needs a real mmap'd stack
+    // from libSystem/pthread internals that this crate's own code has no way
+    // to serialize against. Serializing against this crate's OWN
+    // mmap/munmap-doing tests (via `TEST_SERIAL`, shared with `guest::tests`
+    // and `with_signal_alt_stack_actually_registers_one`) closes the sources
+    // this crate controls, but not the harness's own thread churn -- so
+    // instead of a single-shot assertion, this retries: a mismatch is only
+    // treated as a real bug if it reproduces across every attempt, since a
+    // genuine regression (the hint never being passed through) would fail
+    // every attempt identically, while a harness-thread race would not.
+    let _serial = guest::tests::TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let len = litebox::mm::linux::PAGE_SIZE;
+
+    // SAFETY: each anonymous mapping with no fixed-address request has no
+    // precondition beyond what `mmap` itself checks.
+    let mmap_anon = || unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+
+    let mut last_inconclusive_reason = String::new();
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let low = mmap_anon();
+        let spacer = mmap_anon();
+        let high = mmap_anon();
+        assert_ne!(low, libc::MAP_FAILED, "low probe mmap failed");
+        assert_ne!(spacer, libc::MAP_FAILED, "spacer probe mmap failed");
+        assert_ne!(high, libc::MAP_FAILED, "high probe mmap failed");
+
+        // SAFETY: `low`/`high` are the mappings just created above, still
+        // solely owned here, and each is freed exactly once; `spacer` stays
+        // mapped for the rest of this attempt so `low`'s and `high`'s
+        // now-free regions stay disjoint instead of coalescing into one.
+        unsafe {
+            libc::munmap(low, len);
+            libc::munmap(high, len);
+        }
+
+        let low = low as usize;
+        let high = high as usize;
+
+        // SAFETY: `spacer` is the mapping created above, unmapped exactly
+        // once on every exit path from this closure.
+        let free_spacer = || unsafe {
+            libc::munmap(spacer, len);
+        };
+
+        if !((GUEST_ADDR_MIN..GUEST_ADDR_MAX).contains(&low)
+            && (GUEST_ADDR_MIN..GUEST_ADDR_MAX).contains(&high))
+        {
+            last_inconclusive_reason = format!(
+                "attempt {attempt}: probe addresses low={low:#x} high={high:#x} fell \
+                 outside the guest range, so this attempt could not exercise the \
+                 ordinary (non-correction) Hint path"
+            );
+            free_spacer();
+            continue;
+        }
+
+        // Confirm the kernel's natural, unhinted choice really is `low`, not
+        // `high` -- otherwise the check below would not actually
+        // discriminate a passed-through hint from coincidence.
+        let natural = mmap_anon();
+        if natural as usize != low {
+            last_inconclusive_reason = format!(
+                "attempt {attempt}: an unhinted mmap landed at {:#x}, not the lower \
+                 free candidate low={low:#x} -- something else raced this attempt's \
+                 free window, so it cannot tell a passed-through hint from a lucky \
+                 coincidence",
+                natural as usize
+            );
+            // SAFETY: `natural` is the mapping just created above, still
+            // solely owned here.
+            unsafe { libc::munmap(natural, len) };
+            free_spacer();
+            continue;
+        }
+        // SAFETY: `natural` is the mapping just created above, still solely
+        // owned here.
+        unsafe { libc::munmap(natural, len) };
+
+        let suggested_range = high..high + len;
+        let result = allocate_jit_pages(
+            &suggested_range,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            FixedAddressBehavior::Hint,
+        );
+        let ptr = result.expect("allocate_jit_pages should succeed for a free, in-range hint");
+
+        if ptr as usize == high {
+            // SAFETY: `ptr` is the mapping just created above, still solely
+            // owned here, unmapped exactly once.
+            unsafe { libc::munmap(ptr, len) };
+            free_spacer();
+            return;
+        }
+
+        last_inconclusive_reason = format!(
+            "attempt {attempt}: Hint placed the MAP_JIT mapping at {:#x} instead of \
+             the caller's suggested address high={high:#x} -- either the hint was \
+             silently discarded, or something else raced `high` free between the \
+             precondition check above and this call",
+            ptr as usize
+        );
+        // SAFETY: `ptr` is the mapping just created above, still solely
+        // owned here, unmapped exactly once.
+        unsafe { libc::munmap(ptr, len) };
+        free_spacer();
+    }
+
+    panic!(
+        "allocate_jit_pages did not honor the suggested Hint address in any of \
+         {MAX_ATTEMPTS} attempts -- this many consecutive misses is not \
+         explainable by test-harness thread-stack races alone, and points at a \
+         real regression. Last attempt's reason: {last_inconclusive_reason}"
+    );
 }
 
 /// Move `range`'s contents onto a fresh `MAP_JIT` mapping so the range can
@@ -1261,20 +1430,146 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
     }
 }
 
-/// The interrupt signal exists only to kick a thread out of a blocking call;
-/// the handler itself has nothing to do.
-unsafe extern "C" fn interrupt_signal_handler(_signum: libc::c_int) {}
+/// The interrupt signal has two independent jobs. Every delivery, regardless
+/// of what follows, already accomplishes the older one just by arriving: EINTR
+/// -ing a blocking host call (`SA_RESTART` is deliberately absent below), the
+/// mechanism [`TimerProvider::create_timer`]'s doc comment describes. The
+/// newer one is routing to [`litebox::shim::EnterShim::interrupt`] when the
+/// signalled thread is genuinely executing guest code, mirroring
+/// `litebox_platform_linux_userland`'s `interrupt_signal_handler` (a TLS
+/// `in_guest` byte plus `switch_to_guest_start`/`_end` labels) and
+/// `litebox_platform_windows_userland`'s `interrupt_thread`
+/// (`SuspendThread`/`GetThreadContext`/`SetThreadContext` over the same label
+/// range) -- adapted to this platform's process-global, `GUEST_OWNS_CPU`-based
+/// single-guest-thread bookkeeping rather than either of theirs.
+///
+/// Four cases, matching the Linux reference's own four-way split
+/// (`litebox_platform_linux_userland::interrupt_signal_handler`'s doc
+/// comment), reached in the same priority order that keeps
+/// [`guest::GUEST_OWNS_CPU`]'s own ordering safe: the flag first, then a
+/// PC-range check, so a captured `mcontext` is only ever handed to the guest
+/// when both agree.
+///
+/// 1. **Not in guest** ([`guest::GUEST_OWNS_CPU`] false): includes ordinary
+///    host code between guest entries, *and* the tail of
+///    [`guest::syscall_callback`]/[`guest::sigreturn_trampoline`] once their
+///    own first couple of instructions have already cleared the flag. Record
+///    [`guest::PENDING_INTERRUPT`] for [`guest::enter_guest_asm`] to re-check
+///    the next time it is about to hand control to the guest -- otherwise an
+///    interrupt racing exactly this narrow window (the shim already decided
+///    to signal a thread it saw as "running in guest," but the platform has
+///    not yet set the flag for *this* entry) would be silently lost until the
+///    guest's next syscall, defeating the entire point of interrupting a
+///    compute-bound guest with no syscalls at all.
+/// 2. **In guest, but inside [`guest::syscall_callback`]'s or
+///    [`guest::sigreturn_trampoline`]'s own brief ownership-clearing prologue**
+///    (their address ranges, checked because [`guest::GUEST_OWNS_CPU`] has not
+///    been cleared yet at this exact PC -- see those functions' own doc
+///    comments): the guest is about to reach the shim on its own via the
+///    ordinary syscall/sigreturn path within a couple of instructions.
+///    [`litebox::shim::EnterShim::interrupt`]'s own doc comment says this is
+///    fine ("the platform may just call the corresponding handler instead");
+///    same handling as case 1 -- record and let it proceed.
+/// 3. **In guest, inside [`guest::enter_guest_asm`]'s own restore range**
+///    (mid-restoring a [`litebox_common_linux::PtRegs`] that is still fully
+///    authoritative -- nothing has consumed it yet): abandon this entry
+///    attempt without capturing anything, since the existing `*ctx` already
+///    describes exactly the state the guest would have resumed with.
+/// 4. **Genuinely executing guest code** (flag true, PC outside every above
+///    range): capture the interrupted `mcontext`'s general and vector
+///    registers the same way [`guest::prepare_exception_delivery`] does for a
+///    hardware fault, and redirect to [`guest::interrupt_callback`].
+///
+/// # Safety
+///
+/// Must be installed as an `SA_SIGINFO` handler (see [`install_fault_handlers`]
+/// for why `fault_handler`'s cases don't apply symmetrically the other way:
+/// `SIGSEGV`/`SIGBUS` are synchronous and this signal is masked out for their
+/// duration, so they can never nest inside this function; the reverse mask on
+/// this handler's own installation is what makes the converse true).
+unsafe extern "C" fn interrupt_signal_handler(
+    _signum: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    ucontext: *mut libc::c_void,
+) {
+    // SAFETY: the kernel hands a `ucontext_t` to an `SA_SIGINFO` handler, and
+    // its `uc_mcontext` points at a `_STRUCT_MCONTEXT64` on this architecture,
+    // exactly as in `fault_handler`.
+    let machine_context = unsafe {
+        let ucontext = ucontext.cast::<libc::ucontext_t>();
+        if ucontext.is_null() {
+            return;
+        }
+        (*ucontext).uc_mcontext.cast::<darwin::McontextPrefix64>()
+    };
+    if machine_context.is_null() {
+        return;
+    }
 
-fn install_async_signal_handlers() {
+    if !guest::GUEST_OWNS_CPU.load(Ordering::Relaxed) {
+        // Case 1.
+        guest::PENDING_INTERRUPT.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    // SAFETY: checked non-null just above.
+    let pc = unsafe { (*machine_context).thread_state.pc }.trunc();
+
+    if guest::interrupted_pc_is_in_guest_exit_prologue(pc) {
+        // Case 2.
+        guest::PENDING_INTERRUPT.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    let recovery = if guest::interrupted_pc_is_in_guest_entry_restore(pc) {
+        // Case 3: nothing to capture, `*LIVE_PTREGS` is already correct.
+        //
+        // SAFETY: `GUEST_OWNS_CPU` was true and `pc` falls inside
+        // `enter_guest_asm`'s own restore range, matching this function's
+        // documented precondition.
+        unsafe { guest::abandon_guest_entry_for_interrupt() }
+    } else {
+        // Case 4.
+        //
+        // SAFETY: checked non-null above.
+        let (thread_state, neon_state) = unsafe {
+            (
+                &(*machine_context).thread_state,
+                &(*machine_context).neon_state,
+            )
+        };
+        // SAFETY: `GUEST_OWNS_CPU` true and `pc` outside every switch-code
+        // range checked above means the interrupted context is genuinely the
+        // guest's own, matching this function's documented precondition.
+        unsafe { guest::prepare_interrupt_delivery(thread_state, neon_state) }
+    };
+    // SAFETY: checked non-null above.
+    unsafe { (*machine_context).thread_state.pc = recovery as u64 };
+}
+
+/// `pub(crate)` (rather than private) so `guest::tests` can install the real
+/// `SIGUSR2` handler directly, the same way `install_fault_handlers` already
+/// lets `guest::tests` install the real `SIGSEGV`/`SIGBUS` ones without
+/// constructing a whole [`MacOsUserland`].
+pub(crate) fn install_async_signal_handlers() {
     for signum in [libc::SIGINT, libc::SIGALRM] {
-        darwin::install_handler(signum, async_signal_handler as *const () as usize, false);
+        darwin::install_handler(
+            signum,
+            async_signal_handler as *const () as usize,
+            false,
+            &[],
+        );
     }
     // `SA_RESTART` is deliberately absent: interrupting a blocking call is the
-    // entire purpose of this signal.
+    // entire purpose of this signal. `SIGSEGV`/`SIGBUS` are masked for the
+    // duration of this handler -- see `darwin::install_handler`'s doc comment
+    // -- so a guest fault can never nest atop an in-flight interrupt delivery
+    // and race the same process-global guest-entry state.
     darwin::install_handler(
         INTERRUPT_SIGNAL,
         interrupt_signal_handler as *const () as usize,
-        false,
+        true,
+        &[libc::SIGSEGV, libc::SIGBUS],
     );
 }
 
@@ -1963,9 +2258,21 @@ fn guest_tp_tsd_key_is_disjoint_across_threads() {
 /// Without these, a `UserConstPtr` read of an unmapped guest address takes the
 /// process down instead of returning `None`; see
 /// [`litebox::platform::common_providers::userspace_pointers`].
+///
+/// `INTERRUPT_SIGNAL` is masked for the duration of both handlers -- see
+/// `darwin::install_handler`'s doc comment -- so a cross-thread
+/// `ThreadHandle::interrupt` call can never nest an interrupt-delivery signal
+/// atop an in-flight fault delivery and race the same process-global
+/// guest-entry state (`guest::GUEST_OWNS_CPU`/`LIVE_PTREGS`/`GUEST_FP`/
+/// `PENDING_EXCEPTION_INFO`).
 pub(crate) fn install_fault_handlers() {
     for signum in [libc::SIGSEGV, libc::SIGBUS] {
-        darwin::install_handler(signum, fault_handler as *const () as usize, true);
+        darwin::install_handler(
+            signum,
+            fault_handler as *const () as usize,
+            true,
+            &[INTERRUPT_SIGNAL],
+        );
     }
 }
 
@@ -2176,6 +2483,14 @@ fn current_signal_stack() -> libc::stack_t {
 #[cfg(test)]
 #[test]
 fn with_signal_alt_stack_actually_registers_one() {
+    // `with_signal_alt_stack` does a real host `mmap`/`munmap` of its own,
+    // which can race `allocate_jit_pages_hint_honors_the_suggested_address`'s
+    // address-space probing under the parallel test harness; serialize
+    // against it the same way guest-entry tests already do.
+    let _serial = guest::tests::TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let before = current_signal_stack();
     let during = with_signal_alt_stack(current_signal_stack);
     let after = current_signal_stack();

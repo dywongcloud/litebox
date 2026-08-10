@@ -340,6 +340,89 @@ Known gaps a real guest hits now:
   between the two, not an inferred one. None of this touches a guest that only
   issues syscalls, which is still the common case and still runs end to end.
 
+  **Resolved in a later pass (2026-08-10), on the third attempt at this exact
+  row -- the first two correctly declined rather than forcing it.** What
+  changed this time: the FP/SIMD signal-frame pass above had already landed
+  `darwin::ArmNeonState64`, closing piece 2 for real (confirmed reusable, not
+  just assumed -- `guest::prepare_interrupt_delivery` copies from it exactly
+  the way `prepare_exception_delivery` already did). That still left pieces 1
+  and 3, plus a genuinely new piece 4 this pass's own implementation found
+  along the way (below), all implemented:
+
+  1. **The labelled boundary.** `enter_guest_asm` gained a `switch_to_guest_start`/
+     `_end` label pair around its own restore tail (from where `GUEST_OWNS_CPU`
+     is set true through the branch to guest `pc`), and `syscall_callback`/
+     `sigreturn_trampoline` each gained a whole-function `_start`/`_end` pair
+     covering their own brief ownership-clearing prologue. `lib.rs`'s
+     `interrupt_signal_handler` checks these ranges against the interrupted
+     `pc` (from the real signal `mcontext`, the same source `fault_handler`
+     already trusts) *after* checking `GUEST_OWNS_CPU`, mirroring the
+     exception-table-then-flag priority `GUEST_OWNS_CPU`'s own doc comment
+     established for the fault path: the flag alone is precise enough for a
+     *synchronous* fault (which can only land on an instruction that faults,
+     all of which are already either genuinely guest or covered by an
+     exception-table entry), but not for an *asynchronous* `SIGUSR2`, which can
+     land on any instruction in the handful-of-instructions-wide window between
+     the flag flipping true and the guest's own registers actually becoming
+     live -- a real, narrow, but genuine gap `GUEST_OWNS_CPU` alone does not
+     close, confirmed by walking that exact instruction sequence rather than
+     assumed by analogy to the fault case.
+  2. Confirmed reusable, not duplicated: see above.
+  3. **The second return path.** A third `guest::GuestExit` variant
+     (`Interrupt`), a new `interrupt_callback` naked function (structurally
+     `exception_callback`'s twin, reporting `2` instead of `1`), and
+     `run_thread`'s loop now matches on it and calls `shim.interrupt(ctx)`.
+  4. **Found during implementation, not anticipated going in:** a labelled
+     boundary alone still loses an interrupt that races the narrow window
+     between the shim deciding a thread is "running in guest" (and signalling
+     it) and this platform's own `GUEST_OWNS_CPU` becoming true for *that*
+     specific entry -- `SIGUSR2` arrives while `GUEST_OWNS_CPU` still reads
+     false, the handler correctly does nothing per case 1/2, and nothing was
+     left behind to retry it. `litebox_platform_linux_userland`'s own
+     `switch_to_guest` re-checks a persistent `interrupt` flag immediately
+     after its `in_guest := 1` store for exactly this reason; the port adds
+     the equivalent `guest::PENDING_INTERRUPT`, checked and cleared by
+     `enter_guest_asm` immediately after it sets `GUEST_OWNS_CPU` true, before
+     restoring any guest register.
+
+  A second, independent new finding: `darwin::install_handler` always called
+  `sigemptyset` on `sa_mask`, so nothing blocked `SIGUSR2` from nesting a
+  second signal handler invocation atop an in-flight `SIGSEGV`/`SIGBUS`
+  delivery on the same thread (or the reverse) -- dormant before this pass
+  because the interrupt handler's body was empty, but a real hazard the moment
+  it starts mutating the same process-global `GUEST_OWNS_CPU`/`LIVE_PTREGS`/
+  `GUEST_FP` state `fault_handler`/`prepare_exception_delivery` also touch.
+  Fixed by threading an explicit `extra_mask` through `install_handler`:
+  `SIGSEGV`/`SIGBUS` now mask `SIGUSR2` for their duration and vice versa.
+
+  Verified via cargo build/clippy `-D warnings`/test/fmt --check on real M3
+  Pro hardware, including three new hardware-run tests in
+  `litebox_platform_macos_userland::guest::tests`:
+  `delivers_a_genuine_guest_interrupt_to_the_shim_without_leaking_host_state`
+  (a genuinely-executing guest, interrupted via a real cross-thread
+  `pthread_kill(SIGUSR2)`, resumes via `EnterShim::interrupt` with the exact
+  captured sentinels -- same disclosure-class check as the fault test),
+  `an_interrupt_racing_a_fresh_guest_entry_is_honored_before_any_further_guest_instruction_runs`
+  (deterministic: a synchronous self-`raise(SIGUSR2)` from inside a syscall
+  handler proves `PENDING_INTERRUPT` is honored on the very next guest entry,
+  before the guest executes another instruction), and
+  `concurrent_sigusr2_delivery_does_not_corrupt_a_running_syscall_stream`
+  (defense-in-depth, proof-by-survival: a background thread hammers real
+  `SIGUSR2` throughout thousands of syscall round trips; the full trace still
+  lands exactly once, in order). A fourth test,
+  `interrupted_pc_range_checks_agree_with_the_known_switch_code_addresses`, is
+  pure logic (no guest), checking the range helpers directly. One genuine
+  residual gap, disclosed rather than hidden: no test deterministically forces
+  a `SIGUSR2` into the single-digit-instruction-wide
+  `switch_to_guest_start`/`_end` window itself (case 3, "mid-restoring") --
+  the two deterministic tests exercise cases 1/2 and 4, and the stress test
+  exercises case 3 only probabilistically (real, repeated concurrent pressure
+  across thousands of round trips, but not a forced hit). Forcing that exact
+  window deterministically would need either a debugger-driven single-step or
+  a test-only instrumentation hook widening the window in a way that would no
+  longer test the real production timing; neither was judged worth the
+  fidelity trade-off for this pass.
+
 * `touch` still fails: `utimensat` is unimplemented. Unrelated to the `/proc`
   entry below -- see that entry's own dated correction for what changed there.
 

@@ -444,11 +444,33 @@ pub(crate) fn sysctl_string(
 /// registered an alternate one, so this is never a regression for a handler
 /// that turns out not to need it.
 ///
+/// `extra_mask` names signals to block for the duration of this handler,
+/// beyond `signum` itself (which the kernel already blocks by default absent
+/// `SA_NODEFER`). This matters whenever two handlers installed through this
+/// function touch the same process-global guest-entry state
+/// (`litebox_platform_macos_userland::guest`'s `GUEST_OWNS_CPU`/
+/// `LIVE_PTREGS`/`GUEST_FP`/`PENDING_EXCEPTION_INFO`/`PENDING_INTERRUPT`):
+/// unlike `SIGSEGV`/`SIGBUS`/`SIGUSR2` being merely reentrant-safe Rust code in
+/// isolation, none of those globals is protected against a *second* handler
+/// invocation nesting on top of a first one still in flight on the same
+/// thread (the single-guest-thread invariant these globals otherwise rely on
+/// only rules out a second *concurrent* guest thread, not the same thread's
+/// own signal handler being interrupted by a different signal). The fault
+/// handler and the interrupt handler are exactly this pair -- a real guest
+/// hardware fault and an unrelated cross-thread `ThreadHandle::interrupt`
+/// call can race, and without masking, the second signal would nest atop the
+/// first mid-update.
+///
 /// # Panics
 ///
 /// Panics if the handler cannot be installed, which would leave LiteBox unable
 /// to recover from a faulting guest-memory access.
-pub(crate) fn install_handler(signum: libc::c_int, handler: usize, siginfo: bool) {
+pub(crate) fn install_handler(
+    signum: libc::c_int,
+    handler: usize,
+    siginfo: bool,
+    extra_mask: &[libc::c_int],
+) {
     // SAFETY: `sigaction` is a plain-old-data struct; zero is a valid initial
     // value for every field, and the fields that matter are set below.
     let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
@@ -458,6 +480,9 @@ pub(crate) fn install_handler(signum: libc::c_int, handler: usize, siginfo: bool
     // a handler for a signal number the caller chose has no other precondition.
     let rc = unsafe {
         libc::sigemptyset(&raw mut action.sa_mask);
+        for &extra in extra_mask {
+            libc::sigaddset(&raw mut action.sa_mask, extra);
+        }
         libc::sigaction(signum, &raw const action, core::ptr::null_mut())
     };
     assert_eq!(rc, 0, "failed to install a handler for signal {signum}");

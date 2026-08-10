@@ -293,8 +293,9 @@ into `PtRegs`, restores the host's callee-saved state, and returns *normally*
 into the Rust run loop -- a hand-rolled `swapcontext`, no `longjmp`, no
 `ucontext`. See the module docs for the register-level contract and the
 documented limitations (one guest thread at a time via a process-global save
-area; only the syscall path is wired; below-`SP` staging needs a
-`sigaltstack`).
+area; below-`SP` staging needs a `sigaltstack`). The syscall, hardware-fault
+(`SIGSEGV`/`SIGBUS`) and interrupt (`SIGUSR2`) event paths are all wired now
+-- see the interrupt-routing entry below for the last of the three.
 
 Three smaller gaps worth recording:
 
@@ -349,3 +350,22 @@ Three smaller gaps worth recording:
   `litebox_shim_linux` via its `write_code_bytes` helper, and
   `update_permissions`' migrate-to-`MAP_JIT` path brackets its own copy.
   Still unverified on real hardware, like everything else on this list.
+* ~~The interrupt path (`SIGUSR2`) is not routed to `EnterShim::interrupt`.~~
+  Closed on the third attempt at this row (the first two correctly declined):
+  `enter_guest_asm`/`syscall_callback`/`sigreturn_trampoline` gained labelled
+  `switch_to_guest_start`/`_end`-style boundaries so `interrupt_signal_handler`
+  can tell "mid-restoring a still-authoritative `PtRegs`" from "genuinely
+  executing guest code" the same way `litebox_platform_linux_userland`'s and
+  `litebox_platform_windows_userland`'s own interrupt handlers do; a new
+  `PENDING_INTERRUPT` flag (checked immediately after `enter_guest_asm` sets
+  `GUEST_OWNS_CPU` true) closes a real race the boundary alone would still
+  lose an interrupt to; a new `interrupt_callback`/`GuestExit::Interrupt`
+  return path lets `run_thread`'s loop call `shim.interrupt` instead of always
+  assuming a syscall; and `darwin::install_handler` now masks `SIGUSR2`
+  against `SIGSEGV`/`SIGBUS` (and back) so the two handlers can no longer nest
+  atop each other and race the same process-global guest-entry state. See
+  [`docs/roadmap.md`](./roadmap.md) for the full design and the three new
+  hardware-verified tests in `guest::tests`:
+  `delivers_a_genuine_guest_interrupt_to_the_shim_without_leaking_host_state`,
+  `an_interrupt_racing_a_fresh_guest_entry_is_honored_before_any_further_guest_instruction_runs`,
+  `concurrent_sigusr2_delivery_does_not_corrupt_a_running_syscall_stream`.
