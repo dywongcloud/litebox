@@ -9,6 +9,7 @@ use core::{
 };
 
 use alloc::{
+    boxed::Box,
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
     string::String,
     sync::{Arc, Weak},
@@ -80,11 +81,116 @@ enum UnixBoundSocketAddr<FS: ShimFS> {
 ///
 /// This is used internally to track which addresses are currently bound
 /// by listening sockets.
-#[derive(PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+#[derive(PartialEq, Eq, Hash, Debug, Ord, PartialOrd, Clone)]
 pub(crate) enum UnixSocketAddrKey {
     // TODO: add inode reference once the file system supports it.
     Path(String),
     Abstract(Vec<u8>),
+}
+
+/// Marker used purely for `Arc::ptr_eq` identity of a placeholder reserved
+/// in the shared Unix address table. Carries no data of its own.
+struct ReservationToken;
+
+/// Next candidate abstract name handed out by autobind, masked to the same
+/// 20-bit range Linux draws `sun_path[1..]` from. The mask alone can't give
+/// collision-freedom (it wraps every 2^20 binds), so the picking loop in
+/// `UnixSocketAddr::bind_and_reserve` retries through `reserve_unix_addr`
+/// against the live table on every draw.
+static AUTOBIND_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// An exclusive claim on one key in the shared Unix address table, held
+/// from `bind()` time until the socket either upgrades it into a real
+/// listening/datagram entry (`upgrade`) or is dropped without ever doing
+/// so, at which point `Drop` releases the placeholder.
+///
+/// This is what makes address-collision detection atomic and total: every
+/// real bind path (autobind, explicit path, explicit abstract) claims
+/// through the same `reserve_unix_addr`, under one write-lock critical
+/// section covering both the check and the insert, so a bound-but-not-yet-
+/// listening socket is exactly as visible to a colliding bind as a fully
+/// listening one -- and two concurrent binds to the same address can never
+/// both observe it as free.
+struct UnixAddrReservation<Platform: ShimPlatform, FS: ShimFS> {
+    key: UnixSocketAddrKey,
+    token: Arc<ReservationToken>,
+    global: Arc<GlobalState<Platform, FS>>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> UnixAddrReservation<Platform, FS> {
+    /// Atomically replaces this reservation's placeholder in the shared
+    /// table with the finished entry, consuming the reservation. Nothing
+    /// else can observe or touch a `Reserved` slot except through this same
+    /// token (see `reserve_unix_addr` and this type's `Drop`), so the slot
+    /// is guaranteed to still hold our own placeholder here.
+    fn upgrade(self, entry: UnixEntryInner<Platform, FS>) {
+        let mut table = self.global.unix_addr_table.write();
+        if let Some(slot) = table.get_mut(&self.key) {
+            debug_assert!(
+                matches!(&slot.0, UnixEntryInner::Reserved(current) if Arc::ptr_eq(current, &self.token)),
+                "unix_addr_table slot changed out from under an unconsumed reservation"
+            );
+            slot.0 = entry;
+        } else {
+            debug_assert!(false, "unix_addr_table reservation missing at upgrade time");
+        }
+        // `table`'s write lock is released here, before `self` (and its own
+        // `Drop`) runs at the end of this function -- that `Drop` will find
+        // the slot no longer `Reserved` and no-op.
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixAddrReservation<Platform, FS> {
+    fn drop(&mut self) {
+        let mut table = self.global.unix_addr_table.write();
+        if let Some(UnixEntry(UnixEntryInner::Reserved(current))) = table.get(&self.key)
+            && Arc::ptr_eq(current, &self.token)
+        {
+            table.remove(&self.key);
+        }
+    }
+}
+
+/// A bound address together with its (optional) shared-table reservation.
+/// `None` for path addresses -- see `UnixSocketAddr::bind_and_reserve`.
+type BoundUnixAddr<Platform, FS> = (
+    UnixBoundSocketAddr<FS>,
+    Option<UnixAddrReservation<Platform, FS>>,
+);
+
+/// Atomically checks and claims `key` in the shared Unix address table: a
+/// single write-lock acquisition covers both the presence check and the
+/// insert, so no other bind can observe the key as free in between (the
+/// check-then-act race a read-then-separate-write split would allow).
+/// Released quickly -- callers must not hold this call's result across
+/// unrelated I/O (e.g. filesystem access) any longer than necessary, so
+/// unrelated binds to other keys are never blocked behind it.
+fn reserve_unix_addr<Platform: ShimPlatform, FS: ShimFS>(
+    global: &Arc<GlobalState<Platform, FS>>,
+    key: UnixSocketAddrKey,
+) -> Result<UnixAddrReservation<Platform, FS>, Errno> {
+    let mut table = global.unix_addr_table.write();
+    if table.contains_key(&key) {
+        return Err(Errno::EADDRINUSE);
+    }
+    let token = Arc::new(ReservationToken);
+    table.insert(
+        key.clone(),
+        UnixEntry(UnixEntryInner::Reserved(token.clone())),
+    );
+    drop(table);
+    Ok(UnixAddrReservation {
+        key,
+        token,
+        global: global.clone(),
+    })
+}
+
+/// Mode bits used when creating (or merely reopening) a Unix socket path
+/// file. Mirrors the permissions Linux itself grants a freshly bound socket
+/// inode.
+fn unix_socket_file_mode() -> Mode {
+    Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH
 }
 
 impl UnixSocketAddr {
@@ -93,41 +199,28 @@ impl UnixSocketAddr {
         matches!(self, UnixSocketAddr::Unnamed)
     }
 
-    /// Binds this address to the filesystem or abstract namespace.
-    ///
-    /// # Arguments
-    ///
-    /// * `task` - The current task context
-    /// * `is_server` - Whether this is a server socket (creates the file if true)
+    /// Validates that `self` is reachable as a `connect()` target, mirroring
+    /// Linux's own permission/existence check on the peer's path. Performs
+    /// no reservation and never touches the shared address table -- the
+    /// peer's own `bind` already owns whatever entry exists there, and this
+    /// is only a read-only check on our end.
     ///
     /// # Errors
     ///
-    /// Returns an error if the address cannot be bound (e.g., file doesn't exist,
-    /// permission denied).
-    fn bind<Platform: ShimPlatform, FS: ShimFS>(
+    /// Returns an error if the address cannot be reached (e.g., file
+    /// doesn't exist, permission denied).
+    fn check_reachable<Platform: ShimPlatform, FS: ShimFS>(
         self,
         task: &Task<Platform, FS>,
-        is_server: bool,
     ) -> Result<UnixBoundSocketAddr<FS>, Errno> {
         match self {
             UnixSocketAddr::Path(path) => {
-                let flags = if is_server {
-                    // create the socket file if not exists;
-                    // use O_EXCL to ensure exclusive creation
-                    OFlags::CREAT | OFlags::EXCL | OFlags::RDWR
-                } else {
-                    OFlags::RDWR
-                };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
                 let file = task
                     .files
                     .borrow()
                     .fs
-                    .open(
-                        path.as_str(),
-                        flags,
-                        Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                    )
+                    .open(path.as_str(), OFlags::RDWR, unix_socket_file_mode())
                     .map_err(|err| match err {
                         OpenError::AlreadyExists => Errno::EADDRINUSE,
                         other => Errno::from(other),
@@ -138,11 +231,98 @@ impl UnixSocketAddr {
                     task.files.borrow().fs.clone(),
                 )))
             }
-            UnixSocketAddr::Abstract(data) => {
-                // TODO: check if the abstract address is already in use
-                Ok(UnixBoundSocketAddr::Abstract(data))
+            UnixSocketAddr::Abstract(data) => Ok(UnixBoundSocketAddr::Abstract(data)),
+            // Nothing legitimately connects to an unnamed address.
+            UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
+        }
+    }
+
+    /// Claims `self` exclusively. This is the real `bind(2)` path, shared by
+    /// stream `bind` and datagram `bind` -- every real bind goes through
+    /// this single function, so every real bind is subject to the same
+    /// collision check.
+    ///
+    /// For abstract (and autobound) addresses, which have no filesystem
+    /// backing, the returned `Some(reservation)` atomically reserves the
+    /// address in the shared table (see `reserve_unix_addr`); the caller
+    /// must upgrade it into a real entry (`UnixAddrReservation::upgrade`)
+    /// once the bind is otherwise complete.
+    ///
+    /// For path addresses the return is `None`: collision detection for
+    /// paths is the filesystem's own `O_EXCL` create, keyed on the path
+    /// *string* resolving to an inode, not on any copy of that string held
+    /// elsewhere -- the same reason two listening sockets can legitimately
+    /// share one path string over time (bind, unlink, bind again) while the
+    /// first is still alive, elsewhere. The shared table has no inode
+    /// identity to key on yet (see `UnixSocketAddrKey`'s own `TODO`), so
+    /// routing it through `reserve_unix_addr` would reject that legitimate
+    /// unlink-and-rebind sequence just because the *string* is still
+    /// present from the first, now-unreachable-by-path bind. The caller
+    /// inserts unconditionally for this case, exactly as it did before this
+    /// reservation scheme existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address is already in use, or (for path
+    /// addresses) cannot be created.
+    fn bind_and_reserve<Platform: ShimPlatform, FS: ShimFS>(
+        self,
+        task: &Task<Platform, FS>,
+    ) -> Result<BoundUnixAddr<Platform, FS>, Errno> {
+        match self {
+            UnixSocketAddr::Path(path) => {
+                // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
+                let file = task
+                    .files
+                    .borrow()
+                    .fs
+                    .open(
+                        path.as_str(),
+                        OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
+                        unix_socket_file_mode(),
+                    )
+                    .map_err(|err| match err {
+                        OpenError::AlreadyExists => Errno::EADDRINUSE,
+                        other => Errno::from(other),
+                    })?;
+                Ok((
+                    UnixBoundSocketAddr::Path((path, file, task.files.borrow().fs.clone())),
+                    None,
+                ))
             }
-            UnixSocketAddr::Unnamed => todo!("autobind for unnamed unix socket"),
+            UnixSocketAddr::Abstract(data) => {
+                let reservation =
+                    reserve_unix_addr(&task.global, UnixSocketAddrKey::Abstract(data.clone()))?;
+                Ok((UnixBoundSocketAddr::Abstract(data), Some(reservation)))
+            }
+            UnixSocketAddr::Unnamed => {
+                // Autobind: draw a fresh candidate from Linux's 20-bit
+                // abstract namespace and atomically reserve it, retrying
+                // past a collision. Each candidate's check-and-reserve is
+                // its own short critical section (see `reserve_unix_addr`)
+                // -- the retry loop deliberately never holds the table lock
+                // across attempts, so unrelated binds are never blocked
+                // behind an autobind search.
+                for _ in 0..=0xFFFFFu32 {
+                    let name = AUTOBIND_COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFFFFF;
+                    let candidate = alloc::format!("{name:05x}").into_bytes();
+                    match reserve_unix_addr(
+                        &task.global,
+                        UnixSocketAddrKey::Abstract(candidate.clone()),
+                    ) {
+                        Ok(reservation) => {
+                            return Ok((
+                                UnixBoundSocketAddr::Abstract(candidate),
+                                Some(reservation),
+                            ));
+                        }
+                        // Try the next candidate.
+                        Err(Errno::EADDRINUSE) => {}
+                        Err(other) => return Err(other),
+                    }
+                }
+                Err(Errno::ENOSPC)
+            }
         }
     }
 
@@ -188,13 +368,24 @@ impl<FS: ShimFS> From<&UnixBoundSocketAddr<FS>> for UnixSocketAddr {
     }
 }
 
+/// A rejected `UnixInitStream`, handed back to the caller alongside the
+/// `Errno` that rejected it (so the caller can keep using the socket, e.g.
+/// on a failed `listen()` or `connect()`). Boxed because `UnixInitStream`
+/// carries its own `BoundUnixAddr`, which makes the pair large enough that
+/// `Result`'s error variant would otherwise dominate the type's size.
+type InitRejection<Platform, FS> = Box<(UnixInitStream<Platform, FS>, Errno)>;
+
 /// Represents a Unix stream socket in its initial state.
 ///
 /// This is the state immediately after socket creation, before the socket
 /// has been connected, or put into listening mode.
 struct UnixInitStream<Platform: ShimPlatform, FS: ShimFS> {
-    /// Optional bound address for this socket
-    addr: Option<UnixBoundSocketAddr<FS>>,
+    /// The bound address and its table reservation (if any -- path
+    /// addresses have none, see `UnixSocketAddr::bind_and_reserve`), set
+    /// together by `bind` and released together -- kept as one field
+    /// (rather than two separate top-level `Option`s) so the two can never
+    /// go out of sync with each other.
+    bound: Option<BoundUnixAddr<Platform, FS>>,
     pollee: Pollee<Platform>,
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
@@ -203,7 +394,7 @@ struct UnixInitStream<Platform: ShimPlatform, FS: ShimFS> {
 impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
     fn new() -> Self {
         Self {
-            addr: None,
+            bound: None,
             pollee: Pollee::new(),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
@@ -221,12 +412,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
 
     /// Binds this socket to the given address.
     fn bind(&mut self, task: &Task<Platform, FS>, addr: UnixSocketAddr) -> Result<(), Errno> {
-        if self.addr.is_some() && !addr.is_unnamed() {
+        if self.bound.is_some() && !addr.is_unnamed() {
             return Err(Errno::EINVAL);
         }
-        if self.addr.is_none() {
-            let bound_addr = addr.bind(task, true)?;
-            self.addr = Some(bound_addr);
+        if self.bound.is_none() {
+            self.bound = Some(addr.bind_and_reserve(task)?);
         }
         Ok(())
     }
@@ -240,16 +430,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
         self,
         backlog: u16,
         global: &Arc<GlobalState<Platform, FS>>,
-    ) -> Result<UnixListenStream<Platform, FS>, (Self, Errno)> {
-        let Some(addr) = self.addr else {
-            return Err((self, Errno::EINVAL));
+    ) -> Result<UnixListenStream<Platform, FS>, InitRejection<Platform, FS>> {
+        let Some((addr, reservation)) = self.bound else {
+            return Err(Box::new((self, Errno::EINVAL)));
         };
         let key = addr.to_key();
         let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee));
-        global
-            .unix_addr_table
-            .write()
-            .insert(key, UnixEntry(UnixEntryInner::Stream(backlog.clone())));
+        if let Some(reservation) = reservation {
+            // Upgrade the existing reservation in place instead of
+            // inserting a fresh table entry -- the slot has been ours,
+            // exclusively, since `bind` reserved it.
+            reservation.upgrade(UnixEntryInner::Stream(backlog.clone()));
+        } else {
+            // Path addresses were never reserved through the table at bind
+            // time (see `bind_and_reserve`) -- insert unconditionally,
+            // exactly as this did before the reservation scheme existed.
+            global
+                .unix_addr_table
+                .write()
+                .insert(key, UnixEntry(UnixEntryInner::Stream(backlog.clone())));
+        }
         Ok(UnixListenStream {
             backlog,
             global: global.clone(),
@@ -265,15 +465,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
         UnixConnectedStream<Platform, FS>,
     ) {
         let UnixInitStream {
-            addr,
+            bound,
             pollee,
             read_shutdown,
             write_shutdown,
         } = self;
+        let (addr, reservation) = match bound {
+            Some((addr, reservation)) => (Some(Arc::new(addr)), reservation),
+            None => (None, None),
+        };
+        // The reservation (if this socket explicitly bound before
+        // connecting -- the client-role autobind-then-connect pattern)
+        // carries into the connected stream rather than being dropped here,
+        // so the bound address stays claimed for the connection's whole
+        // lifetime, matching real Unix domain socket semantics.
         UnixConnectedStream::new_pair(
-            addr.map(Arc::new),
+            addr,
             Some(Arc::new(pollee)),
             Some(peer_addr),
+            reservation,
             read_shutdown.load(Ordering::Acquire),
             write_shutdown.load(Ordering::Acquire),
         )
@@ -319,14 +529,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
     fn try_connect(
         &self,
         init: UnixInitStream<Platform, FS>,
-    ) -> Result<UnixConnectedStream<Platform, FS>, (UnixInitStream<Platform, FS>, Errno)> {
+    ) -> Result<UnixConnectedStream<Platform, FS>, InitRejection<Platform, FS>> {
         let mut state = self.state.lock();
         if state.is_shutdown {
-            return Err((init, Errno::ECONNREFUSED));
+            return Err(Box::new((init, Errno::ECONNREFUSED)));
         }
 
         if state.sockets.len() >= state.limit as usize {
-            return Err((init, Errno::EAGAIN));
+            return Err(Box::new((init, Errno::EAGAIN)));
         }
 
         let (client, server) = init.into_connected(self.addr.clone());
@@ -467,6 +677,13 @@ struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
     /// The write end of the connected peer socket for sending messages.
     connected_send_channel: crate::channel::WriteEnd<Platform, Message>,
     pollee: Arc<Pollee<Platform>>,
+    /// Kept alive only for its `Drop` side effect: releases this stream's
+    /// own bound-address reservation (if it explicitly bound before
+    /// connecting) once the connection itself closes, not merely once it
+    /// stops listening -- matching real Unix domain socket semantics, where
+    /// a bound client address stays claimed for as long as the socket
+    /// exists.
+    _reservation: Option<UnixAddrReservation<Platform, FS>>,
 }
 
 const UNIX_BUF_SIZE: usize = 65536;
@@ -475,11 +692,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     ///
     /// `read_shutdown` and `write_shutdown` half-close the corresponding sides of the
     /// *first* returned socket only (used to carry pre-connect shutdown flags from
-    /// `UnixInitStream` across `connect(2)` into the connected state).
+    /// `UnixInitStream` across `connect(2)` into the connected state). `reservation`
+    /// (if any) belongs to the *first* returned socket only, matching `addr`.
     fn new_pair(
         addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
         pollee: Option<Arc<Pollee<Platform>>>,
         peer: Option<Arc<UnixBoundSocketAddr<FS>>>,
+        reservation: Option<UnixAddrReservation<Platform, FS>>,
         read_shutdown: bool,
         write_shutdown: bool,
     ) -> (Self, Self) {
@@ -495,12 +714,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             recv_channel,
             connected_send_channel: send_channel_peer,
             pollee: pollee1,
+            _reservation: reservation,
         };
         let second = UnixConnectedStream {
             addr: addr2,
             recv_channel: recv_channel_peer,
             connected_send_channel: send_channel,
             pollee: pollee2,
+            _reservation: None,
         };
         if read_shutdown {
             first.recv_channel.shutdown();
@@ -670,7 +891,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 UnixStreamState::Init(init) => {
                     return match init.listen(backlog, global) {
                         Ok(listen) => (UnixStreamState::Listen(listen), Ok(())),
-                        Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
+                        Err(boxed) => {
+                            let (init, err) = *boxed;
+                            (UnixStreamState::Init(init), Err(err))
+                        }
                     };
                 }
                 UnixStreamState::Listen(ref listen) => {
@@ -698,13 +922,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         match &entry.0 {
             UnixEntryInner::Stream(backlog) => Ok(backlog.clone()),
             UnixEntryInner::Datagram(_) => Err(Errno::EPROTOTYPE),
+            // Bound but not (yet) listening: nothing is there to connect to,
+            // exactly like Linux's ECONNREFUSED for a non-listening peer.
+            UnixEntryInner::Reserved(_) => Err(Errno::ECONNREFUSED),
         }
     }
     fn try_connect(&self, backlog: &Backlog<Platform, FS>) -> Result<(), TryOpError<Errno>> {
         self.with_state(|state| match state {
             UnixStreamState::Init(init) => match backlog.try_connect(init) {
                 Ok(connected) => (UnixStreamState::Connected(connected), Ok(())),
-                Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
+                Err(boxed) => {
+                    let (init, err) = *boxed;
+                    (UnixStreamState::Init(init), Err(err))
+                }
             },
             UnixStreamState::Listen(s) => (UnixStreamState::Listen(s), Err(Errno::EINVAL)),
             UnixStreamState::Connected(s) => (UnixStreamState::Connected(s), Err(Errno::EISCONN)),
@@ -721,8 +951,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
         let backlog = self.lookup(task, &addr)?;
-        // check if we can bind to the address
-        let _ = addr.bind(task, false)?;
+        // check if we can reach the address
+        let _ = addr.check_reachable(task)?;
         task.wait_cx()
             .wait_on_events(
                 is_nonblocking,
@@ -862,9 +1092,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
     fn get_local_addr(&self) -> UnixSocketAddr {
         self.with_state_ref(|state| match state {
             UnixStreamState::Init(init) => init
-                .addr
+                .bound
                 .as_ref()
-                .map_or(UnixSocketAddr::Unnamed, UnixSocketAddr::from),
+                .map_or(UnixSocketAddr::Unnamed, |(addr, _)| {
+                    UnixSocketAddr::from(addr)
+                }),
             UnixStreamState::Listen(listen) => UnixSocketAddr::from(listen.get_local_addr()),
             UnixStreamState::Connected(connect) => connect.get_local_addr(),
         })
@@ -1043,17 +1275,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        let bound_addr = addr.bind(task, true)?;
-        let key = bound_addr.to_key();
+        let (bound_addr, reservation) = addr.bind_and_reserve(task)?;
         // Registers the write end of the socket in the global address table so it
         // can receive messages sent to this address.
         let (send_channel, recv_channel) =
             Channel::new(UNIX_BUF_SIZE, Arc::new(Pollee::new()), self.pollee.clone()).split();
-        let _ = task
-            .global
-            .unix_addr_table
-            .write()
-            .insert(key, UnixEntry(UnixEntryInner::Datagram(send_channel)));
+        if let Some(reservation) = reservation {
+            // Upgrade the reservation `bind_and_reserve` already atomically
+            // claimed, rather than inserting a fresh entry that could race
+            // a colliding bind.
+            reservation.upgrade(UnixEntryInner::Datagram(send_channel));
+        } else {
+            // Path addresses were never reserved through the table at bind
+            // time (see `bind_and_reserve`) -- insert unconditionally,
+            // exactly as this did before the reservation scheme existed.
+            let key = bound_addr.to_key();
+            task.global
+                .unix_addr_table
+                .write()
+                .insert(key, UnixEntry(UnixEntryInner::Datagram(send_channel)));
+        }
         self.addr = Some((bound_addr, task.global.clone()));
         if self.read_shutdown {
             recv_channel.shutdown();
@@ -1146,11 +1387,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         let Some(entry) = guard.get(&key) else {
             return Err(Errno::ECONNREFUSED);
         };
-        // check if we can bind to the address
-        let _ = addr.bind(task, false)?;
+        // check if we can reach the address
+        let _ = addr.check_reachable(task)?;
         match &entry.0 {
             UnixEntryInner::Stream(_) => Err(Errno::EPROTOTYPE),
             UnixEntryInner::Datagram(send_channel) => Ok(send_channel.clone()),
+            // Bound but not (yet) actually receiving: nothing is there to
+            // send to, matching Linux's ECONNREFUSED for an unreachable peer.
+            UnixEntryInner::Reserved(_) => Err(Errno::ECONNREFUSED),
         }
     }
 
@@ -1463,7 +1707,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     ) -> Option<(UnixSocket<Platform, FS>, UnixSocket<Platform, FS>)> {
         match ty {
             SockType::Stream => {
-                let (conn1, conn2) = UnixConnectedStream::new_pair(None, None, None, false, false);
+                let (conn1, conn2) =
+                    UnixConnectedStream::new_pair(None, None, None, None, false, false);
                 Some((
                     UnixSocket::new_with_inner(
                         UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn1))),
@@ -1667,6 +1912,13 @@ pub(crate) struct UnixEntry<Platform: ShimPlatform, FS: ShimFS>(UnixEntryInner<P
 enum UnixEntryInner<Platform: ShimPlatform, FS: ShimFS> {
     Stream(Arc<Backlog<Platform, FS>>),
     Datagram(WriteEnd<Platform, DatagramMessage>),
+    /// A placeholder claimed by `bind()` (autobind, explicit path, or
+    /// explicit abstract) before the socket has gone on to `listen()` or
+    /// (for datagram sockets) finished its atomic bind. Nothing can lookup
+    /// or connect through a `Reserved` slot -- it exists purely to make the
+    /// address collide with any other bind attempt, exactly as a live
+    /// `Stream`/`Datagram` entry would.
+    Reserved(Arc<ReservationToken>),
 }
 
 /// Type alias for the global Unix socket address table.

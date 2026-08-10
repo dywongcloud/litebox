@@ -3481,6 +3481,240 @@ mod unix_tests {
         }
     }
 
+    // -- Regression coverage for the previously-missed unix-addr-table gap --
+    //
+    // Before this fix, `task.global.unix_addr_table` was only ever populated
+    // by `listen()` (stream sockets) and `UnixDatagramInner::bind()`
+    // (datagram sockets). A plain stream socket that called `bind()` but had
+    // not (yet) called `listen()` -- the ordinary client-role
+    // autobind-then-connect pattern -- was never inserted into the table at
+    // all, so a second, colliding bind was invisible to collision detection
+    // and could succeed anyway. Separately, `UnixSocketAddr::Abstract`'s
+    // explicit-bind arm had *zero* collision detection (a bare `TODO`), and
+    // the read-then-separate-write table access elsewhere was a
+    // check-then-act race. The tests below exercise exactly those three
+    // gaps against the real syscall surface (`do_bind`/`do_connect`), not
+    // against any internal helper.
+
+    #[test]
+    fn test_unix_stream_abstract_bind_without_listen_blocks_collision() {
+        let task = init_platform(None);
+        let name = b"gm_third_attempt_abstract_addr".to_vec();
+
+        // Socket A explicitly binds an abstract address but never calls
+        // listen(). This is exactly the gap the prior attempt's own fix
+        // missed: only listen()/datagram-bind() ever touched the shared
+        // address table, so a bound-but-not-listening socket was invisible
+        // to collision detection.
+        let a_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        task.do_bind(
+            a_fd,
+            SocketAddress::Unix(UnixSocketAddr::Abstract(name.clone())),
+        )
+        .expect("first abstract bind should succeed");
+
+        // A second socket colliding on the same abstract address must be
+        // rejected while A is alive, even though A never listened. The
+        // pre-existing `Abstract` bind arm had zero collision detection at
+        // all (a bare `TODO`), so this is also the abstract-collision case.
+        let b_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        let err = task
+            .do_bind(
+                b_fd,
+                SocketAddress::Unix(UnixSocketAddr::Abstract(name.clone())),
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EADDRINUSE);
+
+        // Once A closes (still never having listened), the address must
+        // become free again for a fresh bind.
+        close_socket(&task, a_fd);
+        task.do_bind(b_fd, SocketAddress::Unix(UnixSocketAddr::Abstract(name)))
+            .expect("bind should succeed once A releases the address");
+
+        close_socket(&task, b_fd);
+    }
+
+    #[test]
+    fn test_unix_stream_path_bind_without_listen_blocks_collision() {
+        let task = init_platform(None);
+        let addr = "/unix_bind_no_listen_path.sock";
+
+        let a_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        task.do_bind(
+            a_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+        )
+        .expect("first bind should succeed");
+
+        let b_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        let err = task
+            .do_bind(
+                b_fd,
+                SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EADDRINUSE);
+
+        close_socket(&task, a_fd);
+        task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+        task.do_bind(
+            b_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+        )
+        .expect("bind should succeed once A is gone and the path is unlinked");
+
+        close_socket(&task, b_fd);
+        task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+    }
+
+    #[test]
+    fn test_unix_bound_client_reservation_survives_into_connected_state() {
+        let task = init_platform(None);
+        let server_path = "/unix_client_reservation_server.sock";
+        let server_fd = create_unix_server_socket(&task, server_path, SockFlags::empty()).unwrap();
+
+        let client_name = b"gm_third_attempt_client_addr".to_vec();
+        let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        task.do_bind(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Abstract(client_name.clone())),
+        )
+        .expect("client bind should succeed");
+
+        // Client connects without ever calling listen() -- the "ordinary
+        // client-role autobind-then-connect pattern" the bug report names
+        // directly.
+        task.do_connect(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .unwrap();
+
+        // The client's own bound address must still be reserved while the
+        // connection is alive -- a second socket must not be able to steal
+        // it just because the client stopped being in "Init" state.
+        let other_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        let err = task
+            .do_bind(
+                other_fd,
+                SocketAddress::Unix(UnixSocketAddr::Abstract(client_name.clone())),
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EADDRINUSE);
+
+        // Closing the connected client releases its reservation.
+        close_socket(&task, client_fd);
+        task.do_bind(
+            other_fd,
+            SocketAddress::Unix(UnixSocketAddr::Abstract(client_name)),
+        )
+        .expect("bind should succeed once the connected client closes");
+
+        close_socket(&task, other_fd);
+        let server_conn = task.do_accept(server_fd, None, SockFlags::empty()).unwrap();
+        close_socket(&task, server_conn);
+        close_socket(&task, server_fd);
+        task.sys_unlinkat(-1, server_path, AtFlags::empty())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_unix_concurrent_bind_same_abstract_address_exactly_one_wins() {
+        let task = init_platform(None);
+
+        for i in 0..20 {
+            let name = alloc::format!("gm_race_addr_{i}").into_bytes();
+            let a_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+            let b_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let barrier_a = barrier.clone();
+            let name_a = name.clone();
+
+            // Both threads race to bind the *same* address, synchronized to
+            // maximize the chance of hitting the window a check-then-act
+            // race (read the table, then write, as two separate critical
+            // sections) would allow -- both observing the address as free
+            // and both succeeding.
+            let handle = task.spawn_clone_for_test(move |task| {
+                barrier_a.wait();
+                task.do_bind(a_fd, SocketAddress::Unix(UnixSocketAddr::Abstract(name_a)))
+            });
+
+            barrier.wait();
+            let result_b = task.do_bind(b_fd, SocketAddress::Unix(UnixSocketAddr::Abstract(name)));
+            let result_a = handle.join().expect("thread A panicked");
+
+            let wins = usize::from(result_a.is_ok()) + usize::from(result_b.is_ok());
+            assert_eq!(
+                wins, 1,
+                "exactly one concurrent bind to the same address must succeed, got a={result_a:?} b={result_b:?}"
+            );
+
+            close_socket(&task, a_fd);
+            close_socket(&task, b_fd);
+        }
+    }
+
+    #[test]
+    fn test_unix_concurrent_bind_different_addresses_both_succeed() {
+        let task = init_platform(None);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier_a = barrier.clone();
+
+        let a_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        let b_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        let name_a = b"gm_concurrent_addr_a".to_vec();
+        let name_b = b"gm_concurrent_addr_b".to_vec();
+        let name_a2 = name_a.clone();
+
+        // Two unrelated binds proceeding concurrently must not spuriously
+        // collide with each other -- the shared table's write-lock critical
+        // sections are per-attempt and brief (see `reserve_unix_addr`), not
+        // one coarse lock serializing every bind against every other.
+        let handle = task.spawn_clone_for_test(move |task| {
+            barrier_a.wait();
+            task.do_bind(a_fd, SocketAddress::Unix(UnixSocketAddr::Abstract(name_a2)))
+        });
+
+        barrier.wait();
+        let result_b = task.do_bind(b_fd, SocketAddress::Unix(UnixSocketAddr::Abstract(name_b)));
+        let result_a = handle.join().expect("thread A panicked");
+
+        assert!(
+            result_a.is_ok(),
+            "bind to address A should succeed: {result_a:?}"
+        );
+        assert!(
+            result_b.is_ok(),
+            "bind to address B should succeed: {result_b:?}"
+        );
+
+        close_socket(&task, a_fd);
+        close_socket(&task, b_fd);
+    }
+
+    #[test]
+    fn test_unix_stream_autobind_assigns_unique_addresses() {
+        let task = init_platform(None);
+        let mut seen = Vec::new();
+        for _ in 0..64 {
+            let fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+            task.do_bind(fd, SocketAddress::Unix(UnixSocketAddr::Unnamed))
+                .expect("autobind should succeed");
+            let addr = task.do_getsockname(fd).unwrap();
+            let SocketAddress::Unix(UnixSocketAddr::Abstract(name)) = addr else {
+                panic!("autobind should assign an abstract address, got {addr:?}");
+            };
+            assert!(
+                !seen.contains(&name),
+                "two autobinds must not collide on the same abstract address"
+            );
+            seen.push(name);
+            close_socket(&task, fd);
+        }
+    }
+
     fn unix_socketpair_bidirectional(ty: SockType, is_nonblocking: bool) {
         let task = init_platform(None);
         let mut sv_ptr = alloc::vec![0u32; 2];

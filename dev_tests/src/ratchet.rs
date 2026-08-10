@@ -60,10 +60,14 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_windows_userland/", 8),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
-            // 4 includes the test-only `ADDRESS_SPACE` and `ASYNC_SIGNAL` mutexes
-            // that serialize tests (see `address_space_guard`), and the
-            // `EPOLL_NEST_LOCK` global lock guarding nested-epoll registration.
-            ("litebox_shim_linux/", 4),
+            // 5, not 4: includes the test-only `ADDRESS_SPACE` and
+            // `ASYNC_SIGNAL` mutexes that serialize tests (see
+            // `address_space_guard`), the `EPOLL_NEST_LOCK` global lock
+            // guarding nested-epoll registration, and `AUTOBIND_COUNTER`,
+            // the monotonic counter Unix-socket autobind draws candidate
+            // abstract addresses from (retried against the shared address
+            // table on collision -- see `UnixSocketAddr::bind_and_reserve`).
+            ("litebox_shim_linux/", 5),
             // 5, not 4: `static INIT_FUNC` arrived with the OP-TEE syscall
             // support in 071841e and the table was never updated, so this count
             // has been stale since well before the macOS work.
