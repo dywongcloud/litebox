@@ -1788,12 +1788,15 @@ fn guest_tp_tsd_key_is_disjoint_across_threads() {
 // Faults
 // ---------------------------------------------------------------------------
 
-/// Install the handlers that make LiteBox's accesses to guest memory fallible.
+/// Install the handlers that make LiteBox's accesses to guest memory fallible,
+/// and that route a genuine guest hardware fault to
+/// [`litebox::shim::EnterShim::exception`] instead of taking the whole process
+/// down.
 ///
 /// Without these, a `UserConstPtr` read of an unmapped guest address takes the
 /// process down instead of returning `None`; see
 /// [`litebox::platform::common_providers::userspace_pointers`].
-fn install_fault_handlers() {
+pub(crate) fn install_fault_handlers() {
     for signum in [libc::SIGSEGV, libc::SIGBUS] {
         darwin::install_handler(signum, fault_handler as *const () as usize, true);
     }
@@ -1822,18 +1825,57 @@ unsafe extern "C" fn fault_handler(
     // SAFETY: checked non-null just above.
     let pc = unsafe { (*machine_context).thread_state.pc };
     if let Some(recovery) = litebox::mm::exception_table::search_exception_tables(pc.trunc()) {
-        // A LiteBox access to guest memory faulted and the exception table says
-        // where to continue; redirecting the program counter is what turns the
-        // fault into a `None` return.
+        // A LiteBox access to guest memory faulted -- either one of this
+        // crate's own recoverable accesses to guest memory, or one of
+        // `guest::GUEST_OWNS_CPU`'s boundary windows -- and the exception
+        // table says where to continue; redirecting the program counter is
+        // what turns the fault into either a `None` return or a loud abort.
+        // This check always takes priority over the GUEST_OWNS_CPU check
+        // below: every guest-memory touch this platform's own switch code
+        // makes while that flag could read true is covered by an entry here,
+        // which is exactly what makes the flag-based check below safe.
         //
         // SAFETY: checked non-null just above.
         unsafe { (*machine_context).thread_state.pc = recovery as u64 };
         return;
     }
 
-    // Not a recoverable LiteBox access. Restore the default disposition and
-    // return so the faulting instruction re-executes and takes the process down
-    // exactly as it would have without this handler installed.
+    if guest::GUEST_OWNS_CPU.load(Ordering::Relaxed) {
+        // The exception table missed and the guest genuinely owns the CPU at
+        // this pc (not merely mid-switch -- see the ordering note above), so
+        // this is a real guest fault: hand it to the guest via
+        // `EnterShim::exception` instead of taking the process down.
+        //
+        // SAFETY: checked non-null just above.
+        let (thread_state, exception_state) = unsafe {
+            (
+                &(*machine_context).thread_state,
+                &(*machine_context).exception_state,
+            )
+        };
+        let esr = u64::from(exception_state.esr);
+        let info = litebox::shim::ExceptionInfo {
+            // ESR_EL1's exception class occupies bits [31:26]; see
+            // `litebox::shim::ExceptionInfo::exception`'s own doc comment.
+            exception: litebox::shim::Exception(((esr >> 26) & 0x3f) as u8),
+            fault_address: exception_state.far.trunc(),
+            esr,
+            // This platform's guest always runs at EL0; there is no
+            // "kernel-mode access faulted" case for a userland host to model.
+            kernel_mode: false,
+        };
+        // SAFETY: `GUEST_OWNS_CPU.load` just returned true, this function's
+        // own documented precondition.
+        let recovery = unsafe { guest::prepare_exception_delivery(thread_state, info) };
+        // SAFETY: checked non-null just above.
+        unsafe { (*machine_context).thread_state.pc = recovery as u64 };
+        return;
+    }
+
+    // Not a recoverable LiteBox access, and not a genuine guest fault either.
+    // Restore the default disposition and return so the faulting instruction
+    // re-executes and takes the process down exactly as it would have without
+    // this handler installed.
     darwin::reraise_fatally(signum);
 }
 

@@ -48,11 +48,23 @@
 //!   panics loudly ([`GUEST_ACTIVE`]) rather than corrupting the first. Lifting
 //!   this needs a per-thread save area reached without a function call -- the
 //!   same `TPIDRRO_EL0`-relative direct-TSD mechanism the rewriter's gates need
-//!   (see `docs/roadmap.md`); it is deliberately out of scope here.
-//! * **Only the syscall path is wired.** Guest hardware faults still reach the
-//!   existing `SIGSEGV`/`SIGBUS` fault handler (host-access recovery), and the
-//!   interrupt path (`SIGUSR2`) is not yet routed to [`litebox::shim::EnterShim::interrupt`].
-//!   A guest that only issues syscalls (the common case) runs end to end.
+//!   (see `docs/roadmap.md`); it is deliberately out of scope here. This
+//!   includes [`GUEST_OWNS_CPU`]: lifting the single-thread restriction would
+//!   need this to become per-thread state too, reached the same
+//!   `TPIDRRO_EL0`-relative way.
+//! * **Guest hardware faults (`SIGSEGV`/`SIGBUS`) are routed** to
+//!   [`litebox::shim::EnterShim::exception`] via [`GUEST_OWNS_CPU`] and
+//!   `lib.rs`'s `fault_handler`; the interrupt path (`SIGUSR2`) is not yet
+//!   routed to [`litebox::shim::EnterShim::interrupt`] -- a separate problem
+//!   (see `docs/roadmap.md`). A delivered exception's captured general
+//!   registers/`PSTATE` are exact (read straight from the kernel's own signal
+//!   `mcontext`, not re-derived); its vector/FPSIMD state is *not* refreshed
+//!   from the fault -- [`GUEST_FP`] still holds whatever it captured at the
+//!   guest's last syscall, since Darwin's `mcontext` NEON state is not yet
+//!   modelled (see [`darwin::McontextPrefix64`]'s own doc comment) -- so a
+//!   guest that resumes from a delivered signal after touching a vector
+//!   register since its last syscall observes stale FP/SIMD content. This
+//!   mirrors the interrupt path's identical, already-documented gap.
 //! * **Below-`SP` staging.** [`enter_guest_asm`] stages the guest `PC` and `X0`
 //!   in the 16 bytes just below the guest `SP` before branching. AArch64 Linux
 //!   has no red zone, so a signal delivered in that window could clobber them;
@@ -61,7 +73,11 @@
 //!   installs carries `SA_ONSTACK` (`darwin::install_handler`), and both
 //!   entry points that can reach here (`ThreadProvider::spawn_thread` and the
 //!   free `run_thread`) install the alternate stack itself
-//!   (`with_signal_alt_stack`) before either can run.
+//!   (`with_signal_alt_stack`) before either can run. The same below-`SP`
+//!   reads are also the last guest-memory touches inside [`GUEST_OWNS_CPU`]'s
+//!   "owns" window before the branch to guest code; a fault there is caught by
+//!   an exception-table entry (see [`GUEST_OWNS_CPU`]) rather than ever being
+//!   weighed as a guest-delivery candidate.
 //!
 //! Darwin's W^X rules still apply: the guest's executable pages are `MAP_JIT`
 //! mappings and every patch is bracketed by
@@ -73,6 +89,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox::shim::ContinueOperation;
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::PtRegs;
 
 // The naked assembly below hard-codes byte offsets into `PtRegs` and its total
@@ -158,6 +175,49 @@ const _: () = assert!(core::mem::offset_of!(GuestFpState, fpsr) == GUEST_FP_OFF_
 /// [`syscall_callback`] can write the captured guest state back into it.
 static LIVE_PTREGS: RawCell<*mut PtRegs> = RawCell(UnsafeCell::new(core::ptr::null_mut()));
 
+/// Whether the CPU is genuinely executing guest instructions right now, as
+/// opposed to running this platform's own [`enter_guest_asm`]/
+/// [`syscall_callback`] switch code with the guest's registers not yet (or no
+/// longer) authoritative. `lib.rs`'s `fault_handler` consults this -- *after*
+/// its existing exception-table check, which always takes priority -- to
+/// decide whether a captured `mcontext` is safe to hand to the guest via
+/// [`litebox::shim::EnterShim::exception`], or must instead be left alone as
+/// an internal/unattributable fault (today's behavior: the process dies).
+///
+/// Set `true` by [`enter_guest_asm`] once every guest register but the branch
+/// vehicle has been restored, and cleared `false` as the first instructions of
+/// [`syscall_callback`] and by `fault_handler` itself when it delivers an
+/// exception. Both entry points still touch a couple of guest-stack bytes
+/// *inside* that window (the below-`SP` staging reads at the end of
+/// `enter_guest_asm`, and the `SVC`-gate-stashed-word reads at the start of
+/// `syscall_callback`) -- deliberately, because by the time every other guest
+/// register is live there is no register left free to place this flag's own
+/// store with any tighter precision. Both windows are covered instead by an
+/// exception-table entry recovering to [`abort_on_boundary_stack_fault`],
+/// which the exception-table check `fault_handler` runs first always finds
+/// before this flag is ever consulted -- so a fault there can never be
+/// misattributed to the guest, regardless of what this flag reads at the time.
+///
+/// A future per-thread port needs this to move to the same `TPIDRRO_EL0`-
+/// relative direct-TSD storage [`GUEST_ACTIVE`]'s doc comment describes for
+/// the rest of this file's process-global state; it is not a new obstacle
+/// beyond what was already true here.
+pub(crate) static GUEST_OWNS_CPU: AtomicBool = AtomicBool::new(false);
+
+/// The [`litebox::shim::ExceptionInfo`] for the fault [`exception_callback`]
+/// is about to report to the run loop, filled in by [`prepare_exception_delivery`]
+/// before `lib.rs`'s `fault_handler` redirects there. Like
+/// [`HOST_SAVE`]/[`LIVE_PTREGS`]/[`GUEST_FP`], this relies on the single-
+/// guest-thread invariant [`GUEST_ACTIVE`] enforces: at most one exception is
+/// ever in flight.
+static PENDING_EXCEPTION_INFO: RawCell<litebox::shim::ExceptionInfo> =
+    RawCell(UnsafeCell::new(litebox::shim::ExceptionInfo {
+        exception: litebox::shim::Exception(0),
+        fault_address: 0,
+        esr: 0,
+        kernel_mode: false,
+    }));
+
 /// Guards the single-guest-thread invariant the process-global save area relies
 /// on: a second concurrent [`run_thread`] is a hard error, not silent
 /// corruption.
@@ -168,9 +228,11 @@ static GUEST_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Saves the host's callee-saved registers, `LR` and `SP` into [`HOST_SAVE`],
 /// records `ctx` in [`LIVE_PTREGS`], restores every guest register from `ctx`,
 /// and branches to `ctx.pc` through `X16`. It "returns" -- with callee-saved
-/// registers preserved, ABI-correctly -- only when [`syscall_callback`]
-/// restores the host context after a guest syscall, at which point `*ctx` holds
-/// the guest state at the syscall.
+/// registers preserved, ABI-correctly -- only when [`syscall_callback`] or
+/// [`exception_callback`] restores the host context after a guest syscall or a
+/// genuine guest hardware fault, at which point `*ctx` holds the guest state
+/// at that event and the return value says which kind it was: `0` for a
+/// syscall, `1` for an exception (see [`GuestExit`]).
 ///
 /// # Safety
 ///
@@ -178,7 +240,7 @@ static GUEST_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// context whose `sp` addresses a valid guest stack with 16 usable bytes below
 /// it. Only one guest thread may be active (see [`GUEST_ACTIVE`]).
 #[unsafe(naked)]
-unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) {
+unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) -> u64 {
     core::arch::naked_asm!(
         // Save host callee-saved registers, LR and SP.
         "adrp x1, {host_save}@PAGE",
@@ -238,6 +300,17 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) {
         "ldr  x16, [x0, #264]",      // pstate -> NZCV
         "msr  nzcv, x16",
         "mov  sp, x1",
+        // Mark the guest as genuinely owning the CPU from here on (see
+        // GUEST_OWNS_CPU's doc comment for why this is not placed immediately
+        // before the branch instead: by the time every guest register but the
+        // branch vehicle is restored, no register is left free to compute
+        // this store's address with). x1 and x16 are the only registers still
+        // free at this specific point (x1's job above is done; x16 has not
+        // been loaded with a real guest value yet).
+        "adrp x16, {owns}@PAGE",
+        "add  x16, x16, {owns}@PAGEOFF",
+        "mov  w1, #1",
+        "strb w1, [x16]",
         // Restore x1..x30 (x0 and x16 handled last; skip regs[16]).
         "ldr  x1,  [x0, #8]",
         "ldp  x2,  x3,  [x0, #16]",
@@ -255,14 +328,51 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) {
         "ldp  x26, x27, [x0, #208]",
         "ldp  x28, x29, [x0, #224]",
         "ldr  x30, [x0, #240]",
-        // Restore x0 and branch to the guest PC through the X16 vehicle.
+        // Restore x0 and branch to the guest PC through the X16 vehicle. These
+        // two below-SP reads are the last guest-memory touches inside the
+        // "owns" window opened above; a fault here is redirected to
+        // {abort} instead of ever reaching the GUEST_OWNS_CPU check (see that
+        // flag's doc comment) -- the exception table is always consulted
+        // first.
+        "90:",
         "ldr  x0,  [sp, #-16]",
         "ldr  x16, [sp, #-8]",
+        "91:",
+        ".pushsection __TEXT,__ex_table,regular,no_dead_strip",
+        ".balign 4",
+        ".long 90b - .",
+        ".long 91b - .",
+        ".long {abort} - .",
+        ".popsection",
         "br   x16",
         host_save = sym HOST_SAVE,
         live = sym LIVE_PTREGS,
         guest_fp = sym GUEST_FP,
+        owns = sym GUEST_OWNS_CPU,
+        abort = sym abort_on_boundary_stack_fault,
     )
+}
+
+/// Which of [`syscall_callback`] or [`exception_callback`] restored the host
+/// context, i.e. what [`enter_guest_asm`]'s return value means. `run_thread`'s
+/// loop dispatches on this instead of always assuming a syscall.
+enum GuestExit {
+    Syscall,
+    Exception,
+}
+
+impl GuestExit {
+    /// Decodes [`enter_guest_asm`]'s return value. Both callbacks set exactly
+    /// `0` or `1`, so anything else would mean the asm and this decoder have
+    /// drifted apart -- a build-time bug, not a runtime condition to handle
+    /// gracefully.
+    fn from_asm_return(value: u64) -> Self {
+        match value {
+            0 => Self::Syscall,
+            1 => Self::Exception,
+            _ => unreachable!("enter_guest_asm returned an undefined GuestExit code {value}"),
+        }
+    }
 }
 
 /// The entry point a rewritten guest's `SVC` gate branches to.
@@ -282,40 +392,72 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) {
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn syscall_callback() {
     core::arch::naked_asm!(
-        // Capture the guest register file into a PtRegs on the guest stack.
-        "sub  sp, sp, #288",
-        "stp  x0,  x1,  [sp, #0]",
-        "stp  x2,  x3,  [sp, #16]",
-        "stp  x4,  x5,  [sp, #32]",
-        "stp  x6,  x7,  [sp, #48]",
-        "stp  x8,  x9,  [sp, #64]",
-        "stp  x10, x11, [sp, #80]",
-        "stp  x12, x13, [sp, #96]",
-        "stp  x14, x15, [sp, #112]",
-        "ldr  x9, [sp, #288]",       // guest x16, saved by the gate at [old_sp]
-        "str  x9, [sp, #128]",
-        "str  x17, [sp, #136]",
-        "stp  x18, x19, [sp, #144]",
-        "stp  x20, x21, [sp, #160]",
-        "stp  x22, x23, [sp, #176]",
-        "stp  x24, x25, [sp, #192]",
-        "stp  x26, x27, [sp, #208]",
-        "stp  x28, x29, [sp, #224]",
-        "str  x30, [sp, #240]",
-        "ldr  x9, [sp, #296]",       // post-SVC return address = guest pc
-        "str  x9, [sp, #256]",
-        "add  x9, sp, #304",         // old_sp + 16 = guest sp
-        "str  x9, [sp, #248]",
+        // Clear ownership before touching anything else -- see GUEST_OWNS_CPU's
+        // doc comment. This is the very first memory write this function makes,
+        // and it targets a fixed host address that never depends on the
+        // (possibly-corrupt) guest sp read below.
+        "adrp x16, {owns}@PAGE",
+        "add  x16, x16, {owns}@PAGEOFF",
+        "strb wzr, [x16]",
+        // Load the destination PtRegs (host-owned, set by enter_guest_asm) and
+        // capture every guest GPR straight into it through this dedicated base
+        // register, x16, held for the whole capture. sp is deliberately never
+        // used as the capture buffer -- it still holds the guest's own
+        // (possibly-corrupt) value at this point -- so nothing below can fault
+        // by dereferencing it, other than the two gate-stashed-word reads
+        // further down.
+        "adrp x16, {live}@PAGE",
+        "add  x16, x16, {live}@PAGEOFF",
+        "ldr  x16, [x16]",
+        "stp  x0,  x1,  [x16, #0]",
+        "stp  x2,  x3,  [x16, #16]",
+        "stp  x4,  x5,  [x16, #32]",
+        "stp  x6,  x7,  [x16, #48]",
+        "stp  x8,  x9,  [x16, #64]",
+        "stp  x10, x11, [x16, #80]",
+        "stp  x12, x13, [x16, #96]",
+        "stp  x14, x15, [x16, #112]",
+        // The SVC gate stashed the guest's real x16 at [sp] and the post-SVC
+        // return address at [sp, #8] before jumping here (having decremented
+        // sp by 16 first) -- the only guest-memory reads in this function, and
+        // the only reason a bad guest sp can still fault inside it. x9 and x11
+        // are free to use as scratch: their real guest values are already
+        // captured above. GUEST_OWNS_CPU is already false by this point (see
+        // above), so if either fault, fault_handler's fallback (today's
+        // behavior: the process dies) runs, never guest delivery.
+        "80:",
+        "ldr  x9,  [sp]",
+        "ldr  x11, [sp, #8]",
+        "81:",
+        ".pushsection __TEXT,__ex_table,regular,no_dead_strip",
+        ".balign 4",
+        ".long 80b - .",
+        ".long 81b - .",
+        ".long {abort} - .",
+        ".popsection",
+        "str  x9,  [x16, #128]",
+        "str  x17, [x16, #136]",
+        "stp  x18, x19, [x16, #144]",
+        "stp  x20, x21, [x16, #160]",
+        "stp  x22, x23, [x16, #176]",
+        "stp  x24, x25, [x16, #192]",
+        "stp  x26, x27, [x16, #208]",
+        "stp  x28, x29, [x16, #224]",
+        "str  x30, [x16, #240]",
+        "str  x11, [x16, #256]",     // pc = post-SVC return address = guest pc
+        "add  x9, sp, #16",          // sp = guest's pre-gate sp
+        "str  x9, [x16, #248]",
         "mrs  x9, nzcv",
-        "str  x9, [sp, #264]",       // pstate
+        "str  x9, [x16, #264]",      // pstate
         // The shim reads the syscall number from `syscallno`, not from `regs[8]`
         // -- that is where a Linux kernel entry path records it, and the shim is
         // written against `pt_regs`. Likewise `orig_x0` keeps the first argument,
         // which the return value overwrites in `regs[0]`. Neither is a copy of a
         // register the guest can see, so both have to be filled here or the
-        // dispatcher reads whatever the guest stack happened to hold.
-        "str  x0, [sp, #272]",       // orig_x0
-        "str  w8, [sp, #280]",       // syscallno (32-bit field)
+        // dispatcher reads whatever the buffer happened to hold. x0 and x8 are
+        // still exactly their original guest values: nothing above wrote them.
+        "str  x0, [x16, #272]",      // orig_x0
+        "str  w8, [x16, #280]",      // syscallno (32-bit field)
         // Capture the guest's whole vector file and FP control/status before any
         // host code runs, since the host is free to use every vector register.
         "adrp x9, {guest_fp}@PAGE",
@@ -340,19 +482,8 @@ pub(crate) unsafe extern "C" fn syscall_callback() {
         "str  x10, [x9, #512]",
         "mrs  x10, fpsr",
         "str  x10, [x9, #520]",
-        // Copy the captured PtRegs into the run loop's live buffer.
-        "adrp x9, {live}@PAGE",
-        "add  x9, x9, {live}@PAGEOFF",
-        "ldr  x9, [x9]",             // dst = *LIVE_PTREGS
-        "mov  x10, sp",              // src
-        "mov  x11, #288",
-        "2:",
-        "ldr  x12, [x10], #8",
-        "str  x12, [x9], #8",
-        "subs x11, x11, #8",
-        "b.ne 2b",
         // Restore host callee-saved registers, LR and SP, then return into the
-        // run loop (as though enter_guest_asm had returned).
+        // run loop (as though enter_guest_asm had returned), reporting a syscall.
         "adrp x1, {host_save}@PAGE",
         "add  x1, x1, {host_save}@PAGEOFF",
         "ldp  x19, x20, [x1, #0]",
@@ -373,18 +504,158 @@ pub(crate) unsafe extern "C" fn syscall_callback() {
         "msr  fpsr, x9",
         "ldr  x2, [x1, #96]",
         "mov  sp, x2",
+        "mov  x0, #0",
         "ret",
         live = sym LIVE_PTREGS,
         host_save = sym HOST_SAVE,
         guest_fp = sym GUEST_FP,
+        owns = sym GUEST_OWNS_CPU,
+        abort = sym abort_on_boundary_stack_fault,
     )
+}
+
+/// The recovery target [`lib.rs`'s `fault_handler`] redirects a genuine guest
+/// hardware fault to, once [`prepare_exception_delivery`] has already copied
+/// the guest's captured register file (from the signal `mcontext`, not from
+/// any guest-stack dereference) into `*`[`LIVE_PTREGS`] and filled in
+/// [`PENDING_EXCEPTION_INFO`]. Unlike [`syscall_callback`], this never touches
+/// guest memory at all -- everything it needs was already captured in Rust --
+/// so it is simply [`syscall_callback`]'s host-state-restore tail, reporting
+/// exception (`1`) instead of syscall (`0`).
+///
+/// # Safety
+///
+/// Reached only via a `pc` redirect from `fault_handler`, with
+/// [`GUEST_OWNS_CPU`] already cleared and `*`[`LIVE_PTREGS`]/
+/// [`PENDING_EXCEPTION_INFO`] already populated by [`prepare_exception_delivery`];
+/// not callable as an ordinary function.
+#[unsafe(naked)]
+unsafe extern "C" fn exception_callback() {
+    core::arch::naked_asm!(
+        "adrp x1, {host_save}@PAGE",
+        "add  x1, x1, {host_save}@PAGEOFF",
+        "ldp  x19, x20, [x1, #0]",
+        "ldp  x21, x22, [x1, #16]",
+        "ldp  x23, x24, [x1, #32]",
+        "ldp  x25, x26, [x1, #48]",
+        "ldp  x27, x28, [x1, #64]",
+        "ldr  x29, [x1, #80]",
+        "ldr  x30, [x1, #88]",
+        "ldp  d8,  d9,  [x1, #104]",
+        "ldp  d10, d11, [x1, #120]",
+        "ldp  d12, d13, [x1, #136]",
+        "ldp  d14, d15, [x1, #152]",
+        "ldr  x9, [x1, #168]",
+        "msr  fpcr, x9",
+        "ldr  x9, [x1, #176]",
+        "msr  fpsr, x9",
+        "ldr  x2, [x1, #96]",
+        "mov  sp, x2",
+        "mov  x0, #1",
+        "ret",
+        host_save = sym HOST_SAVE,
+    )
+}
+
+/// Reached only via one of the exception-table entries emitted inline within
+/// [`enter_guest_asm`] and [`syscall_callback`]: a fault at one of the handful
+/// of instructions where this platform's own switch code must still touch the
+/// bytes at/below a *guest*-controlled `sp`, before the guest is genuinely
+/// executing (or after it has stopped). `lib.rs`'s `fault_handler` always
+/// checks the exception table before [`GUEST_OWNS_CPU`], so a fault here is
+/// redirected to this recovery point instead of ever being weighed as a
+/// candidate for guest delivery -- the `pc`/`x30` a naive "guest owns the CPU"
+/// check would otherwise see there point inside this platform's own binary,
+/// which is exactly the ASLR-disclosure/return-to-host-code hazard this file
+/// exists to avoid. Every such window is only a couple of instructions wide
+/// and touches bytes this same code (or the syscall-rewriter's `SVC` gate)
+/// just finished proving mapped, so reaching here at all means something
+/// beyond an ordinary bad guest pointer has gone wrong; a loud, unambiguous
+/// abort is safer than guessing whose fault it was.
+#[unsafe(naked)]
+unsafe extern "C" fn abort_on_boundary_stack_fault() -> ! {
+    core::arch::naked_asm!(
+        "adrp x0, {host_save}@PAGE",
+        "add  x0, x0, {host_save}@PAGEOFF",
+        "ldr  x1, [x0, #96]",
+        "mov  sp, x1",
+        "b {abort}",
+        host_save = sym HOST_SAVE,
+        abort = sym abort_boundary_stack_fault,
+    )
+}
+
+/// The Rust half of [`abort_on_boundary_stack_fault`], once a valid (host) `sp`
+/// has been restored.
+extern "C" fn abort_boundary_stack_fault() -> ! {
+    // A raw abort, not a Rust panic: unwinding out of a function reached by a
+    // hand-redirected program counter (never a real call site, so no unwind
+    // table covers the jump that got here) would corrupt the process, and
+    // this condition is meant to be unmistakable on stderr either way.
+    eprintln!(
+        "litebox_platform_macos_userland: a fault landed on the guest/host \
+         entry-exit boundary's own instructions rather than genuine guest \
+         code; aborting instead of guessing which side owns it"
+    );
+    std::process::abort()
+}
+
+/// Delivers a genuine guest hardware fault as a
+/// [`litebox::shim::EnterShim::exception`] event. Called by `lib.rs`'s
+/// `fault_handler` only after its exception-table check has already missed
+/// and [`GUEST_OWNS_CPU`] reads true (so this instant's `pc` is guest code,
+/// not this platform's own switch code -- see that flag's doc comment for why
+/// the ordering matters).
+///
+/// Copies the guest's captured GPRs/`SP`/`PC`/`PSTATE` straight from
+/// `thread_state` into the run loop's live [`PtRegs`] (never re-deriving them
+/// from the guest's own stack, unlike `syscall_callback` -- the kernel already
+/// captured the true hardware state into `thread_state` at the moment of the
+/// fault, a strictly more trustworthy source than anything this function could
+/// read back off guest memory), records `info` for [`exception_callback`] to
+/// hand to the run loop, clears the ownership flag, and returns the address
+/// the caller should redirect the faulting `pc` to.
+///
+/// # Safety
+///
+/// Must be called with [`GUEST_OWNS_CPU`] genuinely true and `thread_state`
+/// genuinely describing the interrupted guest, per the caller's own
+/// exception-table-then-flag check.
+pub(crate) unsafe fn prepare_exception_delivery(
+    thread_state: &crate::darwin::ArmThreadState64,
+    info: litebox::shim::ExceptionInfo,
+) -> usize {
+    // SAFETY: `GUEST_OWNS_CPU` was true (the caller's precondition), so
+    // LIVE_PTREGS points at the one live PtRegs for the single active guest
+    // thread, per the single-guest-thread invariant GUEST_ACTIVE enforces.
+    let live = unsafe { &mut *(*LIVE_PTREGS.0.get()) };
+    for (dst, src) in live.regs[..29].iter_mut().zip(thread_state.x.iter()) {
+        *dst = src.trunc();
+    }
+    live.regs[29] = thread_state.fp.trunc();
+    live.regs[30] = thread_state.lr.trunc();
+    live.sp = thread_state.sp.trunc();
+    live.pc = thread_state.pc.trunc();
+    live.pstate = u64::from(thread_state.cpsr);
+    live.orig_x0 = live.regs[0];
+    // No syscall is in flight at a hardware fault, matching the kernel's own
+    // `NO_SYSCALL` convention `litebox_shim_linux` relies on elsewhere.
+    live.syscallno = -1;
+
+    // SAFETY: single-guest-thread invariant, as for HOST_SAVE/GUEST_FP/LIVE_PTREGS.
+    unsafe { *PENDING_EXCEPTION_INFO.0.get() = info };
+
+    GUEST_OWNS_CPU.store(false, Ordering::Relaxed);
+
+    exception_callback as *const () as usize
 }
 
 /// Runs a guest thread with the given shim and initial context.
 ///
-/// Calls [`litebox::shim::EnterShim::init`], then loops: enter the guest, and on
-/// each syscall dispatch to [`litebox::shim::EnterShim::syscall`], resuming
-/// until a handler returns [`ContinueOperation::Terminate`].
+/// Calls [`litebox::shim::EnterShim::init`], then loops: enter the guest, and
+/// dispatch to [`litebox::shim::EnterShim::syscall`] or
+/// [`litebox::shim::EnterShim::exception`] depending on why it returned,
+/// resuming until a handler returns [`ContinueOperation::Terminate`].
 pub(crate) fn run_thread(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = PtRegs>,
     ctx: &mut PtRegs,
@@ -403,15 +674,27 @@ pub(crate) fn run_thread(
     }
 
     loop {
-        // Enter/resume the guest. Returns after a guest syscall with `*ctx`
-        // holding the guest state captured by `syscall_callback`.
+        // Enter/resume the guest. Returns after a guest syscall or a genuine
+        // guest hardware fault, with `*ctx` holding the guest state captured
+        // by `syscall_callback` or `prepare_exception_delivery` respectively.
         //
         // SAFETY: `ctx` is a valid writable PtRegs; `GUEST_ACTIVE` guarantees
         // this is the only active guest thread, so the global save area is not
         // raced.
-        unsafe { enter_guest_asm(core::ptr::from_mut(ctx)) };
+        let exit = GuestExit::from_asm_return(unsafe { enter_guest_asm(core::ptr::from_mut(ctx)) });
 
-        if shim.syscall(ctx) == ContinueOperation::Terminate {
+        let op = match exit {
+            GuestExit::Syscall => shim.syscall(ctx),
+            GuestExit::Exception => {
+                // SAFETY: `prepare_exception_delivery` filled this in just
+                // before redirecting here, and the single-guest-thread
+                // invariant `GUEST_ACTIVE` enforces means nothing else can
+                // have overwritten it since.
+                let info = unsafe { *PENDING_EXCEPTION_INFO.0.get() };
+                shim.exception(ctx, &info)
+            }
+        };
+        if op == ContinueOperation::Terminate {
             return;
         }
     }
@@ -421,7 +704,7 @@ pub(crate) fn run_thread(
 mod tests {
     use super::*;
     use core::cell::RefCell;
-    use litebox::shim::{EnterShim, ExceptionInfo};
+    use litebox::shim::{EnterShim, Exception, ExceptionInfo};
 
     /// Only one guest thread may run at a time (see [`GUEST_ACTIVE`]), so the
     /// guest-entry tests must not run concurrently with each other under the
@@ -521,6 +804,228 @@ mod tests {
             seen,
             vec![(64, 1, 0xABC), (93, 42, 0xABC)],
             "guest should have made write(1,0xABC,..) then exit(42)"
+        );
+    }
+
+    /// The guest stack region [`syscall_survives_a_guest_stack_with_only_16_valid_bytes_below_sp`]
+    /// builds: a single valid page for the guest's usable stack, with an
+    /// unmapped guard page immediately below it.
+    struct GuardedStack {
+        base: usize,
+        page_size: usize,
+    }
+
+    impl GuardedStack {
+        fn new() -> Self {
+            // SAFETY: `sysconf` has no preconditions for this name.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }
+                .try_into()
+                .unwrap_or_else(|_| std::process::abort());
+            // SAFETY: an anonymous mapping with no fixed-address request has no
+            // precondition beyond what `mmap` itself checks.
+            let base = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    page_size * 2,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(base, libc::MAP_FAILED, "failed to map the guarded stack");
+            let base = base as usize;
+            // SAFETY: `base` is the mapping just created, exactly `page_size`
+            // bytes of which (the first page) this call alone will ever touch.
+            let rc =
+                unsafe { libc::mprotect(base as *mut libc::c_void, page_size, libc::PROT_NONE) };
+            assert_eq!(rc, 0, "failed to guard the first page");
+            Self { base, page_size }
+        }
+
+        /// The lowest address a guest occupying this stack may validly touch:
+        /// the start of the second (mapped) page.
+        fn valid_floor(&self) -> usize {
+            self.base + self.page_size
+        }
+    }
+
+    impl Drop for GuardedStack {
+        fn drop(&mut self) {
+            // SAFETY: `self.base` is this struct's own mapping, unmapped
+            // exactly once here.
+            unsafe { libc::munmap(self.base as *mut libc::c_void, self.page_size * 2) };
+        }
+    }
+
+    /// The *original* `syscall_callback` carved 288 bytes for its own `PtRegs`
+    /// capture out of the guest's stack, below the 16 bytes the `SVC` gate
+    /// itself needs -- so a guest stack with fewer than `16 + 288` valid bytes
+    /// below `sp` would fault *inside host code*, not guest code (see
+    /// `docs/roadmap.md`'s "A guest fault kills the host"). The fixed version
+    /// captures directly into the host-owned live `PtRegs` and never
+    /// dereferences anything below `sp - 16`, so a syscall must still complete
+    /// cleanly with only those 16 bytes valid: this guest's `sp` sits with
+    /// nothing but an unmapped guard page below that 16-byte floor. A build
+    /// still carrying the original capture-on-the-guest-stack code would crash
+    /// this whole test process with `SIGSEGV` instead of returning.
+    #[test]
+    fn syscall_survives_a_guest_stack_with_only_16_valid_bytes_below_sp() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let stack = GuardedStack::new();
+        let sp = stack.valid_floor() + 16;
+
+        let mut ctx = PtRegs {
+            pc: test_guest as *const () as usize,
+            sp,
+            ..Default::default()
+        };
+        let shim = RecordingShim {
+            seen: RefCell::new(Vec::new()),
+        };
+        run_thread(&shim, &mut ctx);
+
+        let seen = shim.seen.into_inner();
+        assert_eq!(
+            seen,
+            vec![(64, 1, 0xABC), (93, 42, 0xABC)],
+            "guest should have made write(1,0xABC,..) then exit(42) even with a \
+             guest stack that has only 16 valid bytes below sp"
+        );
+    }
+
+    /// A shim that records a genuinely-delivered guest hardware fault: the
+    /// [`ExceptionInfo`], the full captured register file, and the captured
+    /// `pc` -- everything a naive "guest owns the CPU" check could instead
+    /// fill with host state if it misattributed a host-side fault as the
+    /// guest's own.
+    struct FaultRecordingShim {
+        reported_pc: core::cell::Cell<usize>,
+        delivered: RefCell<Option<(ExceptionInfo, [usize; 31], usize)>>,
+    }
+
+    impl EnterShim for FaultRecordingShim {
+        type ExecutionContext = PtRegs;
+        fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Resume
+        }
+        fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
+            // The guest reports the address it is about to fault at (computed
+            // with `adr`, immediately before the faulting instruction) via
+            // write(1, that_address, 0).
+            self.reported_pc.set(ctx.regs[1]);
+            ctx.regs[0] = 0;
+            ContinueOperation::Resume
+        }
+        fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
+            *self.delivered.borrow_mut() = Some((*info, ctx.regs, ctx.pc));
+            // There is no guest signal handler to resume into in this test.
+            ContinueOperation::Terminate
+        }
+        fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+    }
+
+    /// A guest that seeds sentinels into a caller-saved register (`x9`) and
+    /// the link register (`x30`, singled out because a leaked host `x30` is
+    /// exactly the return-to-host-code hazard this file exists to avoid),
+    /// reports its own about-to-fault `pc` through a syscall, then genuinely
+    /// faults by loading through a null pointer.
+    #[unsafe(naked)]
+    unsafe extern "C" fn faulting_guest() {
+        core::arch::naked_asm!(
+            "movz x9,  #0xCAFE",
+            "movz x30, #0xBEEF",
+            "movz x4,  #0",
+            // write(1, &50f, 0): report the address about to fault.
+            "movz x8, #64",
+            "movz x0, #1",
+            "adr  x1, 50f",
+            "movz x2, #0",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 50f@PAGE",
+            "add  x16, x16, 50f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "br   x16",
+            "50:",
+            "ldr  x3, [x4]",  // deliberate fault: load through a null pointer
+            "brk  #0",        // unreachable
+            cb = sym syscall_callback,
+        )
+    }
+
+    /// The end-to-end fault-routing path this file exists to implement: a
+    /// genuine guest hardware fault must reach [`EnterShim::exception`] with
+    /// the guest's own state, and the host process must not die.
+    #[test]
+    fn delivers_a_genuine_guest_fault_to_the_shim_without_leaking_host_state() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Unlike the other tests in this module, this one deliberately faults,
+        // so the platform's SIGSEGV/SIGBUS handler must actually be installed
+        // -- production always does this via `MacOsUserland::new`, which this
+        // test intentionally does not otherwise construct. Idempotent: safe to
+        // call again if another test in this process already has.
+        crate::install_fault_handlers();
+        let mut stack = vec![0u8; 1 << 16];
+        let top = stack.as_mut_ptr() as usize + stack.len();
+        let sp = (top - 256) & !15;
+
+        let mut ctx = PtRegs {
+            pc: faulting_guest as *const () as usize,
+            sp,
+            ..Default::default()
+        };
+        let shim = FaultRecordingShim {
+            reported_pc: core::cell::Cell::new(0),
+            delivered: RefCell::new(None),
+        };
+        // If this platform ever again misrouted a guest fault, this call
+        // itself would take the whole test process down with a raw signal --
+        // reaching the assertions below is already most of the proof.
+        run_thread(&shim, &mut ctx);
+
+        let reported_pc = shim.reported_pc.get();
+        assert_ne!(reported_pc, 0, "guest never reported its expected fault pc");
+
+        let (info, regs, pc) = shim
+            .delivered
+            .into_inner()
+            .expect("EnterShim::exception was never invoked");
+
+        assert_eq!(
+            pc, reported_pc,
+            "delivered pc must be exactly the guest's own faulting instruction \
+             (self-reported via adr moments before faulting), never a host address"
+        );
+        assert_eq!(
+            regs[9], 0xCAFE,
+            "delivered x9 must be the guest's own sentinel, not host garbage"
+        );
+        assert_eq!(
+            regs[30], 0xBEEF,
+            "delivered x30 must be the guest's own sentinel, never a host return address"
+        );
+        assert_eq!(info.fault_address, 0, "guest dereferenced address 0");
+        assert!(
+            !info.kernel_mode,
+            "this platform's guest never runs kernel-mode"
+        );
+        assert!(
+            matches!(
+                info.exception,
+                Exception::DATA_ABORT_LOWER_EL | Exception::DATA_ABORT_CURRENT_EL
+            ),
+            "expected a data-abort exception class for a null-pointer load, got {:?}",
+            info.exception
         );
     }
 

@@ -48,19 +48,22 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_linux_kernel/", 6),
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 24),
-            // 11 includes `GUEST_FP`, the guest's vector-register file held
-            // across a syscall. It is process-global for the same reason the
-            // rest of the guest-entry save area is: a naked callback running on
-            // the guest stack cannot reach a `thread_local!` without a call.
-            // Lifting the single-guest-thread limit retires all of them together.
-            ("litebox_platform_macos_userland/", 11),
+            // 12 includes `GUEST_FP`, the guest's vector-register file held
+            // across a syscall, and `GUEST_OWNS_CPU`/`PENDING_EXCEPTION_INFO`,
+            // added when guest hardware faults were routed to `EnterShim::exception`.
+            // All are process-global for the same reason the rest of the
+            // guest-entry save area is: a naked callback running on the guest
+            // stack cannot reach a `thread_local!` without a call. Lifting the
+            // single-guest-thread limit retires all of them together.
+            ("litebox_platform_macos_userland/", 12),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
-            // 2 includes the test-only `ADDRESS_SPACE` mutex that serializes tests
-            // mapping guest memory; see `address_space_guard`.
-            ("litebox_shim_linux/", 2),
+            // 4 includes the test-only `ADDRESS_SPACE` and `ASYNC_SIGNAL` mutexes
+            // that serialize tests (see `address_space_guard`), and the
+            // `EPOLL_NEST_LOCK` global lock guarding nested-epoll registration.
+            ("litebox_shim_linux/", 4),
             // 5, not 4: `static INIT_FUNC` arrived with the OP-TEE syscall
             // support in 071841e and the table was never updated, so this count
             // has been stale since well before the macOS work.

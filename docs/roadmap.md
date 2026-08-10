@@ -163,9 +163,11 @@ Remaining, smaller, follow-ups on top of the working switch:
 * Host bookkeeping (save area + live-`PtRegs` pointer) is process-global, so
   **one guest thread at a time** (a second panics loudly). Per-thread needs the
   same `TPIDRRO_EL0` direct-TSD reach the rewriter gates need (below).
-* Only the **syscall** event path is wired; guest hardware faults and the
-  `SIGUSR2` interrupt path are not yet routed to `EnterShim::exception`/
-  `interrupt`.
+* The **syscall** and guest hardware fault (`SIGSEGV`/`SIGBUS`) event paths are
+  wired to `EnterShim::syscall`/`exception`; the `SIGUSR2` interrupt path is
+  not yet routed to `EnterShim::interrupt` (see "A guest fault no longer kills
+  the host" below for the fault path, and "The interrupt path (`SIGUSR2`) is
+  not routed" for why the interrupt path is a separate problem).
 * `enter_guest_asm` stages `PC`/`X0` in the 16 bytes below the guest `SP`
   (AArch64 has no red zone), so guest-directed signals must stay on a
   `sigaltstack`.
@@ -240,25 +242,61 @@ failed on paths `stat` handled.
 
 Known gaps a real guest hits now:
 
-* **A guest fault kills the host.** `busybox sh -c 'f() { f; }; f'` overflows the
-  guest stack and the *runner* dies with `SIGILL`. `install_fault_handlers`
-  registers only `SIGSEGV` and `SIGBUS`, and neither is routed to
-  `EnterShim::exception` anyway, so any guest fault is fatal to the process
-  rather than delivered to the guest.
+* **A guest fault no longer kills the host -- resolved on real hardware this
+  pass.** `busybox sh -c 'f() { f; }; f'` overflows the guest stack; the guest
+  `sh` task is now cleanly terminated (`litebox_shim_linux::syscalls::signal`
+  logs `fatal signal: terminating task signal=Signal(11)`) and the *runner*
+  exits normally (`exit(11)`) instead of the whole process dying with a raw
+  signal. Verified against the exact scenario above through the real
+  `litebox_packager --oci-image docker.io/library/alpine:latest` /
+  `litebox_runner_linux_on_macos_userland` pipeline on an Apple M3 Pro, 3
+  consecutive runs, plus two new hardware-run unit tests in
+  `litebox_platform_macos_userland::guest::tests`:
+  `delivers_a_genuine_guest_fault_to_the_shim_without_leaking_host_state` (a
+  hand-assembled guest self-reports its about-to-fault `pc` via a syscall
+  before dereferencing a null pointer, and seeds sentinels into `x9`/`x30`; the
+  delivered `ExceptionInfo`/`PtRegs` are asserted to match the guest's own
+  state exactly, closing the disclosure this item used to describe) and
+  `syscall_survives_a_guest_stack_with_only_16_valid_bytes_below_sp` (a regression
+  guard: a build that reverted to capturing onto the guest stack would crash
+  this test with a raw `SIGSEGV`).
 
-  Routing them is not the small change it looks like, and the obvious version is
-  worse than the crash. The natural design -- a "guest owns the CPU" flag the
-  handler consults to decide whose fault it is -- does not hold where it must:
-  `syscall_callback` allocates and writes ~304 bytes **onto the guest stack**
-  before it clears that ownership, so a guest that puts `SP` near an unmapped
-  page and issues a rewritten `SVC` faults inside the stub while still marked as
-  the owner. The handler would then copy a *host* `mcontext` -- a `pc` inside
-  `syscall_callback`, a host return address in `x30` -- into the guest's
-  `PtRegs` and deliver it as a guest signal, turning a safe crash into an ASLR
-  disclosure and a return path into host code. `litebox_platform_linux_userland`
-  avoids this by clearing its flag in the first instruction of its callback *and*
-  switching off the guest stack before touching `pt_regs`; a macOS version has to
-  port the ordering, not just the flag.
+  The naive fix really was worse than the crash, for exactly the reason this
+  entry used to describe: a "guest owns the CPU" flag the handler consults, with
+  `syscall_callback` still writing its capture **onto the guest stack** before
+  clearing it, lets a guest with `SP` near an unmapped page turn a safe crash
+  into an ASLR disclosure and a return path into host code. The fix ported both
+  pieces of `litebox_platform_linux_userland`'s ordering -- `GUEST_OWNS_CPU`
+  cleared as the first instructions of `syscall_callback`, before any memory
+  write -- but adapted the second piece (switching off the guest stack) to
+  AArch64's register-pressure reality rather than copying it directly:
+  `syscall_callback` now captures every guest GPR straight into the host-owned
+  live `PtRegs` through a dedicated base register (loaded from `LIVE_PTREGS`),
+  never decrementing `SP` at all, so it needs zero bytes of guest-stack headroom
+  instead of the original 304. The two guest-stack reads that remain structurally
+  necessary either side of the switch (the `SVC` gate's stashed `x16`/return
+  address in `syscall_callback`; the below-`SP` staged `PC`/`X0` in
+  `enter_guest_asm`) are bracketed with new exception-table entries recovering to
+  a loud `std::process::abort()` -- both windows only ever touch bytes a write
+  earlier in the *same* synchronous instruction stream just proved mapped, so
+  they are unreachable by a bad guest `SP` in the normal case, and the
+  exception-table check (which always runs before the `GUEST_OWNS_CPU` check)
+  means they can never be misattributed to the guest even if that reasoning has
+  a gap. This entry-side hazard -- symmetric to the exit-side one the task that
+  produced this fix was originally scoped around -- was found during
+  implementation, not anticipated going in; see
+  `litebox_platform_macos_userland::guest::GUEST_OWNS_CPU`'s doc comment for the
+  full mechanism.
+
+  Known gap left deliberately open: a delivered exception's vector/FPSIMD state
+  is not refreshed from the fault (Darwin's `mcontext` NEON state is not yet
+  modelled, mirroring the interrupt path's identical, already-documented gap
+  below), so a guest that resumes from a delivered signal after touching a
+  vector register since its last syscall observes stale FP/SIMD content. This is
+  a guest-observable correctness gap, not a host-state-disclosure one -- no host
+  information crosses the boundary either way -- and today a guest fault never
+  resumes at all, so it is a new, narrow rough edge on newly-added behavior,
+  never a regression of anything that worked before.
 
 * **The interrupt path (`SIGUSR2`) is not routed to `EnterShim::interrupt`
   either -- and it is a different problem from the fault one above, not the
