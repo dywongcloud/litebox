@@ -1975,6 +1975,7 @@ bitflags::bitflags! {
 pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
+    Requeue = 3,
     WaitBitset = 9,
 }
 
@@ -2013,6 +2014,20 @@ pub enum FutexArgs {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
         count: u32,
+    },
+    /// `FUTEX_REQUEUE`: wake up to `num_to_wake` waiters on `addr`, then move up to
+    /// `num_to_requeue` of the *remaining* waiters on `addr` onto `addr2`'s wait queue, without
+    /// waking them.
+    ///
+    /// Note the raw syscall ABI quirk this is parsed from: for this operation, the argument slot
+    /// normally used for `WAIT`'s `timeout` pointer is instead a plain integer (`num_to_requeue`),
+    /// not a `timespec*` -- see `man 2 futex`.
+    Requeue {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        num_to_wake: u32,
+        num_to_requeue: u32,
+        addr2: UserPtrMut<u32>,
     },
 }
 
@@ -3419,6 +3434,16 @@ impl SyscallRequest {
                 addr,
                 flags,
                 count: val,
+            },
+            FutexOperation::Requeue => FutexArgs::Requeue {
+                addr,
+                flags,
+                num_to_wake: val,
+                // ABI quirk: for `FUTEX_REQUEUE`, argument slot 3 (`WAIT`'s `timeout` pointer)
+                // is instead a plain integer, `num_to_requeue` -- not read via `time_param`/
+                // `sys_req_ptr` at all. See `man 2 futex`.
+                num_to_requeue: ctx.sys_req_arg(3),
+                addr2: ctx.sys_req_ptr(4),
             },
         };
         Ok(SyscallRequest::Futex { args })

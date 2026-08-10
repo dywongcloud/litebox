@@ -3386,4 +3386,90 @@ mod tests {
             Errno::ENOENT
         );
     }
+
+    /// `POLLIN`, matching real Linux's raw `poll(2)`/`ppoll(2)` event-mask bit.
+    const POLLIN: i16 = 0x0001;
+
+    /// A real-concurrency stress test for `sys_ppoll`'s lost-wakeup window: a writer thread is
+    /// released (via a barrier) at the same instant the poller calls `ppoll`, hundreds of times
+    /// in a row, so that across enough iterations the write lands arbitrarily close to whatever
+    /// internal state transition `ppoll` goes through between its "not ready yet" check and
+    /// actually blocking. A poller that checked readiness and *then* registered for
+    /// notification (the classic lost-wakeup ordering bug) would eventually miss a wakeup here
+    /// and report a spurious timeout instead of the byte that was actually written.
+    #[test]
+    fn test_ppoll_does_not_lose_a_concurrent_wakeup() {
+        const ITERATIONS: usize = 300;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let (rfd_u, wfd_u) = task
+            .sys_pipe2(litebox::fs::OFlags::empty())
+            .expect("pipe2 failed");
+        let rfd = i32::try_from(rfd_u).unwrap();
+        let wfd = i32::try_from(wfd_u).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        for i in 0..ITERATIONS {
+            let mut pollfd = litebox_common_linux::Pollfd {
+                fd: rfd,
+                events: POLLIN,
+                revents: 0,
+            };
+
+            // Vary the writer's timing relative to the poller across iterations (immediate,
+            // and after a couple of short delays) so both the poller's initial fast-path check
+            // and its register-then-block path each get real exercise against a genuinely
+            // concurrent write, rather than one path dominating simply because a raw pipe write
+            // is fast.
+            let writer_delay = core::time::Duration::from_micros(match i % 3 {
+                0 => 0,
+                1 => 500,
+                _ => 3_000,
+            });
+            let writer = {
+                let barrier = std::sync::Arc::clone(&barrier);
+                task.spawn_clone_for_test(move |task| {
+                    barrier.wait();
+                    if !writer_delay.is_zero() {
+                        std::thread::sleep(writer_delay);
+                    }
+                    task.sys_write(wfd, &[0x42], None).expect("write failed")
+                })
+            };
+
+            barrier.wait();
+            let ready_count = task
+                .sys_ppoll(
+                    UserPtrMut::from_ptr(&raw mut pollfd),
+                    1,
+                    TimeParam::Milliseconds(2000),
+                    None,
+                    0,
+                )
+                .unwrap_or_else(|e| panic!("iteration {i}: ppoll failed: {e:?}"));
+
+            writer.join().expect("writer thread panicked");
+
+            assert_eq!(
+                ready_count, 1,
+                "iteration {i}: ppoll should report exactly one ready fd, not time out -- a 0 \
+                 here means the wakeup from the concurrent write was lost"
+            );
+            assert_ne!(
+                pollfd.revents & POLLIN,
+                0,
+                "iteration {i}: the ready fd should be reported as POLLIN"
+            );
+
+            // Drain the byte so the next iteration starts from an empty pipe.
+            let mut buf = [0u8; 1];
+            let n = task.sys_read(rfd, &mut buf, None).expect("read failed");
+            assert_eq!(n, 1);
+            assert_eq!(buf, [0x42]);
+        }
+
+        let _ = task.sys_close(rfd);
+        let _ = task.sys_close(wfd);
+    }
 }

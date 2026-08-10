@@ -537,6 +537,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
     }
+
+    /// Explicitly closes every fd still alive in this (process-wide-last) file table.
+    ///
+    /// See `syscalls::process::Task::prepare_for_exit` for why this has to be explicit rather
+    /// than relying on `FilesState`'s `Drop`.
+    pub(crate) fn close_all_fds_on_exit(&self) {
+        let files = self.files.borrow();
+        let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+        for raw_fd in alive_fds {
+            let _ = self.do_close(raw_fd);
+        }
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS> {

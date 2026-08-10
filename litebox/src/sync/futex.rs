@@ -13,7 +13,7 @@
 use core::hash::BuildHasher as _;
 use core::num::NonZeroU32;
 use core::pin::pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::RawSyncPrimitivesProvider;
 use crate::event::wait::{WaitContext, WaitError, Waker};
@@ -40,7 +40,14 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
 const HASH_TABLE_ENTRIES: usize = 256;
 
 struct FutexEntry<Platform: RawSyncPrimitivesProvider> {
-    addr: usize,
+    /// The futex address this entry is currently waiting on.
+    ///
+    /// This is mutated in place (and the entry moved to a different bucket) by
+    /// [`FutexManager::requeue`] when a waiter is requeued from one futex word to another,
+    /// without waking it -- matching `FUTEX_REQUEUE` semantics. It's therefore an `AtomicUsize`
+    /// rather than a plain `usize`, since `requeue` only ever observes this entry through a
+    /// [`crate::utilities::loan_list::LoanedEntry`]'s shared `&FutexEntry`.
+    addr: AtomicUsize,
     waker: Waker<Platform>,
     bitset: u32,
     done: AtomicBool,
@@ -95,7 +102,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
 
         let bucket = self.bucket(addr);
         let mut entry = pin!(LoanListEntry::new(FutexEntry {
-            addr,
+            addr: AtomicUsize::new(addr),
             waker: cx.waker().clone(),
             bitset,
             done: AtomicBool::new(false),
@@ -147,7 +154,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         let bucket = self.bucket(addr);
         // Extract matching entries from the bucket until we've woken enough.
         let entries = bucket.extract_if(|entry| {
-            if entry.addr != addr || entry.bitset & bitset == 0 {
+            if entry.addr.load(Ordering::Relaxed) != addr || entry.bitset & bitset == 0 {
                 return core::ops::ControlFlow::Continue(false);
             }
             woken += 1;
@@ -163,6 +170,74 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             entry.done.store(true, Ordering::Relaxed);
             entry.waker.wake();
         }
+        Ok(woken)
+    }
+
+    /// Implements `FUTEX_REQUEUE`: wakes up to `num_to_wake` waiters on `addr1`, then moves up
+    /// to `num_to_requeue` of the *remaining* waiters on `addr1` onto `addr2`'s wait queue,
+    /// without waking them -- they stay asleep until a later [`Self::wake`] (or another
+    /// [`Self::requeue`]) targets `addr2`.
+    ///
+    /// Reuses the exact same [`LoanList`]-based wait-queue nodes `wait`/`wake` use (via
+    /// [`crate::utilities::loan_list::LoanedEntry::requeue_into`]) rather than a parallel
+    /// mechanism, so a requeued waiter is indistinguishable from one that called `wait(addr2,
+    /// ...)` in the first place, from `wake`'s point of view.
+    ///
+    /// Returns the number of waiters actually woken (matching Linux's `futex(2)` return value
+    /// for `FUTEX_REQUEUE`, which is the wake count, not the requeue count).
+    pub fn requeue(
+        &self,
+        addr1: Platform::RawMutPointer<u32>,
+        addr2: Platform::RawMutPointer<u32>,
+        num_to_wake: u32,
+        num_to_requeue: u32,
+    ) -> Result<u32, FutexError> {
+        let addr1 = addr1.as_usize();
+        let addr2 = addr2.as_usize();
+        if !addr1.is_multiple_of(align_of::<u32>()) || !addr2.is_multiple_of(align_of::<u32>()) {
+            return Err(FutexError::NotAligned);
+        }
+
+        let source = self.bucket(addr1);
+        let total_to_take = num_to_wake.saturating_add(num_to_requeue);
+        let mut taken = 0u32;
+        // Extract, in one pass, every entry we might either wake or requeue: the first
+        // `num_to_wake` matches become the "wake" prefix, the rest (up to `num_to_requeue` more)
+        // become the "requeue" remainder -- split below, once extracted. Checking `taken >=
+        // total_to_take` *before* incrementing (rather than only after) matters at the
+        // `total_to_take == 0` boundary: with the check only after, the very first match would
+        // still be taken (`1 >= 0`) even though nothing was asked for.
+        let entries = source.extract_if(|entry| {
+            if taken >= total_to_take || entry.addr.load(Ordering::Relaxed) != addr1 {
+                return core::ops::ControlFlow::Continue(false);
+            }
+            taken += 1;
+            if taken >= total_to_take {
+                core::ops::ControlFlow::Break(true)
+            } else {
+                core::ops::ControlFlow::Continue(true)
+            }
+        });
+
+        // `bucket` is a cheap hash-table index (no lock taken), so there's no meaningful cost to
+        // resolving it unconditionally, even on the `num_to_requeue == 0` path where it ends up
+        // unused.
+        let target = self.bucket(addr2);
+
+        let mut woken = 0u32;
+        let mut requeued = 0u32;
+        for entry in entries {
+            if woken < num_to_wake {
+                entry.done.store(true, Ordering::Relaxed);
+                entry.waker.wake();
+                woken += 1;
+            } else {
+                entry.addr.store(addr2, Ordering::Relaxed);
+                entry.requeue_into(target);
+                requeued += 1;
+            }
+        }
+        debug_assert!(requeued <= num_to_requeue);
         Ok(woken)
     }
 }
@@ -357,5 +432,164 @@ mod tests {
         }
 
         assert!((1..=3).contains(&woken));
+    }
+
+    /// Real threads, real `FutexManager::requeue`: proves waiters that get requeued (rather than
+    /// woken) genuinely stay asleep -- not just "eventually return", but specifically do NOT
+    /// return before a later `wake` targeting the *new* address, and DO return once that `wake`
+    /// happens. A buggy "requeue == wake everyone" implementation would pass a check that only
+    /// waits for all threads to finish; this test would catch it via `woken_before_second_wake`.
+    #[test]
+    fn test_futex_requeue_moves_remaining_waiters_and_wakes_them_later() {
+        const N: usize = 5;
+
+        let platform = MockPlatform::new();
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = Arc::new(FutexManager::new());
+
+        let futex1 = Arc::new(AtomicU32::new(0));
+        let futex2 = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(Barrier::new(N + 1));
+        // Incremented by each waiter immediately after its `wait()` call returns, so the main
+        // thread can observe *when* (relative to `requeue`/the second `wake`) each waiter
+        // actually unblocked, not just that it eventually did.
+        let completed = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+
+        let mut waiters = std::vec::Vec::new();
+        for _ in 0..N {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex1 = Arc::clone(&futex1);
+            let barrier = Arc::clone(&barrier);
+            let completed = Arc::clone(&completed);
+            waiters.push(thread::spawn(move || {
+                let futex_addr =
+                    <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                        futex1.as_ptr() as usize,
+                    );
+                barrier.wait();
+                let result = futex_manager.wait(
+                    &WaitState::new(platform)
+                        .context()
+                        .with_timeout(Duration::from_secs(10)),
+                    futex_addr,
+                    0,
+                    None,
+                );
+                completed.fetch_add(1, Ordering::SeqCst);
+                result
+            }));
+        }
+
+        barrier.wait(); // release all 5 waiters together
+        thread::sleep(Duration::from_millis(50)); // give them time to genuinely block
+
+        let addr1 =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex1.as_ptr() as usize,
+            );
+        let addr2 =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex2.as_ptr() as usize,
+            );
+
+        // Wake 2, requeue the remaining 3 onto `futex2`'s wait queue.
+        let woken_by_requeue = futex_manager.requeue(addr1, addr2, 2, 3).unwrap();
+        assert_eq!(
+            woken_by_requeue, 2,
+            "requeue's return value is the wake count, not the requeue count"
+        );
+
+        // Give the 2 directly-woken waiters ample time to actually return, and any
+        // incorrectly-also-woken requeued waiters a real chance to (wrongly) return too.
+        thread::sleep(Duration::from_millis(100));
+        let woken_before_second_wake = completed.load(Ordering::SeqCst);
+        assert_eq!(
+            woken_before_second_wake, 2,
+            "exactly the 2 directly-woken waiters should have returned by now -- the other 3 \
+             must still be genuinely blocked, waiting on futex2, not woken early"
+        );
+
+        // Now wake the requeued waiters via their *new* address.
+        let woken_on_addr2 = futex_manager
+            .wake(addr2, NonZeroU32::new(u32::MAX).unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            woken_on_addr2, 3,
+            "all 3 requeued waiters should be discoverable (and wakeable) via addr2"
+        );
+
+        for waiter in waiters {
+            let result = waiter.join().unwrap();
+            assert!(result.is_ok(), "{result:?}");
+        }
+        assert_eq!(completed.load(Ordering::SeqCst), N);
+    }
+
+    /// A single waiter requeued (never woken directly) must actually move to the target futex's
+    /// wait queue and later be wakeable there -- exercising `num_to_wake == 0`.
+    #[test]
+    fn test_futex_requeue_with_zero_wake_moves_the_sole_waiter() {
+        let platform = MockPlatform::new();
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = Arc::new(FutexManager::new());
+
+        let futex1 = Arc::new(AtomicU32::new(0));
+        let futex2 = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let waiter = {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex1 = Arc::clone(&futex1);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let futex_addr =
+                    <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                        futex1.as_ptr() as usize,
+                    );
+                barrier.wait();
+                futex_manager.wait(
+                    &WaitState::new(platform)
+                        .context()
+                        .with_timeout(Duration::from_secs(10)),
+                    futex_addr,
+                    0,
+                    None,
+                )
+            })
+        };
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(50));
+
+        let addr1 =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex1.as_ptr() as usize,
+            );
+        let addr2 =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex2.as_ptr() as usize,
+            );
+
+        let woken = futex_manager.requeue(addr1, addr2, 0, 1).unwrap();
+        assert_eq!(woken, 0);
+
+        // A `wake` still targeting the *old* address must find nobody -- the waiter has
+        // genuinely moved, not merely been duplicated/left behind.
+        let woken_on_stale_addr = futex_manager
+            .wake(addr1, NonZeroU32::new(1).unwrap(), None)
+            .unwrap();
+        assert_eq!(woken_on_stale_addr, 0);
+
+        assert!(
+            !waiter.is_finished(),
+            "the sole waiter was requeued, not woken; it must still be blocked"
+        );
+
+        let woken_on_addr2 = futex_manager
+            .wake(addr2, NonZeroU32::new(1).unwrap(), None)
+            .unwrap();
+        assert_eq!(woken_on_addr2, 1);
+
+        assert!(waiter.join().unwrap().is_ok());
     }
 }

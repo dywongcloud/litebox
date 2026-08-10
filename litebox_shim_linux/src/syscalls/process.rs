@@ -75,9 +75,17 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         })
     }
 
-    fn detach_from_process(&self) {
+    /// Detaches this thread from its process.
+    ///
+    /// Returns `true` if this was the last thread of the process to detach (i.e., the whole
+    /// process is now gone), `false` otherwise -- including when this thread was already
+    /// detached (so callers relying on this to run exactly-once cleanup, like closing every fd
+    /// on process exit, don't double-run it if `Drop` invokes this a second time).
+    fn detach_from_process(&self) -> bool {
         if let Some(tid) = self.attached_tid.take() {
-            self.process.detach_thread(tid);
+            self.process.detach_thread(tid)
+        } else {
+            false
         }
     }
 }
@@ -220,11 +228,14 @@ impl<Platform: ShimPlatform> Process<Platform> {
 
     /// Detaches a thread from this process.
     ///
+    /// Returns `true` if this was the last thread in the process (i.e., the process as a whole
+    /// is now exiting), `false` if other threads remain.
+    ///
     /// # Panics
     /// Panics if the thread ID does not exist in this process.
-    fn detach_thread(&self, tid: i32) {
+    fn detach_thread(&self, tid: i32) -> bool {
         let data;
-        let notify = {
+        let (notify, is_last_thread) = {
             let mut inner = self.inner.lock();
             data = inner.threads.remove(&tid);
             assert!(data.is_some());
@@ -233,7 +244,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
             let n = nr_threads.load(Ordering::Relaxed);
             let new_count = n.checked_sub(1).expect("decrementing from zero threads");
             nr_threads.store(new_count, Ordering::Release);
-            if new_count == 0 {
+            let is_last_thread = new_count == 0;
+            if is_last_thread {
                 assert!(inner.threads.is_empty());
                 // The last thread exited. Prevent new threads.
                 inner.group_exit = true;
@@ -242,11 +254,15 @@ impl<Platform: ShimPlatform> Process<Platform> {
             // Notify waiters if this is the last thread of the process
             // (`wait_for_exit`) or if this is the last thread being killed
             // during an exec (`kill_other_threads`).
-            new_count == 0 || (new_count == 1 && inner.is_killing_other_threads)
+            (
+                is_last_thread || (new_count == 1 && inner.is_killing_other_threads),
+                is_last_thread,
+            )
         };
         if notify {
             self.nr_threads.wake_all();
         }
+        is_last_thread
     }
 }
 
@@ -503,7 +519,7 @@ fn wake_robust_list<Platform: ShimPlatform>(
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
-        self.thread.detach_from_process();
+        let is_last_thread = self.thread.detach_from_process();
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
@@ -519,6 +535,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list::<Platform>(robust_list);
+        }
+
+        // `FilesState` is shared (via `Arc`) across every `CLONE_FILES` thread of the process,
+        // and closing an fd is only ever done explicitly (via `do_close`, which routes through
+        // `Descriptors::remove` and the resource's own `Drop` impl -- e.g. a pipe write-end's
+        // `Drop` firing its `HUP` notification). Just letting `FilesState`/`RawDescriptorStorage`
+        // fall out of scope does NOT do this: `OwnedFd::drop` is a no-op for any fd that was
+        // never explicitly closed, so any fd still open when the process exits would otherwise
+        // leak forever at the descriptor-table level -- e.g. hanging a reader elsewhere in the
+        // process that is blocked in `read()` waiting for a pipe write-end's `EOF`, regardless of
+        // whether something else (like an epoll registration, see `epoll.rs`) also still
+        // references the fd. Real Linux closes every fd of a process as part of process exit, so
+        // mirror that here -- but only once, when the *last* thread sharing this file table is
+        // the one exiting, matching `CLONE_FILES` semantics (a single thread of a still-running
+        // multithreaded process exiting must NOT close fds out from under its siblings).
+        if is_last_thread {
+            self.close_all_fds_on_exit();
         }
     }
 
@@ -1631,6 +1664,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     core::num::NonZeroU32::new(bitmask),
                 )?;
                 0
+            }
+            litebox_common_linux::FutexArgs::Requeue {
+                addr,
+                flags,
+                num_to_wake,
+                num_to_requeue,
+                addr2,
+            } => {
+                warn_shared_futex!(flags);
+                self.global.futex_manager.requeue(
+                    addr.to_platform_ptr::<Platform>(),
+                    addr2.to_platform_ptr::<Platform>(),
+                    num_to_wake,
+                    num_to_requeue,
+                )? as usize
             }
             _ => {
                 log_unsupported!("futex operation {:?}", arg);
@@ -2872,5 +2920,212 @@ mod tests {
             .expect("None should still mean self");
 
         assert_eq!(head_via_tid, head_via_none);
+    }
+
+    /// Real threads, real `sys_futex` syscalls: `FUTEX_REQUEUE` must wake exactly
+    /// `num_to_wake` waiters directly and *move* the rest onto the second futex word's own wait
+    /// queue without waking them -- provable only by observing that the requeued waiters stay
+    /// blocked until a separate, later `FUTEX_WAKE` on the new address, not merely that every
+    /// thread eventually finishes.
+    #[test]
+    fn test_futex_requeue_across_real_threads() {
+        use litebox_common_linux::{FutexArgs, FutexFlags, TimeParam};
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const N: usize = 4;
+        const NUM_TO_WAKE: u32 = 1;
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Real, shared guest-visible memory for both futex words; each spawned thread reaches it
+        // via the raw address (a `Send` `usize`), reconstructing the pointer on its own thread,
+        // exactly as translated syscall arguments would be.
+        let mut futex1: u32 = 0;
+        let mut futex2: u32 = 0;
+        let futex1_addr = core::ptr::from_mut(&mut futex1) as usize;
+        let futex2_addr = core::ptr::from_mut(&mut futex2) as usize;
+
+        let completed = std::sync::Arc::new(AtomicUsize::new(0));
+        let ready = std::sync::Arc::new(Barrier::new(N + 1));
+
+        let waiters: std::vec::Vec<_> = (0..N)
+            .map(|_| {
+                let completed = std::sync::Arc::clone(&completed);
+                let ready = std::sync::Arc::clone(&ready);
+                task.spawn_clone_for_test(move |task| {
+                    ready.wait();
+                    let result = task.sys_futex(FutexArgs::Wait {
+                        addr: UserPtrMut::from_usize(futex1_addr),
+                        flags: FutexFlags::PRIVATE,
+                        val: 0,
+                        timeout: TimeParam::Milliseconds(10_000),
+                    });
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    result
+                })
+            })
+            .collect();
+
+        ready.wait(); // release all N waiters together
+        std::thread::sleep(core::time::Duration::from_millis(100)); // let them genuinely block
+
+        let woken = task
+            .sys_futex(FutexArgs::Requeue {
+                addr: UserPtrMut::from_usize(futex1_addr),
+                flags: FutexFlags::PRIVATE,
+                num_to_wake: NUM_TO_WAKE,
+                num_to_requeue: u32::try_from(N).unwrap() - NUM_TO_WAKE,
+                addr2: UserPtrMut::from_usize(futex2_addr),
+            })
+            .expect("futex requeue failed");
+        assert_eq!(
+            usize::try_from(NUM_TO_WAKE).unwrap(),
+            woken,
+            "futex(FUTEX_REQUEUE) returns the wake count, not the requeue count"
+        );
+
+        // Give the directly-woken waiter(s) ample time to actually return, and any
+        // incorrectly-also-woken requeued waiters a real chance to (wrongly) return too.
+        std::thread::sleep(core::time::Duration::from_millis(150));
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            usize::try_from(NUM_TO_WAKE).unwrap(),
+            "only the directly-woken waiter(s) should have returned -- the requeued ones must \
+             still be genuinely blocked, now waiting on futex2, not woken early by the requeue \
+             call itself"
+        );
+
+        // A stale wake on the *original* address must find nobody left there.
+        let woken_on_stale_addr = task
+            .sys_futex(FutexArgs::Wake {
+                addr: UserPtrMut::from_usize(futex1_addr),
+                flags: FutexFlags::PRIVATE,
+                count: u32::MAX,
+            })
+            .expect("wake on stale addr failed");
+        assert_eq!(
+            woken_on_stale_addr, 0,
+            "the requeued waiters must have genuinely moved off futex1's wait queue"
+        );
+
+        // Now wake the requeued waiters via their new address.
+        let woken_on_addr2 = task
+            .sys_futex(FutexArgs::Wake {
+                addr: UserPtrMut::from_usize(futex2_addr),
+                flags: FutexFlags::PRIVATE,
+                count: u32::MAX,
+            })
+            .expect("wake on addr2 failed");
+        assert_eq!(
+            woken_on_addr2,
+            N - usize::try_from(NUM_TO_WAKE).unwrap(),
+            "every requeued waiter must be discoverable, and wakeable, via the new address"
+        );
+
+        for waiter in waiters {
+            waiter
+                .join()
+                .expect("waiter thread panicked")
+                .expect("sys_futex(Wait) should not have errored");
+        }
+        assert_eq!(completed.load(Ordering::SeqCst), N);
+    }
+
+    /// Real process-exit teardown (`prepare_for_exit`), a real pipe, and a real epoll
+    /// registration on its write end: proves a still-open write-end fd left behind when the
+    /// *last* thread of a process exits -- with no explicit `close()` from the guest, exactly
+    /// how a real Linux program that just calls `_exit()` (or crashes) behaves, relying on the
+    /// kernel to close its fds -- is unconditionally closed, so a reader elsewhere gets `EOF`
+    /// instead of hanging forever, regardless of the epoll registration.
+    #[test]
+    fn test_process_exit_closes_pipe_write_end_even_with_epoll_registered() {
+        use litebox::fd::TypedFd;
+        use litebox::fs::OFlags;
+        use litebox::pipes::Pipes;
+        use litebox_common_linux::{EpollCreateFlags, EpollEvent, EpollOp};
+
+        let writer_task = crate::syscalls::tests::init_platform(None);
+        let fs = writer_task.files.borrow().fs.clone();
+        // A second, wholly independent process -- its own `Process` and its own `FilesState` --
+        // sharing only the same underlying `GlobalState`/`litebox` object, exactly as two real
+        // OS processes sharing one machine would. This is what makes "the reader is unaffected
+        // by the writer's own fd-table teardown" a meaningful, non-tautological claim: the
+        // reader's fd table is not the one `prepare_for_exit` walks.
+        let reader_task = writer_task.global.clone().new_test_task(fs);
+
+        let (read_fd, write_fd) = writer_task
+            .sys_pipe2(OFlags::empty())
+            .expect("pipe2 failed");
+        let write_fd_i32 = i32::try_from(write_fd).unwrap();
+
+        // Register the write end with an epoll instance the writer also owns -- the exact
+        // scenario under investigation: an epoll registration must not keep the write end alive
+        // past the writer's exit.
+        let epfd = writer_task
+            .sys_epoll_create(EpollCreateFlags::empty())
+            .expect("epoll_create failed");
+        let event = EpollEvent {
+            events: litebox::event::Events::OUT.bits(),
+            data: 0,
+        };
+        writer_task
+            .sys_epoll_ctl(
+                i32::try_from(epfd).unwrap(),
+                EpollOp::EpollCtlAdd,
+                write_fd_i32,
+                UserPtr::from_ptr(&raw const event),
+            )
+            .expect("epoll_ctl(ADD) on the write end failed");
+
+        // Hand the *read* end to the independent reader process, mirroring what real fd
+        // inheritance (fork, or SCM_RIGHTS over a Unix socket) would produce: a second,
+        // independent owning reference to the same underlying pipe object, reachable through a
+        // completely different process's fd table.
+        let dup_read_fd = {
+            let writer_files = writer_task.files.borrow();
+            let rds = writer_files.raw_descriptor_store.read();
+            let original: alloc::sync::Arc<TypedFd<Pipes<crate::syscalls::tests::TestPlatform>>> =
+                rds.fd_from_raw_integer(read_fd as usize).unwrap();
+            drop(rds);
+            writer_task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(&original)
+                .expect("duplicating the read end should succeed")
+        };
+        let reader_raw_fd = {
+            let reader_files = reader_task.files.borrow();
+            let mut rds = reader_files.raw_descriptor_store.write();
+            rds.fd_into_raw_integer(dup_read_fd)
+        };
+        let reader_raw_fd = i32::try_from(reader_raw_fd).unwrap();
+
+        // The reader blocks in a real `read()` on its own, independent fd, waiting for EOF.
+        let reader = reader_task.spawn_clone_for_test(move |task| {
+            let mut buf = [0u8; 1];
+            task.sys_read(reader_raw_fd, &mut buf, None)
+        });
+
+        std::thread::sleep(core::time::Duration::from_millis(100)); // let it genuinely block
+        assert!(
+            !reader.is_finished(),
+            "the reader should still be blocked: the write end is still open"
+        );
+
+        // The writer "process" exits -- its last (only) thread -- *without* explicitly closing
+        // either the pipe write end or the epoll fd.
+        drop(writer_task);
+
+        let result = reader
+            .join()
+            .expect("reader thread panicked")
+            .expect("read() should not have errored");
+        assert_eq!(
+            result, 0,
+            "the reader should observe EOF (a 0-byte read) once the writer's process exits, not \
+             hang forever"
+        );
     }
 }
