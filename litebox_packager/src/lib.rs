@@ -12,7 +12,7 @@ pub mod oci;
 use anyhow::{Context, bail};
 use clap::Parser;
 use rayon::prelude::*;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,8 @@ use tar::{Builder, Header};
 ///
 /// Supports two modes:
 /// - **Host mode** (default): Takes local ELF files, discovers dependencies via
-///   `ldd`, rewrites syscalls, and produces a tar.
+///   `ldd` on Linux (macOS requires statically linked inputs), rewrites
+///   syscalls, and produces a tar.
 /// - **OCI mode** (`--oci-image`): Pulls a container image from a registry,
 ///   extracts its rootfs, rewrites all executable ELFs, and produces a tar.
 #[derive(Parser, Debug)]
@@ -72,13 +73,13 @@ pub struct CliArgs {
 }
 
 /// Parsed `--include` entry.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct IncludeEntry {
     host_path: PathBuf,
     tar_path: String,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
     let Some(colon_idx) = spec.find(':') else {
         bail!("invalid --include format: expected HOST_PATH:TAR_PATH, got: {spec}");
@@ -115,23 +116,27 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Host mode (local ELF files + ldd dependency discovery) is Linux-only.
-    #[cfg(target_os = "linux")]
+    // Host mode is Linux (ldd-based dependency discovery) and macOS
+    // (statically linked inputs only; see `require_statically_linked`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         run_host_mode(args)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         bail!(
-            "Host mode (local ELF files) is only supported on Linux. \
+            "Host mode (local ELF files) is only supported on Linux and macOS. \
              Use --oci-image to pull a container image instead."
         );
     }
 }
 
-/// Host mode: package local ELF files with ldd-based dependency discovery.
-#[cfg(target_os = "linux")]
+/// Host mode: package local ELF files. On Linux, dependencies are discovered
+/// via `ldd`; on macOS, inputs must already be statically linked, since
+/// dependency discovery isn't implemented there yet (see
+/// `require_statically_linked`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
     let input_files: Vec<PathBuf> = args
         .input_files
@@ -166,7 +171,10 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
 
     // --- Phase 2: Discover dependencies and build unified file map ---
     eprintln!("Discovering dependencies...");
+    #[cfg(target_os = "linux")]
     let file_map = discover_all_dependencies(&input_files, args.verbose)?;
+    #[cfg(target_os = "macos")]
+    let file_map = require_statically_linked(&input_files)?;
 
     eprintln!(
         "Found {} unique files across {} input file(s)",
@@ -570,6 +578,83 @@ fn discover_all_dependencies(
 }
 
 // ---------------------------------------------------------------------------
+// Dependency discovery (macOS: statically linked inputs only)
+// ---------------------------------------------------------------------------
+
+/// Returns `Some(true)` if the ELF has no `PT_INTERP` program header and no
+/// `DT_NEEDED` dynamic entries, i.e. nothing a dependency resolver would need
+/// to find. Returns `Some(false)` if it has either, and `None` if `data`
+/// cannot be parsed as an ELF file.
+#[cfg(target_os = "macos")]
+fn elf_is_statically_linked(data: &[u8]) -> Option<bool> {
+    use object::read::elf::{Dyn as _, FileHeader, ProgramHeader as _};
+
+    fn has_dynamic_deps<Elf: FileHeader<Endian = object::Endianness>>(
+        header: &Elf,
+        data: &[u8],
+    ) -> Option<bool> {
+        let endian = header.endian().ok()?;
+        for phdr in header.program_headers(endian, data).ok()? {
+            if phdr.p_type(endian) == object::elf::PT_INTERP {
+                return Some(true);
+            }
+            if let Some(entries) = phdr.dynamic(endian, data).ok()?
+                && entries
+                    .iter()
+                    .any(|entry| entry.tag32(endian) == Some(object::elf::DT_NEEDED))
+            {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    let dynamic = if let Ok(header) = object::elf::FileHeader64::<object::Endianness>::parse(data)
+    {
+        has_dynamic_deps(header, data)
+    } else if let Ok(header) = object::elf::FileHeader32::<object::Endianness>::parse(data) {
+        has_dynamic_deps(header, data)
+    } else {
+        None
+    }?;
+    Some(!dynamic)
+}
+
+/// Host mode without `ldd`: every input must already be a statically linked
+/// ELF, so the file map is just each input mapped to itself. Dependency
+/// discovery for dynamically linked guests is not implemented on macOS yet.
+#[cfg(target_os = "macos")]
+fn require_statically_linked(
+    input_files: &[PathBuf],
+) -> anyhow::Result<BTreeMap<PathBuf, Vec<PathBuf>>> {
+    let mut file_map: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+
+    for input_path in input_files {
+        let data = std::fs::read(input_path)
+            .with_context(|| format!("failed to read {}", input_path.display()))?;
+        match elf_is_statically_linked(&data) {
+            Some(true) => {}
+            Some(false) => bail!(
+                "{} is dynamically linked; host mode on macOS only supports statically \
+                 linked binaries, since ldd-based dependency discovery is Linux-only and \
+                 not yet implemented here",
+                input_path.display()
+            ),
+            None => bail!("{} is not a valid ELF file", input_path.display()),
+        }
+
+        let canonical = std::fs::canonicalize(input_path)
+            .with_context(|| format!("could not canonicalize {}", input_path.display()))?;
+        let entry = file_map.entry(canonical).or_default();
+        if !entry.contains(input_path) {
+            entry.push(input_path.clone());
+        }
+    }
+
+    Ok(file_map)
+}
+
+// ---------------------------------------------------------------------------
 // ELF rewriting
 // ---------------------------------------------------------------------------
 
@@ -718,4 +803,64 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
 
     builder.finish().context("failed to finalize tar archive")?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    fn elf64_header(e_phoff: u64, e_phnum: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; 64];
+        buf[0..4].copy_from_slice(&ELF_MAGIC);
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+        buf[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+        buf[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        buf[32..40].copy_from_slice(&e_phoff.to_le_bytes());
+        buf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        buf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize == size_of::<Elf64_Phdr>()
+        buf[56..58].copy_from_slice(&e_phnum.to_le_bytes());
+        buf
+    }
+
+    fn append_phdr(buf: &mut Vec<u8>, p_type: u32, p_offset: u64, p_filesz: u64) {
+        buf.extend_from_slice(&p_type.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // p_flags
+        buf.extend_from_slice(&p_offset.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // p_vaddr
+        buf.extend_from_slice(&0u64.to_le_bytes()); // p_paddr
+        buf.extend_from_slice(&p_filesz.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // p_memsz
+        buf.extend_from_slice(&0u64.to_le_bytes()); // p_align
+    }
+
+    #[test]
+    fn elf_is_statically_linked_true_with_no_program_headers() {
+        let elf = elf64_header(0, 0);
+        assert_eq!(elf_is_statically_linked(&elf), Some(true));
+    }
+
+    #[test]
+    fn elf_is_statically_linked_false_with_pt_interp() {
+        let mut elf = elf64_header(64, 1);
+        append_phdr(&mut elf, object::elf::PT_INTERP, 0, 0);
+        assert_eq!(elf_is_statically_linked(&elf), Some(false));
+    }
+
+    #[test]
+    fn elf_is_statically_linked_false_with_dt_needed() {
+        let mut elf = elf64_header(64, 1);
+        let dynamic_offset = elf.len() as u64 + 56;
+        append_phdr(&mut elf, object::elf::PT_DYNAMIC, dynamic_offset, 16);
+        elf.extend_from_slice(&u64::from(object::elf::DT_NEEDED).to_le_bytes()); // d_tag
+        elf.extend_from_slice(&0u64.to_le_bytes()); // d_val
+        assert_eq!(elf_is_statically_linked(&elf), Some(false));
+    }
+
+    #[test]
+    fn elf_is_statically_linked_none_for_non_elf_data() {
+        assert_eq!(elf_is_statically_linked(b"not an elf file"), None);
+    }
 }

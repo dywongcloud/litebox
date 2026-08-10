@@ -2368,6 +2368,12 @@ pub enum SyscallRequest {
         size: i32,
         list: UserPtrMut<u32>,
     },
+    Setuid {
+        uid: u32,
+    },
+    Setgid {
+        gid: u32,
+    },
     Sysinfo {
         buf: UserPtrMut<Sysinfo>,
     },
@@ -2726,6 +2732,8 @@ impl SyscallRequest {
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
             Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
+            Sysno::setuid => sys_req!(Setuid { uid }),
+            Sysno::setgid => sys_req!(Setgid { gid }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::epoll_wait => {

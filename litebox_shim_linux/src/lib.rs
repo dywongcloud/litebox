@@ -321,13 +321,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 pid,
                 ppid,
                 tid: pid,
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
+                credentials: RefCell::new(
+                    syscalls::process::Credentials {
+                        uid,
+                        euid,
+                        gid,
+                        egid,
+                    }
+                    .into(),
+                ),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
@@ -1228,6 +1230,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
             SyscallRequest::Getgroups { size, list } => syscall!(sys_getgroups(size, list)),
+            SyscallRequest::Setuid { uid } => syscall!(sys_setuid(uid)),
+            SyscallRequest::Setgid { gid } => syscall!(sys_setgid(gid)),
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset::<Platform>(0, sysinfo)
@@ -1320,8 +1324,12 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     /// Thread ID
     tid: i32,
     /// Task credentials. These are set per task but are Arc'd to save space
-    /// since most tasks never change their credentials.
-    credentials: Arc<syscalls::process::Credentials>,
+    /// since most tasks never change their credentials. `setuid`/`setgid`
+    /// replace the `Arc` rather than mutate through it, so a thread that
+    /// still shares the old one (e.g. a sibling from `clone`) is unaffected
+    /// -- matching the raw syscall, which (unlike glibc's thread-broadcasting
+    /// wrapper) only ever updates the calling thread's credentials.
+    credentials: RefCell<Arc<syscalls::process::Credentials>>,
     /// Command name (usually the executable name, excluding the path)
     comm: Cell<[u8; litebox_common_linux::TASK_COMM_LEN]>,
     /// Filesystem state. `RefCell` to support `unshare` in the future.
@@ -1360,12 +1368,12 @@ mod test_utils {
                 pid,
                 ppid: 0,
                 tid: pid,
-                credentials: Arc::new(syscalls::process::Credentials {
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials {
                     uid: 0,
                     euid: 0,
                     gid: 0,
                     egid: 0,
-                }),
+                })),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
@@ -1389,7 +1397,7 @@ mod test_utils {
                 pid: self.pid,
                 ppid: self.ppid,
                 tid,
-                credentials: self.credentials.clone(),
+                credentials: RefCell::new(self.credentials.borrow().clone()),
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),

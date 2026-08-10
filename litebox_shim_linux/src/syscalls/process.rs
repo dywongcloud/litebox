@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -731,7 +731,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         pid: self.pid,
                         tid: child_tid,
                         ppid: self.ppid,
-                        credentials: self.credentials.clone(),
+                        credentials: RefCell::new(self.credentials.borrow().clone()),
                         comm: self.comm.clone(),
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
@@ -886,7 +886,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_rlim: Option<UserPtr<litebox_common_linux::Rlimit64>>,
         old_rlim: Option<UserPtrMut<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
-        if pid != 0 {
+        if pid != 0 && pid != self.pid {
             unimplemented!("prlimit for a specific PID is not supported yet");
         }
         let new_limit = match new_rlim {
@@ -940,7 +940,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         pid: Option<i32>,
         head_ptr: UserPtrMut<usize>,
     ) -> Result<(), Errno> {
-        if pid.is_some() {
+        if pid.is_some_and(|pid| pid != self.tid) {
             unimplemented!("Getting robust list for a specific PID is not supported yet");
         }
         let head = self
@@ -1264,22 +1264,86 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
-        self.credentials.uid
+        self.credentials.borrow().uid
     }
 
     /// Handle syscall `geteuid`.
     pub(crate) fn sys_geteuid(&self) -> u32 {
-        self.credentials.euid
+        self.credentials.borrow().euid
     }
 
     /// Handle syscall `getgid`.
     pub(crate) fn sys_getgid(&self) -> u32 {
-        self.credentials.gid
+        self.credentials.borrow().gid
     }
 
     /// Handle syscall `getegid`.
     pub(crate) fn sys_getegid(&self) -> u32 {
-        self.credentials.egid
+        self.credentials.borrow().egid
+    }
+
+    /// Whether this task may change its uid/gid to an arbitrary value.
+    ///
+    /// LiteBox models no capability set, so `CAP_SETUID`/`CAP_SETGID` have
+    /// nothing to check. An effective uid of 0 is used as the stand-in,
+    /// mirroring the classic pre-capabilities Unix kernel, which gated the
+    /// same operations on `suser()` (effective uid 0) alone.
+    fn is_privileged(&self) -> bool {
+        self.credentials.borrow().euid == 0
+    }
+
+    /// Handle syscall `setuid`.
+    ///
+    /// A privileged task may become any uid; this also sets `euid` to match,
+    /// since with no saved-set-uid tracked here there is nothing else for a
+    /// privileged `setuid` to leave behind for a later drop-and-reclaim. An
+    /// unprivileged task may only switch its effective uid to its current
+    /// real or effective uid, same as the raw Linux syscall (the POSIX
+    /// behavior of applying this to every thread in the process is a glibc
+    /// wrapper feature this shim, operating at the raw-syscall level, does
+    /// not need to reproduce).
+    ///
+    /// # Errors
+    ///
+    /// `EPERM` if the task is unprivileged and `uid` is neither its current
+    /// uid nor euid.
+    pub(crate) fn sys_setuid(&self, uid: u32) -> Result<(), Errno> {
+        let mut new = self.credentials.borrow().as_ref().clone();
+        if self.is_privileged() {
+            new.uid = uid;
+            new.euid = uid;
+        } else if uid == new.uid || uid == new.euid {
+            new.euid = uid;
+        } else {
+            return Err(Errno::EPERM);
+        }
+        *self.credentials.borrow_mut() = Arc::new(new);
+        Ok(())
+    }
+
+    /// Handle syscall `setgid`.
+    ///
+    /// See [`Self::sys_setuid`]; the same policy applies with `gid`/`egid` in
+    /// place of `uid`/`euid`, gated on the same privilege check (Linux
+    /// privileges `setgid` on `CAP_SETGID` rather than `CAP_SETUID`, but
+    /// LiteBox tracks neither, so both fall back to the one uid-0 check).
+    ///
+    /// # Errors
+    ///
+    /// `EPERM` if the task is unprivileged and `gid` is neither its current
+    /// gid nor egid.
+    pub(crate) fn sys_setgid(&self, gid: u32) -> Result<(), Errno> {
+        let mut new = self.credentials.borrow().as_ref().clone();
+        if self.is_privileged() {
+            new.gid = gid;
+            new.egid = gid;
+        } else if gid == new.gid || gid == new.egid {
+            new.egid = gid;
+        } else {
+            return Err(Errno::EPERM);
+        }
+        *self.credentials.borrow_mut() = Arc::new(new);
+        Ok(())
     }
 
     /// Handle syscall `getgroups`.
@@ -1296,7 +1360,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// set, both as Linux does. `EFAULT` if `list` is not writable. `size == 0`
     /// is the "how many?" query and writes nothing.
     pub(crate) fn sys_getgroups(&self, size: i32, list: UserPtrMut<u32>) -> Result<usize, Errno> {
-        let groups = [self.credentials.gid];
+        let groups = [self.credentials.borrow().gid];
         if size < 0 {
             return Err(Errno::EINVAL);
         }
@@ -2189,5 +2253,107 @@ mod tests {
             parse_shebang(b"#!/usr/bin/env\tpython3\n"),
             Some(("/usr/bin/env", Some("python3")))
         );
+    }
+
+    #[test]
+    fn test_setuid_privileged_sets_uid_and_euid() {
+        let task = crate::syscalls::tests::init_platform(None);
+        assert_eq!(task.sys_getuid(), 0);
+
+        task.sys_setuid(1000)
+            .expect("privileged setuid to an arbitrary uid should succeed");
+        assert_eq!(task.sys_getuid(), 1000);
+        assert_eq!(task.sys_geteuid(), 1000);
+    }
+
+    #[test]
+    fn test_setuid_unprivileged_restricted_to_current_ids() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        task.sys_setuid(1000)
+            .expect("privileged setuid should succeed");
+
+        // No longer privileged: switching to its own uid is a no-op success...
+        task.sys_setuid(1000)
+            .expect("setuid to the caller's own uid should succeed");
+        // ...but becoming any other uid is not.
+        let err = task.sys_setuid(0).unwrap_err();
+        assert_eq!(err, Errno::EPERM);
+        assert_eq!(task.sys_getuid(), 1000);
+    }
+
+    #[test]
+    fn test_setgid_privileged_sets_gid_and_egid() {
+        let task = crate::syscalls::tests::init_platform(None);
+        assert_eq!(task.sys_getgid(), 0);
+
+        task.sys_setgid(1000)
+            .expect("privileged setgid to an arbitrary gid should succeed");
+        assert_eq!(task.sys_getgid(), 1000);
+        assert_eq!(task.sys_getegid(), 1000);
+    }
+
+    #[test]
+    fn test_setgid_unprivileged_restricted_to_current_ids() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        // The privilege check keys off euid, not gid, so pick a gid while
+        // still privileged, then drop uid to make the calls below run
+        // unprivileged and confirm the gid check isn't secretly keying off uid.
+        task.sys_setgid(2000)
+            .expect("privileged setgid should succeed");
+        task.sys_setuid(1000)
+            .expect("privileged setuid should succeed");
+
+        task.sys_setgid(2000)
+            .expect("setgid to the caller's own gid should succeed");
+        let err = task.sys_setgid(0).unwrap_err();
+        assert_eq!(err, Errno::EPERM);
+        assert_eq!(task.sys_getgid(), 2000);
+    }
+
+    #[test]
+    fn test_setuid_does_not_affect_sibling_thread_credentials() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let sibling = task
+            .clone_for_test()
+            .expect("clone_for_test should succeed");
+
+        task.sys_setuid(1000).expect("setuid should succeed");
+
+        assert_eq!(task.sys_getuid(), 1000);
+        assert_eq!(sibling.sys_getuid(), 0);
+    }
+
+    #[test]
+    fn test_prlimit_own_pid_is_self() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_prlimit(
+            task.pid,
+            litebox_common_linux::RlimitResource::NOFILE,
+            None,
+            None,
+        )
+        .expect("own pid should be treated the same as pid 0");
+        task.sys_prlimit(0, litebox_common_linux::RlimitResource::NOFILE, None, None)
+            .expect("pid 0 should still mean self");
+    }
+
+    #[test]
+    fn test_get_robust_list_own_tid_is_self() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let mut head_via_tid: usize = 0;
+        task.sys_get_robust_list(Some(task.tid), UserPtrMut::from_ptr(&raw mut head_via_tid))
+            .expect("own tid should be treated the same as pid None");
+
+        let mut head_via_none: usize = 0;
+        task.sys_get_robust_list(None, UserPtrMut::from_ptr(&raw mut head_via_none))
+            .expect("None should still mean self");
+
+        assert_eq!(head_via_tid, head_via_none);
     }
 }
