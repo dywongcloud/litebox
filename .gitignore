@@ -206,3 +206,6 @@ dev_bench/unixbench/*.zip
 
 # agentplug tooling spill
 .agentplug-kv/
+
+# Claude Code local worktrees (Workflow tool isolation:'worktree' agents)
+/.claude/
