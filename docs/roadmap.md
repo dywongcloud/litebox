@@ -225,12 +225,16 @@ hand-written guest and Alpine. The 91 `x18`/`w18` references counted in `busybox
 are real, but they were not what broke it; XNU's `x18` zeroing remains a
 documented restriction that has simply not bitten yet.
 
+A shell runs: `busybox sh -c 'echo shell works; echo $((6*7))'` prints both
+lines, and `ls`, `ls -l`, `wc` and `grep` all behave. Reaching that needed one
+more fix, which was not macOS-specific: `sys_newfstatat` permitted only
+`AT_EMPTY_PATH` and rejected `AT_SYMLINK_NOFOLLOW` with `EINVAL`, even though the
+`do_fstatat` it delegates to already acts on that flag and both `statx` and
+`faccessat` already accepted it. Every directory walker passes it, so `lstat`
+failed on paths `stat` handled.
+
 Known gaps a real guest hits now:
 
-* **`ls` fails on every entry with `EINVAL`.** The shim rejects
-  `AT_SYMLINK_NOFOLLOW` on `fstatat` (`unsupported flags:
-  AtFlags(AT_SYMLINK_NOFOLLOW)`), which is how `ls` stats each name. Not
-  macOS-specific.
 * `setuid`/`setgid` are unsupported, so `busybox id` cannot report groups.
 
 Three things had to be fixed to get that far, each of which would have stopped

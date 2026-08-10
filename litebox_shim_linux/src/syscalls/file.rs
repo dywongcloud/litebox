@@ -1422,7 +1422,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
-        let current_support_flags = AtFlags::AT_EMPTY_PATH;
+        // `AT_SYMLINK_NOFOLLOW` is the flag `ls` and every other directory
+        // walker passes, and `do_fstatat` already acts on it -- it selects
+        // whether `do_stat` resolves the final component. Rejecting it here
+        // while `statx` and `faccessat` both accept it made `lstat` fail with
+        // `EINVAL` on a path that `stat` handled. `AT_NO_AUTOMOUNT` is accepted
+        // as the same no-op `statx` treats it as, since no LiteBox filesystem
+        // automounts.
+        let current_support_flags =
+            AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_NO_AUTOMOUNT;
         if flags.intersects(current_support_flags.complement()) {
             log_unsupported!("unsupported flags: {flags:?}");
             return Err(Errno::EINVAL);
