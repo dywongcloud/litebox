@@ -235,7 +235,38 @@ failed on paths `stat` handled.
 
 Known gaps a real guest hits now:
 
-* `setuid`/`setgid` are unsupported, so `busybox id` cannot report groups.
+* **A guest fault kills the host.** `busybox sh -c 'f() { f; }; f'` overflows the
+  guest stack and the *runner* dies with `SIGILL`. `install_fault_handlers`
+  registers only `SIGSEGV` and `SIGBUS`, and neither is routed to
+  `EnterShim::exception` anyway, so any guest fault is fatal to the process
+  rather than delivered to the guest.
+
+  Routing them is not the small change it looks like, and the obvious version is
+  worse than the crash. The natural design -- a "guest owns the CPU" flag the
+  handler consults to decide whose fault it is -- does not hold where it must:
+  `syscall_callback` allocates and writes ~304 bytes **onto the guest stack**
+  before it clears that ownership, so a guest that puts `SP` near an unmapped
+  page and issues a rewritten `SVC` faults inside the stub while still marked as
+  the owner. The handler would then copy a *host* `mcontext` -- a `pc` inside
+  `syscall_callback`, a host return address in `x30` -- into the guest's
+  `PtRegs` and deliver it as a guest signal, turning a safe crash into an ASLR
+  disclosure and a return path into host code. `litebox_platform_linux_userland`
+  avoids this by clearing its flag in the first instruction of its callback *and*
+  switching off the guest stack before touching `pt_regs`; a macOS version has to
+  port the ordering, not just the flag.
+
+* `touch` fails: `utimensat` is unimplemented. `df`, `free` and `ps` fail because
+  there is no `/proc`. Neither is macOS-specific.
+
+* `setuid`/`setgid` are unimplemented, but that is *not* why `id` was failing --
+  an earlier revision of this file said so and was wrong. `getgroups` was the
+  cause, and `id` is correct now. BusyBox 1.37 discards both return values
+  (`bb_applet.c`: "Don't check for errors"), so implementing them changes no
+  guest-visible behaviour at all; their only current effect is two `WARN` lines.
+
+* The two flaky timer tests do not flake in CI, which runs `cargo nextest`
+  (`.github/workflows/ci.yml`) -- that is process-per-test, so the cross-test
+  interference only appears under `cargo test`.
 
 Three things had to be fixed to get that far, each of which would have stopped
 any guest:

@@ -1284,22 +1284,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getgroups`.
     ///
-    /// A task here has a uid and a gid and no supplementary group list, so the
-    /// answer is always zero groups. That is a legitimate Linux state, not a
-    /// stub: a process whose supplementary set is empty gets exactly this reply,
-    /// and the alternative -- failing the call -- makes every caller that merely
-    /// wants to *ask* fail too. `busybox id` is one, and it reports "can't get
-    /// groups" rather than printing the uid and gid it did obtain.
+    /// The supplementary set is exactly the task's own gid. There is no group
+    /// database to consult, and this is what `initgroups` leaves a process with
+    /// when the only group it belongs to is its primary one -- so it is a
+    /// faithful state rather than a placeholder. Deriving it from `credentials`
+    /// instead of storing it also means the two cannot drift apart.
     ///
     /// # Errors
     ///
-    /// `EINVAL` if `size` is negative, matching Linux. A positive `size` needs
-    /// no bounds check because nothing is written.
-    pub(crate) fn sys_getgroups(&self, size: i32, _list: UserPtrMut<u32>) -> Result<usize, Errno> {
+    /// `EINVAL` if `size` is negative, or positive but too small to hold the
+    /// set, both as Linux does. `EFAULT` if `list` is not writable. `size == 0`
+    /// is the "how many?" query and writes nothing.
+    pub(crate) fn sys_getgroups(&self, size: i32, list: UserPtrMut<u32>) -> Result<usize, Errno> {
+        let groups = [self.credentials.gid];
         if size < 0 {
             return Err(Errno::EINVAL);
         }
-        Ok(0)
+        let size = usize::try_from(size).map_err(|_| Errno::EINVAL)?;
+        if size == 0 {
+            return Ok(groups.len());
+        }
+        if size < groups.len() {
+            return Err(Errno::EINVAL);
+        }
+        list.write_slice_at_offset::<Platform>(0, &groups)
+            .ok_or(Errno::EFAULT)?;
+        Ok(groups.len())
     }
 }
 
