@@ -10,6 +10,7 @@
 mod arch;
 pub mod common_providers;
 pub mod page_mgmt;
+pub mod stdin_pump;
 pub mod trivial_providers;
 
 #[cfg(test)]
@@ -22,6 +23,7 @@ use zerocopy::{FromBytes, IntoBytes};
 pub use arch::FpSimdState64;
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
+pub use stdin_pump::StdinPump;
 
 /// A provider of a platform upon which LiteBox can execute.
 ///
@@ -536,6 +538,26 @@ pub trait StdioProvider {
 
     /// Check if a stream is connected to a TTY.
     fn is_a_tty(&self, stream: StdioStream) -> bool;
+
+    /// Returns a real, epoll-observable readiness handle for stdin, for platforms that track it
+    /// via a background [`StdinPump`]. `None` means this platform cannot distinguish real stdin
+    /// readiness; callers should then treat stdin as always ready (the pre-existing behavior),
+    /// which is a safe, if imprecise, fallback.
+    fn stdin_pollable(&self) -> Option<&dyn crate::event::IOPollable> {
+        None
+    }
+
+    /// Best-effort: mirror the guest's raw/cooked-mode and echo settings onto the real host
+    /// terminal backing `stream`, so that when the guest disables canonical mode (`ICANON`) via
+    /// `TCSETS`, real host keystrokes actually start arriving byte-at-a-time instead of being
+    /// line-buffered by the host tty driver until Enter is pressed.
+    ///
+    /// Only meaningful (and only ever called) when [`Self::is_a_tty`] is true for `stream`.
+    /// Platforms without a real host terminal (or without host-level termios access) may leave
+    /// this a no-op -- the guest-visible termios state is tracked independently regardless.
+    fn set_terminal_raw_mode(&self, stream: StdioStream, raw: bool, echo: bool) {
+        let _ = (stream, raw, echo);
+    }
 }
 
 /// A provider for system information.

@@ -707,6 +707,164 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
+impl Termios {
+    /// A sensible "cooked" (canonical) mode default, matching what a typical Linux pty session
+    /// starts in: canonical line editing, echo, signal-generating control characters, and
+    /// `\n` -> `\r\n` translation on output. Real values from
+    /// `include/uapi/asm-generic/termbits.h`.
+    #[must_use]
+    pub const fn default_cooked() -> Self {
+        let mut c_cc = [0u8; 19];
+        c_cc[VintrIdx::VINTR as usize] = 3; // ^C
+        c_cc[VintrIdx::VQUIT as usize] = 28; // ^\
+        c_cc[VintrIdx::VERASE as usize] = 127; // DEL
+        c_cc[VintrIdx::VKILL as usize] = 21; // ^U
+        c_cc[VintrIdx::VEOF as usize] = 4; // ^D
+        c_cc[VintrIdx::VTIME as usize] = 0;
+        c_cc[VintrIdx::VMIN as usize] = 1;
+        c_cc[VintrIdx::VSTART as usize] = 17; // ^Q
+        c_cc[VintrIdx::VSTOP as usize] = 19; // ^S
+        c_cc[VintrIdx::VSUSP as usize] = 26; // ^Z
+        c_cc[VintrIdx::VREPRINT as usize] = 18; // ^R
+        c_cc[VintrIdx::VDISCARD as usize] = 15; // ^O
+        c_cc[VintrIdx::VWERASE as usize] = 23; // ^W
+        c_cc[VintrIdx::VLNEXT as usize] = 22; // ^V
+        Self {
+            c_iflag: IFlag::ICRNL.bits() | IFlag::IXON.bits(),
+            c_oflag: OFlag::OPOST.bits() | OFlag::ONLCR.bits(),
+            c_cflag: CFlag::CS8.bits() | CFlag::CREAD.bits(),
+            c_lflag: LFlag::ISIG.bits()
+                | LFlag::ICANON.bits()
+                | LFlag::ECHO.bits()
+                | LFlag::ECHOE.bits()
+                | LFlag::ECHOK.bits()
+                | LFlag::ECHOCTL.bits()
+                | LFlag::ECHOKE.bits()
+                | LFlag::IEXTEN.bits(),
+            c_line: 0,
+            c_cc,
+        }
+    }
+
+    /// Whether canonical (line-buffered, editable) input mode is enabled.
+    #[must_use]
+    pub fn is_canonical(&self) -> bool {
+        LFlag::from_bits_truncate(self.c_lflag).contains(LFlag::ICANON)
+    }
+
+    /// Whether the terminal driver is echoing typed input back.
+    #[must_use]
+    pub fn is_echoing(&self) -> bool {
+        LFlag::from_bits_truncate(self.c_lflag).contains(LFlag::ECHO)
+    }
+}
+
+impl Default for Termios {
+    fn default() -> Self {
+        Self::default_cooked()
+    }
+}
+
+/// Indices into [`Termios::c_cc`], from `include/uapi/asm-generic/termbits.h`.
+#[non_exhaustive]
+#[repr(u8)]
+pub enum VintrIdx {
+    VINTR = 0,
+    VQUIT = 1,
+    VERASE = 2,
+    VKILL = 3,
+    VEOF = 4,
+    VTIME = 5,
+    VMIN = 6,
+    VSWTC = 7,
+    VSTART = 8,
+    VSTOP = 9,
+    VSUSP = 10,
+    VEOL = 11,
+    VREPRINT = 12,
+    VDISCARD = 13,
+    VWERASE = 14,
+    VLNEXT = 15,
+    VEOL2 = 16,
+}
+
+bitflags::bitflags! {
+    /// `c_iflag` bits, from `include/uapi/asm-generic/termbits.h`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct IFlag: tcflag_t {
+        const IGNBRK = 0o000001;
+        const BRKINT = 0o000002;
+        const IGNPAR = 0o000004;
+        const PARMRK = 0o000010;
+        const INPCK  = 0o000020;
+        const ISTRIP = 0o000040;
+        const INLCR  = 0o000100;
+        const IGNCR  = 0o000200;
+        const ICRNL  = 0o000400;
+        const IXON   = 0o002000;
+        const IXANY  = 0o004000;
+        const IXOFF  = 0o010000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_oflag` bits, from `include/uapi/asm-generic/termbits.h`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OFlag: tcflag_t {
+        const OPOST  = 0o000001;
+        const ONLCR  = 0o000004;
+        const OCRNL  = 0o000010;
+        const ONOCR  = 0o000020;
+        const ONLRET = 0o000040;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_cflag` bits, from `include/uapi/asm-generic/termbits.h`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CFlag: tcflag_t {
+        const CS5    = 0o000000;
+        const CS6    = 0o000020;
+        const CS7    = 0o000040;
+        const CS8    = 0o000060;
+        const CSTOPB = 0o000100;
+        const CREAD  = 0o000200;
+        const PARENB = 0o000400;
+        const PARODD = 0o001000;
+        const HUPCL  = 0o002000;
+        const CLOCAL = 0o004000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_lflag` bits, from `include/uapi/asm-generic/termbits.h`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LFlag: tcflag_t {
+        const ISIG    = 0o000001;
+        const ICANON  = 0o000002;
+        const ECHO    = 0o000010;
+        const ECHOE   = 0o000020;
+        const ECHOK   = 0o000040;
+        const ECHONL  = 0o000100;
+        const NOFLSH  = 0o000200;
+        const TOSTOP  = 0o000400;
+        const ECHOCTL = 0o001000;
+        const ECHOPRT = 0o002000;
+        const ECHOKE  = 0o004000;
+        const FLUSHO  = 0o010000;
+        const PENDIN  = 0o040000;
+        const IEXTEN  = 0o100000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 #[derive(Debug, Clone, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Winsize {
@@ -718,6 +876,8 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TIOCGPGRP: u32 = 0x540F;
+pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
@@ -731,6 +891,10 @@ pub enum IoctlArg {
     TCGETS(UserPtrMut<Termios>),
     /// Set the current serial port settings.
     TCSETS(UserPtr<Termios>),
+    /// Get the foreground process group ID of the controlling terminal.
+    TIOCGPGRP(UserPtrMut<i32>),
+    /// Set the foreground process group ID of the controlling terminal.
+    TIOCSPGRP(UserPtr<i32>),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
     /// Obtain device unit number, which can be used to generate
@@ -2637,6 +2801,8 @@ impl SyscallRequest {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
+                        TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),

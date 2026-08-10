@@ -246,14 +246,10 @@ where
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if flags.contains(OFlags::NONBLOCK)
-            && matches!(
-                device,
-                Device::Stdin | Device::Stdout | Device::Stderr | Device::URandom
-            )
-        {
-            unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
-        }
+        // Note: `O_NONBLOCK` at open time is otherwise a no-op here -- actual non-blocking
+        // enforcement for stdin happens above this layer, in the shim's syscall dispatch, which
+        // has access to the per-fd status flags this `Backend` trait does not. See
+        // `litebox_shim_linux`'s `do_read` and the `StdioProvider::stdin_pollable` platform hook.
 
         if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and

@@ -375,6 +375,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         self.do_read(raw_fd, buf, offset)
     }
+    /// Whether a non-blocking `read()` on `fd` must return `EAGAIN` immediately instead of
+    /// falling through to the (potentially real-stdin-blocking) `Backend::read` path.
+    ///
+    /// Only ever true for the fixed stdin fd (0): it's the only raw fd this shim attaches both
+    /// `StdioStream` and `StdioStatusFlags` metadata to (see
+    /// `initialize_stdio_in_shared_descriptors_table`), and it's the only one backed by a real,
+    /// potentially-slow host resource that `Backend::read` has no non-blocking story for on its
+    /// own -- see `litebox::platform::StdioProvider::stdin_pollable`.
+    fn stdin_read_would_block(&self, fd: &TypedFd<FS>) -> bool {
+        let dt = self.global.litebox.descriptor_table();
+        let Ok(stream) = dt.with_metadata(fd, |s: &StdioStream| *s) else {
+            return false;
+        };
+        if stream != StdioStream::Stdin {
+            return false;
+        }
+        let Ok(nonblock) = dt.with_metadata(fd, |crate::StdioStatusFlags(flags)| {
+            flags.contains(OFlags::NONBLOCK)
+        }) else {
+            return false;
+        };
+        if !nonblock {
+            return false;
+        }
+        // A platform with no real stdin-readiness signal can't tell us "not ready" for real, so
+        // fall back to the pre-existing (blocking) behavior rather than spuriously EAGAIN-ing.
+        self.global
+            .platform
+            .stdin_pollable()
+            .is_some_and(|pollable| !pollable.check_io_events().contains(Events::IN))
+    }
+
     pub(crate) fn do_read(
         &self,
         fd: u32,
@@ -389,6 +421,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .run_on_raw_fd(
                 fd as usize,
                 |fd| {
+                    if self.stdin_read_would_block(fd) {
+                        return Err(Errno::EAGAIN);
+                    }
                     files
                         .fs
                         .read(fd, &mut buf.borrow_mut(), offset)
@@ -1851,25 +1886,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(raw_fd.try_into().unwrap())
     }
 
-    fn stdio_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
+    fn stdio_ioctl(&self, stream: StdioStream, arg: &IoctlArg) -> Result<u32, Errno> {
         match arg {
             IoctlArg::TCGETS(termios) => {
+                let current = self.global.termios.lock().clone();
                 termios
-                    .write_at_offset::<Platform>(
-                        0,
-                        litebox_common_linux::Termios {
-                            c_iflag: 0,
-                            c_oflag: 0,
-                            c_cflag: 0,
-                            c_lflag: 0,
-                            c_line: 0,
-                            c_cc: [0; 19],
-                        },
-                    )
+                    .write_at_offset::<Platform>(0, current)
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(_) => Ok(0), // TODO: implement
+            IoctlArg::TCSETS(termios) => {
+                let new_termios = termios.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                let lflag = litebox_common_linux::LFlag::from_bits_truncate(new_termios.c_lflag);
+                let raw = !lflag.contains(litebox_common_linux::LFlag::ICANON);
+                let echo = lflag.contains(litebox_common_linux::LFlag::ECHO);
+                *self.global.termios.lock() = new_termios;
+                // Mirror the raw/echo-relevant bits onto the real host terminal so keystrokes
+                // actually arrive byte-at-a-time once the guest disables canonical mode -- a
+                // no-op on platforms/streams without a real backing terminal.
+                self.global
+                    .platform
+                    .set_terminal_raw_mode(stream, raw, echo);
+                Ok(0)
+            }
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                let pgid = self.global.pgid.load(Ordering::Acquire);
+                pgrp.write_at_offset::<Platform>(0, pgid)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp) => {
+                let pgid = pgrp.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                if pgid <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.global.pgid.store(pgid, Ordering::Release);
+                Ok(0)
+            }
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset::<Platform>(
                     0,
@@ -1915,11 +1968,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .borrow()
                     .run_on_raw_fd(
                         desc,
-                        |_file_fd| {
-                            // TODO: stdio NONBLOCK?
-                            #[cfg(debug_assertions)]
-                            litebox_util_log::debug!("set non-blocking on raw fd unimplemented");
-                            Ok(())
+                        |file_fd| {
+                            // Only stdio raw fds carry `StdioStatusFlags` metadata (see
+                            // `initialize_stdio_in_shared_descriptors_table`); other regular
+                            // files have no non-blocking story at the `Backend` layer, so
+                            // `NoSuchMetadata` there is expected and silently ignored, matching
+                            // this ioctl's pre-existing (no-op) behavior for non-stdio raw fds.
+                            match self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
+                                    flags.set(OFlags::NONBLOCK, val != 0);
+                                }) {
+                                Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                                Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
+                            }
                         },
                         |socket_fd| {
                             if let Err(e) = self
@@ -2042,6 +2106,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )?,
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
+            | IoctlArg::TIOCGPGRP(..)
+            | IoctlArg::TIOCSPGRP(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCGWINSZ(..) => files.run_on_raw_fd(
                 desc,
@@ -2063,7 +2129,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 Errno::ENOTTY
                             })?;
                         if self.global.platform.is_a_tty(stream) {
-                            self.stdio_ioctl(&arg)
+                            self.stdio_ioctl(stream, &arg)
                         } else {
                             Err(Errno::ENOTTY)
                         }

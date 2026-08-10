@@ -149,13 +149,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             EpollDescriptor::File(file) => {
-                // TODO: File polling returns dummy events for now, but distinguish stdio enough for REPLs.
+                // Real files in general still get dummy "always ready" events -- only stdin has
+                // a real, epoll-observable readiness signal (see `StdioProvider::stdin_pollable`
+                // and `litebox::platform::StdinPump`); stdout/stderr writes to a real terminal
+                // essentially never block in practice, so `Events::OUT` dummy readiness for them
+                // remains a reasonable approximation.
                 let events = match global
                     .litebox
                     .descriptor_table()
                     .with_metadata(file, |stream: &litebox::platform::StdioStream| *stream)
                 {
-                    Ok(litebox::platform::StdioStream::Stdin) => Events::IN,
+                    Ok(litebox::platform::StdioStream::Stdin) => {
+                        match global.platform.stdin_pollable() {
+                            Some(pollable) => poll(pollable),
+                            // Platform can't distinguish real readiness: fall back to the
+                            // pre-existing dummy "always ready" behavior.
+                            None => Events::IN,
+                        }
+                    }
                     Ok(
                         litebox::platform::StdioStream::Stdout
                         | litebox::platform::StdioStream::Stderr,

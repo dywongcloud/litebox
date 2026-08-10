@@ -292,6 +292,10 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            // Overwritten with the initial task's pid in `load_program`; `0` is not a valid pid
+            // so it's an obviously-uninitialized placeholder if ever observed.
+            pgid: 0.into(),
+            termios: litebox::sync::Mutex::new(litebox_common_linux::Termios::default_cooked()),
         });
         LinuxShim(global)
     }
@@ -328,6 +332,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
+
+        // A freshly started process becomes its own process-group (and session) leader, absent
+        // some other mechanism (e.g. a shell explicitly calling `setpgid`) putting it into an
+        // existing group -- matching real Linux's default for the first process in a new job.
+        self.0
+            .pgid
+            .store(pid, core::sync::atomic::Ordering::Relaxed);
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
@@ -1348,6 +1359,20 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `None` when the shim was built with a filesystem that doesn't mount one.
     /// `Task::set_task_comm` publishes the guest task's identity here as it becomes known.
     proc_handle: Option<litebox::fs::proc::Proc<Platform>>,
+    /// The foreground process-group ID of the controlling terminal, as set by `TIOCSPGRP` /
+    /// read by `TIOCGPGRP`.
+    ///
+    /// This is a single process-wide value rather than a per-task one because `do_clone`
+    /// requires `CLONE_THREAD` for every new task this shim creates (there is no `fork`-like path
+    /// that produces a task with a different `pid`), so every task in the shim is a thread of the
+    /// same single process -- matching real Linux's "the whole process shares the terminal's
+    /// pgrp" semantics. [`LinuxShim::load_program`] initializes this to the initial task's `pid`,
+    /// matching real Linux's convention that a freshly started process (as opposed to one that
+    /// inherited an existing group via `fork`) becomes its own process-group leader.
+    pgid: core::sync::atomic::AtomicI32,
+    /// Real termios state for the process's controlling terminal (shared by stdin/stdout/stderr,
+    /// like a real Linux `tty_struct`), as read by `TCGETS` and written by `TCSETS`.
+    termios: litebox::sync::Mutex<Platform, litebox_common_linux::Termios>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {

@@ -105,6 +105,17 @@ pub struct LinuxUserland {
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
     stdio_is_tty: [bool; 3],
+    /// Real, non-blocking-observable stdin, fed by a background host thread spawned in
+    /// [`Self::new`]. See [`litebox::platform::StdinPump`].
+    stdin_pump: litebox::platform::StdinPump,
+    /// Doorbell the stdin-pump background thread notifies after every push/EOF, so
+    /// [`StdioProvider::read_from_stdin`]'s blocking path can sleep instead of busy-polling.
+    stdin_doorbell: (std::sync::Mutex<()>, std::sync::Condvar),
+    /// Serializes real host writes to stdout, so concurrent guest threads' `write()` calls to the
+    /// same stream don't interleave mid-write.
+    stdout_lock: std::sync::Mutex<()>,
+    /// Serializes real host writes to stderr; see [`Self::stdout_lock`].
+    stderr_lock: std::sync::Mutex<()>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -239,8 +250,16 @@ impl LinuxUserland {
                 std::io::stdout().is_terminal(),
                 std::io::stderr().is_terminal(),
             ],
+            stdin_pump: litebox::platform::StdinPump::new(
+                litebox::platform::stdin_pump::DEFAULT_CAPACITY,
+            ),
+            stdin_doorbell: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
+            stdout_lock: std::sync::Mutex::new(()),
+            stderr_lock: std::sync::Mutex::new(()),
         };
-        Box::leak(Box::new(platform))
+        let platform: &'static Self = Box::leak(Box::new(platform));
+        spawn_stdin_pump_thread(platform);
+        platform
     }
 
     /// Initializes support for KDFs by using boot-specific uniqueness.
@@ -1722,20 +1741,75 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     }
 }
 
+/// Spawns the single background host thread that blockingly reads the real stdin and feeds
+/// [`LinuxUserland::stdin_pump`], notifying [`LinuxUserland::stdin_doorbell`] after every push or
+/// EOF so [`StdioProvider::read_from_stdin`]'s blocking path wakes promptly instead of polling.
+///
+/// Spawned unconditionally in [`LinuxUserland::new`] -- see the identical rationale on
+/// `litebox_platform_macos_userland`'s copy of this function.
+fn spawn_stdin_pump_thread(platform: &'static LinuxUserland) {
+    std::thread::Builder::new()
+        .name("litebox-stdin-pump".to_owned())
+        .spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let result = unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::read,
+                        usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
+                        buf.as_mut_ptr() as usize,
+                        buf.len(),
+                    )
+                };
+                let n = match result {
+                    Ok(0) | Err(_) => {
+                        // EOF, or a real error (e.g. the host closed fd 0 out from under us):
+                        // either way real stdin will never produce more data.
+                        platform.stdin_pump.mark_eof();
+                        platform.notify_stdin_doorbell();
+                        break;
+                    }
+                    Ok(n) => n,
+                };
+                let mut data = &buf[..n];
+                while !data.is_empty() {
+                    let pushed = platform.stdin_pump.push(data);
+                    platform.notify_stdin_doorbell();
+                    if pushed == 0 {
+                        // Ring buffer is full because the guest hasn't drained it yet; back off
+                        // briefly rather than busy-spinning until it does.
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    data = &data[pushed..];
+                }
+            }
+        })
+        .expect("failed to spawn the stdin-pump background thread");
+}
+
+impl LinuxUserland {
+    /// Wakes any thread parked in [`StdioProvider::read_from_stdin`]'s blocking wait.
+    fn notify_stdin_doorbell(&self) {
+        let (lock, cvar) = &self.stdin_doorbell;
+        drop(lock.lock().unwrap());
+        cvar.notify_all();
+    }
+}
+
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::read,
-                usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-            )
+        loop {
+            if let Some(n) = self.stdin_pump.try_read(buf) {
+                return Ok(n);
+            }
+            // No data yet and not at EOF: park until the pump thread notifies. The bounded
+            // timeout is a safety net against a lost wakeup in the (check, then wait) window
+            // above, not the primary wakeup path.
+            let (lock, cvar) = &self.stdin_doorbell;
+            let guard = lock.lock().unwrap();
+            let _ = cvar.wait_timeout(guard, Duration::from_millis(50)).unwrap();
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
     }
 
     fn write_to(
@@ -1743,30 +1817,98 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::write,
-                usize::try_from(match stream {
-                    litebox::platform::StdioOutStream::Stdout => {
-                        litebox_common_linux::STDOUT_FILENO
-                    }
-                    litebox::platform::StdioOutStream::Stderr => {
-                        litebox_common_linux::STDERR_FILENO
-                    }
-                })
-                .unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-            )
+        let (raw_fd, lock) = match stream {
+            litebox::platform::StdioOutStream::Stdout => {
+                (litebox_common_linux::STDOUT_FILENO, &self.stdout_lock)
+            }
+            litebox::platform::StdioOutStream::Stderr => {
+                (litebox_common_linux::STDERR_FILENO, &self.stderr_lock)
+            }
+        };
+        let fd = usize::try_from(raw_fd).unwrap();
+        // Holding this for the whole (potentially multi-syscall) write below is what makes one
+        // guest `write()` call atomic w.r.t. other guest threads' writes to the same stream.
+        let _guard = lock.lock().unwrap();
+        let mut written = 0usize;
+        while written < buf.len() {
+            let result = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::write,
+                    fd,
+                    buf[written..].as_ptr() as usize,
+                    buf.len() - written,
+                )
+            };
+            match result {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(syscalls::Errno::EINTR) => {}
+                Err(_) if written > 0 => {
+                    // Real `write(2)` semantics: a short write due to a later error still
+                    // reports the bytes actually written, and lets the caller retry the rest.
+                    return Ok(written);
+                }
+                Err(_) => return Err(litebox::platform::StdioWriteError::Closed),
+            }
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
+        Ok(written)
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
         self.stdio_is_tty[stream as usize]
+    }
+
+    fn stdin_pollable(&self) -> Option<&dyn litebox::event::IOPollable> {
+        Some(&self.stdin_pump)
+    }
+
+    fn set_terminal_raw_mode(&self, stream: litebox::platform::StdioStream, raw: bool, echo: bool) {
+        // Only stdin's line discipline affects how input bytes arrive at the pump thread.
+        if stream != litebox::platform::StdioStream::Stdin
+            || !self.stdio_is_tty[litebox::platform::StdioStream::Stdin as usize]
+        {
+            return;
+        }
+        // The host is real Linux, so the kernel's real `termios` layout is exactly
+        // `litebox_common_linux::Termios` -- no translation needed, unlike the macOS platform.
+        let mut term = litebox_common_linux::Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 19],
+        };
+        let stdin_fd = usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap();
+        let got = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::ioctl,
+                stdin_fd,
+                litebox_common_linux::TCGETS as usize,
+                (&raw mut term) as usize,
+            )
+        };
+        if got.is_err() {
+            return;
+        }
+        let mut lflag = litebox_common_linux::LFlag::from_bits_truncate(term.c_lflag);
+        if raw {
+            lflag.remove(litebox_common_linux::LFlag::ICANON);
+            term.c_cc[litebox_common_linux::VintrIdx::VMIN as usize] = 1;
+            term.c_cc[litebox_common_linux::VintrIdx::VTIME as usize] = 0;
+        } else {
+            lflag.insert(litebox_common_linux::LFlag::ICANON);
+        }
+        lflag.set(litebox_common_linux::LFlag::ECHO, echo);
+        term.c_lflag = lflag.bits();
+        let _ = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::ioctl,
+                stdin_fd,
+                litebox_common_linux::TCSETS as usize,
+                (&raw const term) as usize,
+            )
+        };
     }
 }
 
