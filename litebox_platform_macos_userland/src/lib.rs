@@ -873,22 +873,21 @@ impl litebox::platform::TimeProvider for MacOsUserland {
 // Architecture-specific state
 // ---------------------------------------------------------------------------
 
-std::thread_local! {
-    /// The guest's virtualized `TPIDR_EL0`.
-    ///
-    /// The host owns the hardware register as its own per-thread anchor, so the
-    /// guest's thread pointer lives here instead. This is the slot the aarch64
-    /// syscall rewriter's `MRS`/`MSR` gates read and write on the guest's behalf.
-    static GUEST_TPIDR_EL0: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
-}
-
 impl litebox::platform::ArchSpecificProvider for MacOsUserland {
     fn get_arch_specific_register(
         &self,
         reg: &litebox::platform::ArchSpecificRegister,
     ) -> Result<usize, litebox::platform::ArchSpecificError> {
         match reg {
-            litebox::platform::ArchSpecificRegister::TpidrEl0 => Ok(GUEST_TPIDR_EL0.get()),
+            litebox::platform::ArchSpecificRegister::TpidrEl0 => {
+                let key = guest_tp_tsd_key()
+                    .ok_or(litebox::platform::ArchSpecificError::RegisterUnsupported)?;
+                // SAFETY: `key` was reserved by `reserve_guest_tpidr_tsd_slot` via
+                // `pthread_key_create`, which this process never invalidates; a
+                // thread that never called `set_arch_specific_register` reads
+                // back the `pthread_key_create`-guaranteed null default.
+                Ok(unsafe { libc::pthread_getspecific(key) } as usize)
+            }
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
     }
@@ -900,11 +899,31 @@ impl litebox::platform::ArchSpecificProvider for MacOsUserland {
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::TpidrEl0 => {
-                // No range check is needed: the value never reaches a hardware
-                // register, so an invalid one can only fault the guest that
-                // dereferences it.
-                GUEST_TPIDR_EL0.set(val);
-                Ok(())
+                let key = guest_tp_tsd_key()
+                    .ok_or(litebox::platform::ArchSpecificError::RegisterUnsupported)?;
+                // This must land in the SAME pthread TSD slot the rewriter's
+                // MRS/MSR gates address directly via `[TPIDRRO_EL0 + offset]`
+                // (see `guest_tp_slot_byte_offset`) -- otherwise a guest thread's
+                // clone(CLONE_SETTLS)-supplied thread pointer would be invisible
+                // to its own later `MRS TPIDR_EL0`. No range check is needed on
+                // `val`: the value never reaches a hardware register, so an
+                // invalid one can only fault the guest that dereferences it.
+                //
+                // SAFETY: `key` was reserved by `reserve_guest_tpidr_tsd_slot`,
+                // and storing an opaque `usize` as a TSD value has no
+                // precondition beyond a valid key.
+                let rc = unsafe { libc::pthread_setspecific(key, val as *const libc::c_void) };
+                // POSIX defines only `EINVAL` for an invalid key here, which
+                // `key` cannot be (it was just reserved above) -- so a nonzero
+                // `rc` means host-level corruption. Every caller in this tree
+                // (`litebox_shim_linux`'s execve/clone paths) already treats a
+                // failure here as fatal, so propagating the error keeps that
+                // boundary in one place instead of duplicating it here too.
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(litebox::platform::ArchSpecificError::RegisterUnsupported)
+                }
             }
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
@@ -1390,12 +1409,15 @@ static GUEST_TP_TSD_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
 /// is load-time offset indirection (see the `macos-guest-tp-runtime-offset`
 /// roadmap item and `docs/roadmap.md`).
 ///
-/// The rewriter half of that fix has landed: `Host::MacOs` gates no longer bake
-/// the slot number in, they read a byte offset from the trampoline header at run
-/// time ([`guest_tp_slot_byte_offset`] is what a loader writes there). Until a
-/// macOS loader fills that word, the rewriter's own packaging-time seed stands,
-/// so the gates still address the baked slot and the mismatch below is still
-/// worth warning about.
+/// Both halves of that fix have landed: `Host::MacOs` gates no longer bake the
+/// slot number in, they read a byte offset from the trampoline header at run
+/// time, and `litebox_shim_linux`'s ELF loader (`loader/elf.rs`) already reads
+/// [`guest_tp_slot_byte_offset`] and writes it there via
+/// `litebox_common_linux::loader::ElfParsedFile::parse_trampoline` /
+/// `load_trampoline`, on every macOS load path. The mismatch below is
+/// therefore no longer live for a guest reached through this platform's
+/// loader; it stays as a defensive warning for any other embedder of this
+/// crate that constructs a trampoline without going through that path.
 ///
 /// This reserves a key and records it, but does **not** hard fail on a mismatch:
 /// panicking here made the whole platform unconstructable on real hardware,
@@ -1403,8 +1425,10 @@ static GUEST_TP_TSD_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
 /// touch the guest thread pointer at all. Instead it warns loudly. A guest that
 /// never reads/writes `TPIDR_EL0` is unaffected; a guest that does would target
 /// the stale baked slot and is **not supported** until a loader fills the header
-/// slot -- no macOS runner loads guests yet, so nothing hits this path in
-/// production today.
+/// slot. `litebox_runner_linux_on_macos_userland` already calls
+/// [`MacOsUserland::new`] for every guest it runs (see `docs/roadmap.md`'s
+/// "Running a guest on macOS"), so this path runs in production on every
+/// syscall-only guest today; only a `TPIDR_EL0`-using guest is unsupported.
 ///
 /// # Panics
 ///
@@ -1435,6 +1459,19 @@ fn reserve_guest_tpidr_tsd_slot() -> libc::pthread_key_t {
     key
 }
 
+/// The pthread TSD key [`ArchSpecificRegister::TpidrEl0`] accessors and
+/// [`guest_tp_slot_byte_offset`] both address, or `None` before
+/// [`reserve_guest_tpidr_tsd_slot`] has run.
+///
+/// [`ArchSpecificRegister::TpidrEl0`]: litebox::platform::ArchSpecificRegister::TpidrEl0
+fn guest_tp_tsd_key() -> Option<libc::pthread_key_t> {
+    let key = GUEST_TP_TSD_KEY.load(Ordering::Relaxed);
+    if key == u32::MAX {
+        return None;
+    }
+    Some(libc::pthread_key_t::from(key))
+}
+
 /// The byte offset a `Host::MacOs` gate must add to `TPIDRRO_EL0` to reach this
 /// process's guest thread-pointer slot, or `None` before
 /// [`reserve_guest_tpidr_tsd_slot`] has run.
@@ -1444,13 +1481,19 @@ fn reserve_guest_tpidr_tsd_slot() -> libc::pthread_key_t {
 /// rather than the one the rewriter guessed at packaging time. Darwin's TSD array
 /// is indexed by key with 8-byte elements and no low-bit masking on arm64
 /// (verified against xnu's `libsyscall/os/tsd.h` `_os_tsd_get_base`), so the
-/// offset is simply the key scaled by the element size.
+/// offset is simply the key scaled by the element size -- the same key
+/// [`ArchSpecificProvider::get_arch_specific_register`]/[`set_arch_specific_register`]
+/// reach via `pthread_getspecific`/`pthread_setspecific` instead, since a gate is
+/// raw bytes patched into an arbitrary guest binary and cannot call either.
+///
+/// [`ArchSpecificProvider::get_arch_specific_register`]: litebox::platform::ArchSpecificProvider::get_arch_specific_register
+/// [`set_arch_specific_register`]: litebox::platform::ArchSpecificProvider::set_arch_specific_register
+// This crate is aarch64-only (see the module docs), so `usize` is always 64
+// bits wide and a `pthread_key_t` always fits; a fallible conversion here
+// would only relocate an unreachable failure, never remove it.
+#[allow(clippy::cast_possible_truncation)]
 pub fn guest_tp_slot_byte_offset() -> Option<usize> {
-    let key = GUEST_TP_TSD_KEY.load(Ordering::Relaxed);
-    if key == u32::MAX {
-        return None;
-    }
-    Some(key as usize * size_of::<usize>())
+    Some(guest_tp_tsd_key()? as usize * size_of::<usize>())
 }
 
 /// Runs a guest thread with the given shim and initial context, returning when
@@ -1508,6 +1551,104 @@ fn reserving_the_tsd_slot_does_not_panic_on_mismatch() {
         u32::try_from(key).unwrap(),
         "the reserved key should be recorded for the future load-time-offset fix"
     );
+}
+
+/// `ArchSpecificProvider::{get,set}_arch_specific_register` for `TpidrEl0`
+/// route through `pthread_setspecific`/`pthread_getspecific` on
+/// [`guest_tp_tsd_key`] -- the same key the rewriter's gates address via
+/// `[TPIDRRO_EL0 + guest_tp_slot_byte_offset()]`. A value stored that way must
+/// round-trip on this hardware, and a second read must not change it
+/// (`macos-tpidr-archspecific-reconciliation`: this used to write a
+/// disconnected thread-local instead).
+#[cfg(test)]
+#[test]
+fn guest_tp_tsd_key_round_trips_a_pthread_specific_value() {
+    reserve_guest_tpidr_tsd_slot();
+    let key = guest_tp_tsd_key().expect("the key is recorded by now");
+
+    // SAFETY: `key` was just reserved above and is live for this thread.
+    let initial = unsafe { libc::pthread_getspecific(key) };
+    assert!(
+        initial.is_null(),
+        "a freshly reserved key starts null, matching clone(2)'s no-CLONE_SETTLS default"
+    );
+
+    let sentinel = 0xDEAD_BEEFusize as *mut libc::c_void;
+    // SAFETY: `key` is a live, reserved key; storing an opaque pointer-sized
+    // value has no precondition beyond that.
+    assert_eq!(unsafe { libc::pthread_setspecific(key, sentinel) }, 0);
+    // SAFETY: same key, same thread as the store above.
+    assert_eq!(
+        unsafe { libc::pthread_getspecific(key) },
+        sentinel,
+        "the value set_arch_specific_register would store must read back unchanged"
+    );
+    // Replay: a second read must not itself mutate the stored value.
+    // SAFETY: same key, same thread.
+    assert_eq!(unsafe { libc::pthread_getspecific(key) }, sentinel);
+
+    // A guest fully controls this value (it is the argument to a guest-issued
+    // `MSR TPIDR_EL0` or `clone(CLONE_SETTLS)`), so the full `usize` range
+    // must survive the round trip losslessly -- no truncation at either the
+    // `val as *const c_void` store or the `as usize` load.
+    for adversarial in [0usize, usize::MAX, usize::MAX / 2] {
+        let ptr = adversarial as *mut libc::c_void;
+        // SAFETY: same key; an opaque store has no precondition on the value.
+        assert_eq!(unsafe { libc::pthread_setspecific(key, ptr) }, 0);
+        // SAFETY: same key, same thread as the store above.
+        assert_eq!(
+            unsafe { libc::pthread_getspecific(key) } as usize,
+            adversarial,
+            "boundary value {adversarial:#x} must round-trip without truncation"
+        );
+    }
+}
+
+/// Two threads sharing the SAME reserved key must observe independent
+/// values -- the disjointness property a real deployment depends on, since
+/// [`reserve_guest_tpidr_tsd_slot`] reserves one key for the whole process and
+/// every guest thread's [`ArchSpecificProvider::set_arch_specific_register`]
+/// writes through it. A shared global instead of per-thread TSD storage would
+/// let one guest thread's `TPIDR_EL0` leak into another's. A `Barrier` forces
+/// both threads' writes to land before either reads back, so the assertion
+/// cannot pass merely because of a lucky non-overlapping schedule.
+///
+/// [`ArchSpecificProvider::set_arch_specific_register`]: litebox::platform::ArchSpecificProvider::set_arch_specific_register
+#[cfg(test)]
+#[test]
+fn guest_tp_tsd_key_is_disjoint_across_threads() {
+    reserve_guest_tpidr_tsd_slot();
+    let key = guest_tp_tsd_key().expect("the key is recorded by now");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let b1 = std::sync::Arc::clone(&barrier);
+    let t1 = std::thread::Builder::new()
+        .spawn(move || {
+            let sentinel = 0x1111_1111usize as *mut libc::c_void;
+            // SAFETY: `key` is a live, process-wide-reserved key; each thread
+            // owns its own TSD slot for it.
+            assert_eq!(unsafe { libc::pthread_setspecific(key, sentinel) }, 0);
+            b1.wait();
+            // SAFETY: same key, same thread as the store above.
+            assert_eq!(unsafe { libc::pthread_getspecific(key) }, sentinel);
+        })
+        .expect("failed to spawn thread 1");
+
+    let b2 = std::sync::Arc::clone(&barrier);
+    let t2 = std::thread::Builder::new()
+        .spawn(move || {
+            let sentinel = 0x2222_2222usize as *mut libc::c_void;
+            // SAFETY: `key` is a live, process-wide-reserved key; each thread
+            // owns its own TSD slot for it.
+            assert_eq!(unsafe { libc::pthread_setspecific(key, sentinel) }, 0);
+            b2.wait();
+            // SAFETY: same key, same thread as the store above.
+            assert_eq!(unsafe { libc::pthread_getspecific(key) }, sentinel);
+        })
+        .expect("failed to spawn thread 2");
+
+    t1.join().expect("thread 1 panicked");
+    t2.join().expect("thread 2 panicked");
 }
 
 // ---------------------------------------------------------------------------

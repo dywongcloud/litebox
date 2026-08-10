@@ -230,23 +230,35 @@ issues syscalls already runs end to end. The pieces:
    leaves construction working (a syscall-only guest is unaffected; a
    `TPIDR_EL0`-using guest is unsupported until the fix).
 
-   **The rewriter half of the fix has landed.** `Host::MacOs` gates no longer
-   bake the slot number in: they load a byte offset from the trampoline header
-   slot `HEADER_GUEST_TP_OFFSET_MACOS` and address `[TPIDRRO_EL0 + offset_reg]`.
-   The slot holds an offset rather than a thread-pointer value because the loader
-   flips the trampoline to read+execute once it is filled, so nothing may write
-   it again while a guest runs; the per-thread part comes from `TPIDRRO_EL0`
-   itself. `Host::Linux` still bakes its immediate, since that offset is genuine
-   compile-time ABI — `GuestTpAddressing` now names the distinction.
+   **Both the rewriter and loader halves of the fix have landed.** `Host::MacOs`
+   gates no longer bake the slot number in: they load a byte offset from the
+   trampoline header slot `HEADER_GUEST_TP_OFFSET_MACOS` and address
+   `[TPIDRRO_EL0 + offset_reg]`. The slot holds an offset rather than a
+   thread-pointer value because the loader flips the trampoline to read+execute
+   once it is filled, so nothing may write it again while a guest runs; the
+   per-thread part comes from `TPIDRRO_EL0` itself. `Host::Linux` still bakes
+   its immediate, since that offset is genuine compile-time ABI —
+   `GuestTpAddressing` now names the distinction. The loader half writes
+   `guest_tp_slot_byte_offset()` (the reserved `pthread_key_create` key scaled
+   by 8) into that header slot: `litebox_shim_linux`'s ELF loader
+   (`loader/elf.rs`) reads it from `SystemInfoProvider::get_guest_tp_slot_offset`
+   and passes it into `litebox_common_linux`'s `parse_trampoline`, whose
+   `load_trampoline` writes it in the same writable window it already writes the
+   syscall entry point at offset 0.
 
-   What remains is the loader half, tracked as `macos-guest-tp-runtime-offset` in
-   `docs/roadmap.md`: writing `guest_tp_slot_byte_offset()` (the reserved
-   `pthread_key_create` key scaled by 8) into that header slot, the way
-   `load_trampoline` already writes the syscall entry point at offset 0. Until
-   then the rewriter's packaging-time seed stands, so gates behave exactly as the
-   old baked-immediate ones did. What remains before a `TPIDR_EL0`-using guest
-   runs also includes `pthread_setspecific`-ing each guest thread's pointer into
-   whichever slot is actually reserved.
+   **`pthread_setspecific`-ing each guest thread's pointer into the reserved
+   slot has also landed.** `MacOsUserland`'s `ArchSpecificProvider` impl for
+   `TpidrEl0` now routes through `pthread_getspecific`/`pthread_setspecific` on
+   the same reserved key, rather than a disconnected in-process value — the
+   storage the rewriter's gates address via `[TPIDRRO_EL0 + offset]` and the
+   storage `litebox_shim_linux`'s `execve`/`clone(CLONE_SETTLS)` paths write
+   through `set_arch_specific_register` are now the same pthread TSD slot.
+   What remains is exercising a real `TPIDR_EL0`/TLS-using guest end to end on
+   real hardware — blocked on multi-threaded guest entry (see "Guest entry
+   (implemented)" below), since `clone(CLONE_SETTLS)`'s new-thread path is the
+   one that actually depends on this fix; the initial thread's own libc startup
+   sets `TPIDR_EL0` via a directly-rewritten `MSR`, bypassing this path
+   entirely.
 2. **Filling the trampoline.** The rewriter writes the syscall-callback address
    at offset 0 of the trampoline it appends to the image; the loader must write
    `SystemInfoProvider::get_syscall_entry_point` there before any guest `SVC`
