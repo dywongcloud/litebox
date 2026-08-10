@@ -2078,7 +2078,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .descriptor_table()
             .entry_handle(&epoll_fd)
             .ok_or(Errno::EBADF)?;
-        handle.with_entry(|entry| entry.epoll_ctl(&self.global, op, fd, &file_descriptor, event))
+        handle.with_entry(|entry| {
+            entry.epoll_ctl(&self.global, &epoll_fd, op, fd, &file_descriptor, event)
+        })
     }
 
     /// Handle syscall `epoll_pwait`

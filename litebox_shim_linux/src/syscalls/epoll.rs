@@ -23,6 +23,17 @@ use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 use super::file::FilesState;
 use crate::{GlobalState, ShimFS, ShimPlatform};
 
+/// Serializes every nested-epoll `epoll_ctl(ADD)` across the whole process, mirroring real
+/// Linux's `epmutex`. Cycle detection (walking the nested-epoll DAG) and the edge insertion it
+/// guards have to happen as one atomic step: checking and inserting under separate locks lets two
+/// concurrent adds that each individually look cycle-free still complete a cycle together (e.g.
+/// thread 1 adds B into A, thread 2 concurrently adds A into B; neither sees the other's
+/// not-yet-committed edge during its own check). A single global lock removes the race by only
+/// ever allowing one such check-then-insert to be in flight anywhere in the process. It is not
+/// taken for plain (non-nested) adds or for readiness polling, so the common case pays nothing
+/// for it.
+static EPOLL_NEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 pub(crate) struct EpollSubsystem<Platform: ShimPlatform, FS: ShimFS>(
     core::marker::PhantomData<(Platform, FS)>,
 );
@@ -133,7 +144,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
-            EpollDescriptor::Epoll(_file) => unimplemented!(),
+            EpollDescriptor::Epoll(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
             EpollDescriptor::File(file) => {
                 // TODO: File polling returns dummy events for now, but distinguish stdio enough for REPLs.
                 let events = match global
@@ -210,13 +224,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     pub(crate) fn epoll_ctl(
         &self,
         global: &GlobalState<Platform, FS>,
+        self_fd: &Arc<TypedFd<EpollSubsystem<Platform, FS>>>,
         op: EpollOp,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: Option<EpollEvent>,
     ) -> Result<(), Errno> {
         match op {
-            EpollOp::EpollCtlAdd => self.add_interest(global, fd, file, event.unwrap()),
+            EpollOp::EpollCtlAdd => self.add_interest(global, self_fd, fd, file, event.unwrap()),
             EpollOp::EpollCtlMod => {
                 log_unsupported!("epoll_ctl mod");
                 Err(Errno::EINVAL)
@@ -234,10 +249,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     fn add_interest(
         &self,
         global: &GlobalState<Platform, FS>,
+        self_fd: &Arc<TypedFd<EpollSubsystem<Platform, FS>>>,
         fd: u32,
         file: &EpollDescriptor<Platform, FS>,
         event: EpollEvent,
     ) -> Result<(), Errno> {
+        // A cycle can only be formed by nesting one epoll inside another, so only that case needs
+        // the global lock; a plain fd add can't create one and stays as cheap as before. The guard
+        // is held across both the cycle check and the insert below -- see `EPOLL_NEST_LOCK` for why
+        // splitting those into separate critical sections would reopen the race this closes.
+        let _nest_guard = matches!(file, EpollDescriptor::Epoll(_)).then(|| EPOLL_NEST_LOCK.lock());
+        if let EpollDescriptor::Epoll(inner_fd) = file
+            && Self::nested_epoll_reaches(global, self_fd, inner_fd, 1)?
+        {
+            return Err(Errno::ELOOP);
+        }
+
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
         if let Some(entry) = interests.get(&key)
@@ -265,6 +292,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
         interests.insert(key, entry);
         Ok(())
+    }
+
+    /// Returns whether `self_fd` is reachable by following already-registered nested-epoll
+    /// interests starting at `fd`, i.e. whether accepting `fd` as a new interest of `self_fd`
+    /// would close a cycle.
+    ///
+    /// Must be called with `EPOLL_NEST_LOCK` held. Under that lock, every edge in the existing
+    /// nested-epoll graph got there by passing this same check, so the graph is acyclic by
+    /// induction going in -- the walk below can therefore only ever revisit `self_fd` itself
+    /// (caught up front via `Arc::ptr_eq`, before `self_fd`'s own entry is ever locked), never an
+    /// intermediate node, so it can't re-lock an entry it is already holding on this call stack.
+    /// Depth is also capped, mirroring real Linux's nesting limit, so a long acyclic chain can't
+    /// blow the stack either.
+    fn nested_epoll_reaches(
+        global: &GlobalState<Platform, FS>,
+        self_fd: &Arc<TypedFd<EpollSubsystem<Platform, FS>>>,
+        fd: &Arc<TypedFd<EpollSubsystem<Platform, FS>>>,
+        depth: u32,
+    ) -> Result<bool, Errno> {
+        const MAX_NESTED_EPOLL_DEPTH: u32 = 5;
+        if Arc::ptr_eq(self_fd, fd) {
+            return Ok(true);
+        }
+        if depth > MAX_NESTED_EPOLL_DEPTH {
+            return Err(Errno::ELOOP);
+        }
+        let Some(handle) = global.litebox.descriptor_table().entry_handle(fd) else {
+            return Ok(false);
+        };
+        handle.with_entry(|entry: &Self| {
+            for nested in entry.interests.lock().values() {
+                if let Some(EpollDescriptor::Epoll(inner_fd)) = nested.desc.upgrade()
+                    && Self::nested_epoll_reaches(global, self_fd, &inner_fd, depth + 1)?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
     }
 
     #[expect(dead_code, reason = "currently unused, but might want to use soon")]
@@ -324,6 +390,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     }
 
     super::common_functions_for_file_status!();
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> IOPollable for EpollFile<Platform, FS> {
+    fn check_io_events(&self) -> Events {
+        if self.ready.entries.lock().is_empty() {
+            Events::empty()
+        } else {
+            Events::IN
+        }
+    }
+
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.ready.pollee.register_observer(observer, mask);
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -644,9 +724,11 @@ mod test {
     use alloc::sync::Arc;
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
+    use litebox::fd::TypedFd;
     use litebox_common_linux::EpollEvent;
+    use litebox_common_linux::errno::Errno;
 
-    use super::EpollFile;
+    use super::{EpollFile, EpollSubsystem};
     use crate::syscalls::file::FilesState;
 
     extern crate std;
@@ -655,19 +737,33 @@ mod test {
         crate::syscalls::tests::test_platform(None)
     }
 
+    type TestEpollFd = Arc<TypedFd<EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>>;
+
+    fn new_epoll_fd(
+        task: &crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>>,
+    ) -> TestEpollFd {
+        Arc::new(
+            task.global
+                .litebox
+                .descriptor_table_mut()
+                .insert::<EpollSubsystem<TestPlatform, crate::DefaultFS<TestPlatform>>>(
+                    EpollFile::new(),
+                ),
+        )
+    }
+
     fn setup_epoll() -> (
         crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>>,
-        EpollFile<TestPlatform, crate::DefaultFS<TestPlatform>>,
+        TestEpollFd,
     ) {
         let task = crate::syscalls::tests::init_platform(None);
-
-        let epoll = EpollFile::new();
-        (task, epoll)
+        let epoll_fd = new_epoll_fd(&task);
+        (task, epoll_fd)
     }
 
     #[test]
     fn test_epoll_with_pipe() {
-        let (task, epoll) = setup_epoll();
+        let (task, epoll_fd) = setup_epoll();
         let (producer, consumer) = task
             .global
             .pipes
@@ -675,16 +771,25 @@ mod test {
             .unwrap();
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
-        epoll
-            .add_interest(
-                &task.global,
-                10,
-                &reader,
-                EpollEvent {
-                    events: Events::IN.bits(),
-                    data: 0,
-                },
-            )
+        let handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&epoll_fd)
+            .unwrap();
+        handle
+            .with_entry(|epoll| {
+                epoll.add_interest(
+                    &task.global,
+                    &epoll_fd,
+                    10,
+                    &reader,
+                    EpollEvent {
+                        events: Events::IN.bits(),
+                        data: 0,
+                    },
+                )
+            })
             .unwrap();
 
         // spawn a thread to write to the pipe
@@ -699,8 +804,10 @@ mod test {
                 2
             );
         });
-        epoll
-            .wait(&task.global, &WaitState::new(platform()).context(), 1024)
+        handle
+            .with_entry(|epoll| {
+                epoll.wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            })
             .unwrap();
         let mut buf = [0; 2];
         task.global
@@ -708,6 +815,220 @@ mod test {
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
+    }
+
+    #[test]
+    fn test_epoll_nested() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let inner_fd = new_epoll_fd(&task);
+        let (producer, consumer) = task
+            .global
+            .pipes
+            .create_pipe(2, litebox::pipes::Flags::empty(), None)
+            .unwrap();
+        let consumer = Arc::new(consumer);
+        let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
+        let inner_handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&inner_fd)
+            .unwrap();
+        inner_handle
+            .with_entry(|inner| {
+                inner.add_interest(
+                    &task.global,
+                    &inner_fd,
+                    20,
+                    &reader,
+                    EpollEvent {
+                        events: Events::IN.bits(),
+                        data: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        let outer_fd = new_epoll_fd(&task);
+        let nested = super::EpollDescriptor::Epoll(Arc::clone(&inner_fd));
+        let outer_handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&outer_fd)
+            .unwrap();
+        outer_handle
+            .with_entry(|outer| {
+                outer.add_interest(
+                    &task.global,
+                    &outer_fd,
+                    10,
+                    &nested,
+                    EpollEvent {
+                        events: Events::IN.bits(),
+                        data: 42,
+                    },
+                )
+            })
+            .unwrap();
+
+        // Writing to the pipe should make the inner epoll ready, which in turn should make the
+        // outer epoll (which has the inner epoll nested inside it) ready.
+        task.global
+            .pipes
+            .write(&WaitState::new(platform()).context(), &producer, &[1, 2])
+            .unwrap();
+
+        let events = outer_handle
+            .with_entry(|outer| {
+                outer.wait(&task.global, &WaitState::new(platform()).context(), 1024)
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let data = events[0].data;
+        assert_eq!(data, 42);
+    }
+
+    #[test]
+    fn test_epoll_nested_cycle_rejected() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let a_fd = new_epoll_fd(&task);
+        let b_fd = new_epoll_fd(&task);
+
+        let a_handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&a_fd)
+            .unwrap();
+        a_handle
+            .with_entry(|a| {
+                a.add_interest(
+                    &task.global,
+                    &a_fd,
+                    20,
+                    &super::EpollDescriptor::Epoll(Arc::clone(&b_fd)),
+                    EpollEvent {
+                        events: Events::IN.bits(),
+                        data: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        // B adding A back would close a 2-fd cycle; this must be rejected synchronously with
+        // ELOOP rather than being allowed to form (which would only surface as a hang later,
+        // on the first event delivered into the cycle).
+        let b_handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&b_fd)
+            .unwrap();
+        let result = b_handle.with_entry(|b| {
+            b.add_interest(
+                &task.global,
+                &b_fd,
+                10,
+                &super::EpollDescriptor::Epoll(Arc::clone(&a_fd)),
+                EpollEvent {
+                    events: Events::IN.bits(),
+                    data: 0,
+                },
+            )
+        });
+        assert_eq!(result, Err(Errno::ELOOP));
+    }
+
+    /// Reproduces, under real concurrency, the exact race a prior cycle-detection attempt
+    /// missed: thread 1 adds B into A while thread 2 concurrently adds A into B. Checking for a
+    /// cycle and committing the new edge are two different critical sections unless a single
+    /// process-wide lock spans both, so each thread's check can run before the other's insert is
+    /// visible -- both threads see an acyclic graph, both commit, and together they still close
+    /// the cycle. Since A adding B and B adding A are reciprocal, the only two correct outcomes
+    /// per iteration are "exactly one add wins, the other gets ELOOP" -- never both winning
+    /// (that would be the cycle itself), never both losing, and never neither thread returning at
+    /// all. A `Barrier` lines both threads up right before their `add_interest` call to maximize
+    /// the chance of hitting the race, and `recv_timeout` bounds each attempt so a regression
+    /// that reintroduces the deadlock fails this test quickly instead of hanging the run.
+    #[test]
+    fn test_epoll_nested_concurrent_add_never_forms_cycle() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let global = task.global.clone();
+
+        for iteration in 0..30u32 {
+            let a_fd = new_epoll_fd(&task);
+            let b_fd = new_epoll_fd(&task);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            let (tx_a, rx_a) = std::sync::mpsc::channel();
+            let g = global.clone();
+            let (a, b) = (Arc::clone(&a_fd), Arc::clone(&b_fd));
+            let bar = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let handle = g.litebox.descriptor_table().entry_handle(&a).unwrap();
+                bar.wait();
+                let result = handle.with_entry(|entry| {
+                    entry.add_interest(
+                        &g,
+                        &a,
+                        1000 + iteration,
+                        &super::EpollDescriptor::Epoll(Arc::clone(&b)),
+                        EpollEvent {
+                            events: Events::IN.bits(),
+                            data: 0,
+                        },
+                    )
+                });
+                let _ = tx_a.send(result);
+            });
+
+            let (tx_b, rx_b) = std::sync::mpsc::channel();
+            let g = global.clone();
+            let (a, b) = (Arc::clone(&a_fd), Arc::clone(&b_fd));
+            let bar = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let handle = g.litebox.descriptor_table().entry_handle(&b).unwrap();
+                bar.wait();
+                let result = handle.with_entry(|entry| {
+                    entry.add_interest(
+                        &g,
+                        &b,
+                        2000 + iteration,
+                        &super::EpollDescriptor::Epoll(Arc::clone(&a)),
+                        EpollEvent {
+                            events: Events::IN.bits(),
+                            data: 0,
+                        },
+                    )
+                });
+                let _ = tx_b.send(result);
+            });
+
+            let timeout = core::time::Duration::from_secs(5);
+            let Ok(result_a) = rx_a.recv_timeout(timeout) else {
+                panic!(
+                    "iteration {iteration}: thread adding B into A never returned -- \
+                     a cycle likely formed and something is stuck on it"
+                );
+            };
+            let Ok(result_b) = rx_b.recv_timeout(timeout) else {
+                panic!(
+                    "iteration {iteration}: thread adding A into B never returned -- \
+                     a cycle likely formed and something is stuck on it"
+                );
+            };
+
+            match (result_a, result_b) {
+                (Ok(()), Err(Errno::ELOOP)) | (Err(Errno::ELOOP), Ok(())) => {}
+                other => panic!(
+                    "iteration {iteration}: expected exactly one add to win and the other to be \
+                     rejected with ELOOP, got {other:?} instead"
+                ),
+            }
+        }
     }
 
     #[test]

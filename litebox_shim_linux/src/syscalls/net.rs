@@ -259,7 +259,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 NetworkProxy::Datagram(proxy)
             }
             SockType::Raw => NetworkProxy::Raw,
-            _ => unimplemented!(),
+            // `SockType` is `#[non_exhaustive]` but only declares these three variants, and
+            // `sock_type` only ever reaches here via `SockType::try_from`, which rejects anything
+            // else before construction.
+            _ => unreachable!(),
         };
         // Save the proxy in both the descriptor table and the network subsystem so that the shim layer
         // can access it without holding the network lock and the network subsystem can access it without
@@ -414,7 +417,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     // keepalive timer ever reads it, so UDP/raw sockets accept the call
                     // and it stays inert, same as on real Linux.
                     litebox::net::errors::SetTcpOptionError::NotTcpSocket => {}
-                    _ => unimplemented!(),
+                    // `SetTcpOptionError` is `#[non_exhaustive]` but only declares these two
+                    // variants, both matched above.
+                    _ => unreachable!(),
                 }
             }
             Ok(())
@@ -638,7 +643,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                             litebox::net::CongestionControl::Reno => "reno",
                             litebox::net::CongestionControl::Cubic => "cubic",
                             litebox::net::CongestionControl::None => "none",
-                            _ => unimplemented!(),
+                            // `CongestionControl` is `#[non_exhaustive]` but only declares these
+                            // three variants, all matched above.
+                            _ => unreachable!(),
                         };
                         let len = name.len().min(len as usize);
                         optval
@@ -688,7 +695,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         self.net.lock().accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
-            _ => unimplemented!(),
+            // `AcceptError` is `#[non_exhaustive]` but only declares these three variants, all
+            // matched above.
+            _ => unreachable!(),
         })
     }
 
@@ -787,9 +796,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         // Another thread bound it in the meantime - that's fine
                     }
                     litebox::net::errors::BindError::InvalidFd => return Err(Errno::EBADF),
+                    // `BindError` is `#[non_exhaustive]` but only declares these four variants,
+                    // all matched here or above; `_` covers the same two named on the left.
                     litebox::net::errors::BindError::UnsupportedAddress(_)
-                    | litebox::net::errors::BindError::PortAlreadyInUse(_) => unreachable!(),
-                    _ => unimplemented!(),
+                    | litebox::net::errors::BindError::PortAlreadyInUse(_)
+                    | _ => unreachable!(),
                 }
             }
             // Get the assigned port
@@ -871,7 +882,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 SockType::Stream => {
                     new_flags.insert(litebox::net::ReceiveFlags::DISCARD);
                 }
-                _ => unimplemented!(),
+                // `SockType` is `#[non_exhaustive]` but only declares these three variants, all
+                // matched above.
+                _ => unreachable!(),
             }
         }
 
@@ -954,7 +967,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 Err(litebox::net::errors::CloseError::InvalidFd) => {
                     Err(TryOpError::Other(Errno::EBADF))
                 }
-                Err(_) => unimplemented!(),
+                // `CloseError` is `#[non_exhaustive]` but only declares these two variants, both
+                // matched above.
+                Err(_) => unreachable!(),
             },
         ) {
             Ok(()) => Ok(()),
@@ -1022,7 +1037,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         litebox::net::Protocol::Udp
                     }
                     SockType::Raw => todo!(),
-                    _ => unimplemented!(),
+                    // `SockType` is `#[non_exhaustive]` but only declares these three variants,
+                    // all matched above (`Raw`'s own handling is a separate, real gap -- see the
+                    // `todo!()` above -- not exhaustiveness padding).
+                    _ => unreachable!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
@@ -1054,7 +1072,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 })?
             }
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
-            _ => unimplemented!(),
+            // `AddressFamily` is `#[non_exhaustive]` but only declares these four variants, all
+            // matched above; `domain` only reaches here via `AddressFamily::try_from`, which
+            // rejects anything else before construction.
+            _ => unreachable!(),
         };
         Ok(u32::try_from(file).unwrap())
     }
@@ -1170,7 +1191,13 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
                 s.to_string_lossy().to_string(),
             )))
         }
-        _ => todo!("unsupported family {family:?}"),
+        // Unlike `do_socket`'s `AddressFamily` match, `INET6`/`NETLINK` really are reachable
+        // here: this parses a sockaddr the guest supplies as a syscall argument (e.g. to
+        // `connect`/`bind`), which is independent of whatever family the fd itself was created
+        // with, so a mismatched or IPv6 sockaddr is a real, guest-triggerable input rather than
+        // exhaustiveness padding. Report it the same way `do_socket` reports an unsupported
+        // socket domain instead of aborting on it.
+        _ => Err(Errno::EAFNOSUPPORT),
     }
 }
 

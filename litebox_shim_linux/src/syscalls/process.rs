@@ -390,7 +390,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // Note we don't support capabilities in LiteBox, so we always return 0.
                 Ok(0)
             }
-            _ => unimplemented!(),
+            // `PrctlArg` is `#[non_exhaustive]` but only declares these three variants, all
+            // matched above; the syscall decoder rejects any other `prctl` option with `EINVAL`
+            // before a `PrctlArg` is ever constructed.
+            _ => unreachable!(),
         }
     }
 
@@ -416,7 +419,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ArchPrctlArg::CETStatus | ArchPrctlArg::CETDisable | ArchPrctlArg::CETLock => {
                 Err(Errno::EINVAL)
             }
-            _ => unimplemented!(),
+            // `ArchPrctlArg` is `#[non_exhaustive]`, but on every target it declares (`SetFs`/
+            // `GetFs` exist only under x86_64) every variant is matched above, and the syscall
+            // decoder itself only runs `#[cfg(target_arch = "x86_64")]`, so on other targets this
+            // is never even reachable via a real `arch_prctl` syscall.
+            _ => unreachable!(),
         }
     }
 }
@@ -1051,7 +1058,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // This is a reasonable default for high-resolution timers
                 Duration::from_nanos(1)
             }
-            _ => unimplemented!(),
+            // `ClockId` is `#[non_exhaustive]` but only declares these three variants, all
+            // matched above; `clockid` only reaches here via `ClockId::try_from`, which rejects
+            // anything else with `EINVAL` before construction.
+            _ => unreachable!(),
         };
 
         res.write::<Platform>(resolution)
@@ -1172,7 +1182,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             {
                 Ok(handle) => alarm.handle = Some(handle),
                 Err(litebox::platform::TimerCreationError::Unsupported) => {}
-                Err(_) => unimplemented!(),
+                // `TimerCreationError` is `#[non_exhaustive]` but only declares this one
+                // variant, already matched above.
+                Err(_) => unreachable!(),
             }
         }
         if let Some(handle) = &alarm.handle {
