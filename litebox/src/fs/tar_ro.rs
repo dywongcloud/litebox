@@ -301,6 +301,14 @@ impl super::backend::Backend for TarRo {
         }
     }
 
+    fn chmod_file(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_dir(&self, _h: &DirHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
     fn chown_at(
         &self,
         dir: DirHandle,
@@ -329,6 +337,24 @@ impl super::backend::Backend for TarRo {
         } else {
             Err(PathError::NoSuchFileOrDirectory.into())
         }
+    }
+
+    fn utimensat_file(
+        &self,
+        _h: &FileHandle,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        Err(UtimeError::ReadOnlyFileSystem)
+    }
+
+    fn utimensat_dir(
+        &self,
+        _h: &DirHandle,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        Err(UtimeError::ReadOnlyFileSystem)
     }
 }
 

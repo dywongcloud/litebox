@@ -12,6 +12,7 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use crate::{
     broker,
     fd::Descriptors,
+    fs::flock::FlockTable,
     platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -109,6 +110,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 descriptors,
                 broker: broker_control,
                 broker_pollables,
+                flock_table: FlockTable::new(),
             }),
         }
     }
@@ -140,6 +142,13 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         &self,
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
+    }
+
+    /// Access to the whole-file (`flock(2)`-style) advisory lock table.
+    ///
+    /// See [`FlockTable`] for exactly what is (and isn't) modeled.
+    pub fn flock_table(&self) -> &FlockTable<Platform> {
+        &self.x.flock_table
     }
 
     pub(crate) fn broker_control(&self) -> Option<Arc<dyn broker::BrokerControl>> {
@@ -198,4 +207,5 @@ pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     descriptors: RwLock<Platform, Descriptors<Platform>>,
     broker: Option<Arc<dyn broker::BrokerControl>>,
     broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
+    flock_table: FlockTable<Platform>,
 }

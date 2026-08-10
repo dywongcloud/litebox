@@ -232,6 +232,34 @@ impl From<litebox::fs::errors::MkdirError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::ChmodError> for Errno {
+    fn from(value: litebox::fs::errors::ChmodError) -> Self {
+        match value {
+            litebox::fs::errors::ChmodError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChmodError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::ChmodError::Io => Errno::EIO,
+            litebox::fs::errors::ChmodError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::ChmodError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::ChmodError::PathOnlyFd => Errno::EBADF,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::UtimeError> for Errno {
+    fn from(value: litebox::fs::errors::UtimeError) -> Self {
+        match value {
+            litebox::fs::errors::UtimeError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::UtimeError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::UtimeError::Io => Errno::EIO,
+            litebox::fs::errors::UtimeError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::UtimeError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::UtimeError::PathOnlyFd => Errno::EBADF,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {

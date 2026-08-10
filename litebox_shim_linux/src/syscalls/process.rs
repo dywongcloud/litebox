@@ -971,7 +971,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok_or(Errno::EFAULT)
     }
 
-    fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
+    pub(crate) fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
         let now = self.global.platform.current_time();
         let unix_epoch = <Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
         now.duration_since(&unix_epoch)

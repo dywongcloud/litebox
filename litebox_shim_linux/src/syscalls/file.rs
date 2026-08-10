@@ -19,8 +19,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
-    signal::Signal,
+    FlockOperation, InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam,
+    errno::Errno, signal::Signal,
 };
 use thiserror::Error;
 
@@ -175,6 +175,16 @@ impl FsPath {
         };
         Ok(fs_path)
     }
+}
+
+/// The `flock(2)`-holder identity used throughout this module: the guest-visible raw fd number.
+///
+/// This is the one place that convention is spelled out, so `sys_flock` and the close-time lock
+/// release (in `do_close_and_replace`) can never drift apart on how a holder is identified. See
+/// [`litebox::fs::flock::FlockTable`]'s doc comment for what this convention does and doesn't
+/// model correctly (in particular, around `dup`).
+fn flock_holder_for_raw_fd(raw_fd: usize) -> u64 {
+    u64::try_from(raw_fd).unwrap_or(u64::MAX)
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -362,6 +372,197 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.files.borrow().fs.rmdir(path).map_err(Errno::from)
         } else {
             self.files.borrow().fs.unlink(path).map_err(Errno::from)
+        }
+    }
+
+    /// Handle syscall `fchmodat`.
+    ///
+    /// `chmod` has no wrapper of its own here, matching this file's existing convention for the
+    /// other legacy no-dirfd syscalls that have an `*at` sibling (compare `sys_mkdirat`, which
+    /// likewise has no separate `sys_mkdir`): `chmod` is reached by the syscall dispatcher
+    /// constructing this same [`litebox_common_linux::SyscallRequest::Fchmodat`] with `dirfd`
+    /// forced to `AT_FDCWD`. The raw `fchmodat(2)` syscall (unlike `fchmodat2(2)`) takes no
+    /// `flags` argument, so callers reached through it always pass `AtFlags::empty()`.
+    pub fn sys_fchmodat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: u32,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        // TODO: `AT_SYMLINK_NOFOLLOW` is accepted for Linux compatibility, but LiteBox file status
+        // lookups do not currently follow symlinks in any backend, so this has no distinct effect
+        // (mirrors the same TODO on `sys_faccessat`).
+        if flags.intersects(AtFlags::AT_SYMLINK_NOFOLLOW.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        self.files
+            .borrow()
+            .fs
+            .chmod(path, Mode::from_bits_retain(mode))
+            .map_err(Errno::from)
+    }
+
+    /// Handle syscall `fchmod`
+    pub fn sys_fchmod(&self, fd: i32, mode: u32) -> Result<(), Errno> {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let mode = Mode::from_bits_retain(mode);
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.fd_chmod(fd, mode).map_err(Errno::from),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()
+    }
+
+    /// Resolve a single raw `timespec` from `utimensat`/`futimens` into fs-layer semantics: `None`
+    /// means "leave unchanged" (`UTIME_OMIT`), `Some` carries a concrete timestamp (resolving
+    /// `UTIME_NOW` against the current wall-clock time).
+    fn resolve_utime(
+        &self,
+        ts: litebox_common_linux::Timespec,
+    ) -> Result<Option<litebox::fs::Timestamp>, Errno> {
+        match ts.tv_nsec {
+            litebox_common_linux::UTIME_OMIT => Ok(None),
+            litebox_common_linux::UTIME_NOW => Ok(Some(self.now_as_fs_timestamp())),
+            nsec if nsec < 1_000_000_000 => Ok(Some(litebox::fs::Timestamp {
+                sec: ts.tv_sec,
+                nsec: nsec.reinterpret_as_signed(),
+            })),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// Resolve the raw two-element `times` array from `utimensat`/`futimens` (`None` meaning a
+    /// `NULL` pointer, i.e., both timestamps set to "now") into `(atime, mtime)`, per
+    /// [`litebox::fs::FileSystem::utimensat`]'s `None`/`Some` semantics.
+    fn resolve_utimes(
+        &self,
+        times: Option<[litebox_common_linux::Timespec; 2]>,
+    ) -> Result<
+        (
+            Option<litebox::fs::Timestamp>,
+            Option<litebox::fs::Timestamp>,
+        ),
+        Errno,
+    > {
+        let Some([atime, mtime]) = times else {
+            let now = self.now_as_fs_timestamp();
+            return Ok((Some(now), Some(now)));
+        };
+        Ok((self.resolve_utime(atime)?, self.resolve_utime(mtime)?))
+    }
+
+    fn now_as_fs_timestamp(&self) -> litebox::fs::Timestamp {
+        let now = self.real_time_as_duration_since_epoch();
+        litebox::fs::Timestamp {
+            sec: now.as_secs().reinterpret_as_signed(),
+            nsec: i64::from(now.subsec_nanos()),
+        }
+    }
+
+    /// Handle syscall `utimensat`
+    pub fn sys_utimensat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        times: Option<[litebox_common_linux::Timespec; 2]>,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        if flags.intersects(AtFlags::AT_SYMLINK_NOFOLLOW.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        let (atime, mtime) = self.resolve_utimes(times)?;
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        self.files
+            .borrow()
+            .fs
+            .utimensat(path, atime, mtime)
+            .map_err(Errno::from)
+    }
+
+    /// Handle syscall `futimens`.
+    ///
+    /// `futimens` has no syscall of its own: glibc implements it as
+    /// `utimensat(fd, NULL, times, 0)`, which LiteBox's syscall dispatcher routes here (see
+    /// [`litebox_common_linux::SyscallRequest::Utimensat`]'s doc comment).
+    pub fn sys_futimens(
+        &self,
+        fd: i32,
+        times: Option<[litebox_common_linux::Timespec; 2]>,
+    ) -> Result<(), Errno> {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let (atime, mtime) = self.resolve_utimes(times)?;
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.fd_utimensat(fd, atime, mtime).map_err(Errno::from),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()
+    }
+
+    /// Handle syscall `flock`.
+    ///
+    /// See [`litebox::fs::flock::FlockTable`]'s doc comment for exactly what whole-file advisory
+    /// locking means in LiteBox's single-process-but-multi-threaded model, and for the
+    /// fd-number-based holder-identity simplification this relies on.
+    pub fn sys_flock(&self, fd: i32, operation: FlockOperation) -> Result<(), Errno> {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let nonblock = operation.contains(FlockOperation::LOCK_NB);
+        let kind = match operation - FlockOperation::LOCK_NB {
+            FlockOperation::LOCK_SH => Some(litebox::fs::flock::FlockKind::Shared),
+            FlockOperation::LOCK_EX => Some(litebox::fs::flock::FlockKind::Exclusive),
+            FlockOperation::LOCK_UN => None,
+            _ => return Err(Errno::EINVAL),
+        };
+
+        let files = self.files.borrow();
+        let node = files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.fd_file_status(fd).map_err(Errno::from),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()?
+            .node_info;
+        drop(files);
+
+        let holder = litebox::fs::flock::FlockHolder(flock_holder_for_raw_fd(raw_fd));
+        let flock_table = self.global.litebox.flock_table();
+        match kind {
+            None => {
+                flock_table.unlock(node, holder);
+                Ok(())
+            }
+            Some(kind) if nonblock => flock_table
+                .try_lock(node, holder, kind)
+                .map_err(|_| Errno::EWOULDBLOCK),
+            Some(kind) => flock_table
+                .lock(&self.wait_cx(), node, holder, kind)
+                .map_err(|_| Errno::EINTR),
         }
     }
 
@@ -841,6 +1042,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ConsumedFd::Fs(fd) => {
                 if let Ok(raw_fd) = i32::try_from(raw_fd) {
                     self.finalize_elf_patch(raw_fd);
+                }
+                // Release any `flock(2)` lock this fd number holds before the fd goes away, so a
+                // guest that never calls `LOCK_UN` doesn't leak the lock for the rest of this
+                // LiteBox instance's lifetime. See `sys_flock`'s doc comment for the fd-number-based
+                // holder-identity simplification this relies on.
+                if let Ok(node) = files.fs.fd_file_status(&fd) {
+                    self.global.litebox.flock_table().unlock(
+                        node.node_info,
+                        litebox::fs::flock::FlockHolder(flock_holder_for_raw_fd(raw_fd)),
+                    );
                 }
                 files.fs.close(&fd).map_err(Errno::from)
             }

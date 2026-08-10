@@ -153,6 +153,16 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Update the permissions for the file/dir `name` at `parent`.
     fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError>;
 
+    /// Update the permissions for an already-open file handle directly (no name lookup).
+    ///
+    /// See [`super::FileSystem::fd_chmod`].
+    fn chmod_file(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError>;
+
+    /// Update the permissions for an already-open directory handle directly (no name lookup).
+    ///
+    /// See [`super::FileSystem::fd_chmod`].
+    fn chmod_dir(&self, h: &DirHandle, mode: Mode) -> Result<(), ChmodError>;
+
     /// Update the owner/group for the file/dir `name` at `parent`.
     fn chown_at(
         &self,
@@ -169,6 +179,24 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
         &self,
         dir: DirHandle,
         name: &str,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError>;
+
+    /// Update the access/modification time for an already-open file handle directly (no name
+    /// lookup). See [`super::FileSystem::fd_utimensat`].
+    fn utimensat_file(
+        &self,
+        h: &FileHandle,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError>;
+
+    /// Update the access/modification time for an already-open directory handle directly (no name
+    /// lookup). See [`super::FileSystem::fd_utimensat`].
+    fn utimensat_dir(
+        &self,
+        h: &DirHandle,
         atime: Option<Timestamp>,
         mtime: Option<Timestamp>,
     ) -> Result<(), UtimeError>;

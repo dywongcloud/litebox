@@ -624,6 +624,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         self.backend.chmod_at(parent, name, mode)
     }
 
+    fn fd_chmod(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ChmodError::ClosedFd)?;
+        let entry = entry.get_entry();
+        if entry.entry.path_only {
+            return Err(ChmodError::PathOnlyFd);
+        }
+        match &entry.entry.handle {
+            OwnedHandle::File(file) => self.backend.chmod_file(file, mode),
+            OwnedHandle::Dir(dir) => self.backend.chmod_dir(dir, mode),
+        }
+    }
+
     fn chown(
         &self,
         path: impl Arg,
@@ -672,6 +688,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             WalkError::PathError(error) => error.into(),
         })?;
         self.backend.utimensat_at(parent, name, atime, mtime)
+    }
+
+    fn fd_utimensat(
+        &self,
+        fd: &TypedFd<Self>,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(UtimeError::ClosedFd)?;
+        let entry = entry.get_entry();
+        if entry.entry.path_only {
+            return Err(UtimeError::PathOnlyFd);
+        }
+        match &entry.entry.handle {
+            OwnedHandle::File(file) => self.backend.utimensat_file(file, atime, mtime),
+            OwnedHandle::Dir(dir) => self.backend.utimensat_dir(dir, atime, mtime),
+        }
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {

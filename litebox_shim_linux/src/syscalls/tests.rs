@@ -2,7 +2,10 @@
 // Licensed under the MIT license.
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_common_linux::{
+    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, FlockOperation, Timespec, UTIME_NOW,
+    UTIME_OMIT, errno::Errno,
+};
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
@@ -685,6 +688,423 @@ fn test_unlinkat() {
         Err(Errno::ENOENT),
         "Second directory should no longer exist after removal"
     );
+}
+
+#[test]
+fn test_chmod_fchmod_fchmodat_round_trip() {
+    let task = init_platform(None);
+
+    let file_path = "/chmod_test_file.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // `chmod` via path. `chmod` has no wrapper of its own (see `sys_fchmodat`'s doc comment); the
+    // syscall dispatcher reaches it by constructing an `Fchmodat` request with `dirfd` forced to
+    // `AT_FDCWD`, so exercise that exact shape here.
+    task.sys_fchmodat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        0o640,
+        AtFlags::empty(),
+    )
+    .expect("chmod (via fchmodat + AT_FDCWD) should succeed");
+    let stat = task.sys_stat(file_path).expect("stat should succeed");
+    assert_eq!(
+        stat.st_mode & 0o7777,
+        0o640,
+        "chmod should have set the new mode, read back via stat"
+    );
+
+    // `fchmod` via the still-open fd.
+    task.sys_fchmod(fd, 0o600).expect("fchmod should succeed");
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    assert_eq!(
+        stat.st_mode & 0o7777,
+        0o600,
+        "fchmod should have set the new mode, read back via fstat"
+    );
+
+    // `fchmodat` with `AT_FDCWD` + a relative path. (This shim does not yet resolve a real,
+    // non-`AT_FDCWD` dirfd against a relative path -- see `resolve_path_at`'s `FsPath::FdRelative`
+    // arm -- a pre-existing limitation shared by every `*at` syscall, not something specific to
+    // this change.)
+    task.sys_chdir("/").unwrap();
+    task.sys_fchmodat(
+        litebox_common_linux::AT_FDCWD,
+        "chmod_test_file.txt",
+        0o755,
+        AtFlags::empty(),
+    )
+    .expect("fchmodat should succeed");
+    let stat = task.sys_stat(file_path).expect("stat should succeed");
+    assert_eq!(
+        stat.st_mode & 0o7777,
+        0o755,
+        "fchmodat should have set the new mode, read back via stat"
+    );
+
+    // An unrecognized flag is rejected.
+    assert_eq!(
+        task.sys_fchmodat(
+            litebox_common_linux::AT_FDCWD,
+            "chmod_test_file.txt",
+            0o755,
+            AtFlags::AT_EMPTY_PATH
+        ),
+        Err(Errno::EINVAL)
+    );
+
+    // `fchmod` on a closed fd fails with `EBADF`.
+    task.sys_close(fd).unwrap();
+    assert_eq!(task.sys_fchmod(fd, 0o600), Err(Errno::EBADF));
+}
+
+#[test]
+fn test_utimensat_futimens_round_trip() {
+    let task = init_platform(None);
+
+    let file_path = "/utime_test_file.txt";
+    let fd = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Explicit atime/mtime via `utimensat`.
+    let atime = Timespec {
+        tv_sec: 1_000_000,
+        tv_nsec: 123,
+    };
+    let mtime = Timespec {
+        tv_sec: 2_000_000,
+        tv_nsec: 456,
+    };
+    task.sys_utimensat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        Some([atime, mtime]),
+        AtFlags::empty(),
+    )
+    .expect("utimensat should succeed");
+    let stat = task.sys_stat(file_path).unwrap();
+    assert_eq!((stat.st_atime, stat.st_atime_nsec), (1_000_000, 123));
+    assert_eq!((stat.st_mtime, stat.st_mtime_nsec), (2_000_000, 456));
+
+    // `UTIME_OMIT` on `atime` leaves it unchanged; an explicit `mtime` still applies.
+    let omit = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_OMIT,
+    };
+    let mtime2 = Timespec {
+        tv_sec: 3_000_000,
+        tv_nsec: 789,
+    };
+    task.sys_utimensat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        Some([omit, mtime2]),
+        AtFlags::empty(),
+    )
+    .expect("utimensat with UTIME_OMIT should succeed");
+    let stat = task.sys_stat(file_path).unwrap();
+    assert_eq!(
+        (stat.st_atime, stat.st_atime_nsec),
+        (1_000_000, 123),
+        "UTIME_OMIT must leave atime unchanged"
+    );
+    assert_eq!((stat.st_mtime, stat.st_mtime_nsec), (3_000_000, 789));
+
+    // `UTIME_NOW` (explicit, both fields) resolves against wall-clock time.
+    let before = task.real_time_as_duration_since_epoch();
+    let now_ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_NOW,
+    };
+    task.sys_utimensat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        Some([now_ts, now_ts]),
+        AtFlags::empty(),
+    )
+    .expect("utimensat with UTIME_NOW should succeed");
+    let after = task.real_time_as_duration_since_epoch();
+    let stat = task.sys_stat(file_path).unwrap();
+    let atime_secs = u64::try_from(stat.st_atime).unwrap();
+    assert!(
+        atime_secs >= before.as_secs() && atime_secs <= after.as_secs(),
+        "UTIME_NOW should resolve to the current wall-clock time, got {atime_secs} \
+         outside [{}, {}]",
+        before.as_secs(),
+        after.as_secs()
+    );
+    assert_eq!(
+        stat.st_atime, stat.st_mtime,
+        "UTIME_NOW applied to both fields should produce matching timestamps"
+    );
+
+    // A `NULL` `times` pointer (`None`) also means "both UTIME_NOW".
+    task.sys_utimensat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        None,
+        AtFlags::empty(),
+    )
+    .expect("utimensat with NULL times should succeed");
+
+    // `futimens`, reached (per the shim's syscall dispatcher) via a `NULL` pathname, operates on
+    // the fd directly rather than re-resolving a path.
+    let atime3 = Timespec {
+        tv_sec: 5_000_000,
+        tv_nsec: 111,
+    };
+    let mtime3 = Timespec {
+        tv_sec: 6_000_000,
+        tv_nsec: 222,
+    };
+    task.sys_futimens(fd, Some([atime3, mtime3]))
+        .expect("futimens should succeed");
+    let stat = task.sys_fstat(fd).unwrap();
+    assert_eq!((stat.st_atime, stat.st_atime_nsec), (5_000_000, 111));
+    assert_eq!((stat.st_mtime, stat.st_mtime_nsec), (6_000_000, 222));
+
+    // An invalid (out-of-range, non-sentinel) `tv_nsec` is rejected.
+    let bad = Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000_000,
+    };
+    assert_eq!(
+        task.sys_utimensat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            Some([bad, bad]),
+            AtFlags::empty()
+        ),
+        Err(Errno::EINVAL)
+    );
+
+    // `futimens` on a closed fd fails with `EBADF`.
+    task.sys_close(fd).unwrap();
+    assert_eq!(
+        task.sys_futimens(fd, Some([atime3, mtime3])),
+        Err(Errno::EBADF)
+    );
+}
+
+#[test]
+fn test_flock_shared_exclusive_contention() {
+    let task = init_platform(None);
+
+    let file_path = "/flock_test_file.txt";
+    let fd1 = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd1 = i32::try_from(fd1).unwrap();
+    // An independent second open of the same file: real `flock` treats these as independent
+    // holders that can contend with each other, which is exactly what's being exercised here.
+    let fd2 = task
+        .sys_open(file_path, OFlags::RDWR, Mode::empty())
+        .unwrap();
+    let fd2 = i32::try_from(fd2).unwrap();
+
+    // Exclusive lock via fd1 succeeds uncontended.
+    task.sys_flock(fd1, FlockOperation::LOCK_EX)
+        .expect("LOCK_EX should succeed uncontended");
+
+    // A non-blocking exclusive attempt via fd2 fails: fd1 holds it exclusively.
+    assert_eq!(
+        task.sys_flock(fd2, FlockOperation::LOCK_EX | FlockOperation::LOCK_NB),
+        Err(Errno::EWOULDBLOCK)
+    );
+    // A non-blocking shared attempt via fd2 fails too, for the same reason.
+    assert_eq!(
+        task.sys_flock(fd2, FlockOperation::LOCK_SH | FlockOperation::LOCK_NB),
+        Err(Errno::EWOULDBLOCK)
+    );
+
+    // Re-locking (converting) from the SAME holder never blocks on itself.
+    task.sys_flock(fd1, FlockOperation::LOCK_EX | FlockOperation::LOCK_NB)
+        .expect("re-affirming the exclusive lock we already hold must not block");
+    task.sys_flock(fd1, FlockOperation::LOCK_SH | FlockOperation::LOCK_NB)
+        .expect("downgrading the exclusive lock we hold must not block");
+
+    // Now that fd1 only holds a shared lock, a second shared lock via fd2 succeeds concurrently.
+    task.sys_flock(fd2, FlockOperation::LOCK_SH | FlockOperation::LOCK_NB)
+        .expect("two shared holders should be able to coexist");
+
+    // But fd2 cannot upgrade to exclusive while fd1 still holds a shared lock too.
+    assert_eq!(
+        task.sys_flock(fd2, FlockOperation::LOCK_EX | FlockOperation::LOCK_NB),
+        Err(Errno::EWOULDBLOCK)
+    );
+
+    // Unlocking fd1 lets fd2 upgrade.
+    task.sys_flock(fd1, FlockOperation::LOCK_UN).unwrap();
+    task.sys_flock(fd2, FlockOperation::LOCK_EX | FlockOperation::LOCK_NB)
+        .expect("fd2 should now be able to acquire exclusively");
+
+    // `LOCK_UN` on an fd that isn't (or is no longer) a holder is a harmless no-op.
+    task.sys_flock(fd1, FlockOperation::LOCK_UN).unwrap();
+
+    // An unrecognized operation is rejected.
+    assert_eq!(
+        task.sys_flock(fd1, FlockOperation::empty()),
+        Err(Errno::EINVAL)
+    );
+
+    task.sys_flock(fd2, FlockOperation::LOCK_UN).unwrap();
+    task.sys_close(fd1).unwrap();
+    task.sys_close(fd2).unwrap();
+}
+
+#[test]
+fn test_flock_blocks_across_real_threads_and_wakes_on_unlock() {
+    fn join_with_timeout<T>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: std::time::Duration,
+        thread_name: &str,
+    ) -> T {
+        let start = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                start.elapsed() < timeout,
+                "{thread_name} timed out after {timeout:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        handle.join().expect("{thread_name} panicked")
+    }
+
+    let task = init_platform(None);
+    let file_path = "/flock_blocking_test_file.txt";
+    let fd1 = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd1 = i32::try_from(fd1).unwrap();
+    let fd2 = task
+        .sys_open(file_path, OFlags::RDWR, Mode::empty())
+        .unwrap();
+    let fd2 = i32::try_from(fd2).unwrap();
+
+    // The main "thread" (guest thread) holds an exclusive lock.
+    task.sys_flock(fd1, FlockOperation::LOCK_EX).unwrap();
+
+    // A second real guest thread, sharing the same fd table (via a real host thread), blocks
+    // trying to acquire the same file exclusively too.
+    let blocked =
+        task.spawn_clone_for_test(move |task| task.sys_flock(fd2, FlockOperation::LOCK_EX));
+
+    // Give the second thread a real chance to actually block before we check it hasn't finished.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !blocked.is_finished(),
+        "the second thread should still be blocked on the lock fd1 holds"
+    );
+
+    // Releasing the lock must wake the blocked waiter.
+    task.sys_flock(fd1, FlockOperation::LOCK_UN).unwrap();
+    let result = join_with_timeout(
+        blocked,
+        std::time::Duration::from_secs(5),
+        "blocked flock waiter",
+    );
+    assert_eq!(
+        result,
+        Ok(()),
+        "the blocked LOCK_EX call should succeed once fd1 releases the lock"
+    );
+
+    task.sys_flock(fd2, FlockOperation::LOCK_UN).unwrap();
+    task.sys_close(fd1).unwrap();
+    task.sys_close(fd2).unwrap();
+}
+
+/// A holder converting its own exclusive lock down to shared can unblock a different, real thread
+/// blocked wanting a shared lock -- without that holder ever calling `LOCK_UN`. Regression test
+/// for a real bug caught during development: only `unlock` used to wake waiters, so this exact
+/// scenario hung until the blocking party's *next* unrelated wake.
+#[test]
+fn test_flock_downgrade_wakes_a_different_blocked_waiter() {
+    fn join_with_timeout<T>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: std::time::Duration,
+        thread_name: &str,
+    ) -> T {
+        let start = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                start.elapsed() < timeout,
+                "{thread_name} timed out after {timeout:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        handle.join().expect("{thread_name} panicked")
+    }
+
+    let task = init_platform(None);
+    let file_path = "/flock_downgrade_test_file.txt";
+    let fd1 = task
+        .sys_open(
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd1 = i32::try_from(fd1).unwrap();
+    let fd2 = task
+        .sys_open(file_path, OFlags::RDWR, Mode::empty())
+        .unwrap();
+    let fd2 = i32::try_from(fd2).unwrap();
+
+    // fd1 holds an exclusive lock.
+    task.sys_flock(fd1, FlockOperation::LOCK_EX).unwrap();
+
+    // A second real guest thread blocks wanting a *shared* lock via fd2.
+    let blocked =
+        task.spawn_clone_for_test(move |task| task.sys_flock(fd2, FlockOperation::LOCK_SH));
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !blocked.is_finished(),
+        "fd2 should still be blocked while fd1 holds the lock exclusively"
+    );
+
+    // fd1 downgrades its own lock to shared -- never calls LOCK_UN. Real flock(2) treats this as
+    // an in-place conversion, and it should immediately make room for fd2's shared request.
+    task.sys_flock(fd1, FlockOperation::LOCK_SH)
+        .expect("downgrading the lock we hold must not block");
+
+    let result = join_with_timeout(
+        blocked,
+        std::time::Duration::from_secs(5),
+        "blocked LOCK_SH waiter",
+    );
+    assert_eq!(
+        result,
+        Ok(()),
+        "fd1's downgrade to shared should have woken fd2's blocked LOCK_SH"
+    );
+
+    task.sys_flock(fd1, FlockOperation::LOCK_UN).unwrap();
+    task.sys_flock(fd2, FlockOperation::LOCK_UN).unwrap();
+    task.sys_close(fd1).unwrap();
+    task.sys_close(fd2).unwrap();
 }
 
 /// Regression test for a bug where readers can be permanently starved on

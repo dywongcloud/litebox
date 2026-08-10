@@ -56,6 +56,13 @@ pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 /// the current working directory.
 pub const AT_FDCWD: i32 = -100;
 
+/// Special value for `utimensat(2)`/`futimens(3)`'s `tv_nsec` field: set the corresponding
+/// timestamp to the current time.
+pub const UTIME_NOW: u64 = 0x3fff_ffff;
+/// Special value for `utimensat(2)`/`futimens(3)`'s `tv_nsec` field: leave the corresponding
+/// timestamp unchanged.
+pub const UTIME_OMIT: u64 = 0x3fff_fffe;
+
 /// Encoding for ioctl commands.
 pub mod ioctl {
     /// The number of bits allocated for the ioctl command number field.
@@ -638,6 +645,22 @@ pub struct Flock {
     #[cfg(target_pointer_width = "64")]
     #[doc(hidden)]
     pub __pad1: u32,
+}
+
+bitflags::bitflags! {
+    /// The `operation` argument to `flock(2)`: a lock kind (`LOCK_SH`/`LOCK_EX`/`LOCK_UN`,
+    /// mutually exclusive) optionally combined with `LOCK_NB`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FlockOperation: core::ffi::c_int {
+        /// Place a shared lock.
+        const LOCK_SH = 1;
+        /// Place an exclusive lock.
+        const LOCK_EX = 2;
+        /// Don't block when locking.
+        const LOCK_NB = 4;
+        /// Remove an existing lock.
+        const LOCK_UN = 8;
+    }
 }
 
 const F_DUPFD: i32 = 0;
@@ -2427,6 +2450,10 @@ pub enum SyscallRequest {
         fd: i32,
         arg: FcntlArg,
     },
+    Flock {
+        fd: i32,
+        operation: FlockOperation,
+    },
     Getcwd {
         buf: UserPtrMut<u8>,
         size: usize,
@@ -2497,6 +2524,29 @@ pub enum SyscallRequest {
     Unlinkat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
+        flags: AtFlags,
+    },
+    /// Reached through `chmod`, `fchmodat`, and `fchmodat2`.
+    ///
+    /// `flags` is empty for `chmod`/`fchmodat`, since the raw `fchmodat(2)` syscall (unlike
+    /// `fchmodat2(2)`) takes no `flags` argument.
+    Fchmodat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        mode: u32,
+        flags: AtFlags,
+    },
+    Fchmod {
+        fd: i32,
+        mode: u32,
+    },
+    /// Reached through `utimensat`. Also covers `futimens`, which has no syscall of its own:
+    /// glibc implements it as `utimensat(fd, NULL, times, 0)`, signaled here by `pathname` being
+    /// `None`.
+    Utimensat {
+        dirfd: i32,
+        pathname: Option<UserPtr<c_char>>,
+        times: Option<UserPtr<Timespec>>,
         flags: AtFlags,
     },
     Newfstatat {
@@ -2764,6 +2814,21 @@ impl SyscallRequest {
                 mode: ctx.sys_req_arg(1),
             },
             Sysno::mkdirat => sys_req!(Mkdirat { dirfd, pathname:*, mode }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chmod => SyscallRequest::Fchmodat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode: ctx.sys_req_arg(1),
+                flags: AtFlags::empty(),
+            },
+            Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
+            Sysno::fchmodat => sys_req!(Fchmodat {
+                dirfd,
+                pathname:*,
+                mode,
+                flags: { AtFlags::empty() },
+            }),
+            Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
@@ -2925,6 +2990,15 @@ impl SyscallRequest {
                     fd: ctx.sys_req_arg(0),
                     arg: FcntlArg::try_from(cmd, arg).ok_or_else(|| {
                         unsupported_einval(format_args!("fcntl(cmd = {cmd}, arg = {arg})"))
+                    })?,
+                }
+            }
+            Sysno::flock => {
+                let operation: i32 = ctx.sys_req_arg(1);
+                SyscallRequest::Flock {
+                    fd: ctx.sys_req_arg(0),
+                    operation: FlockOperation::from_bits(operation).ok_or_else(|| {
+                        unsupported_einval(format_args!("flock(operation = {operation})"))
                     })?,
                 }
             }

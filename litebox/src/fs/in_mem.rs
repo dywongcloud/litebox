@@ -497,6 +497,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
+    fn fd_chmod(&self, fd: &FileFd<Platform>, mode: super::Mode) -> Result<(), ChmodError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd).ok_or(ChmodError::ClosedFd)?;
+        match &entry.entry {
+            Descriptor::File { file, .. } => {
+                let perms = &mut file.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChmodError::NotTheOwner);
+                }
+                perms.mode = mode;
+                Ok(())
+            }
+            Descriptor::Dir { dir } => {
+                let perms = &mut dir.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChmodError::NotTheOwner);
+                }
+                perms.mode = mode;
+                Ok(())
+            }
+        }
+    }
+
     fn chown(
         &self,
         path: impl crate::path::Arg,
@@ -569,6 +592,49 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Entry::Dir(dir) => {
                 let mut dir = dir.write();
+                if let Some(atime) = atime {
+                    dir.atime = atime;
+                }
+                if let Some(mtime) = mtime {
+                    dir.mtime = mtime;
+                }
+                if let Some(changed) = mtime.or(atime) {
+                    dir.ctime = changed;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fd_utimensat(
+        &self,
+        fd: &FileFd<Platform>,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd).ok_or(UtimeError::ClosedFd)?;
+        match &entry.entry {
+            Descriptor::File { file, .. } => {
+                let mut file = file.write();
+                if !self.current_user.can_write(&file.perms) {
+                    return Err(UtimeError::NoWritePerms);
+                }
+                if let Some(atime) = atime {
+                    file.atime = atime;
+                }
+                if let Some(mtime) = mtime {
+                    file.mtime = mtime;
+                }
+                if let Some(changed) = mtime.or(atime) {
+                    file.ctime = changed;
+                }
+            }
+            Descriptor::Dir { dir } => {
+                let mut dir = dir.write();
+                if !self.current_user.can_write(&dir.perms) {
+                    return Err(UtimeError::NoWritePerms);
+                }
                 if let Some(atime) = atime {
                     dir.atime = atime;
                 }

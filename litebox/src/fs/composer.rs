@@ -790,6 +790,25 @@ impl Backend for Composer {
         }
     }
 
+    fn chmod_file(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index]
+            .backend
+            .chmod_file(&h.handle, mode)
+    }
+
+    fn chmod_dir(&self, h: &DirHandle, mode: Mode) -> Result<(), ChmodError> {
+        let h = h.get_typed::<Self>();
+        match &h.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                mount_index,
+                handle,
+                ..
+            } => self.mounts[*mount_index].backend.chmod_dir(handle, mode),
+        }
+    }
+
     fn chown_at(
         &self,
         dir: DirHandle,
@@ -833,6 +852,37 @@ impl Backend for Composer {
                     .backend
                     .utimensat_at(handle, name, atime, mtime)
             }
+        }
+    }
+
+    fn utimensat_file(
+        &self,
+        h: &FileHandle,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index]
+            .backend
+            .utimensat_file(&h.handle, atime, mtime)
+    }
+
+    fn utimensat_dir(
+        &self,
+        h: &DirHandle,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let h = h.get_typed::<Self>();
+        match &h.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(UtimeError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                mount_index,
+                handle,
+                ..
+            } => self.mounts[*mount_index]
+                .backend
+                .utimensat_dir(handle, atime, mtime),
         }
     }
 }

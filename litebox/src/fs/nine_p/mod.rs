@@ -804,6 +804,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         result.map_err(ChmodError::from)
     }
 
+    fn fd_chmod(
+        &self,
+        fd: &FileFd<Platform, T>,
+        mode: super::Mode,
+    ) -> Result<(), super::errors::ChmodError> {
+        let fid = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| desc.entry.fid.clone())
+            .ok_or(ChmodError::ClosedFd)?;
+
+        let stat = fcall::SetAttr {
+            mode: mode.bits(),
+            ..Default::default()
+        };
+
+        self.client
+            .setattr(&fid, fcall::SetattrMask::MODE, stat)
+            .map_err(ChmodError::from)
+    }
+
     fn chown(
         &self,
         path: impl crate::path::Arg,
@@ -870,6 +891,40 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.client.clunk(fid);
 
         result.map_err(UtimeError::from)
+    }
+
+    fn fd_utimensat(
+        &self,
+        fd: &FileFd<Platform, T>,
+        atime: Option<super::Timestamp>,
+        mtime: Option<super::Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let fid = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| desc.entry.fid.clone())
+            .ok_or(UtimeError::ClosedFd)?;
+
+        let mut valid = fcall::SetattrMask::empty();
+        let mut stat = fcall::SetAttr::default();
+        if let Some(atime) = atime {
+            valid |= fcall::SetattrMask::ATIME | fcall::SetattrMask::ATIME_SET;
+            stat.atime = fcall::Time {
+                sec: atime.sec.try_into().unwrap_or_default(),
+                nsec: atime.nsec.try_into().unwrap_or_default(),
+            };
+        }
+        if let Some(mtime) = mtime {
+            valid |= fcall::SetattrMask::MTIME | fcall::SetattrMask::MTIME_SET;
+            stat.mtime = fcall::Time {
+                sec: mtime.sec.try_into().unwrap_or_default(),
+                nsec: mtime.nsec.try_into().unwrap_or_default(),
+            };
+        }
+
+        self.client
+            .setattr(&fid, valid, stat)
+            .map_err(UtimeError::from)
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {

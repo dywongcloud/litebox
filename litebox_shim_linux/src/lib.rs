@@ -992,6 +992,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
             SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
+            SyscallRequest::Flock { fd, operation } => syscall!(sys_flock(fd, operation)),
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
                 self.sys_getcwd(&mut kernel_buf).and_then(|size| {
@@ -1132,6 +1133,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .map_or(Err(Errno::EFAULT), |path| {
                     syscall!(sys_unlinkat(dirfd, path, flags))
                 }),
+            SyscallRequest::Fchmodat {
+                dirfd,
+                pathname,
+                mode,
+                flags,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_fchmodat(dirfd, path, mode, flags))
+                }),
+            SyscallRequest::Fchmod { fd, mode } => syscall!(sys_fchmod(fd, mode)),
+            SyscallRequest::Utimensat {
+                dirfd,
+                pathname,
+                times,
+                flags,
+            } => {
+                let times = times
+                    .map(|ptr| -> Result<_, Errno> {
+                        let a = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                        let b = ptr.read_at_offset::<Platform>(1).ok_or(Errno::EFAULT)?;
+                        Ok([a, b])
+                    })
+                    .transpose()?;
+                match pathname {
+                    Some(pathname) => pathname
+                        .to_cstring::<Platform>()
+                        .map_or(Err(Errno::EFAULT), |path| {
+                            syscall!(sys_utimensat(dirfd, path, times, flags))
+                        }),
+                    // `futimens(fd, times)`, emulated by glibc as `utimensat(fd, NULL, times, 0)`.
+                    None => syscall!(sys_futimens(dirfd, times)),
+                }
+            }
             SyscallRequest::Stat { pathname, buf } => {
                 pathname
                     .to_cstring::<Platform>()

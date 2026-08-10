@@ -947,6 +947,11 @@ impl<
                 ) => {
                     return Err(e);
                 }
+                ChmodError::ClosedFd | ChmodError::PathOnlyFd => {
+                    // `chmod` is path-based and never resolves through an fd, so `self.upper.chmod`
+                    // (also path-based) cannot produce these fd-specific errors.
+                    unreachable!()
+                }
                 ChmodError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
@@ -970,6 +975,19 @@ impl<
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
         self.chmod(path, mode)
+    }
+
+    fn fd_chmod(&self, fd: &FileFd<Platform, Upper, Lower>, mode: Mode) -> Result<(), ChmodError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .ok_or(ChmodError::ClosedFd)?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.fd_chmod(fd, mode),
+            EntryX::Lower { fd } => self.lower.fd_chmod(fd, mode),
+            EntryX::Tombstone => unreachable!(),
+        }
     }
 
     fn chown(
@@ -1037,6 +1055,12 @@ impl<
                 ) => {
                     return Err(e);
                 }
+                UtimeError::ClosedFd | UtimeError::PathOnlyFd => {
+                    // `utimensat` is path-based and never resolves through an fd, so
+                    // `self.upper.utimensat` (also path-based) cannot produce these fd-specific
+                    // errors.
+                    unreachable!()
+                }
                 UtimeError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 ) => {
@@ -1060,6 +1084,24 @@ impl<
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
         self.utimensat(path, atime, mtime)
+    }
+
+    fn fd_utimensat(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .ok_or(UtimeError::ClosedFd)?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.fd_utimensat(fd, atime, mtime),
+            EntryX::Lower { fd } => self.lower.fd_utimensat(fd, atime, mtime),
+            EntryX::Tombstone => unreachable!(),
+        }
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {

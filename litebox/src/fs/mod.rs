@@ -16,6 +16,7 @@ pub mod backend;
 pub mod composer;
 pub mod devices;
 pub mod errors;
+pub mod flock;
 pub mod in_mem;
 pub(crate) mod inode_allocator;
 pub mod layered;
@@ -114,6 +115,13 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Change the permissions of a file
     fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
 
+    /// Equivalent to [`Self::chmod`], but operating on an already-open `fd` directly.
+    ///
+    /// Unlike [`Self::chmod`], this does not re-resolve a path, so (matching `fchmod(2)`) it keeps
+    /// working even if the path used to open `fd` has since been unlinked or replaced by a
+    /// different file.
+    fn fd_chmod(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError>;
+
     /// Change the owner of a file
     fn chown(
         &self,
@@ -131,6 +139,18 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     fn utimensat(
         &self,
         path: impl path::Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError>;
+
+    /// Equivalent to [`Self::utimensat`], but operating on an already-open `fd` directly.
+    ///
+    /// Unlike [`Self::utimensat`], this does not re-resolve a path, so (matching `futimens(2)`) it
+    /// keeps working even if the path used to open `fd` has since been unlinked or replaced by a
+    /// different file. See [`Self::utimensat`]'s docs for `None`/`Some` semantics.
+    fn fd_utimensat(
+        &self,
+        fd: &TypedFd<Self>,
         atime: Option<Timestamp>,
         mtime: Option<Timestamp>,
     ) -> Result<(), UtimeError>;
