@@ -301,6 +301,19 @@ pub trait TimeProvider {
     fn now(&self) -> Self::Instant;
     /// Returns the current system time.
     fn current_time(&self) -> Self::SystemTime;
+    /// Returns the total CPU time (user + system) consumed so far by the thread calling this
+    /// method, corresponding to `CLOCK_THREAD_CPUTIME_ID` on Linux.
+    ///
+    /// This must be genuine CPU-time accounting (i.e. it should stop advancing while the thread
+    /// is blocked/asleep and not scheduled on a CPU), not wall-clock time mislabeled as CPU time.
+    /// Implementations that cannot source real per-thread CPU time from their host must document
+    /// their fallback explicitly rather than silently returning elapsed wall-clock time.
+    fn thread_cpu_time(&self) -> core::time::Duration;
+    /// Returns the total CPU time (user + system) consumed so far by every thread that has ever
+    /// run as part of the current process, corresponding to `CLOCK_PROCESS_CPUTIME_ID` on Linux.
+    ///
+    /// See [`Self::thread_cpu_time`] for the same real-vs-fallback expectation.
+    fn process_cpu_time(&self) -> core::time::Duration;
 }
 
 /// An opaque measurement of a monotonically nondecreasing clock.

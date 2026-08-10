@@ -1340,6 +1340,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // platform.
                 Ok(0)
             }
+            SyscallRequest::SchedGetParam { pid, param } => {
+                syscall!(sys_sched_getparam(pid, param))
+            }
+            SyscallRequest::SchedSetParam { pid, param } => {
+                syscall!(sys_sched_setparam(pid, param))
+            }
+            SyscallRequest::SchedGetScheduler { pid } => syscall!(sys_sched_getscheduler(pid)),
+            SyscallRequest::SchedSetScheduler { pid, policy, param } => {
+                syscall!(sys_sched_setscheduler(pid, policy, param))
+            }
             SyscallRequest::Futex { args } => self.sys_futex(args),
             SyscallRequest::Umask { mask } => {
                 let old_mask = self.sys_umask(mask);

@@ -1419,6 +1419,59 @@ impl litebox::platform::TimeProvider for WindowsUserland {
         let filetime = (u64::from(high) << 32) | u64::from(low);
         SystemTime { filetime }
     }
+
+    fn thread_cpu_time(&self) -> Duration {
+        // Real per-thread CPU-time accounting from the host: `GetThreadTimes` on the
+        // pseudo-handle for the calling thread reports that thread's own kernel + user time,
+        // genuinely halting while the thread is not scheduled on a CPU.
+        let mut creation = zeroed_filetime();
+        let mut exit = zeroed_filetime();
+        let mut kernel = zeroed_filetime();
+        let mut user = zeroed_filetime();
+        unsafe {
+            Win32_Threading::GetThreadTimes(
+                Win32_Threading::GetCurrentThread(),
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            );
+        }
+        filetime_to_duration(kernel) + filetime_to_duration(user)
+    }
+
+    fn process_cpu_time(&self) -> Duration {
+        // As above, but `GetProcessTimes` sums kernel + user time across every thread that has
+        // run as part of the process.
+        let mut creation = zeroed_filetime();
+        let mut exit = zeroed_filetime();
+        let mut kernel = zeroed_filetime();
+        let mut user = zeroed_filetime();
+        unsafe {
+            Win32_Threading::GetProcessTimes(
+                GetCurrentProcess(),
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            );
+        }
+        filetime_to_duration(kernel) + filetime_to_duration(user)
+    }
+}
+
+/// A zero-initialized [`FILETIME`], suitable as an out-parameter.
+fn zeroed_filetime() -> FILETIME {
+    FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }
+}
+
+/// Converts a [`FILETIME`] (100ns units) into a [`Duration`].
+fn filetime_to_duration(ft: FILETIME) -> Duration {
+    let intervals_100ns = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+    Duration::from_nanos(intervals_100ns * 100)
 }
 
 /// 100ns units returned by `QueryUnbiasedInterruptTimePrecise`.

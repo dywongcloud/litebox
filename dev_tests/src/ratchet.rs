@@ -102,7 +102,11 @@ fn ratchet_maybe_uninit() -> Result<()> {
             ("dev_tests/", 1),
             ("litebox/", 1),
             ("litebox_broker_transport_linux_userland/", 3),
-            ("litebox_platform_linux_userland/", 2),
+            // 4, not 2: `TimeProvider::thread_cpu_time`/`process_cpu_time` (added to back real
+            // `CLOCK_THREAD_CPUTIME_ID`/`CLOCK_PROCESS_CPUTIME_ID` support) each read a
+            // `libc::timespec` out-parameter via `clock_gettime`, following the exact same
+            // pattern `now`/`current_time` already used in this file.
+            ("litebox_platform_linux_userland/", 4),
         ],
         |file| {
             Ok(file

@@ -1206,6 +1206,22 @@ impl litebox::platform::TimeProvider for MacOsUserland {
             nanos_since_epoch: i128::from(darwin::clock_gettime_nanos(libc::CLOCK_REALTIME)),
         }
     }
+
+    fn thread_cpu_time(&self) -> core::time::Duration {
+        // Real per-thread CPU-time accounting from the host: Darwin's `clock_gettime` has
+        // supported `CLOCK_THREAD_CPUTIME_ID` since macOS 10.12, and it genuinely stops
+        // advancing while the calling thread is not scheduled on a CPU (verified: it does not
+        // advance during a blocking sleep, and does advance under a busy loop).
+        core::time::Duration::from_nanos(darwin::clock_gettime_nanos(libc::CLOCK_THREAD_CPUTIME_ID))
+    }
+
+    fn process_cpu_time(&self) -> core::time::Duration {
+        // As above, but `CLOCK_PROCESS_CPUTIME_ID` sums CPU time across every thread of the
+        // process.
+        core::time::Duration::from_nanos(darwin::clock_gettime_nanos(
+            libc::CLOCK_PROCESS_CPUTIME_ID,
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

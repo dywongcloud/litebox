@@ -997,21 +997,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // CLOCK_REALTIME
                 self.real_time_as_duration_since_epoch()
             }
-            litebox_common_linux::ClockId::Monotonic => {
-                // CLOCK_MONOTONIC
+            litebox_common_linux::ClockId::RealTimeCoarse => {
+                // CLOCK_REALTIME_COARSE - a faster, lower-resolution CLOCK_REALTIME.
+                // Simplification: we have no cheaper coarse clock source, so we reuse the exact
+                // same (full-precision) value as CLOCK_REALTIME; see `sys_clock_getres` for the
+                // (still coarse) resolution we report for this clock.
+                self.real_time_as_duration_since_epoch()
+            }
+            litebox_common_linux::ClockId::Monotonic
+            | litebox_common_linux::ClockId::MonotonicCoarse
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::Boottime => {
+                // CLOCK_MONOTONIC / CLOCK_MONOTONIC_COARSE / CLOCK_MONOTONIC_RAW /
+                // CLOCK_BOOTTIME.
+                //
+                // Simplification: LiteBox tracks only a single monotonic clock, so all four map
+                // onto it. This is exact for CLOCK_MONOTONIC; for the others it elides real
+                // Linux's distinctions (COARSE trades precision for speed; RAW excludes NTP
+                // slewing; BOOTTIME additionally counts suspend time) -- see the `ClockId`
+                // variant docs for why each is a legitimate simplification here.
                 self.global
                     .platform
                     .now()
                     .duration_since(&self.global.boot_time)
             }
-            litebox_common_linux::ClockId::MonotonicCoarse => {
-                // CLOCK_MONOTONIC_COARSE - provides faster but less precise monotonic time
-                // For simplicity, we can reuse the same monotonic time as CLOCK_MONOTONIC
-                // In a real implementation, this would typically have lower resolution
-                self.global
-                    .platform
-                    .now()
-                    .duration_since(&self.global.boot_time)
+            litebox_common_linux::ClockId::ProcessCpuTime => {
+                // CLOCK_PROCESS_CPUTIME_ID - genuine per-process CPU-time accounting, sourced
+                // from the host (not wall-clock time).
+                self.global.platform.process_cpu_time()
+            }
+            litebox_common_linux::ClockId::ThreadCpuTime => {
+                // CLOCK_THREAD_CPUTIME_ID - genuine per-thread CPU-time accounting, sourced from
+                // the host (not wall-clock time).
+                self.global.platform.thread_cpu_time()
             }
             _ => {
                 log_unsupported!("gettime for {clockid:?}");
@@ -1034,7 +1052,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<Option<<Platform as TimeProvider>::Instant>, Errno> {
         match clock_id {
             litebox_common_linux::ClockId::Monotonic
-            | litebox_common_linux::ClockId::MonotonicCoarse => {
+            | litebox_common_linux::ClockId::MonotonicCoarse
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::Boottime => {
                 // No need to compute the current time since the offset from the
                 // request to `Instant` is known.
                 Ok(self.global.boot_time.checked_add(duration))
@@ -1060,18 +1080,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<(), Errno> {
         // Return the resolution of the clock
         let resolution = match clockid {
-            litebox_common_linux::ClockId::MonotonicCoarse => {
-                // Coarse clocks typically have lower resolution (e.g., 4 millisecond)
+            litebox_common_linux::ClockId::MonotonicCoarse
+            | litebox_common_linux::ClockId::RealTimeCoarse => {
+                // Coarse clocks typically have lower resolution (e.g., 4 millisecond). We report
+                // this even though we actually source these from the full-precision clock (see
+                // `gettime_as_duration`), matching the resolution real coarse clocks advertise.
                 Duration::from_millis(4)
             }
-            litebox_common_linux::ClockId::RealTime | litebox_common_linux::ClockId::Monotonic => {
+            litebox_common_linux::ClockId::RealTime
+            | litebox_common_linux::ClockId::Monotonic
+            | litebox_common_linux::ClockId::MonotonicRaw
+            | litebox_common_linux::ClockId::Boottime
+            | litebox_common_linux::ClockId::ProcessCpuTime
+            | litebox_common_linux::ClockId::ThreadCpuTime => {
                 // For most modern systems, the resolution is typically 1 nanosecond
                 // This is a reasonable default for high-resolution timers
                 Duration::from_nanos(1)
             }
-            // `ClockId` is `#[non_exhaustive]` but only declares these three variants, all
-            // matched above; `clockid` only reaches here via `ClockId::try_from`, which rejects
-            // anything else with `EINVAL` before construction.
+            // `ClockId` is `#[non_exhaustive]` but only declares the variants matched above;
+            // `clockid` only reaches here via `ClockId::try_from`, which rejects anything else
+            // with `EINVAL` before construction.
             _ => unreachable!(),
         };
 
@@ -1086,6 +1114,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         request: TimeParam,
         remain: TimeParam,
     ) -> Result<(), Errno> {
+        if matches!(
+            clockid,
+            litebox_common_linux::ClockId::ProcessCpuTime
+                | litebox_common_linux::ClockId::ThreadCpuTime
+        ) {
+            // Real Linux rejects sleeping against a CPU-time clock: a blocked (not-running)
+            // thread cannot accumulate CPU time, so waiting for one of these clocks to reach a
+            // given value could never wake up.
+            return Err(Errno::EINVAL);
+        }
         let request = request.read::<Platform>()?.ok_or(Errno::EFAULT)?;
         if flags.intersects(litebox_common_linux::TimerFlags::ABSTIME.complement()) {
             return Err(Errno::EINVAL);
@@ -1424,6 +1462,107 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut cpuset = bitvec::bitvec![u8, bitvec::order::Lsb0; 0; NR_CPUS];
         cpuset.iter_mut().for_each(|mut b| *b = true);
         CpuSet { bits: cpuset }
+    }
+
+    /// Returns whether `pid`, as passed to one of the `sched_*` syscalls below, refers to the
+    /// calling thread. `pid == 0` (as with all four `sched_*` syscalls per their man pages) means
+    /// "the calling thread"; `sched_*` operates at thread (not process) granularity on Linux, so
+    /// this compares against `self.tid`, not a process-wide id.
+    fn sched_target_is_self(&self, pid: Option<i32>) -> bool {
+        pid.is_none_or(|pid| pid == self.tid)
+    }
+
+    /// Handle syscall `sched_getparam`.
+    ///
+    /// LiteBox's process model has no real scheduling-class enforcement to expose, so every
+    /// thread is always reported as `SCHED_OTHER` with priority 0 -- the same default every
+    /// unprivileged Linux thread starts with, and the only priority `SCHED_OTHER` ever accepts.
+    pub(crate) fn sys_sched_getparam(
+        &self,
+        pid: Option<i32>,
+        param: UserPtrMut<litebox_common_linux::SchedParam>,
+    ) -> Result<usize, Errno> {
+        if !self.sched_target_is_self(pid) {
+            log_unsupported!("sched_getparam for a remote pid");
+            return Err(Errno::ESRCH);
+        }
+        param
+            .write_at_offset::<Platform>(0, litebox_common_linux::SchedParam { sched_priority: 0 })
+            .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// Handle syscall `sched_setparam`.
+    ///
+    /// Since every thread is always `SCHED_OTHER` (see [`Self::sys_sched_getparam`]), and
+    /// `SCHED_OTHER`'s only valid priority is 0, this accepts a priority-0 request as a no-op and
+    /// rejects anything else with `EINVAL`, matching what real Linux would do to a process that
+    /// never leaves `SCHED_OTHER`.
+    pub(crate) fn sys_sched_setparam(
+        &self,
+        pid: Option<i32>,
+        param: UserPtr<litebox_common_linux::SchedParam>,
+    ) -> Result<usize, Errno> {
+        if !self.sched_target_is_self(pid) {
+            log_unsupported!("sched_setparam for a remote pid");
+            return Err(Errno::ESRCH);
+        }
+        let param = param.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if param.sched_priority != 0 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(0)
+    }
+
+    /// Handle syscall `sched_getscheduler`.
+    pub(crate) fn sys_sched_getscheduler(&self, pid: Option<i32>) -> Result<usize, Errno> {
+        if !self.sched_target_is_self(pid) {
+            log_unsupported!("sched_getscheduler for a remote pid");
+            return Err(Errno::ESRCH);
+        }
+        // The return value of `sched_getscheduler` IS the policy (unlike most syscalls, it is
+        // not a separate out-parameter), so no bitwise cast/sign issues arise turning a small
+        // non-negative `i32` constant into a `usize` success value.
+        Ok(usize::try_from(litebox_common_linux::sched_policy::SCHED_OTHER).unwrap())
+    }
+
+    /// Handle syscall `sched_setscheduler`.
+    ///
+    /// Non-real-time policies (`SCHED_OTHER`/`SCHED_BATCH`/`SCHED_IDLE`) are accepted as no-ops,
+    /// same as a real unprivileged Linux process switching between them would experience.
+    /// Real-time policies (`SCHED_FIFO`/`SCHED_RR`/`SCHED_DEADLINE`) are rejected with `EPERM`,
+    /// matching real Linux's behavior for a process without `CAP_SYS_NICE` -- a real, accurate
+    /// constraint here, since LiteBox guests never have that capability, not a shortcut.
+    pub(crate) fn sys_sched_setscheduler(
+        &self,
+        pid: Option<i32>,
+        policy: i32,
+        param: UserPtr<litebox_common_linux::SchedParam>,
+    ) -> Result<usize, Errno> {
+        use litebox_common_linux::sched_policy::{
+            SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_OTHER, SCHED_RESET_ON_FORK,
+            SCHED_RR,
+        };
+
+        if !self.sched_target_is_self(pid) {
+            log_unsupported!("sched_setscheduler for a remote pid");
+            return Err(Errno::ESRCH);
+        }
+        match policy & !SCHED_RESET_ON_FORK {
+            SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => {}
+            SCHED_FIFO | SCHED_RR | SCHED_DEADLINE => {
+                log_unsupported!(
+                    "sched_setscheduler(policy = {policy}): real-time scheduling is never available to a LiteBox guest"
+                );
+                return Err(Errno::EPERM);
+            }
+            _ => return Err(Errno::EINVAL),
+        }
+        let param = param.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if param.sched_priority != 0 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(0)
     }
 }
 
@@ -1816,6 +1955,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(test)]
 mod tests {
     use crate::{UserPtr, UserPtrMut};
+    use core::time::Duration;
 
     extern crate std;
 
@@ -1865,6 +2005,347 @@ mod tests {
             .map(|b| b.count_ones() as usize)
             .sum();
         assert_eq!(ones, super::NR_CPUS);
+    }
+
+    /// Reproduces the V8-startup-abort scenario this row was filed for: V8's own startup code
+    /// aborts the whole process if `clock_gettime` returns an error for any of these clock IDs.
+    /// Before this change, `ClockId::try_from` rejected everything but `RealTime`/`Monotonic`/
+    /// `MonotonicCoarse`, so a real guest binary probing any of the other five clocks at startup
+    /// (as V8 does) would see `clock_gettime` fail and abort. Verifies every clock ID Linux
+    /// actually defines round-trips successfully through the real syscall path (`sys_clock_gettime`
+    /// on `MacOsUserland`/`LinuxUserland`/`WindowsUserland`, backed by real host clocks -- not a
+    /// mock), and returns a plausible (non-negative) value.
+    #[test]
+    fn test_clock_gettime_and_getres_succeed_for_every_clock_id() {
+        use litebox_common_linux::{ClockId, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        for clock_id in [
+            ClockId::RealTime,
+            ClockId::Monotonic,
+            ClockId::ProcessCpuTime,
+            ClockId::ThreadCpuTime,
+            ClockId::MonotonicRaw,
+            ClockId::RealTimeCoarse,
+            ClockId::MonotonicCoarse,
+            ClockId::Boottime,
+        ] {
+            let mut ts = Timespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            };
+            let ptr = UserPtrMut::from_ptr(&raw mut ts);
+            task.sys_clock_gettime(clock_id, TimeParam::Timespec64(ptr))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "clock_gettime({clock_id:?}) unexpectedly failed with {e:?} -- this is \
+                         exactly the error that makes V8 abort at startup"
+                    )
+                });
+            assert!(
+                ts.tv_sec >= 0,
+                "clock_gettime({clock_id:?}) returned a nonsensical negative tv_sec: {}",
+                ts.tv_sec
+            );
+            assert!(
+                ts.tv_nsec < 1_000_000_000,
+                "clock_gettime({clock_id:?}) returned an out-of-range tv_nsec: {}",
+                ts.tv_nsec
+            );
+
+            let mut res = Timespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            };
+            let res_ptr = UserPtrMut::from_ptr(&raw mut res);
+            task.sys_clock_getres(clock_id, TimeParam::Timespec64(res_ptr))
+                .unwrap_or_else(|e| {
+                    panic!("clock_getres({clock_id:?}) unexpectedly failed: {e:?}")
+                });
+            assert!(
+                res.tv_sec > 0 || res.tv_nsec > 0,
+                "clock_getres({clock_id:?}) reported a zero resolution"
+            );
+        }
+    }
+
+    /// The newly added monotonic-family clocks (`CLOCK_MONOTONIC_RAW`, `CLOCK_BOOTTIME`) must
+    /// behave like real monotonic clocks: never go backwards, and actually advance across real
+    /// elapsed wall-clock time.
+    #[test]
+    fn test_clock_gettime_monotonic_raw_and_boottime_are_monotonic() {
+        use litebox_common_linux::{ClockId, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let read = |clock_id: ClockId| -> Duration {
+            let mut ts = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let ptr = UserPtrMut::from_ptr(&raw mut ts);
+            task.sys_clock_gettime(clock_id, TimeParam::Timespec64(ptr))
+                .unwrap_or_else(|e| panic!("clock_gettime({clock_id:?}) failed: {e:?}"));
+            Duration::try_from(ts).expect("valid timespec")
+        };
+
+        for clock_id in [ClockId::MonotonicRaw, ClockId::Boottime] {
+            let before = read(clock_id);
+            std::thread::sleep(Duration::from_millis(50));
+            let after = read(clock_id);
+            assert!(
+                after > before,
+                "{clock_id:?} did not advance across a real 50ms sleep: before={before:?} after={after:?}"
+            );
+        }
+    }
+
+    /// Real, host-sourced CPU-time accounting: `CLOCK_THREAD_CPUTIME_ID` must genuinely advance
+    /// while the thread burns real CPU, and must *not* advance (by anywhere close to the same
+    /// amount) while the thread is merely sleeping -- proving this isn't wall-clock time
+    /// silently mislabeled as CPU time.
+    #[test]
+    fn test_clock_gettime_thread_cpu_time_tracks_real_cpu_usage_not_wall_clock() {
+        use litebox_common_linux::{ClockId, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let read_thread_cpu_time = || -> Duration {
+            let mut ts = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let ptr = UserPtrMut::from_ptr(&raw mut ts);
+            task.sys_clock_gettime(ClockId::ThreadCpuTime, TimeParam::Timespec64(ptr))
+                .expect("clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+            Duration::try_from(ts).expect("valid timespec")
+        };
+
+        let before_busy = read_thread_cpu_time();
+
+        // Burn real CPU on this thread. `std::hint::black_box` keeps the optimizer from
+        // eliminating the loop.
+        let mut acc: u64 = 0;
+        for i in 0..300_000_000u64 {
+            acc = std::hint::black_box(acc.wrapping_add(std::hint::black_box(i)));
+        }
+        std::hint::black_box(acc);
+
+        let after_busy = read_thread_cpu_time();
+        assert!(
+            after_busy > before_busy,
+            "thread CPU time did not increase after a real busy loop: before={before_busy:?} \
+             after={after_busy:?}"
+        );
+        let consumed_by_busy_loop = after_busy.saturating_sub(before_busy);
+        assert!(
+            consumed_by_busy_loop > Duration::from_millis(1),
+            "expected a meaningful amount of CPU time consumed by the busy loop, got \
+             {consumed_by_busy_loop:?}"
+        );
+
+        // Sleep for much longer than the busy loop took, without doing any CPU work, and
+        // confirm thread CPU time barely moves.
+        std::thread::sleep(Duration::from_millis(300));
+        let after_sleep = read_thread_cpu_time();
+        let consumed_by_sleep = after_sleep.saturating_sub(after_busy);
+        assert!(
+            consumed_by_sleep < Duration::from_millis(100),
+            "thread CPU time advanced by {consumed_by_sleep:?} across a 300ms *sleep* (no CPU \
+             work performed) -- real CPU-time accounting should barely move here, this looks \
+             like wall-clock time mislabeled as CPU time"
+        );
+    }
+
+    /// `CLOCK_PROCESS_CPUTIME_ID` sums CPU time across the whole process; it must at least
+    /// reflect the real CPU work done by the calling thread (the only thread in this test).
+    #[test]
+    fn test_clock_gettime_process_cpu_time_tracks_real_cpu_usage() {
+        use litebox_common_linux::{ClockId, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let read_process_cpu_time = || -> Duration {
+            let mut ts = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let ptr = UserPtrMut::from_ptr(&raw mut ts);
+            task.sys_clock_gettime(ClockId::ProcessCpuTime, TimeParam::Timespec64(ptr))
+                .expect("clock_gettime(CLOCK_PROCESS_CPUTIME_ID) failed");
+            Duration::try_from(ts).expect("valid timespec")
+        };
+
+        let before = read_process_cpu_time();
+        let mut acc: u64 = 0;
+        for i in 0..300_000_000u64 {
+            acc = std::hint::black_box(acc.wrapping_add(std::hint::black_box(i)));
+        }
+        std::hint::black_box(acc);
+        let after = read_process_cpu_time();
+
+        assert!(
+            after > before,
+            "process CPU time did not increase after a real busy loop: before={before:?} \
+             after={after:?}"
+        );
+    }
+
+    /// `clock_nanosleep` against a CPU-time clock can never wake up (a blocked thread cannot
+    /// accumulate CPU time), so real Linux rejects it outright; confirm LiteBox does too now that
+    /// these clock IDs are otherwise recognized.
+    #[test]
+    fn test_clock_nanosleep_rejects_cpu_time_clocks() {
+        use litebox_common_linux::{ClockId, TimeParam, Timespec};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        for clock_id in [ClockId::ProcessCpuTime, ClockId::ThreadCpuTime] {
+            let mut request = Timespec {
+                tv_sec: 0,
+                tv_nsec: 1,
+            };
+            let result = task.sys_clock_nanosleep(
+                clock_id,
+                litebox_common_linux::TimerFlags::empty(),
+                TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut request)),
+                TimeParam::None,
+            );
+            assert_eq!(
+                result,
+                Err(litebox_common_linux::errno::Errno::EINVAL),
+                "clock_nanosleep({clock_id:?}) should be rejected with EINVAL"
+            );
+        }
+    }
+
+    /// `sched_getscheduler`/`sched_setscheduler` round-trip: every thread is always reported as
+    /// (and can always be, as a no-op, "set" to) `SCHED_OTHER`, matching what any real guest
+    /// program checking "did the syscall succeed, and is the policy the plain default" would
+    /// see.
+    #[test]
+    fn test_sched_getscheduler_and_setscheduler_round_trip() {
+        use litebox_common_linux::sched_policy::SCHED_OTHER;
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(
+            task.sys_sched_getscheduler(None),
+            Ok(usize::try_from(SCHED_OTHER).unwrap())
+        );
+
+        let param = litebox_common_linux::SchedParam { sched_priority: 0 };
+        let param_ptr = UserPtr::from_ptr(&raw const param);
+        assert_eq!(
+            task.sys_sched_setscheduler(None, SCHED_OTHER, param_ptr),
+            Ok(0)
+        );
+
+        // Also works when explicitly targeting our own tid (pid == 0 and pid == self.tid are
+        // both "self", matching real Linux semantics for these thread-granularity syscalls).
+        assert_eq!(
+            task.sys_sched_getscheduler(Some(task.sys_gettid())),
+            Ok(usize::try_from(SCHED_OTHER).unwrap())
+        );
+    }
+
+    /// Real, unprivileged-process-accurate rejection: LiteBox guests never have `CAP_SYS_NICE`,
+    /// so real-time policies must be rejected with `EPERM`, exactly as they would be on a real
+    /// unprivileged Linux process. Also checks the ordinary `EINVAL` cases (unknown policy,
+    /// out-of-range priority for `SCHED_OTHER`).
+    #[test]
+    fn test_sched_setscheduler_rejects_real_time_policies_and_bad_priority() {
+        use litebox_common_linux::errno::Errno;
+        use litebox_common_linux::sched_policy::{
+            SCHED_DEADLINE, SCHED_FIFO, SCHED_OTHER, SCHED_RR,
+        };
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let param_zero = litebox_common_linux::SchedParam { sched_priority: 0 };
+        let param_zero_ptr = UserPtr::from_ptr(&raw const param_zero);
+
+        for policy in [SCHED_FIFO, SCHED_RR, SCHED_DEADLINE] {
+            assert_eq!(
+                task.sys_sched_setscheduler(None, policy, param_zero_ptr),
+                Err(Errno::EPERM),
+                "real-time policy {policy} should be rejected with EPERM (no CAP_SYS_NICE)"
+            );
+        }
+
+        // An unrecognized policy value is EINVAL, not EPERM.
+        assert_eq!(
+            task.sys_sched_setscheduler(None, 0x1234, param_zero_ptr),
+            Err(Errno::EINVAL)
+        );
+
+        // SCHED_OTHER only accepts priority 0.
+        let param_nonzero = litebox_common_linux::SchedParam { sched_priority: 5 };
+        let param_nonzero_ptr = UserPtr::from_ptr(&raw const param_nonzero);
+        assert_eq!(
+            task.sys_sched_setscheduler(None, SCHED_OTHER, param_nonzero_ptr),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    /// `sched_getparam`/`sched_setparam` round-trip.
+    #[test]
+    fn test_sched_getparam_setparam_round_trip() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let mut got = litebox_common_linux::SchedParam { sched_priority: -1 };
+        let got_ptr = UserPtrMut::from_ptr(&raw mut got);
+        assert_eq!(task.sys_sched_getparam(None, got_ptr), Ok(0));
+        assert_eq!(got.sched_priority, 0);
+
+        let set = litebox_common_linux::SchedParam { sched_priority: 0 };
+        let set_ptr = UserPtr::from_ptr(&raw const set);
+        assert_eq!(task.sys_sched_setparam(None, set_ptr), Ok(0));
+
+        let bad = litebox_common_linux::SchedParam { sched_priority: 1 };
+        let bad_ptr = UserPtr::from_ptr(&raw const bad);
+        assert_eq!(task.sys_sched_setparam(None, bad_ptr), Err(Errno::EINVAL));
+    }
+
+    /// None of the four `sched_*` syscalls can honestly answer for a thread other than the
+    /// caller (LiteBox tracks no state for one), so a pid that isn't "self" must fail with
+    /// `ESRCH`, matching what real Linux would do for a genuinely nonexistent target thread.
+    #[test]
+    fn test_sched_calls_reject_a_remote_pid() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let remote_pid = task.sys_gettid().wrapping_add(999_999);
+
+        assert_eq!(
+            task.sys_sched_getscheduler(Some(remote_pid)),
+            Err(Errno::ESRCH)
+        );
+
+        let mut param = litebox_common_linux::SchedParam { sched_priority: 0 };
+        let param_ptr = UserPtrMut::from_ptr(&raw mut param);
+        assert_eq!(
+            task.sys_sched_getparam(Some(remote_pid), param_ptr),
+            Err(Errno::ESRCH)
+        );
+
+        let set_param = litebox_common_linux::SchedParam { sched_priority: 0 };
+        let set_param_ptr = UserPtr::from_ptr(&raw const set_param);
+        assert_eq!(
+            task.sys_sched_setparam(Some(remote_pid), set_param_ptr),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            task.sys_sched_setscheduler(
+                Some(remote_pid),
+                litebox_common_linux::sched_policy::SCHED_OTHER,
+                set_param_ptr
+            ),
+            Err(Errno::ESRCH)
+        );
     }
 
     #[test]

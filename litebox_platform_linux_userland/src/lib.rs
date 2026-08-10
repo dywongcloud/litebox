@@ -1364,6 +1364,33 @@ impl litebox::platform::TimeProvider for LinuxUserland {
             ),
         }
     }
+
+    fn thread_cpu_time(&self) -> Duration {
+        // Real per-thread CPU-time accounting from the host: `CLOCK_THREAD_CPUTIME_ID` is a
+        // dynamic clock ID that always refers to the calling thread and genuinely stops
+        // advancing while that thread is not scheduled on a CPU.
+        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, t.as_mut_ptr()) };
+        let t = unsafe { t.assume_init() };
+        #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+        Duration::new(
+            t.tv_sec.reinterpret_as_unsigned().into(),
+            t.tv_nsec.reinterpret_as_unsigned().trunc(),
+        )
+    }
+
+    fn process_cpu_time(&self) -> Duration {
+        // As above, but `CLOCK_PROCESS_CPUTIME_ID` sums CPU time across every thread of the
+        // process.
+        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, t.as_mut_ptr()) };
+        let t = unsafe { t.assume_init() };
+        #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+        Duration::new(
+            t.tv_sec.reinterpret_as_unsigned().into(),
+            t.tv_nsec.reinterpret_as_unsigned().trunc(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

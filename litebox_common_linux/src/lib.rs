@@ -1887,11 +1887,77 @@ pub struct LinuxDirent64 {
 
 #[non_exhaustive]
 #[repr(i32)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, Clone, Copy, IntEnum)]
 pub enum ClockId {
     RealTime = 0,
     Monotonic = 1,
+    /// `CLOCK_PROCESS_CPUTIME_ID`: CPU time consumed so far by all threads of the calling
+    /// process. Unlike the other clocks here, this is *not* wall-clock time -- it only
+    /// advances while the process is actually running on a CPU.
+    ProcessCpuTime = 2,
+    /// `CLOCK_THREAD_CPUTIME_ID`: CPU time consumed so far by the calling thread only. Also not
+    /// wall-clock time.
+    ThreadCpuTime = 3,
+    /// `CLOCK_MONOTONIC_RAW`: like `CLOCK_MONOTONIC`, but on real Linux specifically excludes any
+    /// NTP frequency slewing, giving raw hardware-derived elapsed time.
+    ///
+    /// Simplification: LiteBox maps this onto the same value as [`ClockId::Monotonic`]. This is
+    /// legitimate for macOS, whose `Monotonic` is already sourced from the host's
+    /// `CLOCK_MONOTONIC_RAW`; on other hosts it means we don't distinguish NTP-slewed monotonic
+    /// time from raw monotonic time, which is a real (if minor) semantic difference from Linux.
+    MonotonicRaw = 4,
+    /// `CLOCK_REALTIME_COARSE`: a faster, lower-resolution version of `CLOCK_REALTIME`, intended
+    /// to trade precision for speed.
+    ///
+    /// Simplification: LiteBox maps this onto the same (full-precision) value as
+    /// [`ClockId::RealTime`]. We have no separate, cheaper-to-read coarse clock source, so callers
+    /// get a more precise answer than real Linux would give, never a less precise one.
+    RealTimeCoarse = 5,
+    /// `CLOCK_MONOTONIC_COARSE`: a faster, lower-resolution version of `CLOCK_MONOTONIC`.
+    ///
+    /// Simplification: as with [`ClockId::RealTimeCoarse`], LiteBox maps this onto the full
+    /// precision [`ClockId::Monotonic`] value.
     MonotonicCoarse = 6,
+    /// `CLOCK_BOOTTIME`: like `CLOCK_MONOTONIC`, but on real Linux also includes time the system
+    /// spent suspended.
+    ///
+    /// Simplification: LiteBox has no notion of the guest (or host) being suspended -- there is
+    /// no way for wall-clock time to elapse without [`ClockId::Monotonic`] also elapsing -- so
+    /// this is mapped onto the exact same value as [`ClockId::Monotonic`].
+    Boottime = 7,
+}
+
+/// The `struct sched_param` argument of `sched_setparam`/`sched_getparam`/`sched_setscheduler`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes)]
+pub struct SchedParam {
+    pub sched_priority: i32,
+}
+
+/// Scheduling policy values accepted by `sched_setscheduler`, and reported by
+/// `sched_getscheduler`.
+///
+/// LiteBox's process model has no real scheduling-class enforcement to expose (there is a single
+/// cooperative/host-scheduled pool of threads, not a configurable in-guest scheduler), so these
+/// are recognized only so `sched_setscheduler`/`sched_getscheduler`/`sched_setparam`/
+/// `sched_getparam` can give believable, inert answers: the non-real-time policies are accepted
+/// as no-ops (matching what an unprivileged real Linux process seeing a plain `SCHED_OTHER`
+/// system would experience), while the real-time policies are recognized only so they can be
+/// correctly rejected with `EPERM` -- matching real Linux's behavior for a process without
+/// `CAP_SYS_NICE`, which is a real, accurate constraint on LiteBox guests (they never have that
+/// capability), not a shortcut.
+pub mod sched_policy {
+    pub const SCHED_OTHER: i32 = 0;
+    pub const SCHED_FIFO: i32 = 1;
+    pub const SCHED_RR: i32 = 2;
+    pub const SCHED_BATCH: i32 = 3;
+    pub const SCHED_IDLE: i32 = 5;
+    pub const SCHED_DEADLINE: i32 = 6;
+    /// May be OR'd into the `policy` argument of `sched_setscheduler` to request that the
+    /// policy revert to `SCHED_OTHER` across `fork()`. LiteBox has no `fork()` (see
+    /// `litebox_shim_linux`'s `do_clone`), so this bit is accepted, to avoid spuriously
+    /// rejecting an otherwise well-formed call, but has no effect.
+    pub const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
 }
 
 bitflags::bitflags! {
@@ -2665,6 +2731,22 @@ pub enum SyscallRequest {
         mask: UserPtrMut<u8>,
     },
     SchedYield,
+    SchedGetParam {
+        pid: Option<i32>,
+        param: UserPtrMut<SchedParam>,
+    },
+    SchedSetParam {
+        pid: Option<i32>,
+        param: UserPtr<SchedParam>,
+    },
+    SchedGetScheduler {
+        pid: Option<i32>,
+    },
+    SchedSetScheduler {
+        pid: Option<i32>,
+        policy: i32,
+        param: UserPtr<SchedParam>,
+    },
     Futex {
         args: FutexArgs,
     },
@@ -3246,6 +3328,34 @@ impl SyscallRequest {
                 }
             }
             Sysno::sched_yield => SyscallRequest::SchedYield,
+            Sysno::sched_getparam => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedGetParam {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    param: ctx.sys_req_ptr(1),
+                }
+            }
+            Sysno::sched_setparam => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedSetParam {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    param: ctx.sys_req_ptr(1),
+                }
+            }
+            Sysno::sched_getscheduler => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedGetScheduler {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                }
+            }
+            Sysno::sched_setscheduler => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedSetScheduler {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    policy: ctx.sys_req_arg(1),
+                    param: ctx.sys_req_ptr(2),
+                }
+            }
             Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old, unsupported_einval)?,
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
