@@ -353,6 +353,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let comm = &comm[..comm.len().min(litebox_common_linux::TASK_COMM_LEN - 1)];
         new_comm[..comm.len()].copy_from_slice(comm);
         self.comm.set(new_comm);
+
+        // Publish to `/proc/<pid>/{stat,status,comm}`, if a `/proc` is mounted. `pid`/`ppid`
+        // never change after task construction (this process model has no `fork`), and live
+        // `setuid`/`setgid` credential changes are not tracked here (out of this call's scope);
+        // re-publishing them on every `comm` change is simply cheaper than a separate
+        // first-publish flag, not a claim that they can change.
+        if let Some(proc) = &self.global.proc_handle {
+            let credentials = self.credentials.borrow();
+            proc.set_identity(self.pid, self.ppid, credentials.uid, credentials.gid);
+            proc.set_comm(&new_comm);
+        }
     }
 
     /// Handle syscall `prctl`.
@@ -1684,6 +1695,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        // Captured before `argv` moves into `loader.load` below: publishes
+        // `/proc/<pid>/cmdline` for this load (initial program load, or `execve`).
+        if let Some(proc) = &self.global.proc_handle {
+            let argv_bytes: alloc::vec::Vec<&[u8]> =
+                argv.iter().map(alloc::ffi::CString::as_bytes).collect();
+            proc.set_cmdline(&argv_bytes);
+        }
+
         let load_info = loader.load(argv, envp, self.init_auxv())?;
 
         self.set_task_comm(loader.comm());

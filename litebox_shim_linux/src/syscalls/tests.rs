@@ -315,6 +315,8 @@ fn test_getdent64() {
             "bar",
             "dev",
             "foo",
+            // `/proc`, mounted alongside `/dev` by `default_fs` (see `litebox::fs::proc`).
+            "proc",
             "test_file1.txt",
             "test_file2.txt"
         ]
@@ -481,6 +483,7 @@ fn test_getdent64() {
             "bar",
             "dev",
             "foo",
+            "proc",
             "test_file1.txt",
             "test_file2.txt"
         ]

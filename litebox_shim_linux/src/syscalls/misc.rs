@@ -83,9 +83,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             uptime: now.duration_since(&self.global.boot_time).as_secs().trunc(),
             // TODO: Populate these fields with actual values
             loads: [0; 3],
-            #[cfg(target_arch = "x86_64")]
-            totalram: 4 * 1024 * 1024 * 1024,
-            freeram: 2 * 1024 * 1024 * 1024,
+            // Shared with `/proc/meminfo` (`litebox::fs::proc`) so `free` -- which reads
+            // totalram/freeram from this syscall but Cached/MemAvailable/SReclaimable from
+            // `/proc/meminfo` -- can't observe the two sources drifting apart. Previously this
+            // field was `#[cfg(target_arch = "x86_64")]`-only, so `..Default::default()` silently
+            // left it 0 on aarch64 (this host's own architecture): `free`'s "used" column
+            // underflowed since `freeram` was nonzero while `totalram` was 0.
+            totalram: litebox::fs::proc::SYNTHETIC_TOTAL_RAM_BYTES.trunc(),
+            freeram: litebox::fs::proc::SYNTHETIC_FREE_RAM_BYTES.trunc(),
             sharedram: 0, // We don't support shared memory
             bufferram: 0,
             totalswap: 0,

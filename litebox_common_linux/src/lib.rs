@@ -1530,6 +1530,13 @@ pub enum MadviseBehavior {
     DontNeedLocked = 24,
 }
 
+// `#[repr(C)]` is load-bearing, not decoration: this struct is written into guest memory as raw
+// bytes (`write_at_offset`) for the guest's libc to read back as the real Linux ABI `struct
+// sysinfo`. Without it, `repr(Rust)`'s free field-reordering silently scrambled the layout --
+// `busybox free`, which reads `totalram`/`freeram` straight out of this syscall, printed
+// nonsensical multi-exabyte figures on real hardware (previously unobserved, since `free` always
+// died at the missing `/proc/meminfo` open before reaching the `printf` that would have shown it).
+#[repr(C)]
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
 pub struct Sysinfo {
     /// Seconds since boot
@@ -1552,6 +1559,12 @@ pub struct Sysinfo {
     pub procs: u16,
     /// Explicit padding for m68k
     pub pad: u16,
+    /// Explicit padding so `totalhigh` lands on its natural 8-byte alignment, matching the real
+    /// ABI's implicit compiler-inserted padding here. `IntoBytes` refuses a type with implicit
+    /// padding (it would write uninitialized bytes into guest memory), so this has to be a real,
+    /// zeroed field rather than a gap.
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad2: u32,
     /// Total high memory size
     pub totalhigh: usize,
     /// Available high memory size
@@ -1561,6 +1574,41 @@ pub struct Sysinfo {
     /// Padding: libc5 uses this..
     #[allow(clippy::pub_underscore_fields)]
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
+    /// Trailing padding rounding the struct up to `usize`'s alignment (the real ABI struct gets
+    /// this from the compiler implicitly; see `_pad2` above on why it must be explicit here).
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad3: u32,
+}
+
+/// Linux's `statfs` struct (the generic `<asm-generic/statfs.h>` layout `statfs`/`fstatfs` use on
+/// both x86-64 and aarch64 -- unlike `stat`, the 64-bit `statfs` ABI does not diverge per-arch).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct Statfs {
+    /// Filesystem magic number (e.g. a `*_MAGIC` constant from `<linux/magic.h>`).
+    pub f_type: i64,
+    /// Optimal transfer block size.
+    pub f_bsize: i64,
+    /// Total data blocks in the filesystem.
+    pub f_blocks: u64,
+    /// Free blocks.
+    pub f_bfree: u64,
+    /// Free blocks available to unprivileged users.
+    pub f_bavail: u64,
+    /// Total file nodes.
+    pub f_files: u64,
+    /// Free file nodes.
+    pub f_ffree: u64,
+    /// Filesystem ID.
+    pub f_fsid: [i32; 2],
+    /// Maximum length of filenames.
+    pub f_namelen: i64,
+    /// Fragment size.
+    pub f_frsize: i64,
+    /// Mount flags (`ST_*`).
+    pub f_flags: i64,
+    /// Reserved for future use.
+    pub f_spare: [i64; 4],
 }
 
 bitflags::bitflags! {
@@ -2437,6 +2485,14 @@ pub enum SyscallRequest {
         mask: StatxMask,
         statxbuf: UserPtrMut<Statx>,
     },
+    Statfs {
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<Statfs>,
+    },
+    Fstatfs {
+        fd: i32,
+        buf: UserPtrMut<Statfs>,
+    },
 }
 
 impl SyscallRequest {
@@ -2966,8 +3022,10 @@ impl SyscallRequest {
                 mask,
                 statxbuf:*,
             }),
+            Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
+            Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
             // Noisy unsupported syscalls.
-            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {

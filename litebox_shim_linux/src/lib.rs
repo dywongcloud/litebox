@@ -233,6 +233,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
 pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
+    /// Handle to the `/proc` backend mounted by [`Self::default_fs`], if it was called.
+    /// [`Self::build`] moves this into [`GlobalState`] so the shim can publish the guest task's
+    /// identity into it as that becomes known (see `syscalls::process::Task::set_task_comm`).
+    proc_handle: Cell<Option<litebox::fs::proc::Proc<Platform>>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -243,7 +247,11 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
 
     /// Returns a new shim builder using an already-created LiteBox instance.
     pub fn new_with_litebox(platform: &'static Platform, litebox: LiteBox<Platform>) -> Self {
-        Self { platform, litebox }
+        Self {
+            platform,
+            litebox,
+            proc_handle: Cell::new(None),
+        }
     }
 
     /// Returns the litebox object for the shim.
@@ -252,12 +260,20 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     }
 
     /// Create a default layered file system with the given in-memory layer and tar data.
+    ///
+    /// Also mounts a `/proc` backend and stashes a handle to it on `self`; [`Self::build`] moves
+    /// that handle into the built shim's [`GlobalState`] so the guest task's identity can be
+    /// published into `/proc/<pid>/*` once it's known. Calling this more than once replaces the
+    /// stashed handle with the most recent call's -- only the `/proc` mounted by the filesystem
+    /// actually passed to `LinuxShim::load_program` should be kept live.
     pub fn default_fs(
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem_fs, tar_data)
+        let (fs, proc_handle) = default_fs(&self.litebox, in_mem_fs, tar_data);
+        self.proc_handle.set(Some(proc_handle));
+        fs
     }
 
     /// Build the shim.
@@ -272,6 +288,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
+            proc_handle: self.proc_handle.take(),
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
@@ -411,20 +428,31 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
 }
 
 /// Create a default layered file system with the given in-memory layer and tar data.
+///
+/// Also returns a handle to the mounted `/proc` backend; the caller (`LinuxShimBuilder`) is
+/// responsible for keeping it reachable so the guest task's identity can be published into it
+/// once known -- see `syscalls::process::Task::set_task_comm`.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_data: Cow<'static, [u8]>,
-) -> LinuxFS<Platform> {
+) -> (LinuxFS<Platform>, litebox::fs::proc::Proc<Platform>) {
+    let mut proc_handle = None;
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
             .mount("/dev", |allocator| {
                 litebox::fs::devices::Devices::new(litebox, allocator)
             })
+            .mount("/proc", |allocator| {
+                let proc = litebox::fs::proc::Proc::new(allocator);
+                proc_handle = Some(proc.clone());
+                proc
+            })
             .build()
             .unwrap(),
     );
+    let proc_handle = proc_handle.expect("mounted immediately above");
     let tar_ro = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
@@ -434,7 +462,7 @@ fn default_fs<Platform: ShimPlatform>(
             .build()
             .unwrap(),
     );
-    litebox::fs::layered::FileSystem::new(
+    let fs = litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
@@ -444,7 +472,8 @@ fn default_fs<Platform: ShimPlatform>(
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    )
+    );
+    (fs, proc_handle)
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
@@ -1159,6 +1188,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                 })
             }
+            SyscallRequest::Statfs { pathname, buf } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| syscall!(sys_statfs(path, buf))),
+            SyscallRequest::Fstatfs { fd, buf } => syscall!(sys_fstatfs(fd, buf)),
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
@@ -1311,6 +1344,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Handle to the `/proc` backend mounted by [`LinuxShimBuilder::default_fs`], if any --
+    /// `None` when the shim was built with a filesystem that doesn't mount one.
+    /// `Task::set_task_comm` publishes the guest task's identity here as it becomes known.
+    proc_handle: Option<litebox::fs::proc::Proc<Platform>>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {

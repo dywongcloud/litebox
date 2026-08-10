@@ -1230,6 +1230,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
+/// Block size used for the synthetic `statfs` figures below, as both the `i64` the ABI struct's
+/// fields need and the `u64` the byte-count constants below need to divide by.
+const SYNTHETIC_DISK_BLOCK_SIZE: i64 = 4096;
+const SYNTHETIC_DISK_BLOCK_SIZE_U64: u64 = 4096;
+/// Total synthetic "disk" space, matching the scale of `sys_sysinfo`'s synthetic RAM figures
+/// (`litebox::fs::proc::SYNTHETIC_TOTAL_RAM_BYTES`) rather than anything measured -- LiteBox does
+/// not model real per-mount disk usage. Kept a distinct constant since disk and RAM are unrelated
+/// figures on any real system.
+const SYNTHETIC_DISK_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Free synthetic "disk" space; half of [`SYNTHETIC_DISK_TOTAL_BYTES`], the same
+/// total/free ratio `sys_sysinfo`'s synthetic RAM figures use.
+const SYNTHETIC_DISK_FREE_BYTES: u64 = SYNTHETIC_DISK_TOTAL_BYTES / 2;
+/// `TMPFS_MAGIC` from `<linux/magic.h>`: the closest real filesystem-type magic to LiteBox's own
+/// synthetic, in-memory-backed filesystem.
+const SYNTHETIC_STATFS_MAGIC: i64 = 0x0102_1994;
+
+/// The same synthetic `statfs` figures for every path/fd -- see `sys_statfs`/`sys_fstatfs`.
+fn synthetic_statfs() -> litebox_common_linux::Statfs {
+    litebox_common_linux::Statfs {
+        f_type: SYNTHETIC_STATFS_MAGIC,
+        f_bsize: SYNTHETIC_DISK_BLOCK_SIZE,
+        f_blocks: SYNTHETIC_DISK_TOTAL_BYTES / SYNTHETIC_DISK_BLOCK_SIZE_U64,
+        f_bfree: SYNTHETIC_DISK_FREE_BYTES / SYNTHETIC_DISK_BLOCK_SIZE_U64,
+        f_bavail: SYNTHETIC_DISK_FREE_BYTES / SYNTHETIC_DISK_BLOCK_SIZE_U64,
+        f_files: 0,
+        f_ffree: 0,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: SYNTHETIC_DISK_BLOCK_SIZE,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
+
 fn descriptor_stat<Platform: ShimPlatform, FS: ShimFS, T>(
     raw_fd: usize,
     task: &Task<Platform, FS>,
@@ -1471,6 +1505,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // report the actual filled set via `Statx::stx_mask`. Matches Linux's
         // documented behavior of returning more than what was asked.
         self.do_fstatat(dirfd, pathname, flags)
+    }
+
+    /// Handle syscall `statfs`.
+    ///
+    /// LiteBox does not model per-mount free/total space, so every path (on any mount) reports
+    /// the same synthetic figures -- just enough for `df`'s `statvfs` call (via
+    /// `/proc/mounts`-enumerated mount points, see `litebox::fs::proc`) to succeed rather than
+    /// fail outright. The path only needs to resolve to *something*; real Linux behaves the same
+    /// way for any path on the same filesystem.
+    pub(crate) fn sys_statfs(
+        &self,
+        pathname: impl path::Arg,
+        buf: UserPtrMut<litebox_common_linux::Statfs>,
+    ) -> Result<(), Errno> {
+        use litebox::path::Arg as _;
+
+        let resolved = self.resolve_path(pathname)?;
+        let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
+        self.files
+            .borrow()
+            .fs
+            .file_status(abs_path.as_str())
+            .map_err(Errno::from)?;
+        buf.write_at_offset::<Platform>(0, synthetic_statfs())
+            .ok_or(Errno::EFAULT)
+    }
+
+    /// Handle syscall `fstatfs`. See [`Self::sys_statfs`] on why every result is the same.
+    pub(crate) fn sys_fstatfs(
+        &self,
+        fd: i32,
+        buf: UserPtrMut<litebox_common_linux::Statfs>,
+    ) -> Result<(), Errno> {
+        self.sys_fstat(fd)?;
+        buf.write_at_offset::<Platform>(0, synthetic_statfs())
+            .ok_or(Errno::EFAULT)
     }
 
     pub(crate) fn sys_fcntl(&self, fd: i32, arg: FcntlArg) -> Result<u32, Errno> {

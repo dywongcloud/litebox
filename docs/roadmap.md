@@ -340,8 +340,76 @@ Known gaps a real guest hits now:
   between the two, not an inferred one. None of this touches a guest that only
   issues syscalls, which is still the common case and still runs end to end.
 
-* `touch` fails: `utimensat` is unimplemented. `df`, `free` and `ps` fail because
-  there is no `/proc`. Neither is macOS-specific.
+* `touch` still fails: `utimensat` is unimplemented. Unrelated to the `/proc`
+  entry below -- see that entry's own dated correction for what changed there.
+
+* **`df`, `free` and `ps` no longer fail for lack of `/proc` -- resolved this
+  pass (2026-08-10), and, as this entry originally said, it was never
+  macOS-specific: it was a gap in the shared VFS/shim layer.** A minimal,
+  read-only `/proc` (`litebox::fs::proc::Proc`, mounted at `/proc` in
+  `default_fs` the same way `litebox::fs::devices::Devices` is mounted at
+  `/dev`) now serves `/proc/meminfo`, `/proc/mounts`, and
+  `/proc/<pid>/{stat,status,cmdline}` for the single guest task LiteBox's
+  Linux shim ever runs: `clone` requires `CLONE_THREAD` and there is no
+  `fork`, so there is exactly one pid to publish, not a real process tree --
+  this backend intentionally does not invent multi-process support the shim
+  doesn't have. `df` also needed a real `statfs`/`fstatfs` syscall, previously
+  a deliberate `ENOSYS`: BusyBox's `df` enumerates `/proc/mounts` (Alpine's
+  BusyBox has no `/etc/mtab`, so it reads this directly rather than falling
+  back to it) and calls `statvfs` on each mount point; both syscalls now
+  return the same synthetic-but-plausible free/total figures LiteBox already
+  used for `sysinfo()`.
+
+  Making `free` actually reach its own output (rather than dying first at the
+  missing-file open) surfaced a real, previously-unobservable bug the same
+  size as the `/proc` gap itself: `Sysinfo` (the `sysinfo()` ABI struct) had
+  no `#[repr(C)]`, so `repr(Rust)`'s free field reordering silently scrambled
+  the struct written into guest memory. `free` calls `sysinfo()` before ever
+  touching `/proc/meminfo`, but always died at the missing-file open first, so
+  the already-scrambled `totalram`/`freeram` were never actually printed
+  until `/proc` existed to get `free` past that point -- at which point it
+  printed multi-exabyte garbage instead of a number. `Sysinfo` is
+  `#[repr(C)]` now, with the same kind of now-explicit padding fields
+  `FileStat` and the new `Statfs` already needed for the same reason.
+
+  Verified against the real `litebox_packager` / `litebox_runner_linux_on_macos_userland`
+  pipeline on an Apple M3 Pro. `docker.io`'s own anonymous-pull auth endpoint
+  (`auth.docker.io`) was unreachable from this host -- unrelated to LiteBox,
+  general internet access was otherwise fine -- so the image came from
+  `public.ecr.aws/docker/library/alpine:latest` instead, which mirrors the
+  same image. Real output:
+
+  ```
+  $ busybox df
+  Filesystem           1K-blocks      Used Available Use% Mounted on
+  litebox                8388608   4194304   4194304  50% /
+  devtmpfs               8388608   4194304   4194304  50% /dev
+  proc                   8388608   4194304   4194304  50% /proc
+
+  $ busybox free
+                total        used        free      shared  buff/cache   available
+  Mem:        4194304     2097152     2097152           0           0     2097152
+  Swap:             0           0           0
+
+  $ busybox ps
+  PID   USER     TIME  COMMAND
+   1000 1000      0:00 /bin/busybox ps
+  ```
+
+  `ps`'s `USER` column and `/proc/<pid>`'s owner both come from `stat`-ing the
+  `/proc/<pid>` directory itself (matching BusyBox's `procps_scan`, which gets
+  uid/gid that way rather than parsing `/proc/<pid>/status`), and `COMMAND`
+  round-trips the real `argv` through `/proc/<pid>/cmdline`.
+
+  An intermittent guest-fault `SIGSEGV` (exit 11) was also observed on this
+  same run a few times across roughly a dozen individual `ps`/`free`
+  invocations this session -- but 5 concurrent runs of each were clean every
+  time, it reproduces with no `/proc`-specific error in the trace, and
+  `busybox cat` on an unrelated file flaked identically once in the same
+  session. This matches the guest-entry scheduling sensitivity this doc
+  already documents (see the flaky-timer-tests entry under "The test suite's
+  own macOS gaps"), not a new defect in this change; noted here rather than
+  silently dropped.
 
 * `setuid`/`setgid` are unimplemented, but that is *not* why `id` was failing --
   an earlier revision of this file said so and was wrong. `getgroups` was the
