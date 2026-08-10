@@ -1,0 +1,114 @@
+# Boxer: OCI workloads as wasm-carried boxes
+
+Boxer completes the [dphilla/boxer](https://github.com/dphilla/boxer) idea on
+top of LiteBox: any OCI container image or Dockerfile becomes a single
+`.box.wasm` artifact -- a genuine WebAssembly module that carries the image's
+rootfs with every executable pre-rewritten by the LiteBox syscall rewriter.
+`boxer run` executes the workload under the LiteBox sandbox; any wasm runtime
+can load the artifact and print its self-description.
+
+## Quickstart
+
+```sh
+# From a Dockerfile
+boxer build -f Dockerfile -o app.box.wasm
+
+# From a registry image, for both architectures
+boxer build -i mcr.microsoft.com/cbl-mariner/busybox:2.0 --platform linux/amd64,linux/arm64
+
+# From a `docker save` archive or an OCI layout directory/tar
+boxer build --archive image.tar
+
+# Inspect and run
+boxer inspect app.box.wasm
+boxer run app.box.wasm            # image ENTRYPOINT/CMD
+boxer run app.box.wasm /bin/echo hi   # override CMD
+```
+
+## The box format
+
+A box is a valid wasm module (binary format v1):
+
+- The executable part is a minimal WASI preview1 program: `_start` writes the
+  box's banner and metadata JSON to stdout via `fd_write` and returns, so
+  `wasmtime app.box.wasm` (or a browser/node embedding with a `fd_write`
+  stub) reports what the artifact holds without touching the payload.
+- `box.meta.v1` custom section: metadata JSON (platform, entrypoint, cmd,
+  env, workdir, source, rootfs size and SHA-256). See `BoxMeta` in
+  `boxer/src/boxfmt.rs`.
+- `box.rootfs.v1` custom section: the LiteBox-packaged rootfs tar, i.e.
+  exactly what `litebox-packager` produces -- syscall-rewritten executables
+  plus `litebox/config.json` (the OCI image config) and
+  `litebox/config_and_run.sh` (ENV/WORKDIR/ENTRYPOINT wrapper).
+
+Custom sections are skipped at instantiation, so load cost is independent of
+image size. Boxes are deterministic: identical inputs produce byte-identical
+artifacts (ordered tar, fixed uid/gid, no timestamps).
+
+Integrity: `parse` verifies the payload length and SHA-256 against the
+metadata before running anything.
+
+## Architecture support
+
+| | build (package) | run natively |
+|---|---|---|
+| x86-64 Linux | yes | yes (`litebox_runner_linux_userland`, in-process) |
+| arm64 Linux | -- | not yet (no LiteBox arm64-linux userland runner) |
+| macOS Apple Silicon | yes | via `litebox_runner_linux_on_macos_userland` (manual; see docs/macos.md) |
+| anything with a wasm runtime | -- | self-description only |
+
+Cross-architecture packaging works because the syscall rewriter dispatches on
+each ELF's own `e_machine`: building `--platform linux/arm64` on an x86-64
+host rewrites the aarch64 binaries (anchored per `--rewrite-host`, default
+`linux`; use `macos` for boxes that will run under the macOS runner).
+`boxer run` refuses a box whose platform differs from the host, naming both.
+
+A workload that is itself a wasm binary (detected by magic) is delegated to
+`wasmtime`/`wasmer`/`wasmedge` from `PATH` instead of the native runner.
+
+## Dockerfile support
+
+The parser and evaluator are dependency-free and total (line-numbered errors,
+no panics on user input): parser directives (`# escape=`), comments, line
+continuations, multi-stage `FROM ... AS`, `--platform=` on FROM, exec and
+shell command forms, heredocs (`RUN <<EOF`, `COPY <<EOF dest`), variable
+substitution (`$V`, `${V}`, `${V:-def}`, `${V:+alt}`, `--build-arg`),
+`.dockerignore`, COPY/ADD flags (`--from` stage or external image,
+`--chmod`, globs), ADD tar auto-extraction (gzip/zstd/plain) and URL fetch,
+and ENV/ARG/LABEL/WORKDIR/USER/EXPOSE/VOLUME/SHELL/STOPSIGNAL recorded into
+the synthesized OCI config (HEALTHCHECK/ONBUILD recorded, not executed).
+
+`RUN` executes in a chroot of the in-progress rootfs. That is a deliberate
+divergence from "everything under LiteBox": the LiteBox tar filesystem is
+in-memory and read-only by design, so guest filesystem mutations cannot
+persist back out of the sandbox -- a builder needs real writes. Consequences:
+
+- `RUN` needs root (chroot) and a build host matching the target platform;
+  cross-platform builds with `RUN` fail with a named error.
+- The final workload still gets the LiteBox sandbox at run time.
+
+## Image acquisition
+
+- Registry pulls are anonymous, honor `--platform`, and accept gzip, zstd,
+  and uncompressed layers (whiteouts, opaque dirs, hard links, and symlink
+  chains are handled by `litebox_packager::oci`). A missing platform is
+  reported with the list the registry actually offers.
+- `--archive` accepts `docker save` tars and OCI image layouts (directory or
+  tar), including nested indexes, with the same layer pipeline. An archive
+  whose config declares a different architecture than `--platform` is
+  refused rather than mislabeled.
+
+## Known costs and limits
+
+- The LiteBox tar filesystem supports neither symlinks nor hard links, so
+  every applet-style link materializes as a full copy: a busybox image
+  (hundreds of applet links to one binary) expands to a multi-GB box. This
+  is a LiteBox filesystem roadmap item, not a box format limit.
+- Boxes above 2 GiB stay valid wasm and run fine natively, but JS engines cap
+  single buffers at 2 GiB; `boxer build` warns when crossing that line.
+  The hard format ceiling is 3.5 GiB (u32 section sizes).
+- Private registries (authentication) are not supported yet, matching
+  `litebox-packager --oci-image`.
+- `USER` is recorded in the config but not enforced by the runner.
+- Upstream boxer's `compile` subcommand (marcotte-based C-to-wasm) is not
+  reproduced here; its repository does not include the marcotte sources.

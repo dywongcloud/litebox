@@ -3,6 +3,8 @@
 
 ### Local agent tooling ###
 /.gm/
+/CLAUDE.md
+/.npmignore
 
 ### Emacs ###
 # -*- mode: gitignore; -*-

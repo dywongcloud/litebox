@@ -68,7 +68,21 @@ pub struct RootfsEntry {
     pub mode: u32,
 }
 
+/// A single image layer as pulled from a registry or read from an archive:
+/// the (possibly compressed) tar bytes plus the media type that names the
+/// compression.
+pub struct LayerData {
+    pub data: Vec<u8>,
+    pub media_type: String,
+}
+
 /// Pull an OCI image from a registry and extract its layers into a temp directory.
+///
+/// Selects the Linux image whose architecture matches the host. LiteBox runs
+/// guest instructions natively rather than emulating them, so a guest of any
+/// other architecture could not execute here -- pulling one would only defer
+/// the failure to run time. Use [`pull_and_extract_for_platform`] to select a
+/// different architecture explicitly (e.g. to package a box for another host).
 ///
 /// Supports standard image references like:
 /// - `docker.io/library/alpine:latest`
@@ -84,6 +98,27 @@ pub struct RootfsEntry {
 /// registries or images that require credentials will fail with an
 /// authorization error from the registry.
 pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<ExtractedImage> {
+    pull_and_extract_for_platform(image_ref, None, verbose)
+}
+
+/// The OCI architecture name for the host LiteBox is running on.
+fn host_image_arch() -> oci_spec::image::Arch {
+    if cfg!(target_arch = "aarch64") {
+        oci_spec::image::Arch::ARM64
+    } else {
+        oci_spec::image::Arch::Amd64
+    }
+}
+
+/// As [`pull_and_extract`], but selecting an explicit target architecture
+/// (`None` selects the host architecture). When the registry's manifest list
+/// has no Linux entry for the requested architecture, the error names the
+/// platforms that were available.
+pub fn pull_and_extract_for_platform(
+    image_ref: &str,
+    arch: Option<oci_spec::image::Arch>,
+    verbose: bool,
+) -> anyhow::Result<ExtractedImage> {
     // Parse the image reference
     let reference: Reference = image_ref
         .parse()
@@ -93,39 +128,38 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         eprintln!("Pulling image: {reference}");
     }
 
-    // Create async runtime for the OCI client (which is async-based)
-    #[allow(
-        clippy::items_after_statements,
-        reason = "kept next to its only caller below"
-    )]
-    /// The OCI architecture name for the host LiteBox is running on.
-    fn host_image_arch() -> oci_spec::image::Arch {
-        if cfg!(target_arch = "aarch64") {
-            oci_spec::image::Arch::ARM64
-        } else {
-            oci_spec::image::Arch::Amd64
-        }
-    }
+    let wanted_arch = arch.unwrap_or_else(host_image_arch);
 
+    // Captures the platforms present in the manifest list so a failed
+    // selection can name what was actually available. Written from inside the
+    // resolver closure, read after the pull fails.
+    let seen_platforms: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Create async runtime for the OCI client (which is async-based)
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to create tokio runtime")?;
 
     let image_data = rt.block_on(async {
+        let resolver_arch = wanted_arch.clone();
+        let resolver_seen = std::sync::Arc::clone(&seen_platforms);
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
-            // Pull the Linux image whose architecture matches the host. LiteBox
-            // runs guest instructions natively rather than emulating them, so a
-            // guest of any other architecture could not execute here -- pulling
-            // one would only defer the failure to run time.
-            platform_resolver: Some(Box::new(|entries| {
+            platform_resolver: Some(Box::new(move |entries| {
+                if let Ok(mut seen) = resolver_seen.lock() {
+                    *seen = entries
+                        .iter()
+                        .filter_map(|entry| entry.platform.as_ref())
+                        .map(|p| format!("{}/{}", p.os, p.architecture))
+                        .collect();
+                }
                 entries
                     .iter()
                     .find(|entry| {
                         entry.platform.as_ref().is_some_and(|p| {
-                            p.os == oci_spec::image::Os::Linux
-                                && p.architecture == host_image_arch()
+                            p.os == oci_spec::image::Os::Linux && p.architecture == resolver_arch
                         })
                     })
                     .map(|e| e.digest.clone())
@@ -150,10 +184,23 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
                     oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
                     oci_client::manifest::IMAGE_LAYER_MEDIA_TYPE,
                     oci_client::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+                    IMAGE_LAYER_ZSTD_MEDIA_TYPE,
+                    IMAGE_LAYER_NONDISTRIBUTABLE_ZSTD_MEDIA_TYPE,
                 ],
             )
             .await
-            .with_context(|| format!("failed to pull image {reference}"))?;
+            .map_err(|e| {
+                let seen = seen_platforms.lock().map(|s| s.clone()).unwrap_or_default();
+                if seen.is_empty() {
+                    anyhow::Error::new(e).context(format!("failed to pull image {reference}"))
+                } else {
+                    anyhow::Error::new(e).context(format!(
+                        "failed to pull image {reference} for platform linux/{wanted_arch}; \
+                         available platforms: {}",
+                        seen.join(", ")
+                    ))
+                }
+            })?;
 
         if verbose {
             eprintln!("  Pulled {} layer(s)", image_data.layers.len());
@@ -162,6 +209,28 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         Ok::<_, anyhow::Error>(image_data)
     })?;
 
+    let layers: Vec<LayerData> = image_data
+        .layers
+        .into_iter()
+        .map(|layer| LayerData {
+            data: layer.data.to_vec(),
+            media_type: layer.media_type,
+        })
+        .collect();
+
+    extract_image_layers(&layers, image_data.config.data.to_vec(), verbose)
+}
+
+/// Extract already-fetched image layers into a temp-directory rootfs and parse
+/// the image config. This is the registry-independent tail of
+/// [`pull_and_extract`]; archive-based sources (`docker save` tars, OCI layout
+/// directories) feed their layers through here so every input shares one
+/// whiteout/symlink/permission implementation.
+pub fn extract_image_layers(
+    layers: &[LayerData],
+    config_json: Vec<u8>,
+    verbose: bool,
+) -> anyhow::Result<ExtractedImage> {
     // Create temp directory for extraction
     let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
     let rootfs_path = tempdir.path().join("rootfs");
@@ -170,12 +239,12 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     // Extract layers in order (bottom layer first)
     let mut symlinks: Vec<DeferredSymlink> = Vec::new();
     let mut permissions: HashMap<PathBuf, u32> = HashMap::new();
-    for (i, layer) in image_data.layers.iter().enumerate() {
+    for (i, layer) in layers.iter().enumerate() {
         if verbose {
             eprintln!(
                 "  Extracting layer {}/{} ({} bytes)...",
                 i + 1,
-                image_data.layers.len(),
+                layers.len(),
                 layer.data.len()
             );
         }
@@ -206,11 +275,8 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         eprintln!("  Rootfs extracted to {}", rootfs_path.display());
     }
 
-    // Save the raw config JSON before parsing (try_from consumes it).
-    let config_json = image_data.config.data.to_vec();
-
     // Parse image config for ENTRYPOINT, CMD, ENV, WORKDIR.
-    let config = match ConfigFile::try_from(image_data.config) {
+    let config = match serde_json::from_slice::<ConfigFile>(&config_json) {
         Ok(cf) => {
             let exec_config = cf.config.as_ref();
             let ic = ImageConfig {
@@ -334,7 +400,14 @@ fn shell_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
-/// Extract a single OCI layer (tar or tar+gzip) into the rootfs directory.
+/// OCI zstd-compressed layer media type (OCI image spec v1.1).
+const IMAGE_LAYER_ZSTD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+/// Non-distributable variant of the zstd layer media type.
+const IMAGE_LAYER_NONDISTRIBUTABLE_ZSTD_MEDIA_TYPE: &str =
+    "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd";
+
+/// Extract a single OCI layer (tar, tar+gzip, or tar+zstd) into the rootfs
+/// directory.
 ///
 /// Handles OCI whiteout files (`.wh.*` prefixed entries) which indicate
 /// files deleted in upper layers. Symlinks are collected into `symlinks` for
@@ -347,11 +420,15 @@ fn extract_layer(
     symlinks: &mut Vec<DeferredSymlink>,
     permissions: &mut HashMap<PathBuf, u32>,
 ) -> anyhow::Result<()> {
-    // Determine if the layer is gzipped
-    let is_gzip = media_type.contains("gzip") || is_gzip_data(data);
-
-    if is_gzip {
+    // The media type names the compression, but sniff magic bytes too: layers
+    // read back from `docker save` archives carry generic tar media types
+    // regardless of their actual on-disk compression.
+    if media_type.contains("gzip") || is_gzip_data(data) {
         let decoder = flate2::read::GzDecoder::new(data);
+        extract_tar(decoder, rootfs, symlinks, permissions)
+    } else if media_type.contains("zstd") || is_zstd_data(data) {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(data)
+            .context("failed to initialize zstd decoder for layer")?;
         extract_tar(decoder, rootfs, symlinks, permissions)
     } else {
         extract_tar(data, rootfs, symlinks, permissions)
@@ -361,6 +438,11 @@ fn extract_layer(
 /// Check if data starts with the gzip magic bytes.
 fn is_gzip_data(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
+}
+
+/// Check if data starts with the zstd frame magic bytes.
+fn is_zstd_data(data: &[u8]) -> bool {
+    data.len() >= 4 && data[..4] == [0x28, 0xb5, 0x2f, 0xfd]
 }
 
 /// A hard link whose target was not yet extracted when encountered.

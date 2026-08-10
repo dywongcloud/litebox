@@ -291,15 +291,6 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     eprintln!("Pulling OCI image: {image_ref}");
     let extracted = oci::pull_and_extract(image_ref, args.verbose)?;
 
-    // --- Phase 2: Scan rootfs for files ---
-    eprintln!("Scanning rootfs...");
-    let file_map = oci::scan_rootfs(
-        &extracted.rootfs_path,
-        &extracted.symlink_map,
-        &extracted.permissions,
-        args.verbose,
-    )?;
-
     let no_rewrite: BTreeSet<PathBuf> = args
         .no_rewrite
         .iter()
@@ -315,13 +306,67 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         })
         .collect();
 
+    let tar_entries = package_extracted_image(
+        &extracted,
+        &PackageOptions {
+            elf_machine: target_elf_machine(),
+            rewrite_host: rewrite_host(),
+            no_rewrite,
+            verbose: args.verbose,
+        },
+    )?;
+
+    finalize_tar(tar_entries, args)?;
+
+    Ok(())
+}
+
+/// Options for [`package_extracted_image`].
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
+pub struct PackageOptions {
+    /// The ELF `e_machine` value binaries must match to be rewritten
+    /// (see [`EM_X86_64`]/[`EM_AARCH64`]). `0` disables the check.
+    pub elf_machine: u16,
+    /// AArch64 host anchor to rewrite against; ignored for x86-64 guests.
+    pub rewrite_host: litebox_syscall_rewriter::Host,
+    /// Absolute host paths excluded from rewriting.
+    pub no_rewrite: BTreeSet<PathBuf>,
+    pub verbose: bool,
+}
+
+/// Scan an extracted image rootfs, rewrite its executables for the requested
+/// architecture, and return the tar entries (rootfs files plus the
+/// `litebox/config.json` and `litebox/config_and_run.sh` payloads).
+///
+/// This is `run_oci` minus the pull and the output-file write, so callers with
+/// their own image sources (registry, `docker save` archive, Dockerfile build)
+/// and their own output formats share one packaging path.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
+pub fn package_extracted_image(
+    extracted: &oci::ExtractedImage,
+    options: &PackageOptions,
+) -> anyhow::Result<Vec<TarEntry>> {
+    // --- Scan rootfs for files ---
+    eprintln!("Scanning rootfs...");
+    let file_map = oci::scan_rootfs(
+        &extracted.rootfs_path,
+        &extracted.symlink_map,
+        &extracted.permissions,
+        options.verbose,
+    )?;
+
     let exec_count = file_map.files.values().filter(|e| e.is_executable).count();
     let total_count = file_map.files.len();
     eprintln!("Found {total_count} files ({exec_count} executables to rewrite)");
 
-    // --- Phase 3: Rewrite ELFs in parallel ---
+    // --- Rewrite ELFs in parallel ---
     eprintln!("Rewriting {exec_count} executable ELF files...");
-    let verbose = args.verbose;
     let file_entries: Vec<(PathBuf, oci::RootfsEntry)> = file_map.files.into_iter().collect();
 
     let par_results: Vec<anyhow::Result<TarEntry>> = file_entries
@@ -330,8 +375,15 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
             let data = std::fs::read(&entry.read_path)
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
-            let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
-                rewrite_elf(&data, &entry.read_path, verbose)
+            let rewritten = if entry.is_executable && !options.no_rewrite.contains(&entry.read_path)
+            {
+                rewrite_elf_for(
+                    &data,
+                    &entry.read_path,
+                    options.elf_machine,
+                    options.rewrite_host,
+                    options.verbose,
+                )
             } else {
                 data
             };
@@ -352,13 +404,13 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     let mut added_tar_paths: BTreeSet<String> =
         tar_entries.iter().map(|e| e.tar_path.clone()).collect();
 
-    // --- Phase 4: Store config.json and generate config_and_run.sh from image config ---
+    // --- Store config.json and generate config_and_run.sh from image config ---
 
     // Always store the raw OCI config JSON for future use.
     {
         const CONFIG_JSON_TAR_PATH: &str = "litebox/config.json";
         if added_tar_paths.insert(CONFIG_JSON_TAR_PATH.to_string()) {
-            if args.verbose {
+            if options.verbose {
                 eprintln!(
                     "  Storing {CONFIG_JSON_TAR_PATH} ({} bytes)",
                     extracted.config_json.len()
@@ -366,7 +418,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
             }
             tar_entries.push(TarEntry {
                 tar_path: CONFIG_JSON_TAR_PATH.to_string(),
-                data: extracted.config_json,
+                data: extracted.config_json.clone(),
                 mode: 0o644,
             });
         } else {
@@ -378,7 +430,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         const CONFIG_AND_RUN_TAR_PATH: &str = "litebox/config_and_run.sh";
         let script = oci::generate_config_and_run_script(&extracted.config);
         if added_tar_paths.insert(CONFIG_AND_RUN_TAR_PATH.to_string()) {
-            if args.verbose {
+            if options.verbose {
                 eprintln!("  Generating {CONFIG_AND_RUN_TAR_PATH} from image config");
             }
             tar_entries.push(TarEntry {
@@ -393,9 +445,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    finalize_tar(tar_entries, args)?;
-
-    Ok(())
+    Ok(tar_entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -661,9 +711,9 @@ fn require_statically_linked(
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
 /// ELF e_machine value for x86_64.
-const EM_X86_64: u16 = 62;
+pub const EM_X86_64: u16 = 62;
 /// ELF e_machine value for AArch64.
-const EM_AARCH64: u16 = 183;
+pub const EM_AARCH64: u16 = 183;
 
 /// Read the ELF e_machine field using the `object` crate for proper header parsing.
 fn elf_machine(data: &[u8]) -> Option<u16> {
@@ -706,7 +756,7 @@ fn target_elf_machine() -> u16 {
 /// before running a guest; the guest-entry side of that is still unimplemented
 /// (see `docs/roadmap.md`), so a macOS-packaged binary is not yet *runnable*,
 /// but it is now correctly *anchored*.
-fn rewrite_host() -> litebox_syscall_rewriter::Host {
+pub fn rewrite_host() -> litebox_syscall_rewriter::Host {
     if cfg!(target_os = "macos") {
         litebox_syscall_rewriter::Host::MacOs
     } else {
@@ -722,6 +772,22 @@ fn rewrite_host() -> litebox_syscall_rewriter::Host {
 /// hooked, no syscalls, unsupported object, missing `.text`) are treated as
 /// warnings and the original bytes are returned.
 fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
+    rewrite_elf_for(data, path, target_elf_machine(), rewrite_host(), verbose)
+}
+
+/// As `rewrite_elf`, but rewriting for an explicit target: `elf_machine` is
+/// the ELF `e_machine` binaries must match to be rewritten (`0` disables the
+/// check), and `host` is the AArch64 anchor to rewrite against. The rewriter
+/// itself dispatches on the binary's own architecture, so a caller packaging
+/// an arm64 image on an x86-64 build host passes [`EM_AARCH64`] here and gets
+/// correctly rewritten arm64 binaries.
+pub fn rewrite_elf_for(
+    data: &[u8],
+    path: &Path,
+    elf_machine_wanted: u16,
+    host: litebox_syscall_rewriter::Host,
+    verbose: bool,
+) -> Vec<u8> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
         if verbose {
@@ -730,11 +796,13 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
         return data.to_vec();
     }
 
-    // Skip ELF files whose architecture doesn't match the target. OCI images
-    // may contain cross-architecture binaries (e.g., aarch64 in an x86_64
-    // image) which the rewriter cannot handle.
-    let target_machine = target_elf_machine();
-    if target_machine != 0 && elf_machine(data).is_some_and(|machine| machine != target_machine) {
+    // Skip ELF files whose architecture doesn't match the requested target.
+    // OCI images may contain cross-architecture binaries (e.g., aarch64 in an
+    // x86_64 image); rewriting those would produce binaries for a platform the
+    // box does not declare.
+    if elf_machine_wanted != 0
+        && elf_machine(data).is_some_and(|machine| machine != elf_machine_wanted)
+    {
         if verbose {
             eprintln!(
                 "  {} (wrong ELF architecture, skipping rewrite)",
@@ -744,7 +812,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
         return data.to_vec();
     }
 
-    match litebox_syscall_rewriter::hook_syscalls_in_elf_for_host(data, None, rewrite_host()) {
+    match litebox_syscall_rewriter::hook_syscalls_in_elf_for_host(data, None, host) {
         Ok(rewritten) => {
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
@@ -769,13 +837,17 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
 // Tar archive construction
 // ---------------------------------------------------------------------------
 
-struct TarEntry {
-    tar_path: String,
-    data: Vec<u8>,
-    mode: u32,
+/// A file destined for the output tar: rootfs-relative path, contents, and
+/// Unix permission bits.
+pub struct TarEntry {
+    pub tar_path: String,
+    pub data: Vec<u8>,
+    pub mode: u32,
 }
 
-fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
+/// Write `entries` as a ustar archive at `output`. Deterministic: entry order
+/// is the caller's, uid/gid are fixed, and no timestamps are recorded.
+pub fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
     let file = std::fs::File::create(output)
         .with_context(|| format!("failed to create output file {}", output.display()))?;
     let mut builder = Builder::new(file);

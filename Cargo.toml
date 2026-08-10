@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "boxer",
     "litebox",
     "litebox_broker_local",
     "litebox_broker_core",
@@ -39,6 +40,7 @@ members = [
     "dev_bench",
 ]
 default-members = [
+    "boxer",
     "litebox",
     "litebox_broker_local",
     "litebox_broker_core",
