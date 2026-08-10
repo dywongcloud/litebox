@@ -28,7 +28,7 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, UtimeError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -120,6 +120,19 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
+
+    /// Update the access and/or modification time of a file/directory.
+    ///
+    /// `None` for either parameter leaves that timestamp unchanged (mirroring `UTIME_OMIT`).
+    /// Resolving `UTIME_NOW` into a concrete [`Timestamp`] is the caller's responsibility: this
+    /// subsystem has no clock of its own, matching how wall-clock time is already sourced only at
+    /// the shim layer (see `Platform: TimeProvider`) rather than threaded through here.
+    fn utimensat(
+        &self,
+        path: impl path::Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError>;
 
     /// Unlink a file
     fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
@@ -321,6 +334,21 @@ pub struct FileStatus {
     pub node_info: NodeInfo,
     /// Block size for file system I/O
     pub blksize: usize,
+    /// Last access time
+    pub atime: Timestamp,
+    /// Last modification time
+    pub mtime: Timestamp,
+    /// Last status-change time
+    pub ctime: Timestamp,
+}
+
+/// A POSIX-style timestamp: seconds and nanoseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timestamp {
+    /// Whole seconds since the Unix epoch.
+    pub sec: i64,
+    /// The sub-second remainder, in nanoseconds.
+    pub nsec: i64,
 }
 
 /// User information

@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::fs::OFlags;
 use crate::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, UtimeError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
@@ -256,6 +256,21 @@ impl From<Error> for ChownError {
     }
 }
 
+impl From<Error> for UtimeError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => UtimeError::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => UtimeError::PathError(PathError::NoSuchFileOrDirectory),
+                ENOTDIR => UtimeError::PathError(PathError::ComponentNotADirectory),
+                EPERM | EACCES => UtimeError::NoWritePerms,
+                _ => UtimeError::Io,
+            },
+            Error::Io | Error::InvalidResponse => UtimeError::Io,
+        }
+    }
+}
+
 impl From<Rlerror> for Error {
     fn from(err: Rlerror) -> Self {
         Error::Remote(err.ecode)
@@ -439,6 +454,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
     }
 
+    /// Convert a 9P wire timestamp to our [`super::Timestamp`]
+    fn time_to_timestamp(t: fcall::Time) -> Result<super::Timestamp, Error> {
+        Ok(super::Timestamp {
+            sec: i64::try_from(t.sec).map_err(|_| Error::InvalidResponse)?,
+            nsec: i64::try_from(t.nsec).map_err(|_| Error::InvalidResponse)?,
+        })
+    }
+
     /// Convert getattr response to FileStatus
     fn rgetattr_to_file_status(attr: &fcall::Rgetattr) -> Result<super::FileStatus, Error> {
         let file_type = Self::qid_type_to_file_type(attr.qid.typ);
@@ -460,6 +483,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     ),
                 },
                 blksize: usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?,
+                atime: Self::time_to_timestamp(attr.stat.atime)?,
+                mtime: Self::time_to_timestamp(attr.stat.mtime)?,
+                ctime: Self::time_to_timestamp(attr.stat.ctime)?,
             })
         } else {
             Ok(super::FileStatus {
@@ -501,6 +527,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                     usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?
                 } else {
                     0
+                },
+                atime: if attr.valid.contains(fcall::GetattrMask::ATIME) {
+                    Self::time_to_timestamp(attr.stat.atime)?
+                } else {
+                    super::Timestamp::default()
+                },
+                mtime: if attr.valid.contains(fcall::GetattrMask::MTIME) {
+                    Self::time_to_timestamp(attr.stat.mtime)?
+                } else {
+                    super::Timestamp::default()
+                },
+                ctime: if attr.valid.contains(fcall::GetattrMask::CTIME) {
+                    Self::time_to_timestamp(attr.stat.ctime)?
+                } else {
+                    super::Timestamp::default()
                 },
             })
         }
@@ -797,6 +838,38 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.client.clunk(fid);
 
         result.map_err(ChownError::from)
+    }
+
+    fn utimensat(
+        &self,
+        path: impl crate::path::Arg,
+        atime: Option<super::Timestamp>,
+        mtime: Option<super::Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let path = self.absolute_path(path)?;
+        let fid = self.walk_to(&path)?;
+
+        let mut valid = fcall::SetattrMask::empty();
+        let mut stat = fcall::SetAttr::default();
+        if let Some(atime) = atime {
+            valid |= fcall::SetattrMask::ATIME | fcall::SetattrMask::ATIME_SET;
+            stat.atime = fcall::Time {
+                sec: atime.sec.try_into().unwrap_or_default(),
+                nsec: atime.nsec.try_into().unwrap_or_default(),
+            };
+        }
+        if let Some(mtime) = mtime {
+            valid |= fcall::SetattrMask::MTIME | fcall::SetattrMask::MTIME_SET;
+            stat.mtime = fcall::Time {
+                sec: mtime.sec.try_into().unwrap_or_default(),
+                nsec: mtime.nsec.try_into().unwrap_or_default(),
+            };
+        }
+
+        let result = self.client.setattr(&fid, valid, stat);
+        self.client.clunk(fid);
+
+        result.map_err(UtimeError::from)
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {

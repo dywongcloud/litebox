@@ -374,6 +374,9 @@ impl From<litebox::fs::FileStatus> for FileStat {
             owner: litebox::fs::UserInfo { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             blksize,
+            atime,
+            mtime,
+            ctime,
             ..
         } = value;
         Self {
@@ -398,6 +401,12 @@ impl From<litebox::fs::FileStatus> for FileStat {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             st_blksize: blksize as i32,
             st_blocks: 0,
+            st_atime: atime.sec,
+            st_atime_nsec: atime.nsec,
+            st_mtime: mtime.sec,
+            st_mtime_nsec: mtime.nsec,
+            st_ctime: ctime.sec,
+            st_ctime_nsec: ctime.nsec,
             ..Default::default()
         }
     }
@@ -433,10 +442,6 @@ bitflags::bitflags! {
             | Self::STATX_INO.bits()
             | Self::STATX_SIZE.bits()
             | Self::STATX_BLOCKS.bits();
-        /// The basic-stats fields LiteBox actually fills. Excludes the
-        /// time bits because `FileStatus` doesn't carry timestamps.
-        const STATX_BASIC_FILLED = Self::STATX_BASIC_STATS.bits()
-            & !(Self::STATX_ATIME.bits() | Self::STATX_MTIME.bits() | Self::STATX_CTIME.bits());
         const STATX_BTIME = 0x0000_0800;
         const STATX_MNT_ID = 0x0000_1000;
         const STATX_DIOALIGN = 0x0000_2000;
@@ -514,12 +519,15 @@ impl From<litebox::fs::FileStatus> for Statx {
             owner: litebox::fs::UserInfo { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             blksize,
+            atime,
+            mtime,
+            ctime,
             ..
         } = value;
         let dev = dev as u64;
         let rdev = rdev.map_or(0u64, |r| r.get() as u64);
         Self {
-            stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
+            stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             stx_blksize: blksize.trunc(),
             stx_nlink: 1,
             stx_uid: u32::from(user),
@@ -527,6 +535,9 @@ impl From<litebox::fs::FileStatus> for Statx {
             stx_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             stx_ino: ino as u64,
             stx_size: size as u64,
+            stx_atime: statx_timestamp(atime.sec, atime.nsec),
+            stx_mtime: statx_timestamp(mtime.sec, mtime.nsec),
+            stx_ctime: statx_timestamp(ctime.sec, ctime.nsec),
             stx_blocks: 0,
             stx_rdev_major: dev_major(rdev),
             stx_rdev_minor: dev_minor(rdev),

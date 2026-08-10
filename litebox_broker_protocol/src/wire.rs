@@ -1117,4 +1117,138 @@ mod tests {
             [0, 13, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]
         );
     }
+
+    #[test]
+    fn decode_functions_reject_every_truncation_and_unknown_tag() {
+        let handle = ObjectHandle(9);
+
+        assert_decoder_fails_closed(
+            &encode_handshake_request(BrokerHandshakeRequest {
+                protocol_version: ProtocolVersion(1),
+            }),
+            &[REQUEST_TAG_NEGOTIATE],
+            decode_handshake_request,
+        );
+
+        for operation in [
+            BrokerOperation::CloseObject(handle),
+            BrokerOperation::CheckReadiness(handle),
+            BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+                initial_count: 7,
+            })),
+            BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
+                capacity: 4096,
+                atomic_write_size: 512,
+            })),
+            BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+                handle,
+                address: SocketAddressV4 {
+                    address: Ipv4Address([203, 0, 113, 7]),
+                    port: Port(443),
+                },
+            })),
+        ] {
+            assert_decoder_fails_closed(
+                &encode_request(BrokerRequest {
+                    request_id: TEST_REQUEST_ID,
+                    operation,
+                }),
+                &[
+                    REQUEST_TAG_EVENT,
+                    REQUEST_TAG_CLOSE_OBJECT,
+                    REQUEST_TAG_PIPE,
+                    REQUEST_TAG_CHECK_READINESS,
+                    REQUEST_TAG_SOCKET,
+                ],
+                decode_request,
+            );
+        }
+
+        assert_decoder_fails_closed(
+            &encode_handshake_response(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: ProtocolVersion(1),
+            }),
+            &[
+                RESPONSE_TAG_NEGOTIATED,
+                RESPONSE_TAG_HANDSHAKE_ERROR,
+                RESPONSE_TAG_VERSION_MISMATCH,
+            ],
+            decode_handshake_response,
+        );
+
+        for result in [
+            BrokerResult::ObjectClosed,
+            BrokerResult::Readiness(ReadinessFlags::READ),
+            BrokerResult::Event(EventResponse::Create(CreateEventResponse { handle })),
+            BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
+                read_handle: handle,
+                write_handle: ObjectHandle(handle.0 + 1),
+            })),
+            BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Connected,
+            })),
+            BrokerResult::Error(ErrorCode::PolicyDenied),
+        ] {
+            assert_decoder_fails_closed(
+                &encode_response(BrokerResponse {
+                    request_id: TEST_REQUEST_ID,
+                    result,
+                }),
+                &[
+                    RESPONSE_TAG_EVENT,
+                    RESPONSE_TAG_OBJECT_CLOSED,
+                    RESPONSE_TAG_PIPE,
+                    RESPONSE_TAG_READINESS,
+                    RESPONSE_TAG_ERROR,
+                    RESPONSE_TAG_SOCKET,
+                ],
+                decode_response,
+            );
+        }
+
+        assert_decoder_fails_closed(
+            &encode_notification(BrokerNotification::Readiness(ReadinessNotification {
+                handle,
+                readiness: ReadinessFlags::READ,
+            })),
+            &[NOTIFICATION_TAG_READINESS],
+            decode_notification,
+        );
+    }
+
+    /// Asserts that `decode` accepts `valid_frame` itself but nothing that
+    /// truncates it and nothing that swaps its leading tag byte for one
+    /// outside `ok_tags`.
+    ///
+    /// A parser that is total (never panics) can still fail open by decoding
+    /// a truncated prefix into a shorter, wrong-but-plausible value, or by
+    /// accepting a tag it never assigned meaning to; walking every prefix
+    /// length and every tag byte turns both into a checked property instead
+    /// of the handful of hand-picked offsets the tests above cover.
+    fn assert_decoder_fails_closed<T>(
+        valid_frame: &[u8],
+        ok_tags: &[u8],
+        decode: impl Fn(&[u8]) -> Result<T, WireError>,
+    ) {
+        assert!(decode(valid_frame).is_ok());
+
+        for len in 0..valid_frame.len() {
+            assert!(
+                decode(&valid_frame[..len]).is_err(),
+                "{len}-byte truncation of {valid_frame:?} was accepted"
+            );
+        }
+
+        for tag in 0..=u8::MAX {
+            if ok_tags.contains(&tag) {
+                continue;
+            }
+            let mut mutated = valid_frame.to_vec();
+            mutated[0] = tag;
+            assert!(
+                decode(&mutated).is_err(),
+                "tag {tag} was accepted outside {ok_tags:?}"
+            );
+        }
+    }
 }

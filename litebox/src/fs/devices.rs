@@ -18,10 +18,10 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, TruncateError, UnlinkError, UtimeError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: usize = 1024;
@@ -89,6 +89,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: STDIO_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
             },
             Device::Null => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -97,6 +100,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: NULL_NODE_INFO,
                 blksize: NULL_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
             },
             Device::URandom => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -105,6 +111,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: URANDOM_NODE_INFO,
                 blksize: URANDOM_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
             },
         }
     }
@@ -351,6 +360,9 @@ where
             owner: UserInfo::ROOT,
             node_info: self.root_inode.clone(),
             blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+            ctime: Timestamp::default(),
         })
     }
 
@@ -387,5 +399,15 @@ where
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn utimensat_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        Err(UtimeError::ReadOnlyFileSystem)
     }
 }

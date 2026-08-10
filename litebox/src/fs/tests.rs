@@ -400,6 +400,79 @@ mod in_mem {
     }
 
     #[test]
+    fn utimensat_test() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        let path = "/testfile";
+
+        fs.with_root_privileges(|fs| {
+            let fd = fs
+                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.close(&fd).expect("Failed to close file");
+        });
+
+        // A freshly created file has no real timestamps yet.
+        let status = fs.file_status(path).expect("Failed to stat file");
+        assert_eq!(status.atime, crate::fs::Timestamp::default());
+        assert_eq!(status.mtime, crate::fs::Timestamp::default());
+        assert_eq!(status.ctime, crate::fs::Timestamp::default());
+
+        // Round-trip: write a timestamp via utimensat, and read it back via stat.
+        let atime = crate::fs::Timestamp {
+            sec: 1_000_000,
+            nsec: 111,
+        };
+        let mtime = crate::fs::Timestamp {
+            sec: 2_000_000,
+            nsec: 222,
+        };
+        fs.with_root_privileges(|fs| {
+            fs.utimensat(path, Some(atime), Some(mtime))
+                .expect("Failed to set times as root");
+        });
+        let status = fs.file_status(path).expect("Failed to stat file");
+        assert_eq!(status.atime, atime);
+        assert_eq!(status.mtime, mtime);
+        assert_eq!(status.ctime, mtime);
+
+        // `None` leaves the corresponding timestamp untouched.
+        let new_atime = crate::fs::Timestamp {
+            sec: 3_000_000,
+            nsec: 333,
+        };
+        fs.with_root_privileges(|fs| {
+            fs.utimensat(path, Some(new_atime), None)
+                .expect("Failed to set atime only");
+        });
+        let status = fs.file_status(path).expect("Failed to stat file");
+        assert_eq!(status.atime, new_atime);
+        assert_eq!(status.mtime, mtime);
+
+        // A user without write permission cannot update timestamps.
+        fs.with_user(500, 500, |fs| {
+            match fs.utimensat(path, Some(atime), Some(mtime)) {
+                Err(crate::fs::errors::UtimeError::NoWritePerms) => {
+                    // Expected behavior
+                }
+                Ok(()) => panic!("User without write perms should not be able to utimensat"),
+                Err(e) => panic!("Unexpected error: {e:?}"),
+            }
+        });
+
+        // Test utimensat on non-existent file (should fail)
+        match fs.utimensat("/nonexistent", Some(atime), Some(mtime)) {
+            Err(crate::fs::errors::UtimeError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory,
+            )) => {
+                // Expected behavior
+            }
+            Ok(()) => panic!("Should not be able to utimensat non-existent file"),
+            Err(e) => panic!("Unexpected error: {e:?}"),
+        }
+    }
+
+    #[test]
     fn o_directory_flag_tests() {
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);

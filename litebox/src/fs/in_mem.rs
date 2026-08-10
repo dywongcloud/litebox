@@ -14,9 +14,10 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, UtimeError,
+    WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, Timestamp, UserInfo};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'IMem'.hex()`.
@@ -230,6 +231,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     },
                     data: Vec::new().into(),
                     unique_id: self.fresh_id(),
+                    atime: Timestamp::default(),
+                    mtime: Timestamp::default(),
+                    ctime: Timestamp::default(),
                 })));
                 let old = root.entries.insert(path, entry.clone());
                 assert!(old.is_none());
@@ -535,6 +539,50 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
+    fn utimensat(
+        &self,
+        path: impl crate::path::Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let path = self.absolute_path(path)?;
+        let root = self.root.read();
+        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let Some(entry) = entry else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        };
+        if !self.current_user.can_write(&entry.perms()) {
+            return Err(UtimeError::NoWritePerms);
+        }
+        match entry {
+            Entry::File(file) => {
+                let mut file = file.write();
+                if let Some(atime) = atime {
+                    file.atime = atime;
+                }
+                if let Some(mtime) = mtime {
+                    file.mtime = mtime;
+                }
+                if let Some(changed) = mtime.or(atime) {
+                    file.ctime = changed;
+                }
+            }
+            Entry::Dir(dir) => {
+                let mut dir = dir.write();
+                if let Some(atime) = atime {
+                    dir.atime = atime;
+                }
+                if let Some(mtime) = mtime {
+                    dir.mtime = mtime;
+                }
+                if let Some(changed) = mtime.or(atime) {
+                    dir.ctime = changed;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
@@ -593,6 +641,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 },
                 children: HashMap::default(),
                 unique_id: self.fresh_id(),
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
             }))),
         );
         assert!(old.is_none());
@@ -712,7 +763,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
-        let (file_type, perms, size, unique_id) = match entry {
+        let (file_type, perms, size, unique_id, atime, mtime, ctime) = match entry {
             Entry::File(file) => {
                 let file = file.read();
                 (
@@ -720,6 +771,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     file.perms.clone(),
                     file.data.len(),
                     file.unique_id,
+                    file.atime,
+                    file.mtime,
+                    file.ctime,
                 )
             }
             Entry::Dir(dir) => {
@@ -729,6 +783,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     dir.perms.clone(),
                     super::DEFAULT_DIRECTORY_SIZE,
                     dir.unique_id,
+                    dir.atime,
+                    dir.mtime,
+                    dir.ctime,
                 )
             }
         };
@@ -743,11 +800,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 rdev: None,
             },
             blksize: BLOCK_SIZE,
+            atime,
+            mtime,
+            ctime,
         })
     }
 
     fn fd_file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
-        let (file_type, perms, size, unique_id) = match &self
+        let (file_type, perms, size, unique_id, atime, mtime, ctime) = match &self
             .litebox
             .descriptor_table()
             .get_entry(fd)
@@ -761,6 +821,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     file.perms.clone(),
                     file.data.len(),
                     file.unique_id,
+                    file.atime,
+                    file.mtime,
+                    file.ctime,
                 )
             }
             Descriptor::Dir { dir, .. } => {
@@ -770,6 +833,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     dir.perms.clone(),
                     super::DEFAULT_DIRECTORY_SIZE,
                     dir.unique_id,
+                    dir.atime,
+                    dir.mtime,
+                    dir.ctime,
                 )
             }
         };
@@ -784,6 +850,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 rdev: None,
             },
             blksize: BLOCK_SIZE,
+            atime,
+            mtime,
+            ctime,
         })
     }
 
@@ -826,6 +895,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                     },
                     children: HashMap::default(),
                     unique_id: 0,
+                    atime: Timestamp::default(),
+                    mtime: Timestamp::default(),
+                    ctime: Timestamp::default(),
                 }))),
             )]
             .into_iter()
@@ -904,6 +976,9 @@ pub(crate) struct DirX {
     perms: Permissions,
     children: HashMap<String, FileType>,
     unique_id: usize,
+    atime: Timestamp,
+    mtime: Timestamp,
+    ctime: Timestamp,
 }
 
 type File<Platform> = Arc<sync::RwLock<Platform, FileX>>;
@@ -912,6 +987,9 @@ pub(crate) struct FileX {
     perms: Permissions,
     data: alloc::borrow::Cow<'static, [u8]>,
     unique_id: usize,
+    atime: Timestamp,
+    mtime: Timestamp,
+    ctime: Timestamp,
 }
 
 #[derive(Clone, Debug)]

@@ -132,6 +132,20 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::utimensat`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum UtimeError {
+    #[error("the file does not allow write permission for the current user")]
+    NoWritePerms,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::unlink`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

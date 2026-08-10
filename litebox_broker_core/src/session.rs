@@ -359,7 +359,10 @@ impl Drop for BrokerSession {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use hashbrown::HashMap;
+    use spin::rwlock::RwLock;
 
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
@@ -797,5 +800,33 @@ mod tests {
             crate::event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
+    }
+
+    #[test]
+    fn unauthenticated_caller_gets_no_rights_under_the_deployed_broker_policy() {
+        // `BrokerCore::new` enforces one core per process, and the lifecycle
+        // group above already claims that slot for this test binary, so this
+        // builds a core's fields directly to get an independent instance
+        // configured the way `litebox_broker_userland`'s production entry
+        // point configures it: host-guaranteed rights only, nothing granted
+        // to an unauthenticated caller.
+        let broker = BrokerCore {
+            policy: PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
+            limits: BrokerCoreLimits::DEFAULT,
+            next_session_id: Arc::new(RwLock::new(1)),
+            next_reference_handle: Arc::new(RwLock::new(1)),
+            references: Arc::new(RwLock::new(HashMap::new())),
+            reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        assert_eq!(
+            crate::event::create(&session, 0),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert!(broker.references.read().is_empty());
     }
 }

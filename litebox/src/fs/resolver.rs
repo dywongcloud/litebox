@@ -13,11 +13,11 @@ use crate::{LiteBox, fd::TypedFd, sync};
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, UtimeError,
+    WalkError, WriteError,
 };
 use super::{
-    FileType, Mode, OFlags,
+    FileType, Mode, OFlags, Timestamp,
     backend::{
         DirHandle, FileHandle, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
         WalkStopReason, WalkingDirHandle,
@@ -647,6 +647,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             WalkError::PathError(error) => error.into(),
         })?;
         self.backend.chown_at(parent, name, user, group)
+    }
+
+    fn utimensat(
+        &self,
+        path: impl Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let context = default_context_pre_context_management_changes();
+        let path = context.resolve(path)?;
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, &path)
+                .map_err(|error| match error {
+                    WalkError::Io => UtimeError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
+        else {
+            // TODO(jayb): Add backend support for mutating the root directory itself.
+            unimplemented!("utimensat root directory")
+        };
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => UtimeError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.utimensat_at(parent, name, atime, mtime)
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {

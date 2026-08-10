@@ -15,10 +15,10 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, TruncateError, UnlinkError, UtimeError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
 use crate::path::Arg;
 use thiserror::Error;
 
@@ -280,6 +280,9 @@ impl Composer {
             owner: UserInfo::ROOT,
             node_info,
             blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+            ctime: Timestamp::default(),
         }
     }
 
@@ -806,6 +809,29 @@ impl Backend for Composer {
                 self.mounts[mount_index]
                     .backend
                     .chown_at(handle, name, user, group)
+            }
+        }
+    }
+
+    fn utimensat_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let dir = dir.into_typed::<Self>();
+        match dir.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(UtimeError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle,
+            } => {
+                self.checked_child_path(path, name, UtimeError::ReadOnlyFileSystem)?;
+                self.mounts[mount_index]
+                    .backend
+                    .utimensat_at(handle, name, atime, mtime)
             }
         }
     }
