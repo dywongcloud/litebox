@@ -321,6 +321,9 @@ jobs:
           # - `litebox_platform_windows_userland` is allowed to have `std` access,
           #   since it is a purely-userland implementation.
           #
+          # - `litebox_platform_macos_userland` is allowed to have `std` access,
+          #   since it is a purely-userland implementation.
+          #
           # - `litebox_broker_transport_linux_userland` is allowed to have
           #   `std` access, since it is the Linux-userland binding that owns
           #   both the local and the broker/host endpoints of the current
@@ -343,6 +346,10 @@ jobs:
           #   relevant files, and then actually trigger LiteBox itself.
           #
           # - `litebox_runner_windows_on_linux_userland` is allowed to have `std`
+          #   access since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
+          # - `litebox_runner_linux_on_macos_userland` is allowed to have `std`
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
@@ -388,8 +395,10 @@ jobs:
             -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
+            -not -path './litebox_platform_macos_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_windows_on_linux_userland/Cargo.toml' \
+            -not -path './litebox_runner_linux_on_macos_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \

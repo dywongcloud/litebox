@@ -56,9 +56,12 @@
 //! * **Below-`SP` staging.** [`enter_guest_asm`] stages the guest `PC` and `X0`
 //!   in the 16 bytes just below the guest `SP` before branching. AArch64 Linux
 //!   has no red zone, so a signal delivered in that window could clobber them;
-//!   the platform must therefore keep guest-directed signals on a
-//!   `sigaltstack` (its async handlers already run there). Documented so it is
-//!   not mistaken for safe on a shared stack.
+//!   the platform therefore keeps guest-directed signals on a `sigaltstack`,
+//!   not merely as a documented assumption -- every handler this platform
+//!   installs carries `SA_ONSTACK` (`darwin::install_handler`), and both
+//!   entry points that can reach here (`ThreadProvider::spawn_thread` and the
+//!   free `run_thread`) install the alternate stack itself
+//!   (`with_signal_alt_stack`) before either can run.
 //!
 //! Darwin's W^X rules still apply: the guest's executable pages are `MAP_JIT`
 //! mappings and every patch is bracketed by

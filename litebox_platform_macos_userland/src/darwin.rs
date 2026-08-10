@@ -437,6 +437,13 @@ pub(crate) fn sysctl_string(
 /// `siginfo` selects the three-argument handler form, which is what a fault
 /// handler needs in order to reach the interrupted machine context.
 ///
+/// Always `SA_ONSTACK`: every signal installed through this function is one
+/// that can land while a guest is executing (see
+/// `litebox_platform_macos_userland::guest`'s below-`SP` staging note), and
+/// `SA_ONSTACK` falls back to the current stack on a thread that never
+/// registered an alternate one, so this is never a regression for a handler
+/// that turns out not to need it.
+///
 /// # Panics
 ///
 /// Panics if the handler cannot be installed, which would leave LiteBox unable
@@ -446,7 +453,7 @@ pub(crate) fn install_handler(signum: libc::c_int, handler: usize, siginfo: bool
     // value for every field, and the fields that matter are set below.
     let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
     action.sa_sigaction = handler;
-    action.sa_flags = if siginfo { libc::SA_SIGINFO } else { 0 };
+    action.sa_flags = (if siginfo { libc::SA_SIGINFO } else { 0 }) | libc::SA_ONSTACK;
     // SAFETY: `sa_mask` is a live, correctly typed out-parameter, and installing
     // a handler for a signal number the caller chose has no other precondition.
     let rc = unsafe {

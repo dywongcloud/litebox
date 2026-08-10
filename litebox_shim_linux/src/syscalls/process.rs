@@ -1963,6 +1963,7 @@ mod tests {
         use litebox::platform::{Instant as _, TimeProvider};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
+        let _guard = crate::syscalls::tests::async_signal_guard();
         let task = crate::syscalls::tests::init_platform(None);
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let platform = task.global.platform;
@@ -2022,6 +2023,7 @@ mod tests {
     fn test_alarm_cancel_prevents_signal() {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
+        let _guard = crate::syscalls::tests::async_signal_guard();
         let task = crate::syscalls::tests::init_platform(None);
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             assert_eq!(task.sys_alarm(1).unwrap(), 0);
@@ -2058,6 +2060,7 @@ mod tests {
             signal::{SigSet, SigmaskHow, Signal},
         };
 
+        let _guard = crate::syscalls::tests::async_signal_guard();
         let task = crate::syscalls::tests::init_platform(None);
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let block_set = SigSet::empty().with(Signal::SIGUSR1);
@@ -2105,6 +2108,7 @@ mod tests {
         use litebox_common_linux::signal::{SIG_IGN, SaFlags, SigAction, SigSet, Signal};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
+        let _guard = crate::syscalls::tests::async_signal_guard();
         let task = crate::syscalls::tests::init_platform(None);
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             // Install SIG_IGN for SIGALRM.
@@ -2161,6 +2165,7 @@ mod tests {
         use litebox_common_linux::signal::Signal;
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
+        let _guard = crate::syscalls::tests::async_signal_guard();
         let task = crate::syscalls::tests::init_platform(None);
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let platform = task.global.platform;

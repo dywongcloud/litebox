@@ -609,8 +609,7 @@ fn elf_is_statically_linked(data: &[u8]) -> Option<bool> {
         Some(false)
     }
 
-    let dynamic = if let Ok(header) = object::elf::FileHeader64::<object::Endianness>::parse(data)
-    {
+    let dynamic = if let Ok(header) = object::elf::FileHeader64::<object::Endianness>::parse(data) {
         has_dynamic_deps(header, data)
     } else if let Ok(header) = object::elf::FileHeader32::<object::Endianness>::parse(data) {
         has_dynamic_deps(header, data)

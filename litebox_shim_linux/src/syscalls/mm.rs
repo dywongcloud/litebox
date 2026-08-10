@@ -397,7 +397,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             Errno::EBADF => MappingError::BadFD(fd),
                             Errno::EISDIR => MappingError::NotAFile,
                             Errno::EACCES => MappingError::NotForReading,
-                            _ => unimplemented!(),
+                            other => MappingError::Io(other.into()),
                         })?;
                 if size == 0 {
                     break;
@@ -1264,7 +1264,7 @@ mod tests {
     // Only `test_collision_with_global_allocator` needs these, and it is gated to
     // the hosts whose allocator layout it knows.
     use litebox::platform::PageManagementProvider;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     use litebox_common_linux::MRemapFlags;
     use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
@@ -1486,7 +1486,7 @@ mod tests {
         task.sys_munmap(addr2, PAGE_SIZE).unwrap();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_collision_with_global_allocator() {
         let _guard = crate::syscalls::tests::address_space_guard();
@@ -1524,6 +1524,33 @@ mod tests {
                 }));
                 addr
             };
+            // Darwin's non-fixed `mmap(NULL, ...)` packs consecutive anonymous
+            // requests back to back rather than scattering them the way Linux's
+            // ASLR does, so a bare `mmap(NULL, 0x10_000, ...)` here would make
+            // `addr - PAGE_SIZE` land inside the previous iteration's (still
+            // mapped) block every time, and the loop below would never find the
+            // free page it needs. Map one extra leading page and free just that
+            // one instead, so `[addr - PAGE_SIZE, addr)` is available by
+            // construction rather than by chance.
+            #[cfg(target_os = "macos")]
+            let addr = {
+                let base = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        0x10_000 + PAGE_SIZE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                } as usize;
+                unsafe { libc::munmap(base as *mut libc::c_void, PAGE_SIZE) };
+                let addr = base + PAGE_SIZE;
+                data.push(alloc::vec::Vec::<u8>::from(unsafe {
+                    core::slice::from_raw_parts(addr as *const u8, 0x10_000)
+                }));
+                addr
+            };
 
             let mut included = false;
             for r in <crate::syscalls::tests::TestPlatform as PageManagementProvider<
@@ -1537,17 +1564,20 @@ mod tests {
             }
 
             if !included {
-                // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
+                // Also ensure that [addr - PAGE_SIZE, addr) is available, which is needed in the test below.
+                // `MAP_FIXED_NOREPLACE` rather than a plain hint: a non-fixed `mmap` is free to place
+                // the mapping wherever it likes regardless of the hint, so only a fixed request can
+                // guarantee landing exactly at `addr - PAGE_SIZE`.
                 if let Ok(ptr) = task.sys_mmap(
-                    addr - 0x1000,
-                    0x1000,
+                    addr - PAGE_SIZE,
+                    PAGE_SIZE,
                     ProtFlags::PROT_READ,
-                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON | MapFlags::MAP_FIXED_NOREPLACE,
                     -1,
                     0,
                 ) {
-                    if ptr.as_usize() != addr - 0x1000 {
-                        task.sys_munmap(ptr, 0x1000).unwrap();
+                    if ptr.as_usize() != addr - PAGE_SIZE {
+                        task.sys_munmap(ptr, PAGE_SIZE).unwrap();
                         continue;
                     }
                     break addr;
@@ -1559,7 +1589,7 @@ mod tests {
         let res = task
             .sys_mmap(
                 addr,
-                0x1000,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
                 -1,
@@ -1572,11 +1602,11 @@ mod tests {
         // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
         let err = task
             .sys_mremap(
-                UserPtrMut::from_usize(addr - 0x1000),
-                0x1000,
-                0x2000,
+                UserPtrMut::from_usize(addr - PAGE_SIZE),
+                PAGE_SIZE,
+                2 * PAGE_SIZE,
                 MRemapFlags::empty(),
-                addr - 0x1000,
+                addr - PAGE_SIZE,
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);

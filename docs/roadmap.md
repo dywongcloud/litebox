@@ -173,15 +173,20 @@ Remaining, smaller, follow-ups on top of the working switch:
 These, plus the guest thread-pointer plumbing, are what stand between "a
 syscall-only guest runs end to end" (true today) and "an arbitrary unmodified
 Linux binary runs."
-* **The `jit_write_protect` bracketing gap** documented in
-  [`docs/macos.md`](./macos.md#wx-map_jit-and-code-signing): nothing in
-  `litebox_shim_linux`'s ELF loader or syscall-rewriter patching calls
-  `pthread_jit_write_protect_np` around its writes into a `MAP_JIT` mapping.
-  The fix is a `PageManagementProvider` hook (no-op default, macOS override)
-  wrapping the write call sites in `litebox_shim_linux/src/syscalls/mm.rs`
-  (`maybe_patch_exec_segment`, `apply_trap_fallback`) -- straightforward to
-  write, but only real hardware can confirm it actually resolves the SIGBUS
-  this gap implies rather than papering over a misunderstanding of the API.
+* **The `jit_write_protect` bracketing gap is implemented; hardware
+  confirmation is still outstanding.** `litebox_shim_linux`'s
+  `write_code_bytes` helper now brackets every code write with
+  `jit_write_protect(false)`/`(true)`, and both `maybe_patch_exec_segment` and
+  `apply_trap_fallback` in `litebox_shim_linux/src/syscalls/mm.rs` route
+  through it at every call site; `update_permissions`' own migrate-to-`MAP_JIT`
+  path brackets its own copy independently. What remains: no automated test
+  (in `mm.rs`'s own test module, `syscalls/tests.rs`, or
+  `litebox_runner_linux_on_macos_userland`, which CI builds but never
+  executes) exercises the JIT-migrate-then-patch-then-execute path end to end,
+  so there is still no empirical evidence this actually resolves the SIGBUS
+  the gap implied rather than papering over a misunderstanding of the API --
+  see [`docs/macos.md`](./macos.md#wx-map_jit-and-code-signing), which
+  correctly still marks this "unverified on real hardware."
 * **Darwin ABI drift beyond what `darwin_abi_probe.c` already checks.** The
   probe (added this pass, see the `Build and Test macOS` CI job) covers the
   three hand-written struct layouts the fault handler depends on. Anything
@@ -254,6 +259,42 @@ Known gaps a real guest hits now:
   avoids this by clearing its flag in the first instruction of its callback *and*
   switching off the guest stack before touching `pt_regs`; a macOS version has to
   port the ordering, not just the flag.
+
+* **The interrupt path (`SIGUSR2`) is not routed to `EnterShim::interrupt`
+  either -- and it is a different problem from the fault one above, not the
+  same one.** `litebox::event::wait::ThreadHandle::interrupt` only calls
+  `ThreadProvider::interrupt_thread` while the target thread is between the
+  shim's `prepare_to_run_guest`/`finish_running_guest` (state
+  `RUNNING_IN_GUEST`), i.e. only while the platform's own guest-entry call is
+  on the stack. On macOS that call is `guest::run_thread`'s
+  `enter_guest_asm`/`syscall_callback` pair, and `interrupt_signal_handler`
+  today takes no context and does nothing: `SIGUSR2` here currently only does
+  its other job, EINTR-ing a blocking host call (see the
+  `TimerProvider::create_timer` doc comment), which is a different thread
+  state entirely.
+
+  Unlike the fault case, a conservative "not in guest, do nothing but remember
+  it happened" fallback is genuinely safe here -- it never copies host state
+  into the guest's `PtRegs`, so getting the boundary slightly wrong in that
+  direction is not an ASLR/host-return hazard. What is missing is still real
+  new machinery, not a flag flip: both `litebox_platform_linux_userland` (a
+  TLS `in_guest` byte plus `switch_to_guest_start`/`_end` labels) and
+  `litebox_platform_windows_userland` (`SuspendThread`/`GetThreadContext`/
+  `SetThreadContext` plus the same split) distinguish "mid-restoring a
+  `PtRegs` that is still authoritative" from "genuinely executing guest code,
+  where the live registers are now the truth" before they redirect, and
+  `enter_guest_asm` has no labelled window today to make that distinction.
+  The genuinely-in-guest case also needs the guest's live NEON/FPSIMD state
+  out of the signal `ucontext_t`, which `darwin::McontextPrefix64`
+  deliberately does not expose ("the NEON state that follows them is never
+  touched," per its own doc comment), so it needs a new, independently
+  verified struct alongside it. And `guest::run_thread`'s loop has no way
+  today to tell "returned because of a syscall" from "returned because of an
+  interrupt" -- unlike the Linux/Windows versions, whose asm calls a different
+  native handler directly for each case, it always calls `shim.syscall` after
+  `enter_guest_asm` returns, so a second return path needs a real signal
+  between the two, not an inferred one. None of this touches a guest that only
+  issues syscalls, which is still the common case and still runs end to end.
 
 * `touch` fails: `utimensat` is unimplemented. `df`, `free` and `ps` fail because
   there is no `/proc`. Neither is macOS-specific.
@@ -350,9 +391,17 @@ rather than in the code they cover. Three are fixed; one is not.
   This is invisible where the guest range sits clear of the host's own image, and
   routine on arm64 macOS where both live above the 4 GiB floor -- the loader test
   leaked two images and broke five later tests that way. Serializing the mapping
-  tests (`address_space_guard`) makes the suite deterministic, but the underlying
-  gap is real: `test_collision_with_global_allocator` covers exactly this and is
-  still gated to Linux and Windows, so macOS has never been checked for it.
+  tests (`address_space_guard`) makes the suite deterministic.
+
+* **Fixed since:** `test_collision_with_global_allocator` now runs on macOS too.
+  Its search for a host mapping outside LiteBox's view assumed the host scatters
+  successive anonymous `mmap`s the way Linux's ASLR does; Darwin instead packs
+  them back to back, so the page the test needs free right before its candidate
+  address was always still occupied by the previous iteration's own mapping, and
+  the search never terminated. The macOS probe now frees exactly the page it
+  needs itself, by construction rather than by chance, and the setup `mmap` that
+  must land at an exact address uses `MAP_FIXED_NOREPLACE` instead of a hint
+  Darwin does not reliably honor.
 
 ## Needs a real multi-threaded guest to exercise
 

@@ -1337,7 +1337,9 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
                 // Let the shim set up its per-thread state before the new thread
                 // reaches guest code.
                 let shim = init_thread.init();
-                ThreadHandle::run_with_handle(|| guest::run_thread(shim.as_ref(), &mut ctx));
+                ThreadHandle::run_with_handle(|| {
+                    with_signal_alt_stack(|| guest::run_thread(shim.as_ref(), &mut ctx));
+                });
             })?;
         Ok(())
     }
@@ -1519,7 +1521,9 @@ where
     // does: `EnterShim::init` attaches an interrupt handle to the thread, which
     // reads `current_thread()`, and that panics on a thread this was never
     // called on. `spawn_thread` wraps its own entry the same way.
-    ThreadHandle::run_with_handle(|| guest::run_thread(&shim, ctx));
+    ThreadHandle::run_with_handle(|| {
+        with_signal_alt_stack(|| guest::run_thread(&shim, ctx));
+    });
 }
 
 /// The reserved key must convert into a byte offset the gates can actually use:
@@ -1719,4 +1723,141 @@ impl litebox::mm::linux::VmemPageFaultHandler for MacOsUserland {
     fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
         unreachable!("host kernel handles page faults for macOS userland")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Guest-directed signal delivery
+// ---------------------------------------------------------------------------
+
+/// Guard page below the alternate signal stack, sized to this platform's 16
+/// KiB pages so a stack-overflowing handler faults instead of corrupting
+/// whatever mapping [`with_signal_alt_stack`] happened to place below it.
+const ALT_STACK_GUARD_SIZE: usize = litebox::mm::linux::PAGE_SIZE;
+
+/// Runs `f` with an alternate signal stack installed on the calling thread.
+///
+/// `guest::enter_guest_asm` stages the guest `PC` and `X0` in the 16 bytes
+/// below the guest `SP` for the brief window before it branches there, and
+/// AArch64 has no red zone protecting that staging area from a signal handler
+/// that runs on the interrupted stack. `darwin::install_handler` sets
+/// `SA_ONSTACK` on every handler this platform installs precisely so that risk
+/// is avoidable, but `SA_ONSTACK` only takes effect once a thread has actually
+/// registered a stack for it to use -- every entry point that can run guest
+/// code ([`ThreadProvider::spawn_thread`](litebox::platform::ThreadProvider::spawn_thread)
+/// and the free [`run_thread`]) wraps its call in this so that registration
+/// always happens first.
+fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
+    let alt_stack_size = libc::SIGSTKSZ * 2;
+    // SAFETY: an anonymous mapping with no fixed-address request has no
+    // precondition beyond what `mmap` itself checks.
+    let stack_base = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            ALT_STACK_GUARD_SIZE + alt_stack_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    assert!(
+        stack_base != libc::MAP_FAILED,
+        "failed to allocate the alternate signal stack: {}",
+        std::io::Error::last_os_error()
+    );
+    let _unmap_guard = litebox::utils::defer(|| {
+        // SAFETY: `stack_base` is the mapping created above, unmapped exactly
+        // once here.
+        let rc = unsafe { libc::munmap(stack_base, ALT_STACK_GUARD_SIZE + alt_stack_size) };
+        assert!(
+            rc == 0,
+            "failed to unmap the alternate signal stack: {}",
+            std::io::Error::last_os_error()
+        );
+    });
+
+    // SAFETY: `stack_base` is a live mapping of at least `ALT_STACK_GUARD_SIZE`
+    // bytes, still solely owned by this function.
+    let rc = unsafe { libc::mprotect(stack_base, ALT_STACK_GUARD_SIZE, libc::PROT_NONE) };
+    assert!(
+        rc == 0,
+        "failed to guard the alternate signal stack: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let alt_stack = libc::stack_t {
+        // SAFETY: `stack_base` addresses a mapping at least
+        // `ALT_STACK_GUARD_SIZE + alt_stack_size` bytes long, so this stays
+        // within it.
+        ss_sp: unsafe { stack_base.add(ALT_STACK_GUARD_SIZE) },
+        ss_size: alt_stack_size,
+        ss_flags: 0,
+    };
+    // SAFETY: a zeroed `stack_t` is a valid, if meaningless, initial value;
+    // `sigaltstack` below overwrites every field that matters.
+    let mut previous: libc::stack_t = unsafe { core::mem::zeroed() };
+    // SAFETY: `alt_stack` addresses the mapping above, which outlives this
+    // call; `previous` is a live, correctly typed out-parameter.
+    let rc = unsafe { libc::sigaltstack(&raw const alt_stack, &raw mut previous) };
+    assert!(
+        rc == 0,
+        "failed to install the alternate signal stack: {}",
+        std::io::Error::last_os_error()
+    );
+    let _restore_guard = litebox::utils::defer(|| {
+        // SAFETY: `previous` was filled in by the `sigaltstack` call above and
+        // describes whatever stack (if any) this thread had before it.
+        let rc = unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) };
+        assert!(
+            rc == 0,
+            "failed to restore the previous signal stack: {}",
+            std::io::Error::last_os_error()
+        );
+    });
+
+    f()
+}
+
+#[cfg(test)]
+fn current_signal_stack() -> libc::stack_t {
+    // SAFETY: a null `ss` argument only queries the current stack, it does not
+    // install one.
+    unsafe {
+        let mut oss: libc::stack_t = core::mem::zeroed();
+        libc::sigaltstack(core::ptr::null(), &raw mut oss);
+        oss
+    }
+}
+
+/// Rust's own runtime already installs a guard-page alternate stack on every
+/// thread it starts (for its stack-overflow handler), so a fresh test thread
+/// does *not* reliably start with [`libc::SS_DISABLE`] -- this compares
+/// against whatever `before` actually was rather than assuming it is
+/// disabled.
+#[cfg(test)]
+#[test]
+fn with_signal_alt_stack_actually_registers_one() {
+    let before = current_signal_stack();
+    let during = with_signal_alt_stack(current_signal_stack);
+    let after = current_signal_stack();
+
+    assert_ne!(
+        during.ss_sp, before.ss_sp,
+        "with_signal_alt_stack must install a stack distinct from whatever \
+         (if any) the thread already had"
+    );
+    assert_eq!(
+        during.ss_flags & libc::SS_DISABLE,
+        0,
+        "the installed stack must actually be enabled"
+    );
+    assert!(
+        during.ss_size >= libc::SIGSTKSZ,
+        "the installed stack must be large enough to actually run a handler"
+    );
+    assert_eq!(
+        (after.ss_sp, after.ss_size, after.ss_flags),
+        (before.ss_sp, before.ss_size, before.ss_flags),
+        "the previous stack (if any) must be restored exactly once f returns"
+    );
 }

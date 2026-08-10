@@ -1039,6 +1039,8 @@ pub enum MappingError {
     NotAFile,
     #[error("file not open for reading")]
     NotForReading,
+    #[error("I/O error reading file: errno {0}")]
+    Io(i32),
 
     #[error("mapping failed: {0}")]
     MapError(#[from] crate::platform::page_mgmt::AllocationError),

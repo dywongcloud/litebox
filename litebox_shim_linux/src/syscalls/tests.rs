@@ -66,6 +66,28 @@ pub(crate) fn address_space_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Serializes tests that exercise real asynchronous-signal delivery: alarms,
+/// timers, and anything that ends up checking or draining pending signals.
+///
+/// Each test builds its own task, but every task in this binary shares the one
+/// `TestPlatform`, and on `litebox_platform_macos_userland` that platform's
+/// pending-signal bitmap and real host signal handlers are process-wide by
+/// design -- correct for its actual one-host-process-per-guest deployment,
+/// where a single process-wide bitmap is exactly right for signals any thread
+/// of that one guest may handle. Two such tests running at once instead race
+/// to drain that one bitmap first, so whichever task's blocking wait checks it
+/// next steals or misattributes a signal that was never meant for it. Holding
+/// this for the duration of the test keeps each test's signal traffic its own.
+static ASYNC_SIGNAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the async-signal lock for the rest of the current test. A poisoned
+/// lock is not a failure here, matching [`address_space_guard`].
+pub(crate) fn async_signal_guard() -> std::sync::MutexGuard<'static, ()> {
+    ASYNC_SIGNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[must_use]
 pub(crate) fn init_platform(
     tun_device_name: Option<&str>,

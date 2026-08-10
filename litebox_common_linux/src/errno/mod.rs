@@ -286,6 +286,9 @@ impl From<litebox::mm::linux::MappingError> for Errno {
             litebox::mm::linux::MappingError::BadFD(_) => Errno::EBADF,
             litebox::mm::linux::MappingError::NotAFile => Errno::EISDIR,
             litebox::mm::linux::MappingError::NotForReading => Errno::EACCES,
+            litebox::mm::linux::MappingError::Io(errno) => {
+                Errno::try_from(errno).unwrap_or(Errno::EIO)
+            }
             litebox::mm::linux::MappingError::MapError(e) => e.into(),
             _ => unimplemented!(),
         }
