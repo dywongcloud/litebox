@@ -4220,7 +4220,12 @@ mod tests {
         let child = 0x4343;
         table.add_child(child, task.pid);
         // As if the child had genuinely consumed 2.5s of host CPU time across its threads.
-        table.record_exit(child, super::ExitStatus::Exit(0), 2_500_000_000);
+        let cpu_time = Duration::from_millis(2500);
+        table.record_exit(
+            child,
+            super::ExitStatus::Exit(0),
+            u64::try_from(cpu_time.as_nanos()).unwrap(),
+        );
 
         // A sentinel fill: if `sys_wait4` ever again leaves the buffer untouched, this pattern
         // survives every assertion below rather than silently reading back as zero.
@@ -4235,7 +4240,7 @@ mod tests {
         let rusage = Rusage::read_from_bytes(&buf).unwrap();
         assert_eq!(
             rusage.ru_utime.as_bytes(),
-            TimeVal::from(Duration::from_nanos(2_500_000_000)).as_bytes(),
+            TimeVal::from(cpu_time).as_bytes(),
             "ru_utime must be the real, host-measured CPU time, not the sentinel or garbage"
         );
         assert_eq!(
