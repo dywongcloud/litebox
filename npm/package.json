@@ -1,0 +1,34 @@
+{
+  "name": "@openclew/litebox",
+  "version": "0.1.0",
+  "description": "Boot an interactive Linux shell inside LiteBox, a userspace syscall-translation sandbox. Builds from a pinned source revision on first run.",
+  "bin": {
+    "litebox": "bin/litebox.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "keywords": [
+    "litebox",
+    "sandbox",
+    "syscall",
+    "linux",
+    "container"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dywongcloud/litebox.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/dywongcloud/litebox#readme",
+  "bugs": {
+    "url": "https://github.com/dywongcloud/litebox/issues"
+  }
+}

@@ -137,6 +137,11 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
 // tests. Please do NOT modify this unless you have a very compelling reason to.
 const SKIP_FILES: &[&str] = &[
     "LICENSE",
+    // An `npm` `bin` entry must start with a `#!` line for the shim npm
+    // generates on Unix to work, and the header rule requires the copyright to
+    // be the very first bytes of the file. The two cannot both hold, so the
+    // copyright sits immediately below the shebang instead.
+    "npm/bin/litebox.js",
     "litebox/src/sync/mutex.rs",
     "litebox/src/sync/rwlock.rs",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_exec_nolibc",
