@@ -2347,6 +2347,10 @@ pub enum SyscallRequest {
         sigsetsize: usize,
     },
     RtSigreturn,
+    RtSigsuspend {
+        mask: Option<UserPtr<SigSet>>,
+        sigsetsize: usize,
+    },
     Kill {
         pid: i32,
         sig: i32,
@@ -2964,6 +2968,7 @@ impl SyscallRequest {
                 sigsetsize,
             }),
             Sysno::rt_sigreturn => SyscallRequest::RtSigreturn,
+            Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
             Sysno::kill => sys_req!(Kill { pid, sig }),
             Sysno::tkill => sys_req!(Tkill { tid, sig }),
             Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),

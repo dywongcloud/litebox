@@ -27,18 +27,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.wait_state.0.context().with_check_for_interrupt(self)
     }
 
-    /// Returns a wait context that ignores pending guest signals.
-    ///
-    /// Almost every wait in the shim should be interruptible; use [`Task::wait_cx`] for those.
-    /// This exists for the one wait that must not be: the parent side of `fork`, which cannot
-    /// return to guest code while the child is still running on its stack (see
-    /// `syscalls::process::VforkParent`).
-    pub(crate) fn wait_state_uninterruptible(
-        &self,
-    ) -> litebox::event::wait::WaitContext<'_, Platform> {
-        self.wait_state.0.context()
-    }
-
     /// Marks that the task has just returned from running guest code.
     pub(crate) fn enter_from_guest(&self) {
         self.wait_state.0.finish_running_guest();
@@ -55,6 +43,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             #[cfg(feature = "alarm_fallback")]
             self.check_alarm_deadline();
             self.process_signals(ctx);
+            // After delivery, so that an `rt_sigsuspend` handler frame captured the temporary
+            // mask rather than the one being put back here.
+            self.restore_saved_signal_mask();
             !self.is_exiting()
         })
     }
@@ -70,5 +61,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::event::wait::CheckForInterrupt
         #[cfg(feature = "alarm_fallback")]
         self.check_alarm_deadline();
         self.is_exiting() || self.has_pending_signals()
+    }
+
+    /// Hands a shared guest address space to whichever other guest process wants it, for as long
+    /// as this task is asleep.
+    ///
+    /// This is the hook that lets a `fork`ed child and its parent make progress in turn instead
+    /// of the parent being suspended for the child's whole lifetime; see
+    /// `syscalls::process::SharedAddressSpace`. It is a no-op -- a single predictable branch --
+    /// for the overwhelmingly common case of a task that has never `fork`ed.
+    fn yield_while_blocking(&self) {
+        self.release_address_space();
+    }
+
+    fn resume_after_blocking(&self) {
+        self.acquire_address_space();
     }
 }

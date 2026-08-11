@@ -220,6 +220,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         if !is_init {
             self.task.enter_from_guest();
         }
+        // Recorded on every entry so that a snapshot taken later -- at a blocking point deep
+        // inside a syscall, where no `PtRegs` is in reach -- knows where this task's live guest
+        // stack starts. See `syscalls::process::Task::save_address_space`.
+        self.task
+            .record_guest_sp(syscalls::process::guest_stack_pointer(ctx));
         f(&self.task, ctx);
         if self.task.prepare_to_run_guest(ctx) {
             ContinueOperation::Resume
@@ -370,7 +375,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                vfork_parent: RefCell::new(None),
+                address_space: RefCell::new(None),
+                guest_sp: Cell::new(0),
             },
         };
 
@@ -750,6 +756,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = (ctx.syscallno as isize).reinterpret_as_unsigned();
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        // A permanent, trace-gated record of every decoded syscall
+        // (`LITEBOX_LOG=litebox_shim_linux=trace`). Off by default and a single level check when
+        // it is off, but it is the only view of what a real guest is actually asking for: it is
+        // what showed that busybox's blocking `wait` is a `sigsuspend` loop, and that the shim
+        // was answering `sigsuspend` with an unimplemented-syscall error that release builds did
+        // not even log (`log_unsupported_fmt` is `debug_assertions`-only).
+        litebox_util_log::trace!(pid:? = self.pid, tid:? = self.tid, req:? = request; "syscall");
 
         match request {
             SyscallRequest::Exit { status } => {
@@ -843,6 +856,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 sigsetsize,
             } => self.sys_rt_sigaction(signum, act, oldact, sigsetsize),
             SyscallRequest::RtSigreturn => self.sys_rt_sigreturn(ctx),
+            SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
+                self.sys_rt_sigsuspend(mask, sigsetsize)
+            }
             SyscallRequest::Ioctl { fd, arg } => syscall!(sys_ioctl(fd, arg)),
             SyscallRequest::Pread64 {
                 fd,
@@ -1481,13 +1497,18 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
-    /// Set on a task created by `fork` for as long as it still runs in its parent's address
-    /// space, with the parent suspended inside its own `fork` call.
+    /// Set while this task shares one guest address space with other guest processes, which is
+    /// what `fork` produces here.
     ///
-    /// See `syscalls::process::VforkParent` for why `fork` has to work this way here, and
-    /// `Task::release_vfork_parent` for the two places (`execve` and task exit) that hand the
-    /// address space back.
-    vfork_parent: RefCell<Option<syscalls::process::VforkParent<Platform>>>,
+    /// See `syscalls::process::SharedAddressSpace` for why, and for the hand-off protocol that
+    /// keeps exactly one member running on the shared memory at a time.
+    address_space: RefCell<Option<syscalls::process::AddressSpaceMembership<Platform>>>,
+    /// The guest stack pointer as of the most recent entry into the shim.
+    ///
+    /// Needed because a snapshot of this task's memory can be taken at any blocking point, not
+    /// just at a syscall that was handed a `PtRegs`; see
+    /// `syscalls::process::Task::save_address_space` for what it is used for.
+    guest_sp: Cell<usize>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
@@ -1528,7 +1549,8 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                vfork_parent: RefCell::new(None),
+                address_space: RefCell::new(None),
+                guest_sp: Cell::new(0),
                 global: self,
             }
         }
@@ -1553,7 +1575,8 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
-                vfork_parent: RefCell::new(None),
+                address_space: RefCell::new(None),
+                guest_sp: Cell::new(0),
             };
             Some(task)
         }

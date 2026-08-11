@@ -294,6 +294,26 @@ pub trait CheckForInterrupt {
     /// block the thread. If this returns `true`, the wait will return with
     /// [`WaitError::Interrupted`].
     fn check_for_interrupt(&self) -> bool;
+
+    /// Gives up anything this thread holds only for as long as it is running.
+    ///
+    /// Called by [`WaitContext::wait_until`] immediately before it puts the thread to sleep, and
+    /// paired with exactly one [`resume_after_blocking`](Self::resume_after_blocking) once the
+    /// thread is awake again. Nothing between the two touches state the implementation may have
+    /// yielded, and in particular the wait condition is only ever evaluated after a resume, so an
+    /// implementation may hand off a resource that the condition depends on.
+    ///
+    /// Must not itself perform an interruptible wait: the thread is already in the waiting state
+    /// when this runs, and [`wait_until`](WaitContext::wait_until) is not reentrant.
+    ///
+    /// Does nothing by default.
+    fn yield_while_blocking(&self) {}
+
+    /// Takes back whatever [`yield_while_blocking`](Self::yield_while_blocking) gave up.
+    ///
+    /// Called once for each call to that method, whether the wait ended normally, by interrupt,
+    /// or by timeout. Subject to the same no-reentrant-wait rule.
+    fn resume_after_blocking(&self) {}
 }
 
 struct NeverInterrupt;
@@ -462,6 +482,11 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
             if ready() {
                 break Ok(());
             }
+            // Only around the sleep itself, and never around `ready`: see
+            // `CheckForInterrupt::yield_while_blocking`. The `defer` pairs the resume with the
+            // yield on every exit from this iteration, including the `?` below.
+            self.check_interrupt.yield_while_blocking();
+            let _resume = crate::utils::defer(|| self.check_interrupt.resume_after_blocking());
             self.commit_wait()?;
         }
     }

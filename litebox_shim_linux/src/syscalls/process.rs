@@ -203,23 +203,128 @@ impl OwnedRanges {
     }
 }
 
-/// The parent side of a `fork` whose child still shares the parent's address space.
+/// One guest address space, shared by a `fork`ed child and its parent, plus the hand-off that
+/// keeps exactly one of them running on it at a time.
 ///
 /// LiteBox executes guest code natively, so a guest virtual address *is* a host virtual address
 /// (see `litebox::mm::linux::Vmem::insert_mapping`, which passes the guest's own range straight to
 /// the platform allocator). One host address space therefore cannot hold two guest processes that
 /// both believe they own the same addresses, which is exactly what a copying `fork` would have to
-/// produce. What *is* representable is the other classic answer to the same problem: the child
-/// runs in the parent's address space, on the parent's stack, with the parent suspended until the
-/// child either `execve`s into an image of its own (at fresh addresses -- guest binaries here are
-/// `ET_DYN`, so the loader is free to place them anywhere) or exits. That is `vfork(2)`'s
-/// contract, and it is what this shim's `fork` provides.
+/// produce. So the child runs in the parent's address space, on the parent's stack.
 ///
-/// The child holds one of these; [`Task::release_vfork_parent`] flips the flag and wakes the
-/// parent blocked in [`Task::wait_for_vfork_child`].
-pub(crate) struct VforkParent<Platform: ShimPlatform> {
-    released: Arc<AtomicBool>,
-    waker: litebox::event::wait::Waker<Platform>,
+/// What this type adds is that the parent does not have to stay suspended for the child's whole
+/// lifetime. The address space is a *token*. Its holder is the one member whose memory is
+/// currently live in it; every other member is parked, holding a host-memory copy of its own view
+/// (see [`AddressSpaceMembership::parked`]). A member gives the token up whenever it is about to
+/// block -- `litebox::event::wait::CheckForInterrupt::yield_while_blocking`, which fires for every
+/// interruptible wait in the shim -- and takes it back before it looks at guest memory again.
+/// Since a member only ever reads or writes guest memory while it holds the token, and taking the
+/// token restores that member's own copy, each member sees exactly the memory `fork(2)` promises
+/// it.
+///
+/// That is what makes a `fork`ed child that never `execve`s -- a shell builtin on the left of a
+/// pipeline, a background subshell -- able to run concurrently with its parent: when it blocks on
+/// a full pipe, the parent gets the address space back and can fork the stage that drains it.
+///
+/// A member leaves for good when it `execve`s (the new image is loaded at addresses no other
+/// member owns, so it no longer needs the token) or when it exits.
+///
+/// Known limits, all of them "it hangs", never "it silently returns the wrong bytes":
+///
+/// * A member that never blocks and never exits starves the others. The token is only ever
+///   yielded voluntarily; there is no preemption, because memory cannot be taken away from a
+///   thread that is in the middle of executing guest instructions on it.
+/// * `CLONE_THREAD` threads of a member do not join the family, so a guest that `fork`s from a
+///   multithreaded process still gets the old, single-holder behaviour for its extra threads.
+///   Guests in scope here (shells) are single-threaded when they fork.
+pub(crate) struct SharedAddressSpace<Platform: ShimPlatform> {
+    /// [`ADDRESS_SPACE_FREE`], or the tid of the member holding the token. Used directly as the
+    /// word members block on while waiting to acquire.
+    holder: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+}
+
+/// A copy of a guest process's private memory, as `(start address, contents)` pairs.
+type MemoryImage = Vec<(usize, alloc::boxed::Box<[u8]>)>;
+
+/// One member's place in a [`SharedAddressSpace`].
+pub(crate) struct AddressSpaceMembership<Platform: ShimPlatform> {
+    shared: Arc<SharedAddressSpace<Platform>>,
+    /// Whether this member currently holds the token.
+    holding: Cell<bool>,
+    /// This member's copy of its own private memory, taken when it gave the token up. `Some`
+    /// exactly while [`Self::holding`] is false and the member still intends to come back.
+    parked: RefCell<Option<MemoryImage>>,
+}
+
+/// The value of [`SharedAddressSpace::holder`] when no member holds the token. No tid is ever
+/// zero, so this cannot collide with one.
+const ADDRESS_SPACE_FREE: u32 = 0;
+
+/// Encodes a tid as a [`SharedAddressSpace::holder`] value.
+fn tid_as_holder(tid: i32) -> u32 {
+    let raw = tid.cast_unsigned();
+    assert_ne!(raw, ADDRESS_SPACE_FREE, "tid 0 cannot own an address space");
+    raw
+}
+
+impl<Platform: ShimPlatform> SharedAddressSpace<Platform> {
+    /// How long to block before re-checking whether this task is being torn down. The token is
+    /// handed over explicitly, so this only bounds how long a *dying* task waits for a holder
+    /// that will never release; it is not a polling interval in the normal case.
+    const ABANDON_CHECK_INTERVAL: Duration = Duration::from_millis(20);
+
+    fn new(initial_holder: i32) -> Self {
+        let holder = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        holder
+            .underlying_atomic()
+            .store(tid_as_holder(initial_holder), Ordering::Relaxed);
+        Self { holder }
+    }
+
+    /// Blocks until the token is free and takes it for `tid`.
+    ///
+    /// Returns `false` if `abandon` became true first, which only happens when the caller is
+    /// being torn down and will never run guest code again.
+    fn acquire(&self, tid: i32, mut abandon: impl FnMut() -> bool) -> bool {
+        let me = tid_as_holder(tid);
+        loop {
+            match self.holder.underlying_atomic().compare_exchange(
+                ADDRESS_SPACE_FREE,
+                me,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => {
+                    if abandon() {
+                        return false;
+                    }
+                    let _ = self
+                        .holder
+                        .block_or_timeout(current, Self::ABANDON_CHECK_INTERVAL);
+                }
+            }
+        }
+    }
+
+    /// Gives the token up, waking anything waiting for it.
+    fn release(&self) {
+        self.holder
+            .underlying_atomic()
+            .store(ADDRESS_SPACE_FREE, Ordering::Release);
+        self.holder.wake_all();
+    }
+
+    /// Passes the token straight to `tid` without ever making it free.
+    ///
+    /// Used by `fork`: the child is not running yet and so cannot [`Self::acquire`] for itself,
+    /// and a free window here would let some other member take the address space out from under
+    /// it before its first instruction.
+    fn hand_off_to(&self, tid: i32) {
+        self.holder
+            .underlying_atomic()
+            .store(tid_as_holder(tid), Ordering::Release);
+    }
 }
 
 /// Parent/child relationships and exit statuses of every guest process in the shim.
@@ -238,6 +343,19 @@ struct ProcessTableInner<Platform: ShimPlatform> {
     /// Parents currently blocked in `wait4`, as (parent pid, registration token, waker).
     waiters: Vec<(i32, u64, litebox::event::wait::Waker<Platform>)>,
     next_waiter_token: u64,
+    /// Every live guest process, so that a signal can be posted to one of them from another.
+    live: BTreeMap<i32, LiveProcess<Platform>>,
+}
+
+/// The handle needed to post a process-directed signal to another guest process.
+///
+/// Deliberately not a `Task`: the sender runs on a different host thread, and a `Task` is
+/// full of `Cell`s and `RefCell`s that only its own thread may touch. Everything here is
+/// `Sync`.
+struct LiveProcess<Platform: ShimPlatform> {
+    /// The target's process-wide pending queue -- the same one its own threads drain from.
+    /// Survives `execve` (which replaces the handler table, not this).
+    signals: crate::syscalls::signal::RemoteSignalTarget<Platform>,
 }
 
 struct ChildRecord {
@@ -253,6 +371,7 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
                 children: BTreeMap::new(),
                 waiters: Vec::new(),
                 next_waiter_token: 0,
+                live: BTreeMap::new(),
             }),
         }
     }
@@ -269,7 +388,22 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
         assert!(old.is_none(), "pid {child} is already live");
     }
 
-    /// Turns `child` into a zombie carrying `status`, and wakes its parent if one is waiting.
+    /// Registers a live guest process so signals can be posted to it.
+    fn register_process(
+        &self,
+        pid: i32,
+        signals: crate::syscalls::signal::RemoteSignalTarget<Platform>,
+    ) {
+        self.inner.lock().live.insert(pid, LiveProcess { signals });
+    }
+
+    /// Removes a process that has exited from the live set.
+    fn unregister_process(&self, pid: i32) {
+        self.inner.lock().live.remove(&pid);
+    }
+
+    /// Turns `child` into a zombie carrying `status`, wakes its parent if one is waiting, and
+    /// posts `SIGCHLD` to that parent.
     ///
     /// Does nothing for a pid with no recorded parent (the initial process, or a child whose
     /// parent already exited and dropped it).
@@ -286,6 +420,19 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
             .filter(|(waiting, _, _)| *waiting == parent)
             .map(|(_, _, waker)| waker.clone())
             .collect();
+        // Queue the parent's `SIGCHLD` before the wakeups, so that whichever of its threads wakes
+        // first already finds the signal pending.
+        //
+        // Without this, a guest that blocks waiting for `SIGCHLD` -- which is exactly how
+        // busybox's `ash` implements a blocking `wait`, via `sigsuspend` -- never wakes up. The
+        // signal is discarded harmlessly by a parent that has no `SIGCHLD` handler; see
+        // [`Task::has_pending_signals`].
+        if let Some(live) = inner.live.get(&parent) {
+            live.signals.post(
+                litebox_common_linux::signal::Signal::SIGCHLD,
+                crate::syscalls::signal::siginfo_child_exited(child, status),
+            );
+        }
         drop(inner);
         for waker in wakers {
             waker.wake();
@@ -336,7 +483,11 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
         self.inner.lock().children.remove(&child);
     }
 
-    fn register_waiter(&self, parent: i32, waker: litebox::event::wait::Waker<Platform>) -> u64 {
+    pub(crate) fn register_waiter(
+        &self,
+        parent: i32,
+        waker: litebox::event::wait::Waker<Platform>,
+    ) -> u64 {
         let mut inner = self.inner.lock();
         let token = inner.next_waiter_token;
         inner.next_waiter_token += 1;
@@ -344,13 +495,13 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
         token
     }
 
-    fn unregister_waiter(&self, token: u64) {
+    pub(crate) fn unregister_waiter(&self, token: u64) {
         self.inner.lock().waiters.retain(|(_, t, _)| *t != token);
     }
 }
 
 /// The guest stack pointer recorded in a saved register context.
-fn guest_stack_pointer(ctx: &litebox_common_linux::PtRegs) -> usize {
+pub(crate) fn guest_stack_pointer(ctx: &litebox_common_linux::PtRegs) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         ctx.rsp
@@ -783,11 +934,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn prepare_for_exit(&mut self) {
         let is_last_thread = self.thread.detach_from_process();
 
-        // A forked child that never reached `execve` -- because it exited, or because something
-        // killed it -- still owes its parent the address space back. Do this first: the parent is
-        // blocked and cannot make progress until it happens.
-        self.release_vfork_parent();
-
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
@@ -803,6 +949,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list::<Platform>(robust_list);
         }
+
+        // Every write to guest memory above is done, so a task that shares its address space can
+        // now hand it back -- which it must, or the members still alive would wait for it
+        // forever. See [`SharedAddressSpace`].
+        let _ = self.leave_address_space();
 
         // `FilesState` is shared (via `Arc`) across every `CLONE_FILES` thread of the process,
         // and closing an fd is only ever done explicitly (via `do_close`, which routes through
@@ -822,6 +973,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // The process is gone: become a zombie its parent can `wait4`, and let go of any
             // children of our own (nothing can ever reap them now).
             let status = self.thread.process.inner.lock().exit_status;
+            self.global.processes.unregister_process(self.pid);
             self.global.processes.record_exit(self.pid, status);
             self.global.processes.discard_children_of(self.pid);
         }
@@ -928,7 +1080,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // A `fork(2)`: libc issues it as a bare `clone(exit_signal, 0)` with no sharing flags at
         // all. `vfork(2)` and `posix_spawn` add `CLONE_VM | CLONE_VFORK`, which asks for exactly
-        // the semantics this shim implements anyway (see `VforkParent`), so accept those too --
+        // the semantics this shim implements anyway (see `SharedAddressSpace`), so accept those --
         // but only together, and only without `CLONE_THREAD`, which would mean a thread rather
         // than a process.
         let fork_optional_flags = CloneFlags::VM | CloneFlags::VFORK;
@@ -979,11 +1131,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        // `exit_signal` is validated but otherwise ignored: it names the signal to send the
-        // parent when this task dies, and this shim does not deliver signals across processes.
-        // A parent learns of its children through `wait4` instead (see `Task::sys_wait4`).
+        // `exit_signal` names the signal to send the parent when this task dies. Only its range
+        // is checked: this shim always sends `SIGCHLD` (see `ProcessTable::record_exit`), and a
+        // parent that asked for something else would learn of its children through `wait4`
+        // anyway (see `Task::sys_wait4`).
         if exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
+        }
+
+        // A new thread would run on memory this task only holds a *turn* on (see
+        // `SharedAddressSpace`), and it has no turn of its own: it and the token holder would
+        // both write to the same pages, and one of them would later have its writes rolled back
+        // by a restore it knows nothing about. There is no way to support that here, so refuse
+        // rather than corrupt the guest silently.
+        if self.shares_address_space() {
+            log_unsupported!("clone of a new thread from a process that has forked");
+            return Err(Errno::ENOSYS);
         }
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
@@ -1073,7 +1236,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
-                        vfork_parent: RefCell::new(None),
+                        address_space: RefCell::new(None),
+                        guest_sp: Cell::new(0),
                     },
                 }),
             )
@@ -1090,8 +1254,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Creates a new *process* sharing this one's address space, and suspends the caller until
-    /// that child `execve`s or exits -- `vfork(2)` semantics. See [`VforkParent`] for why a
-    /// copying `fork` is not representable here.
+    /// that child hands the address space back -- which it does as soon as it blocks, `execve`s
+    /// or exits, not only at the end of its life. See [`SharedAddressSpace`] for why a copying
+    /// `fork` is not representable here and how the sharing works.
     ///
     /// Unlike `vfork`, and like `fork`, the child gets its own copy of everything that is not
     /// memory: its own pid, its own file-descriptor table (so the shell's `dup2`/`close` dance
@@ -1110,10 +1275,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             log_unsupported!("fork with a stack, set_tid or cgroup");
             return Err(Errno::EINVAL);
         }
+        // The child runs on this process's memory and takes a turn at it (see
+        // `SharedAddressSpace`), which only works if this thread is the only one running on that
+        // memory. A sibling thread has no turn to lose and would keep writing to pages the child
+        // is about to have rolled back under it. Refuse loudly instead of corrupting both.
+        if self.process().nr_threads() > 1 {
+            log_unsupported!("fork from a multithreaded process");
+            return Err(Errno::ENOSYS);
+        }
 
-        // The child runs on this thread's guest stack, below this thread's current `sp`, so the
-        // parent must not touch guest memory again until the child gives the address space back.
-        // Everything else about the child is copied here, in the parent, before it can run.
+        // The child runs on this thread's guest stack, below this thread's current `sp`, and gets
+        // the address-space token, so the parent must not touch guest memory again until it takes
+        // the token back. Everything else about the child is copied here, in the parent, before
+        // it can run.
         let child_pid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let files = self.files.borrow().fork_copy(self)?;
         let fs = alloc::sync::Arc::new((**self.fs.borrow()).clone());
@@ -1129,15 +1303,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .filter(|tls| *tls != 0)
             .map(ThreadLocalDescriptor::from_usize);
 
-        let released = Arc::new(AtomicBool::new(false));
-        let vfork_parent = VforkParent {
-            released: released.clone(),
-            waker: self.wait_cx().waker().clone(),
-        };
+        // This task becomes a member of a shared address space if it was not one already, with
+        // itself as the current holder -- it is, after all, the thread running right now.
+        let shared = self.join_address_space();
 
         let thread = ThreadState::new_process(child_pid);
         thread.init_state.set(ThreadInitState::NewThread {
-            // No stack of its own: that is what makes this a `vfork`.
+            // No stack of its own: it runs on the parent's, below the parent's `sp`.
             stack: None,
             tls,
             set_child_tid: None,
@@ -1155,7 +1327,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             fs: fs.into(),
             files: Arc::new(files).into(),
             signals: self.signals.clone_for_new_process(),
-            vfork_parent: RefCell::new(Some(vfork_parent)),
+            // The child starts out holding the token: it is about to run on this memory, and the
+            // hand-off below transfers it without ever letting the token go free.
+            address_space: RefCell::new(Some(AddressSpaceMembership {
+                shared: shared.clone(),
+                holding: Cell::new(true),
+                parked: RefCell::new(None),
+            })),
+            guest_sp: Cell::new(guest_stack_pointer(ctx)),
         };
         child.process().brk.store(
             self.process().brk.load(Ordering::Relaxed),
@@ -1165,9 +1344,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // which matters if the child `fork`s again before it `exec`s.
         *child.process().owned_ranges.lock() = self.process().owned_ranges.lock().clone();
         self.global.processes.add_child(child_pid, self.pid);
+        // Registered before the child can run, so a child that exits immediately still finds its
+        // parent (this one) in the live set and can post it a `SIGCHLD`.
+        self.register_for_remote_signals();
+        self.global
+            .processes
+            .register_process(child_pid, child.remote_signal_target());
 
-        // Saved last, so that it captures memory exactly as the child will find it.
-        let saved = self.save_address_space(guest_stack_pointer(ctx));
+        // Done last, so that the copy captures memory exactly as the child will find it.
+        self.park_and_hand_off(guest_stack_pointer(ctx), child_pid);
 
         let r = unsafe {
             self.global
@@ -1176,32 +1361,168 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         if let Err(err) = r {
             litebox_util_log::error!(err:% = err; "failed to spawn forked process");
-            // Dropping the child's `Task` on the way out of `spawn_thread` already released this
-            // parent and turned the child into a zombie; since the child never existed as far as
+            // Dropping the child's `Task` on the way out of `spawn_thread` already gave the token
+            // back and turned the child into a zombie; since the child never existed as far as
             // the guest is concerned, drop the record too rather than leave an unwaitable pid.
             self.global.processes.forget(child_pid);
-            self.restore_address_space(saved);
+            self.acquire_address_space();
             return Err(Errno::ENOMEM);
         }
 
-        self.wait_for_vfork_child(&released);
-        self.restore_address_space(saved);
+        // Blocks until some member -- the child, or whoever it in turn handed on to -- gives the
+        // address space back, then puts this task's own memory into it. Unlike a real `vfork`
+        // this does not have to be the end of the child's life: it is enough for the child to
+        // block on something.
+        self.acquire_address_space();
         Ok(usize::try_from(child_pid).unwrap())
+    }
+
+    /// Returns this task's shared address space, creating one (with this task as its first
+    /// member and current holder) if it is not in one yet.
+    fn join_address_space(&self) -> Arc<SharedAddressSpace<Platform>> {
+        let mut slot = self.address_space.borrow_mut();
+        if let Some(membership) = slot.as_ref() {
+            debug_assert!(
+                membership.holding.get(),
+                "forking without holding the address space"
+            );
+            return membership.shared.clone();
+        }
+        let shared = Arc::new(SharedAddressSpace::new(self.tid));
+        *slot = Some(AddressSpaceMembership {
+            shared: shared.clone(),
+            holding: Cell::new(true),
+            parked: RefCell::new(None),
+        });
+        shared
+    }
+
+    /// Copies this task's memory out and passes the address space directly to `tid`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this task is not currently a member holding the token; `fork` is the only
+    /// caller and it has just made sure of both.
+    fn park_and_hand_off(&self, sp: usize, tid: i32) {
+        let slot = self.address_space.borrow();
+        let membership = slot.as_ref().expect("forking outside an address space");
+        assert!(membership.holding.get());
+        let saved = self.save_address_space(sp);
+        *membership.parked.borrow_mut() = Some(saved);
+        membership.holding.set(false);
+        membership.shared.hand_off_to(tid);
+    }
+
+    /// Gives the address space up for as long as this task is blocked, so that another member can
+    /// run on it. Paired with [`Task::acquire_address_space`].
+    ///
+    /// Does nothing if this task is not sharing an address space, or is already parked. If it is
+    /// the *only* remaining member, membership is dropped instead of parked: nobody can take the
+    /// token, so copying memory out and back would be pure cost. (A new member can only appear
+    /// via `fork`, which requires holding the token, so no member can turn up while this runs.)
+    pub(crate) fn release_address_space(&self) {
+        let mut slot = self.address_space.borrow_mut();
+        let Some(membership) = slot.as_ref() else {
+            return;
+        };
+        if !membership.holding.get() {
+            return;
+        }
+        if Arc::strong_count(&membership.shared) == 1 {
+            *slot = None;
+            return;
+        }
+        let saved = self.save_address_space(self.guest_sp.get());
+        *membership.parked.borrow_mut() = Some(saved);
+        membership.holding.set(false);
+        membership.shared.release();
+    }
+
+    /// Takes the address space back and restores this task's memory into it, blocking until the
+    /// current holder gives it up.
+    ///
+    /// Does nothing if this task is not sharing an address space, or already holds it.
+    pub(crate) fn acquire_address_space(&self) {
+        let slot = self.address_space.borrow();
+        let Some(membership) = slot.as_ref() else {
+            return;
+        };
+        if membership.holding.get() {
+            return;
+        }
+        if !membership.shared.acquire(self.tid, || self.is_exiting()) {
+            // Being torn down. Nothing will run guest code on this task's behalf again, so its
+            // copy of the address space is worthless; drop it and let the members that are still
+            // alive have the space.
+            drop(slot);
+            *self.address_space.borrow_mut() = None;
+            return;
+        }
+        membership.holding.set(true);
+        if let Some(saved) = membership.parked.borrow_mut().take() {
+            self.restore_address_space(saved);
+        }
+    }
+
+    /// Leaves the shared address space for good, waking anything waiting for it.
+    ///
+    /// Returns `true` if, afterwards, this task's guest memory is its alone -- either it was
+    /// never shared, or this was the last member -- and so is safe to tear down. Called from
+    /// `execve`, whose new image lives at addresses no other member owns, and from task exit.
+    fn leave_address_space(&self) -> bool {
+        let Some(membership) = self.address_space.borrow_mut().take() else {
+            return true;
+        };
+        if membership.holding.get() {
+            membership.shared.release();
+        }
+        // The only other strong reference is this one, so no other member is left to care about
+        // the memory. A member can only be created by `fork`, which needs the token, and this
+        // task held it until the line above.
+        Arc::strong_count(&membership.shared) == 1
+    }
+
+    /// Whether this task's guest memory is shared with another guest process.
+    fn shares_address_space(&self) -> bool {
+        self.address_space.borrow().is_some()
+    }
+
+    /// Leaves the shared address space if this task is its only remaining member, and reports
+    /// whether this task's guest memory is now unshared.
+    ///
+    /// `execve` uses this to decide whether the old mappings are its to tear down. A sole member
+    /// still holds the token, so no new member can appear while this runs.
+    fn leave_address_space_if_alone(&self) -> bool {
+        let mut slot = self.address_space.borrow_mut();
+        let Some(membership) = slot.as_ref() else {
+            return true;
+        };
+        if Arc::strong_count(&membership.shared) != 1 {
+            return false;
+        }
+        debug_assert!(membership.holding.get());
+        *slot = None;
+        true
+    }
+
+    /// Records the guest stack pointer for the current trip through the shim.
+    pub(crate) fn record_guest_sp(&self, sp: usize) {
+        self.guest_sp.set(sp);
     }
 
     /// Copies this process's private writable memory out into host memory.
     ///
     /// This is what makes a shared-address-space `fork` behave like a real one for a guest that
     /// was built for a real one. The child necessarily runs on the parent's memory (see
-    /// [`VforkParent`]), and `vfork(2)`'s contract -- "the child may only `exec` or `_exit`" --
-    /// is one a `fork(2)`-using program has no reason to honour. busybox's shell, for instance,
-    /// *returns* out of the function that called `fork`, overwriting the frames its parent is
-    /// suspended in, and its `forkchild` frees the parent's job list on the shared heap. But the
-    /// parent cannot run until the child is finished with the address space, so none of that has
-    /// to be visible to it: this saves the memory, and [`Task::restore_address_space`] puts it
-    /// back before the parent executes a single guest instruction. The parent then sees exactly
-    /// what `fork(2)` promises -- its own memory, untouched -- while the child saw a faithful
-    /// copy of it, because it *was* it.
+    /// [`SharedAddressSpace`]), and `vfork(2)`'s contract -- "the child may only `exec` or
+    /// `_exit`" -- is one a `fork(2)`-using program has no reason to honour. busybox's shell, for
+    /// instance, *returns* out of the function that called `fork`, overwriting the frames its
+    /// parent is parked in, and its `forkchild` frees the parent's job list on the shared heap.
+    /// But only the token holder ever runs on that memory, so none of that has to be visible to
+    /// anyone else: this copies the memory out, and [`Task::restore_address_space`] puts it back
+    /// before the task executes another guest instruction. Each member then sees exactly what
+    /// `fork(2)` promises -- its own memory, untouched -- while the child saw a faithful copy of
+    /// the parent's, because it *was* it.
     ///
     /// Two deliberate limits on what is saved:
     ///
@@ -1212,7 +1533,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///   ABI keeps live data below the stack pointer across a call), and it is where the child
     ///   does most of its work -- saving the whole 8 MiB stack mapping would make every `fork`
     ///   pointlessly expensive to preserve nothing.
-    fn save_address_space(&self, sp: usize) -> Vec<(usize, alloc::boxed::Box<[u8]>)> {
+    fn save_address_space(&self, sp: usize) -> MemoryImage {
         let owned = self.process().owned_ranges.lock();
         let mut saved = Vec::new();
         for (range, flags) in self.global.pm.mappings() {
@@ -1232,10 +1553,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 match UserPtr::<u8>::from_usize(start).to_owned_slice::<Platform>(part.end - start)
                 {
                     Some(bytes) => saved.push((start, bytes)),
-                    None => litebox_util_log::warn!(
-                        start:? = start, end:? = part.end;
-                        "could not save a mapping across fork; the child's writes to it will be \
-                         visible to the parent"
+                    // Only reachable if a mapping this process owns is no longer readable, which
+                    // no correct program arranges. Loud, because the consequence is that this
+                    // task's own writes to that range are silently lost the next time another
+                    // member of the address space runs.
+                    None => litebox_util_log::error!(
+                        pid:? = self.pid, start:? = start, end:? = part.end;
+                        "could not copy a mapping out before giving up the address space; this \
+                         process's data in it will be whatever the next process to run leaves \
+                         there"
                     ),
                 }
             }
@@ -1245,53 +1571,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Puts back what [`Task::save_address_space`] took, undoing everything a forked child did to
     /// its parent's memory.
-    fn restore_address_space(&self, saved: Vec<(usize, alloc::boxed::Box<[u8]>)>) {
+    fn restore_address_space(&self, saved: MemoryImage) {
         for (start, bytes) in saved {
             if UserPtrMut::<u8>::from_usize(start)
                 .copy_from_slice::<Platform>(0, &bytes)
                 .is_none()
             {
-                // Only reachable if the child unmapped or write-protected memory belonging to its
-                // parent, which no correct program does; the parent is left with whatever the
-                // child made of it.
+                // Only reachable if another member of the address space unmapped or
+                // write-protected memory belonging to this process, which no correct program
+                // does; this process is left with whatever that member made of it.
                 litebox_util_log::error!(
                     pid:? = self.pid, start:? = start;
-                    "failed to restore a mapping after fork"
+                    "failed to restore a mapping when taking the address space back"
                 );
             }
         }
     }
 
-    /// Blocks until the forked child hands the address space back.
+    /// Publishes this process in the shim's live-process set so other processes can post signals
+    /// to it. Idempotent: re-registering simply replaces the entry with an identical one.
     ///
-    /// This wait is deliberately not interruptible by guest signals: the caller cannot run guest
-    /// code again until the child is done with its stack, so returning early would corrupt it.
-    /// It still ends if this task is being torn down, which is the only way the child can fail to
-    /// arrive (its own teardown releases the parent -- see [`Task::release_vfork_parent`]).
-    fn wait_for_vfork_child(&self, released: &AtomicBool) {
-        while !released.load(Ordering::Acquire) && !self.is_exiting() {
-            // Ignore interruptions: the loop condition, not the wait, decides when this ends.
-            let _ = self
-                .wait_state_uninterruptible()
-                .wait_until(|| released.load(Ordering::Acquire) || self.is_exiting());
-        }
-    }
-
-    /// Hands the parent's address space back, if this task is a forked child that still holds it.
-    ///
-    /// Called from `execve` (once the new image is loaded, so the parent never observes a
-    /// half-built address space) and from task teardown (so a child that exits without ever
-    /// `exec`ing, or that dies, cannot strand its parent).
-    pub(crate) fn release_vfork_parent(&self) {
-        if let Some(parent) = self.vfork_parent.borrow_mut().take() {
-            parent.released.store(true, Ordering::Release);
-            parent.waker.wake();
-        }
-    }
-
-    /// Whether this task is still running in its parent's address space.
-    pub(crate) fn shares_parent_address_space(&self) -> bool {
-        self.vfork_parent.borrow().is_some()
+    /// Done at `fork` rather than at task construction because that is the first moment a process
+    /// can acquire a child, and a process with no children has nothing to receive.
+    fn register_for_remote_signals(&self) {
+        self.global
+            .processes
+            .register_process(self.pid, self.remote_signal_target());
     }
 
     /// Handle syscall `wait4`.
@@ -2440,17 +2745,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.signals.reset_for_exec();
 
-        if self.shares_parent_address_space() {
-            // This task is a `fork`ed child still running in its parent's address space (see
-            // `VforkParent`), so those mappings belong to the suspended parent, not to us:
-            // tearing them down here would destroy the process we are about to hand control back
-            // to. The new image is loaded alongside them instead -- it is position-independent,
-            // and `Vmem::get_unmmaped_area` places it wherever the parent is not.
-        } else {
+        if self.leave_address_space_if_alone() {
             // Don't release reserved mappings.
             let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
             unsafe { self.global.pm.release_memory(release) }
                 .expect("failed to release memory mappings");
+        } else {
+            // Another guest process is still living in this address space (see
+            // `SharedAddressSpace`), so these mappings are not this task's alone to tear down:
+            // doing so would destroy the process this one is about to hand the space back to. The
+            // new image is loaded alongside them instead -- it is position-independent, and
+            // `Vmem::get_unmmaped_area` places it where nobody else is.
         }
 
         // Either the old mappings are gone or (for a `fork`ed child) they were never this
@@ -2466,9 +2771,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .expect("TODO: terminate the process cleanly");
 
         self.init_thread_context(ctx);
-        // The new image is fully built, so the parent can safely run again -- and must, since
-        // this is the point at which we stopped needing its address space.
-        self.release_vfork_parent();
+        // The new image is fully built, at addresses no other member of the old address space
+        // owns, so this task no longer needs the shared one. Handing it back here rather than
+        // earlier means no other member ever observes a half-built image.
+        let _ = self.leave_address_space();
         Ok(0)
     }
 
@@ -3912,5 +4218,141 @@ mod tests {
 
         task.sys_close(read_fd).unwrap();
         task.sys_close(write_fd).unwrap();
+    }
+
+    /// The address-space token is a strict hand-off: only one member holds it at a time, a
+    /// waiter takes it the moment it is released, and `hand_off_to` never lets it go free (which
+    /// is what stops a third member from stealing a freshly `fork`ed child's memory before its
+    /// first instruction).
+    #[test]
+    fn address_space_token_is_held_by_exactly_one_member() {
+        use super::{ADDRESS_SPACE_FREE, Ordering, SharedAddressSpace};
+        use litebox::platform::RawMutex as _;
+
+        let shared: SharedAddressSpace<crate::syscalls::tests::TestPlatform> =
+            SharedAddressSpace::new(1000);
+        let word = || shared.holder.underlying_atomic().load(Ordering::Relaxed);
+        assert_eq!(word(), 1000);
+
+        // Acquiring while another member holds it must not succeed; `abandon` is the only way
+        // out, and it must not have taken the token.
+        assert!(!shared.acquire(1001, || true));
+        assert_eq!(word(), 1000);
+
+        // A direct hand-off never passes through the free state.
+        shared.hand_off_to(1001);
+        assert_eq!(word(), 1001);
+
+        shared.release();
+        assert_eq!(word(), ADDRESS_SPACE_FREE);
+        assert!(shared.acquire(1002, || panic!("should not have had to block")));
+        assert_eq!(word(), 1002);
+    }
+
+    /// A child becoming a zombie posts `SIGCHLD` to its parent.
+    ///
+    /// Without this, busybox `ash`'s blocking `wait` -- which is a `sigsuspend` loop waiting for
+    /// its `SIGCHLD` handler to set a flag -- spins forever.
+    #[test]
+    fn child_exit_posts_sigchld_to_the_parent() {
+        use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let table = &task.global.processes;
+        let child = task.pid + 1;
+        table.register_process(task.pid, task.remote_signal_target());
+        table.add_child(child, task.pid);
+
+        // With the default disposition (ignore), the signal must not make blocking syscalls
+        // return `EINTR`, exactly as on Linux, where an ignored signal is never queued at all.
+        table.record_exit(child, super::ExitStatus::Exit(0));
+        assert!(
+            !task.has_pending_signals(),
+            "an ignored SIGCHLD must not count as deliverable"
+        );
+
+        // With a handler installed it must be deliverable.
+        let act = SigAction {
+            sigaction: 0x1234,
+            flags: SaFlags::empty(),
+            #[cfg(target_pointer_width = "64")]
+            __pad: 0,
+            restorer: 0,
+            mask: SigSet::empty(),
+        };
+        task.sys_rt_sigaction(
+            Signal::SIGCHLD,
+            Some(UserPtr::from_ptr(&raw const act)),
+            None,
+            core::mem::size_of::<SigSet>(),
+        )
+        .expect("rt_sigaction failed");
+        assert!(
+            task.has_pending_signals(),
+            "a handled SIGCHLD must be deliverable"
+        );
+        assert!(task.pending_signal_set().contains(Signal::SIGCHLD));
+    }
+
+    /// `rt_sigsuspend` always fails with `EINTR`, and leaves the caller's original mask to be put
+    /// back by the return-to-guest path rather than restoring it itself -- restoring it early
+    /// would re-block the signal whose handler the caller is waiting to run.
+    #[test]
+    fn rt_sigsuspend_defers_restoring_the_callers_mask() {
+        use litebox_common_linux::{
+            errno::Errno,
+            signal::{SigSet, SigmaskHow, Signal},
+        };
+
+        let _guard = crate::syscalls::tests::async_signal_guard();
+        let task = crate::syscalls::tests::init_platform(None);
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(
+            || {
+                // Block everything, as busybox's `waitproc` does before it suspends.
+                let everything = !SigSet::empty();
+                task.sys_rt_sigprocmask(
+                    SigmaskHow::SIG_SETMASK,
+                    Some(UserPtr::from_ptr(&raw const everything)),
+                    None,
+                    core::mem::size_of::<SigSet>(),
+                )
+                .expect("block everything failed");
+
+                // Suspend under a mask that leaves everything through, and let the alarm end it.
+                let allow_everything = SigSet::empty();
+                assert_eq!(task.sys_alarm(1).unwrap(), 0);
+                assert_eq!(
+                    task.sys_rt_sigsuspend(
+                        Some(UserPtr::from_ptr(&raw const allow_everything)),
+                        core::mem::size_of::<SigSet>()
+                    ),
+                    Err(Errno::EINTR)
+                );
+                task.sys_alarm(0).unwrap();
+
+                // Still under the temporary mask, so the signal that ended the wait is still
+                // deliverable and its handler would run with SIGALRM unblocked.
+                assert!(
+                    task.pending_signal_set().contains(Signal::SIGALRM),
+                    "the suspending mask must still be in effect on return"
+                );
+
+                // The return-to-guest path puts the caller's mask back.
+                task.restore_saved_signal_mask();
+                let mut current = SigSet::empty();
+                task.sys_rt_sigprocmask(
+                    SigmaskHow::SIG_BLOCK,
+                    None,
+                    Some(UserPtrMut::from_ptr(&raw mut current)),
+                    core::mem::size_of::<SigSet>(),
+                )
+                .expect("read mask failed");
+                assert_eq!(
+                    current.as_u64(),
+                    everything.as_u64(),
+                    "the mask in force before rt_sigsuspend must be restored afterwards"
+                );
+            },
+        );
     }
 }
