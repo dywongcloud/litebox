@@ -346,9 +346,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 global: self.0.clone(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
-                pid,
-                ppid,
-                tid: pid,
+                pid: Cell::new(pid),
+                ppid: Cell::new(ppid),
+                tid: Cell::new(pid),
                 credentials: RefCell::new(
                     syscalls::process::Credentials {
                         uid,
@@ -1264,6 +1264,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Ok(0)
                 })
             }
+            SyscallRequest::Wait4 {
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::SetThreadArea { user_desc } => {
@@ -1436,12 +1442,18 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     global: Arc<GlobalState<Platform, FS>>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
-    /// Process ID
-    pid: i32,
-    /// Parent Process ID
-    ppid: i32,
-    /// Thread ID
-    tid: i32,
+    /// Process ID.
+    ///
+    /// A `Cell` because `fork` gives the child a new one: the child *is* this
+    /// same `Task`, resumed in a duplicated address space (see
+    /// `syscalls::process::Task::become_forked_child`), so its identity is
+    /// rewritten in place rather than by constructing a second task.
+    pid: Cell<i32>,
+    /// Parent Process ID. A `Cell` for the same reason as [`Self::pid`].
+    ppid: Cell<i32>,
+    /// Thread ID. A `Cell` for the same reason as [`Self::pid`]: a forked child
+    /// has exactly one thread, so its `tid` becomes its new `pid`.
+    tid: Cell<i32>,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials. `setuid`/`setgid`
     /// replace the `Arc` rather than mutate through it, so a thread that
@@ -1484,9 +1496,9 @@ mod test_utils {
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 thread: syscalls::process::ThreadState::new_process(pid),
-                pid,
-                ppid: 0,
-                tid: pid,
+                pid: Cell::new(pid),
+                ppid: Cell::new(0),
+                tid: Cell::new(pid),
                 credentials: RefCell::new(Arc::new(syscalls::process::Credentials {
                     uid: 0,
                     euid: 0,
@@ -1513,9 +1525,9 @@ mod test_utils {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
                 thread: self.thread.new_thread(tid)?,
-                pid: self.pid,
-                ppid: self.ppid,
-                tid,
+                pid: self.pid.clone(),
+                ppid: self.ppid.clone(),
+                tid: Cell::new(tid),
                 credentials: RefCell::new(self.credentials.borrow().clone()),
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),

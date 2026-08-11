@@ -1547,6 +1547,17 @@ pub(crate) mod tests {
     /// [`run_thread`] is per-thread now, and
     /// [`concurrent_guest_threads_each_keep_their_own_context`] deliberately
     /// runs several guests at once while holding this.
+    ///
+    /// It also serializes the two tests that create *processes*
+    /// (`fork_survives_sibling_threads_hammering_the_allocator`, which forks,
+    /// and `the_runner_profile_denies_host_access_without_breaking_jit_or_hwcap`,
+    /// which re-executes this binary through `posix_spawn`). Those two must not
+    /// overlap: Darwin's own `fork` child-side handlers kill a child outright
+    /// -- SIGKILL, before the child runs a single instruction of its own --
+    /// when another thread was driving the `posix_spawn`/XPC machinery at the
+    /// moment of the fork. That is a documented-by-behaviour libSystem
+    /// constraint, not something LiteBox's own fork gate can mediate, so the
+    /// only correct answer in a shared test process is to keep the two apart.
     pub(crate) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Stands in for the word the rewriter's trampoline header holds and every

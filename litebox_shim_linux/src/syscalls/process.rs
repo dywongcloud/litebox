@@ -75,6 +75,38 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         })
     }
 
+    /// Re-registers this thread under `new_tid` after a `fork`.
+    ///
+    /// A forked child is a copy of its parent, so its single thread arrives
+    /// still registered in the (copied) process under the parent's thread ID.
+    /// Leaving it there is not cosmetic: the ID a thread is *keyed by* is what
+    /// [`Task::kill_other_threads`] compares against to decide which threads are
+    /// somebody else's, so a child whose `tid` and key disagree identifies
+    /// itself as another thread and kills itself the first time it calls
+    /// `execve` -- which is the first thing a forked shell child does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this thread is not currently attached, or if `new_tid` is
+    /// already registered. Neither is reachable from a fork: the child is
+    /// attached (it is a copy of an attached parent) and it is the only thread
+    /// in its new process, so no other key can exist.
+    fn adopt_forked_identity(&self, new_tid: i32) {
+        let old_tid = self
+            .attached_tid
+            .get()
+            .expect("a forking thread is attached to its process");
+        let mut inner = self.process.inner.lock();
+        let remote = inner
+            .threads
+            .remove(&old_tid)
+            .expect("an attached thread is registered under its own ID");
+        let previous = inner.threads.insert(new_tid, remote);
+        assert!(previous.is_none(), "thread ID {new_tid} already exists");
+        drop(inner);
+        self.attached_tid.set(Some(new_tid));
+    }
+
     /// Detaches this thread from its process.
     ///
     /// Returns `true` if this was the last thread of the process to detach (i.e., the whole
@@ -304,7 +336,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return false;
             }
             for (&tid, thread) in &inner.threads {
-                if tid == self.tid {
+                if tid == self.tid.get() {
                     continue;
                 }
                 thread.is_exiting.store(true, Ordering::Relaxed);
@@ -377,7 +409,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // first-publish flag, not a claim that they can change.
         if let Some(proc) = &self.global.proc_handle {
             let credentials = self.credentials.borrow();
-            proc.set_identity(self.pid, self.ppid, credentials.uid, credentials.gid);
+            proc.set_identity(
+                self.pid.get(),
+                self.ppid.get(),
+                credentials.uid,
+                credentials.gid,
+            );
             proc.set_comm(&new_comm);
         }
     }
@@ -654,6 +691,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
+        // A `clone` that shares neither the address space nor the thread group
+        // is a `fork`, not a thread creation, and is served by an entirely
+        // different mechanism -- see `do_fork`. This is the shape `fork(2)` and
+        // `vfork(2)` reach the kernel in on aarch64, where neither has a syscall
+        // of its own: libc issues `clone(exit_signal, 0, ...)`.
+        if !flags.intersects(CloneFlags::VM | CloneFlags::THREAD) {
+            return self.do_fork(flags, exit_signal, clone3);
+        }
+
         let required_clone_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
 
@@ -779,9 +825,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         global: self.global.clone(),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
-                        pid: self.pid,
-                        tid: child_tid,
-                        ppid: self.ppid,
+                        pid: self.pid.clone(),
+                        tid: Cell::new(child_tid),
+                        ppid: self.ppid.clone(),
                         credentials: RefCell::new(self.credentials.borrow().clone()),
                         comm: self.comm.clone(),
                         fs: fs.into(),
@@ -802,15 +848,188 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(usize::try_from(child_tid).unwrap())
     }
 
+    /// `fork(2)`: duplicate this task, address space and all, into a second
+    /// process that resumes at the same point with `0` in place of the return
+    /// value.
+    ///
+    /// This is reached from [`Self::do_clone`] for a `clone` that shares neither
+    /// the address space nor the thread group, which is how `fork` and `vfork`
+    /// arrive on architectures (aarch64 among them) that have no separate
+    /// syscall for either.
+    ///
+    /// # How the duplication happens
+    ///
+    /// Not here. The shim asks the platform, because the shim cannot do it: the
+    /// thing being duplicated is a whole address space, and only whatever is
+    /// hosting that address space can copy it. On a platform that runs the guest
+    /// natively inside a host process, the host's own `fork(2)` *is* the answer,
+    /// and it is an exact one -- every guest mapping comes across
+    /// copy-on-write, with `fork`'s semantics, because they are host mappings.
+    /// Platforms that cannot do this refuse, and the guest sees `ENOSYS`.
+    ///
+    /// The child returns from the platform call inside this very function, in
+    /// its own copy of the address space, with its own copy of every piece of
+    /// shim state -- which is exactly the state a forked child should have. All
+    /// that is left is for it to stop believing it is its parent, which is
+    /// [`Self::become_forked_child`].
+    fn do_fork(&self, flags: CloneFlags, exit_signal: u64, clone3: bool) -> Result<usize, Errno> {
+        use litebox::platform::{ForkOutcome, ProcessOpError};
+
+        // Everything a real `fork(2)` or `vfork(2)` passes is covered by the
+        // empty flag set plus an exit signal. Anything else is a caller asking
+        // for a `clone` variant -- an unshared namespace, `CLONE_PARENT`,
+        // `CLONE_FILES` without `CLONE_VM` -- that this does not implement, and
+        // silently giving them a plain `fork` would be worse than refusing.
+        if !flags.is_empty() {
+            log_unsupported!("fork-shaped clone with unsupported flags: {flags:?}");
+            return Err(Errno::EINVAL);
+        }
+        if exit_signal > 64 {
+            return Err(Errno::EINVAL);
+        }
+        if clone3 {
+            // `clone3` can express a fork, but it also carries `set_tid`,
+            // `cgroup` and a pidfd that a plain host `fork` cannot honor.
+            log_unsupported!("clone3 used to request a fork");
+            return Err(Errno::EINVAL);
+        }
+
+        match self.global.platform.fork_process() {
+            Ok(ForkOutcome::Parent { child_pid }) => {
+                Ok(usize::try_from(child_pid).map_err(|_| Errno::EAGAIN)?)
+            }
+            Ok(ForkOutcome::Child { pid, parent_pid }) => {
+                self.become_forked_child(pid, parent_pid);
+                Ok(0)
+            }
+            Err(ProcessOpError::Unsupported) => Err(Errno::ENOSYS),
+            // Everything else -- the host refusing, a resource limit -- is what
+            // `fork(2)` reports as `EAGAIN`, and callers already retry or fail
+            // cleanly on it.
+            Err(_) => Err(Errno::EAGAIN),
+        }
+    }
+
+    /// Rewrites this task's identity after it has come back from a fork on the
+    /// child side.
+    ///
+    /// Everything else about the task is already right by construction: it is a
+    /// byte-for-byte copy of the parent taken at the moment of the fork, which
+    /// is precisely what `fork(2)` specifies the child's memory, descriptors,
+    /// signal dispositions and working directory to be. Only the identity is
+    /// wrong, because a copy necessarily copies the parent's.
+    ///
+    /// `tid` moves with `pid` because the child has exactly one thread, and
+    /// Linux gives a single-threaded process `tid == pid`. The thread's
+    /// registration inside its [`Process`] moves with it -- see
+    /// [`ThreadState::adopt_forked_identity`] for why leaving the two
+    /// disagreeing is fatal rather than cosmetic.
+    fn become_forked_child(&self, pid: i32, parent_pid: i32) {
+        self.pid.set(pid);
+        self.ppid.set(parent_pid);
+        self.tid.set(pid);
+        self.thread.adopt_forked_identity(pid);
+
+        // `/proc/self/*` is published from the task's identity, so it has to be
+        // republished now rather than continuing to describe the parent.
+        if let Some(proc) = &self.global.proc_handle {
+            let credentials = self.credentials.borrow();
+            proc.set_identity(pid, parent_pid, credentials.uid, credentials.gid);
+        }
+    }
+
+    /// Handle syscall `wait4`.
+    ///
+    /// Children created by [`Self::do_fork`] are the platform's children, so the
+    /// platform is what knows about them; this translates between the guest's
+    /// `wait4` ABI and [`litebox::platform::ThreadProvider::reap_child`].
+    ///
+    /// # Deliberate limits
+    ///
+    /// * `WUNTRACED`/`WCONTINUED` are accepted and then never reported against:
+    ///   nothing in this shim stops or continues a guest process, so there is no
+    ///   state change for them to observe. Accepting them matters because
+    ///   shells pass them unconditionally.
+    /// * A negative `pid` below `-1` selects a *guest* process group, and guest
+    ///   process groups are not host process groups (the shim tracks its own
+    ///   `pgid` and never calls `setpgid` on the host), so it reports `ECHILD`
+    ///   rather than silently waiting on the wrong set.
+    /// * `rusage` is filled with zeroes. The shim collects no per-process
+    ///   accounting, and a zeroed `struct rusage` is the honest report of "no
+    ///   accounting" -- inventing plausible-looking numbers would be worse.
+    pub(crate) fn sys_wait4(
+        &self,
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: litebox_common_linux::WaitOptions,
+        rusage: Option<UserPtrMut<u8>>,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::ProcessOpError;
+        use litebox_common_linux::{WaitOptions, errno::Errno};
+
+        let known = WaitOptions::WNOHANG
+            | WaitOptions::WUNTRACED
+            | WaitOptions::WCONTINUED
+            | WaitOptions::WNOWAIT
+            | WaitOptions::WALL
+            | WaitOptions::WCLONE
+            | WaitOptions::WNOTHREAD;
+        if options.intersects(!known) {
+            return Err(Errno::EINVAL);
+        }
+        if options.contains(WaitOptions::WNOWAIT) {
+            // Leaving the child waitable means not reaping it, which the
+            // platform interface deliberately cannot express.
+            log_unsupported!("wait4 with WNOWAIT");
+            return Err(Errno::EINVAL);
+        }
+        if pid < -1 {
+            return Err(Errno::ECHILD);
+        }
+        // `0` asks for "any child in my process group". Every child this shim
+        // creates is forked from this very process and never moved to another
+        // host process group, so that set and "any child" are the same set here.
+        let target = if pid == 0 { -1 } else { pid };
+
+        let reaped = self
+            .global
+            .platform
+            .reap_child(target, options.contains(WaitOptions::WNOHANG));
+
+        let reaped = match reaped {
+            Ok(reaped) => reaped,
+            // `WNOHANG` with a live but not-yet-exited child: `wait4` reports
+            // this as a successful return of `0`, not as an error.
+            Err(ProcessOpError::WouldBlock) => return Ok(0),
+            Err(ProcessOpError::Interrupted) => return Err(Errno::EINTR),
+            Err(ProcessOpError::Unsupported) => return Err(Errno::ENOSYS),
+            // `NoChildren` and any other refusal both mean "there is no child
+            // for you to reap", which `wait4` reports as `ECHILD`.
+            Err(_) => return Err(Errno::ECHILD),
+        };
+
+        if let Some(wstatus) = wstatus {
+            wstatus
+                .write_at_offset::<Platform>(0, reaped.status)
+                .ok_or(Errno::EFAULT)?;
+        }
+        if let Some(rusage) = rusage {
+            rusage
+                .copy_from_slice::<Platform>(0, &[0u8; litebox_common_linux::RUSAGE_SIZE])
+                .ok_or(Errno::EFAULT)?;
+        }
+        usize::try_from(reaped.pid).map_err(|_| Errno::ECHILD)
+    }
+
     /// Handle syscall `set_tid_address`.
     pub(crate) fn sys_set_tid_address(&self, tidptr: UserPtrMut<i32>) -> i32 {
         self.thread.clear_child_tid.set(Some(tidptr));
-        self.tid
+        self.tid.get()
     }
 
     /// Handle syscall `gettid`.
     pub(crate) fn sys_gettid(&self) -> i32 {
-        self.tid
+        self.tid.get()
     }
 }
 
@@ -937,7 +1156,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_rlim: Option<UserPtr<litebox_common_linux::Rlimit64>>,
         old_rlim: Option<UserPtrMut<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
-        if pid != 0 && pid != self.pid {
+        if pid != 0 && pid != self.pid.get() {
             unimplemented!("prlimit for a specific PID is not supported yet");
         }
         let new_limit = match new_rlim {
@@ -991,7 +1210,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         pid: Option<i32>,
         head_ptr: UserPtrMut<usize>,
     ) -> Result<(), Errno> {
-        if pid.is_some_and(|pid| pid != self.tid) {
+        if pid.is_some_and(|pid| pid != self.tid.get()) {
             unimplemented!("Getting robust list for a specific PID is not supported yet");
         }
         let head = self
@@ -1349,11 +1568,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getpid`.
     pub(crate) fn sys_getpid(&self) -> i32 {
-        self.pid
+        self.pid.get()
     }
 
     pub(crate) fn sys_getppid(&self) -> i32 {
-        self.ppid
+        self.ppid.get()
     }
 
     /// Handle syscall `getuid`.
@@ -1502,7 +1721,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// "the calling thread"; `sched_*` operates at thread (not process) granularity on Linux, so
     /// this compares against `self.tid`, not a process-wide id.
     fn sched_target_is_self(&self, pid: Option<i32>) -> bool {
-        pid.is_none_or(|pid| pid == self.tid)
+        pid.is_none_or(|pid| pid == self.tid.get())
     }
 
     /// Handle syscall `sched_getparam`.
@@ -1993,7 +2212,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
                 if let Some(child_tid_ptr) = set_child_tid {
                     // Set the child TID if requested.
-                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid);
+                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid.get());
                 }
             }
         }
@@ -2633,7 +2852,7 @@ mod tests {
             .expect("block SIGUSR1 failed");
 
             assert_eq!(task.sys_alarm(1).unwrap(), 0);
-            task.sys_tkill(task.tid, Signal::SIGUSR1.as_i32())
+            task.sys_tkill(task.tid.get(), Signal::SIGUSR1.as_i32())
                 .expect("tkill failed");
             assert!(!task.has_pending_signals(), "blocked SIGUSR1 should not be deliverable");
 
@@ -2897,7 +3116,7 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
 
         task.sys_prlimit(
-            task.pid,
+            task.pid.get(),
             litebox_common_linux::RlimitResource::NOFILE,
             None,
             None,
@@ -2912,7 +3131,10 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut head_via_tid: usize = 0;
-        task.sys_get_robust_list(Some(task.tid), UserPtrMut::from_ptr(&raw mut head_via_tid))
+        task.sys_get_robust_list(
+                Some(task.tid.get()),
+                UserPtrMut::from_ptr(&raw mut head_via_tid),
+            )
             .expect("own tid should be treated the same as pid None");
 
         let mut head_via_none: usize = 0;
@@ -3126,6 +3348,141 @@ mod tests {
             result, 0,
             "the reader should observe EOF (a 0-byte read) once the writer's process exits, not \
              hang forever"
+        );
+    }
+
+    /// The exact regression that made the first working `fork` produce a silent,
+    /// output-free child: a forked child adopts a new `tid`, but its thread was
+    /// still *registered* in the (copied) process under the parent's `tid`. That
+    /// disagreement makes `kill_other_threads` -- which `execve` calls before it
+    /// does anything else -- classify the child's own thread as somebody else's,
+    /// mark it exiting and interrupt it, so the child exits cleanly with status
+    /// 0 before its new program ever runs. A shell's `ls /etc` produced no
+    /// output and no error at all.
+    ///
+    /// This pins both halves: the identity actually changes, and the registration
+    /// moves with it, so the child still recognizes itself.
+    #[test]
+    fn a_forked_child_that_adopted_its_identity_does_not_kill_itself_on_execve() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let parent_pid = task.sys_getpid();
+        let old_tid = task.sys_gettid();
+        let child_pid = parent_pid + 4242;
+
+        task.become_forked_child(child_pid, parent_pid);
+
+        assert_eq!(task.sys_getpid(), child_pid);
+        assert_eq!(task.sys_getppid(), parent_pid);
+        assert_eq!(
+            task.sys_gettid(),
+            child_pid,
+            "a single-threaded process has tid == pid"
+        );
+
+        {
+            let inner = task.thread.process.inner.lock();
+            assert!(
+                inner.threads.contains_key(&child_pid),
+                "the thread must be registered under its new ID"
+            );
+            assert!(
+                !inner.threads.contains_key(&old_tid),
+                "the thread must no longer be registered under the parent's ID"
+            );
+        }
+
+        // The actual failure mode. Before the registration moved, this call
+        // marked the calling thread itself as exiting.
+        assert!(
+            task.kill_other_threads(),
+            "a forked child is the only thread in its process, so this must succeed"
+        );
+        assert!(
+            !task.is_exiting(),
+            "kill_other_threads must not have marked the calling thread as exiting -- that is \
+             what silently terminated the child before its execve'd program could run"
+        );
+    }
+
+    /// `fork` is reached through a `clone` that shares neither the address space
+    /// nor the thread group. Anything *else* in the flag word means the caller
+    /// wanted a `clone` variant this does not implement, and quietly giving it a
+    /// plain `fork` would be a wrong answer rather than a refusal.
+    #[test]
+    fn a_fork_shaped_clone_carrying_extra_flags_is_refused() {
+        use litebox_common_linux::{CloneFlags, errno::Errno};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        for flags in [
+            CloneFlags::NEWPID,
+            CloneFlags::NEWUSER,
+            CloneFlags::PARENT,
+            CloneFlags::FILES,
+            CloneFlags::FS,
+            CloneFlags::SIGHAND,
+        ] {
+            assert!(
+                !flags.intersects(CloneFlags::VM | CloneFlags::THREAD),
+                "this case must actually reach the fork path"
+            );
+            assert_eq!(
+                task.do_fork(flags, 17, false),
+                Err(Errno::EINVAL),
+                "a fork carrying {flags:?} must be refused, not silently downgraded"
+            );
+        }
+
+        // An out-of-range exit signal is rejected the same way the thread path
+        // rejects it.
+        assert_eq!(
+            task.do_fork(CloneFlags::empty(), 65, false),
+            Err(Errno::EINVAL)
+        );
+        // `clone3` can express things a plain host `fork` cannot honor.
+        assert_eq!(
+            task.do_fork(CloneFlags::empty(), 17, true),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    /// `wait4`'s argument handling, on the paths that never reach the host at
+    /// all. A shell passes these combinations routinely, so getting them wrong
+    /// shows up as a hang or a bogus reap rather than as an obvious error.
+    #[test]
+    fn wait4_rejects_what_it_cannot_honor_and_reports_no_children_as_echild() {
+        use litebox_common_linux::{WaitOptions, errno::Errno};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // `WNOWAIT` asks for the child to stay waitable, i.e. not be reaped --
+        // which the platform interface deliberately cannot express, so it must
+        // be refused rather than silently reaping.
+        assert_eq!(
+            task.sys_wait4(-1, None, WaitOptions::WNOWAIT, None),
+            Err(Errno::EINVAL)
+        );
+        // An unknown option bit is a caller asking for semantics that were never
+        // implemented.
+        assert_eq!(
+            task.sys_wait4(-1, None, WaitOptions::from_bits_retain(0x40), None),
+            Err(Errno::EINVAL)
+        );
+        // A `pid` below -1 selects a *guest* process group, which is not a host
+        // process group; waiting on the host's group of that number would reap
+        // the wrong set entirely.
+        assert_eq!(
+            task.sys_wait4(-2, None, WaitOptions::empty(), None),
+            Err(Errno::ECHILD)
+        );
+
+        // With no children at all, a non-blocking wait reports `ECHILD` rather
+        // than blocking or claiming a successful reap of nothing. `WNOHANG`
+        // keeps this from ever blocking the test even if the harness process
+        // does have unrelated children.
+        assert_eq!(
+            task.sys_wait4(-1, None, WaitOptions::WNOHANG, None),
+            Err(Errno::ECHILD)
         );
     }
 }

@@ -95,9 +95,24 @@ unsafe extern "C" {
 /// The posture is the same one: deny by default, then re-admit only the host
 /// facilities that the *platform itself* still needs once the guest is running.
 ///
-/// There is exactly **one** exception to `(deny default)`, and it is there
+/// There are exactly **two** exceptions to `(deny default)`, and each is there
 /// because the platform provably stops working without it:
 ///
+/// * `process-fork`. A guest `fork(2)` is served by a real host `fork(2)` (see
+///   `<MacOsUserland as ThreadProvider>::fork_process`), because this platform
+///   runs the guest inside this host process, so only the host kernel can
+///   duplicate the guest's address space with copy-on-write `fork` semantics.
+///   Measured on this host: under a bare `(deny default)` the `fork` returns
+///   `EPERM`, and every guest `fork` -- which is to say every command a guest
+///   shell runs -- fails. This admits *only* duplication: `process-exec` stays
+///   denied, so a forked child is still confined to the same jail with the same
+///   already-open descriptors and still cannot run a single host program, and
+///   `signal` stays denied, so it cannot even signal its own parent. What a
+///   subverted guest gains is the ability to make copies of a process that could
+///   already map, execute and crash arbitrary in-process code; what it does not
+///   gain is any new reach outside this process. `(allow process-fork*)` --
+///   the variant that also covers `posix_spawn`'s fork half -- is deliberately
+///   *not* used; the bare operation is the narrower one.
 /// * `sysctl-read` restricted to the `hw.optional.` prefix.
 ///   [`crate::MacOsUserland::get_hwcap`] reads ~30 `hw.optional.*` sysctls to
 ///   synthesize the guest's `AT_HWCAP`/`AT_HWCAP2`, and it does so from inside
@@ -131,7 +146,10 @@ unsafe extern "C" {
 ///   outbound network access is gone.
 /// * `socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL)`, which is the only way to
 ///   open a *new* `utun` device.
-/// * `posix_spawn`/`fork`+`exec` of any host program.
+/// * `posix_spawn`/`fork`+`exec` of any host program. Note this is the *exec*
+///   half: since `process-fork` is admitted above, a bare `fork` succeeds and it
+///   is the `exec` that is refused, so a child can be made but can never become
+///   a different program.
 /// * `kill` of any *other* process, including a child this very process spawned
 ///   moments earlier and that ordinary Unix permissions would let it signal.
 ///
@@ -159,6 +177,7 @@ unsafe extern "C" {
 /// residual-risk note.
 const RUNNER_PROFILE: &CStr = c"(version 1)
 (deny default)
+(allow process-fork)
 (allow sysctl-read (sysctl-name-prefix \"hw.optional.\"))
 ";
 
@@ -287,6 +306,14 @@ pub fn enable_seatbelt_sandbox() {
 #[cfg(test)]
 #[test]
 fn a_profile_that_does_not_compile_is_reported_and_installs_nothing() {
+    // `sandbox_init` compiles the profile by talking to the system sandbox
+    // machinery, which is the same XPC surface that makes a concurrent `fork`
+    // in another thread of this process fatal to its child. Held for the same
+    // reason, and against the same test, as in the profile test below; see
+    // `TEST_SERIAL`'s docs.
+    let _serial = crate::guest::tests::TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let err = apply_profile(c"(version 1)\n(deny default)\n(litebox-not-an-sbpl-operation)\n")
         .expect_err("a malformed SBPL profile must not install");
     let SeatbeltError::Init(message) = &err;
@@ -344,6 +371,14 @@ const DENIED_SYSCTL: &CStr = c"hw.ncpu";
 #[test]
 fn the_runner_profile_denies_host_access_without_breaking_jit_or_hwcap() {
     if std::env::var_os(SEATBELT_CHILD_VAR).is_none() {
+        // Held for as long as this test drives `posix_spawn`. A `fork` in
+        // another thread of this same process while that machinery is running
+        // gets its child killed by Darwin before the child executes anything;
+        // see `TEST_SERIAL`'s docs. Only the parent branch takes it -- the
+        // re-executed child is a fresh process with its own, uncontended copy.
+        let _serial = crate::guest::tests::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let exe = std::env::current_exe().expect("the test binary has a path");
         let output = std::process::Command::new(&exe)
             .args([
@@ -448,6 +483,63 @@ fn the_runner_profile_denies_host_access_without_breaking_jit_or_hwcap() {
             "{what}: expected EPERM from the sandbox, got {err}"
         );
     }
+
+    // `process-fork` is admitted, so a bare `fork` must still work -- this is
+    // what every guest `fork(2)` is served by, so a regression here silently
+    // breaks every command a guest shell runs. Measured, not assumed: without
+    // the `(allow process-fork)` line this call returns `EPERM`.
+    // SAFETY: the child below reaches only `_exit`, which is async-signal-safe
+    // and needs nothing from a lock a sibling thread might have held.
+    let forked = unsafe { libc::fork() };
+    assert_ne!(
+        forked,
+        -1,
+        "fork must succeed inside the profile: {}",
+        std::io::Error::last_os_error()
+    );
+    if forked == 0 {
+        // SAFETY: `_exit` performs no cleanup and cannot fail.
+        unsafe { libc::_exit(19) };
+    }
+    let mut forked_status: c_int = 0;
+    // SAFETY: `forked_status` is a live, uniquely owned out-parameter.
+    let reaped = unsafe { libc::waitpid(forked, &raw mut forked_status, 0) };
+    assert_eq!(reaped, forked, "the forked child must be reapable");
+    assert_eq!(
+        forked_status, 19 << 8,
+        "the forked child must run and exit normally inside the sandbox"
+    );
+
+    // ...but admitting `process-fork` must not have admitted `exec` with it: a
+    // child that can become an arbitrary host program is exactly what this
+    // profile exists to prevent, and `(allow process-fork)` is only defensible
+    // while that stays true. The `Command::output()` probe above already covers
+    // the `posix_spawn` route; this covers the raw `fork`+`execve` one, which is
+    // the route a subverted guest would actually take.
+    // SAFETY: as above -- the child reaches only `execve` and `_exit`.
+    let exec_child = unsafe { libc::fork() };
+    assert_ne!(exec_child, -1, "fork must succeed inside the profile");
+    if exec_child == 0 {
+        let path = c"/bin/echo";
+        let argv = [path.as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<c_char>()];
+        // SAFETY: `path` is NUL-terminated and both vectors are NULL-terminated
+        // and live for the call.
+        unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+        // Only reachable because `execve` failed, which is the expected outcome.
+        let denied = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        // SAFETY: `_exit` performs no cleanup and cannot fail.
+        unsafe { libc::_exit(if denied { 23 } else { 24 }) };
+    }
+    let mut exec_status: c_int = 0;
+    // SAFETY: `exec_status` is a live, uniquely owned out-parameter.
+    let reaped = unsafe { libc::waitpid(exec_child, &raw mut exec_status, 0) };
+    assert_eq!(reaped, exec_child);
+    assert_eq!(
+        exec_status,
+        23 << 8,
+        "execve of a host program must still be denied with EPERM inside a forked child"
+    );
 
     // Signalling another process is denied, even one this very process spawned
     // and that ordinary Unix permissions would let it signal. This is half of

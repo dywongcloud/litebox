@@ -122,6 +122,107 @@ pub trait ThreadProvider: RawPointerProvider {
         reason = "no-op by default; a real implementation consumes `state`"
     )]
     fn set_fp_state(&self, state: &crate::platform::arch::FpSimdState64) {}
+
+    /// Duplicates the whole task -- address space included -- into a second,
+    /// independently scheduled copy, i.e. `fork(2)`.
+    ///
+    /// This lives on [`ThreadProvider`] rather than in a provider of its own so
+    /// that platforms which cannot offer it need write nothing at all: the
+    /// default refuses, and a shim treats that refusal as "this platform has no
+    /// `fork`". Only a platform that runs the guest *inside a host process
+    /// whose address space is the guest's address space* can implement it, and
+    /// on such a platform the host's own `fork` already provides exactly the
+    /// copy-on-write duplication `fork(2)` is defined to perform.
+    ///
+    /// # Fork safety
+    ///
+    /// The returned child has only the calling thread. Any lock another thread
+    /// held at the moment of the fork is frozen in the child forever, so an
+    /// implementation is responsible for bringing every other thread it owns to
+    /// a point where it holds no lock the child can ever need, and for holding
+    /// them there across the duplication. An implementation that cannot
+    /// guarantee that must refuse rather than usually work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessOpError::Unsupported`] on any platform that cannot
+    /// duplicate a task, and [`ProcessOpError::Failed`] if the host refused.
+    fn fork_process(&self) -> Result<ForkOutcome, ProcessOpError> {
+        Err(ProcessOpError::Unsupported)
+    }
+
+    /// Waits for a child created by [`Self::fork_process`] to change state, and
+    /// reaps it, i.e. `wait4(2)`.
+    ///
+    /// `pid` is `-1` for "any child", or a specific child's id. When `nohang`
+    /// is set this returns [`ProcessOpError::WouldBlock`] instead of blocking if
+    /// no child has exited yet. On success it returns the reaped child's id and
+    /// its wait status in the same encoding Linux's `wait4` writes through its
+    /// `wstatus` pointer.
+    ///
+    /// # Errors
+    ///
+    /// [`ProcessOpError::Unsupported`] if the platform has no notion of child
+    /// tasks, [`ProcessOpError::NoChildren`] if the caller has none matching
+    /// `pid`, [`ProcessOpError::WouldBlock`] per `nohang` above, and
+    /// [`ProcessOpError::Interrupted`] if the wait was interrupted.
+    #[expect(
+        unused_variables,
+        reason = "refusing by default; a real implementation consumes both"
+    )]
+    fn reap_child(&self, pid: i32, nohang: bool) -> Result<ReapedChild, ProcessOpError> {
+        Err(ProcessOpError::Unsupported)
+    }
+}
+
+/// Which side of a [`ThreadProvider::fork_process`] the caller came back on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkOutcome {
+    /// The caller is the original task; the new task's id is `child_pid`.
+    Parent {
+        /// The newly created task's id.
+        child_pid: i32,
+    },
+    /// The caller is the freshly created copy.
+    Child {
+        /// The child's own task id, and therefore also the value the parent saw
+        /// as [`Self::Parent::child_pid`]. The implementation reads it on the
+        /// child side rather than copying it across, so the two agreeing is a
+        /// property of the host's own numbering rather than of this plumbing.
+        pid: i32,
+        /// The task id of the process that forked this one.
+        parent_pid: i32,
+    },
+}
+
+/// A child reaped by [`ThreadProvider::reap_child`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReapedChild {
+    /// The child's task id.
+    pub pid: i32,
+    /// The wait status, in Linux's `wait4` `wstatus` encoding.
+    pub status: i32,
+}
+
+/// Why a task-level operation on [`ThreadProvider`] could not be performed.
+#[non_exhaustive]
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOpError {
+    /// This platform cannot duplicate or reap tasks at all.
+    #[error("the platform does not support task duplication")]
+    Unsupported,
+    /// The caller has no child matching the request.
+    #[error("the caller has no matching child task")]
+    NoChildren,
+    /// A non-blocking wait found no child ready to reap.
+    #[error("no child has exited yet")]
+    WouldBlock,
+    /// The wait was interrupted before any child was reaped.
+    #[error("the wait was interrupted")]
+    Interrupted,
+    /// The host refused the operation.
+    #[error("the host refused the operation")]
+    Failed,
 }
 
 #[non_exhaustive]

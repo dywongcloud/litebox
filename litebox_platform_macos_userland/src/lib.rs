@@ -67,7 +67,7 @@
 // there is deliberately no x86-64 variant.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::io::IsTerminal as _;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -76,7 +76,7 @@ use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
     PermissionUpdateError,
 };
-use litebox::platform::{ImmediatelyWokenUp, UnblockedOrTimedOut};
+use litebox::platform::{ImmediatelyWokenUp, ProcessOpError, UnblockedOrTimedOut};
 use litebox::utils::TruncateExt as _;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -132,6 +132,131 @@ pub struct MacOsUserland {
     /// the backing file. Mirrors `litebox_platform_linux_userland`'s identical
     /// mechanism.
     cow_regions: std::sync::RwLock<alloc::collections::BTreeMap<usize, CowRegionInfo>>,
+    /// Keeps this platform's own background threads out of their critical
+    /// sections while [`Self::fork_process`] duplicates the process. See
+    /// [`ForkGate`].
+    fork_gate: ForkGate,
+    /// How many `litebox-timer` threads [`TimerProvider::create_timer`] has ever
+    /// spawned. [`Self::fork_process`] refuses while this is non-zero, because a
+    /// timer thread is the one background thread here that [`ForkGate`] cannot
+    /// bracket -- see `fork_process`'s docs.
+    timer_threads: AtomicUsize,
+}
+
+/// A fork barrier: it lets one thread reach a point where it knows every *other*
+/// thread this platform owns is outside any critical section, and holds them
+/// there until it says otherwise.
+///
+/// # Why this and not `pthread_atfork`, or an ordinary lock
+///
+/// `fork(2)` gives the child only the calling thread. A lock another thread held
+/// at that instant is frozen held in the child, forever, and the child of a
+/// LiteBox guest is not a child that can just `exec` and be done: it re-enters
+/// the shim, which allocates, takes the page manager's locks, and eventually
+/// runs a whole ELF load for `execve`. So "the child touches nothing before
+/// `exec`" is not available as an argument here; the locks genuinely have to be
+/// free.
+///
+/// Darwin's own `fork` already handles the *system* allocator (libmalloc
+/// registers atfork handlers and the child's zones are reinitialized), which is
+/// why an ordinary `malloc` in the child works even when sibling threads were
+/// hammering it. What Darwin knows nothing about is LiteBox's own locks -- the
+/// `spin::Mutex`es inside [`litebox::platform::StdinPump`] above all, which are
+/// bare atomics with no atfork handling and no owner tracking, so a child that
+/// inherits one held will spin on it until it is killed.
+///
+/// `pthread_atfork` is the textbook answer and is deliberately not used: its
+/// handlers run for *every* fork in the process, they cannot fail, and the
+/// prepare handler would have to acquire the very locks it is protecting --
+/// which turns a background thread that is blocked in `read(2)` while holding
+/// nothing (the common case here) into an unbounded wait anyway. The gate below
+/// instead has the background threads *declare* their critical sections, so the
+/// forking thread waits only for a section that is genuinely in progress, and
+/// never for a thread parked in a blocking syscall.
+///
+/// # Why it is sound rather than usually-sound
+///
+/// It is built only from atomics, so it has no internal lock of its own to
+/// inherit broken, and the "closed" flag and the in-flight count live in *one*
+/// word updated by compare-exchange. That single-word design is load bearing
+/// rather than tidiness: with a separate flag and counter, a background thread
+/// can pass the flag check and then increment the counter after a fork has
+/// already begun. The forking thread is not endangered by that (such a thread
+/// backs out without entering the section), but the *child* inherits a counter
+/// stuck above zero with no thread left alive to decrement it -- so the child's
+/// own next `fork` waits on it forever. A guest shell forks for every command it
+/// runs, so "the second fork in a child hangs" is a live failure, not a
+/// theoretical one. Folding both into one word makes the increment impossible
+/// once the gate is closed, which makes the count the child inherits provably
+/// zero.
+///
+/// The forking thread does not proceed until the in-flight count has actually
+/// reached zero, so "no other thread is inside a critical section" is observed,
+/// not assumed.
+struct ForkGate {
+    /// [`Self::CLOSED`] in the top bit, the number of background threads
+    /// currently inside a critical section in the rest.
+    state: AtomicUsize,
+}
+
+impl ForkGate {
+    /// Set while a fork is pending: background threads must stay out.
+    const CLOSED: usize = 1 << (usize::BITS - 1);
+    /// The in-flight-critical-section count occupies every other bit.
+    const COUNT: usize = !Self::CLOSED;
+
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+        }
+    }
+
+    /// Runs `f` as a critical section that no fork may straddle.
+    ///
+    /// Callers must not block indefinitely inside `f`: a fork waits for it.
+    fn critical_section<R>(&self, f: impl FnOnce() -> R) -> R {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & Self::CLOSED != 0 {
+                std::thread::yield_now();
+                continue;
+            }
+            // Entering is one atomic step with the check, so a gate that closes
+            // concurrently always wins: this either takes effect before the
+            // close (and the closer waits for it) or fails and retries.
+            if self
+                .state
+                .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let r = f();
+        self.state.fetch_sub(1, Ordering::AcqRel);
+        r
+    }
+
+    /// Closes the gate and waits until every background thread is out of its
+    /// critical section. The caller must pair this with [`Self::finish_fork`].
+    fn begin_fork(&self) {
+        self.state.fetch_or(Self::CLOSED, Ordering::AcqRel);
+        while self.state.load(Ordering::Acquire) & Self::COUNT != 0 {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Reopens the gate.
+    ///
+    /// Correct on both sides of a fork, with no need to know which side it is
+    /// on: the parent lets its own background threads back in, and the child --
+    /// which has none, and which provably inherited a zero count because
+    /// [`Self::begin_fork`] waited for exactly that and nothing could raise it
+    /// afterwards -- is left with a fully open, uncontended gate, the same state
+    /// a fresh process would have.
+    fn finish_fork(&self) {
+        self.state.fetch_and(!Self::CLOSED, Ordering::AcqRel);
+    }
 }
 
 /// Information about a CoW-eligible memory region backed by a host file.
@@ -185,6 +310,8 @@ impl MacOsUserland {
             stderr_lock: std::sync::Mutex::new(()),
             tun,
             cow_regions: std::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            fork_gate: ForkGate::new(),
+            timer_threads: AtomicUsize::new(0),
         };
 
         // A platform must outlive every guest thread that can reach it, and
@@ -1370,14 +1497,26 @@ fn spawn_stdin_pump_thread(platform: &'static MacOsUserland) {
                     }
                     // EOF (n == 0) or a real error: either way, real stdin will never produce
                     // more data, so mark EOF and stop pumping.
-                    platform.stdin_pump.mark_eof();
-                    platform.notify_stdin_doorbell();
+                    //
+                    // Every touch of `stdin_pump` and of the doorbell runs inside the fork
+                    // gate: those take a `spin::Mutex` and a `std::sync::Mutex` respectively,
+                    // and a fork that straddled either would hand the child a lock nobody
+                    // will ever release. The blocking `read` above is deliberately *outside*
+                    // the gate -- it holds nothing, and gating it would stall every fork
+                    // until the next byte of stdin arrived.
+                    platform.fork_gate.critical_section(|| {
+                        platform.stdin_pump.mark_eof();
+                        platform.notify_stdin_doorbell();
+                    });
                     break;
                 }
                 let mut data = &buf[..n.unsigned_abs()];
                 while !data.is_empty() {
-                    let pushed = platform.stdin_pump.push(data);
-                    platform.notify_stdin_doorbell();
+                    let pushed = platform.fork_gate.critical_section(|| {
+                        let pushed = platform.stdin_pump.push(data);
+                        platform.notify_stdin_doorbell();
+                        pushed
+                    });
                     if pushed == 0 {
                         // Ring buffer is full because the guest hasn't drained it yet; back off
                         // briefly rather than busy-spinning until it does.
@@ -2012,6 +2151,14 @@ impl litebox::platform::TimerProvider for MacOsUserland {
             .name("litebox-timer".into())
             .spawn(move || timer_thread(&thread_state))
             .map_err(|_| litebox::platform::TimerCreationError::Unsupported)?;
+        // A timer thread is the one background thread here that `ForkGate`
+        // cannot bracket, so its mere existence disables `fork_process`. Counted
+        // before returning the handle, so no window exists in which the thread
+        // is running but a fork still believes it is not. Never decremented:
+        // `delete_timer` retires the thread asynchronously, and a count that
+        // could go stale in the permissive direction would be worse than one
+        // that is merely conservative.
+        self.timer_threads.fetch_add(1, Ordering::AcqRel);
         Ok(TimerHandle { state })
     }
 }
@@ -2264,6 +2411,372 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
 
     fn set_fp_state(&self, state: &litebox::platform::FpSimdState64) {
         guest::set_guest_fp_state(state);
+    }
+
+    /// `fork(2)`, straight through to the host kernel.
+    ///
+    /// This platform runs the guest's instructions natively inside this host
+    /// process, so the guest's address space *is* part of this process's address
+    /// space. A host `fork` therefore duplicates every guest mapping
+    /// copy-on-write, with exactly the semantics `fork(2)` is specified to have,
+    /// and the child resumes inside the shim at the same point the parent did --
+    /// which is precisely what the guest's `fork` needs.
+    ///
+    /// # What makes this safe on a multithreaded host
+    ///
+    /// Three separate things, in order of how much of the risk they carry:
+    ///
+    /// 1. **The system allocator.** Darwin's `fork` runs libmalloc's own atfork
+    ///    handlers, so the child's malloc zones are reinitialized rather than
+    ///    inherited mid-mutation. This is not taken on trust: it is what makes
+    ///    `fork_survives_sibling_threads_hammering_the_allocator` below pass
+    ///    while several threads allocate as fast as they can.
+    /// 2. **This platform's own background threads.** [`ForkGate`] holds them
+    ///    outside their critical sections across the duplication, so no
+    ///    `StdinPump` spin lock and no doorbell mutex can come across held. See
+    ///    that type's docs for why a gate rather than `pthread_atfork`.
+    /// 3. **The threads it cannot gate.** A `litebox-timer` thread parks in
+    ///    `Condvar::wait` holding a `std::sync::Mutex`, and there is no point in
+    ///    its loop where it is both idle and lock-free for a gate to catch. So
+    ///    rather than claim a guarantee that is not there, this refuses to fork
+    ///    at all once any timer thread exists. A guest that has armed a timer
+    ///    gets `EAGAIN` from `fork`, which is a real, expected `fork` error that
+    ///    callers already handle -- not a corrupt child.
+    ///
+    /// The guest thread doing the forking is, by construction, not inside any
+    /// shim lock: it is between two guest instructions, in a syscall handler
+    /// this call is the top of.
+    ///
+    /// # The one hazard this cannot mediate, stated plainly
+    ///
+    /// Darwin runs its *own* child-side handlers inside `fork`, and some of
+    /// them refuse rather than repair: measured in this crate's own test binary,
+    /// a `fork` issued while another thread of the same process was driving the
+    /// `posix_spawn`/XPC machinery produced a child that was `SIGKILL`ed before
+    /// it executed a single instruction of its own. No user-space gate can fix
+    /// that, because the kill happens inside `fork` itself.
+    ///
+    /// It is nevertheless unreachable in a runner, and by construction rather
+    /// than by luck: a runner process installs the Seatbelt profile before the
+    /// guest starts, which denies `process-exec` outright, so nothing in this
+    /// process can spawn anything for the rest of its life. The only threads a
+    /// runner has besides the guest are the stdin pump -- which does nothing but
+    /// `read(2)` and the gated push above -- and timer threads, which disable
+    /// forking entirely. The test binary is the one context where a sibling
+    /// thread can be spawning processes, and there the two tests are held apart
+    /// explicitly (see `guest::tests::TEST_SERIAL`).
+    ///
+    /// # Errors
+    ///
+    /// [`ProcessOpError::Unsupported`] when a timer thread exists (see 3 above),
+    /// and [`ProcessOpError::Failed`] if the host `fork` itself fails -- notably
+    /// `EPERM` if the Seatbelt profile in force does not admit `process-fork`.
+    fn fork_process(&self) -> Result<litebox::platform::ForkOutcome, ProcessOpError> {
+        use litebox::platform::ForkOutcome;
+
+        if self.timer_threads.load(Ordering::Acquire) != 0 {
+            return Err(ProcessOpError::Unsupported);
+        }
+
+        // Sampled before the fork: after it, the child's own `getppid` is the
+        // only other way to learn this, and reading it here costs nothing and
+        // cannot race (this process cannot be reparented mid-call).
+        // SAFETY: `getpid` has no preconditions and cannot fail.
+        let parent_pid = unsafe { libc::getpid() };
+
+        self.fork_gate.begin_fork();
+        // SAFETY: `fork` itself has no preconditions. What makes the *child*
+        // usable is established above and documented on this function: the gate
+        // is closed and drained, so no thread of this process is inside a
+        // critical section, and Darwin reinitializes the child's allocator.
+        let rc = unsafe { libc::fork() };
+        // Runs on both sides. In the child this reopens a gate whose `active`
+        // count the parent already drained to zero, so it starts life open and
+        // uncontended -- see `ForkGate::finish_fork`.
+        self.fork_gate.finish_fork();
+
+        match rc {
+            0 => Ok(ForkOutcome::Child {
+                // SAFETY: `getpid` has no preconditions and cannot fail.
+                pid: unsafe { libc::getpid() },
+                parent_pid,
+            }),
+            -1 => Err(ProcessOpError::Failed),
+            child_pid => Ok(ForkOutcome::Parent { child_pid }),
+        }
+    }
+
+    /// `wait4(2)`, straight through to the host kernel.
+    ///
+    /// Children created by [`Self::fork_process`] are real host processes, so
+    /// the host's own child bookkeeping is the only bookkeeping needed: it
+    /// already knows which tasks are this one's children, already blocks until
+    /// one exits, and already reports the status.
+    ///
+    /// Darwin and Linux encode `wstatus` identically for exit and signal
+    /// deaths -- `(code << 8)` for an exit, the signal number in the low seven
+    /// bits for a signal death -- so the exit case passes straight through. The
+    /// *signal numbers* are not identical, so a signal death is translated with
+    /// [`darwin_signal_to_linux`] rather than reported as the wrong signal.
+    fn reap_child(&self, pid: i32, nohang: bool) -> Result<litebox::platform::ReapedChild, ProcessOpError> {
+        let mut status: libc::c_int = 0;
+        let options = if nohang { libc::WNOHANG } else { 0 };
+        loop {
+            // SAFETY: `status` is a live, uniquely owned out-parameter.
+            let rc = unsafe { libc::waitpid(pid, &raw mut status, options) };
+            if rc > 0 {
+                return Ok(litebox::platform::ReapedChild {
+                    pid: rc,
+                    status: linux_wait_status(status),
+                });
+            }
+            if rc == 0 {
+                // Only reachable with `WNOHANG`: a child exists but has not
+                // exited.
+                return Err(ProcessOpError::WouldBlock);
+            }
+            return Err(match std::io::Error::last_os_error().raw_os_error() {
+                // A host signal (this platform's own `SIGUSR2` guest-interrupt,
+                // for instance) landed mid-wait. Nothing was reaped and nothing
+                // was lost, so just wait again rather than surfacing an `EINTR`
+                // the guest never asked about.
+                Some(libc::EINTR) => continue,
+                Some(libc::ECHILD) => ProcessOpError::NoChildren,
+                _ => ProcessOpError::Failed,
+            });
+        }
+    }
+}
+
+/// The central claim behind `fork_process` -- that a child forked out of this
+/// multithreaded host process is actually usable -- rests on Darwin
+/// reinitializing the child's allocator rather than handing it whatever state
+/// libmalloc's locks happened to be in. That is a property of the host, not of
+/// this crate, so it is measured here rather than asserted in a comment: sibling
+/// threads allocate as fast as they can for the whole run, and every child has
+/// to allocate, take a `MAP_JIT` mapping (the one mapping kind the whole
+/// platform depends on) and write to its heap before exiting cleanly.
+///
+/// A child that inherited a frozen allocator lock does not fail this test with a
+/// wrong answer; it hangs. That is deliberate: `waitpid` below would never
+/// return and the harness's own timeout is what would report it, which is a far
+/// louder failure than a silently-skipped assertion.
+#[cfg(test)]
+#[test]
+fn fork_survives_sibling_threads_hammering_the_allocator() {
+    use core::sync::atomic::AtomicBool;
+
+    const HAMMER_THREADS: usize = 4;
+    const ROUNDS: usize = 60;
+
+    // Keeps this apart from the one other test in this binary that creates
+    // processes; see `TEST_SERIAL`'s docs for why overlapping them makes Darwin
+    // kill this test's children before they run.
+    let _serial = guest::tests::TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let hammers: alloc::vec::Vec<_> = (0..HAMMER_THREADS)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut sink: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+                while !stop.load(Ordering::Acquire) {
+                    sink.push(alloc::vec![0xa5u8; 4096]);
+                    if sink.len() > 32 {
+                        sink.clear();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let gate = ForkGate::new();
+    let mut healthy = 0;
+    for _ in 0..ROUNDS {
+        gate.begin_fork();
+        // SAFETY: `fork` has no preconditions; the child below only performs
+        // operations this test is measuring the safety of.
+        let pid = unsafe { libc::fork() };
+        gate.finish_fork();
+        assert_ne!(pid, -1, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // A heap allocation, a real `MAP_JIT` mapping, and a write through
+            // both. Any of these would hang or fail on a broken child.
+            let mut owned = alloc::vec![0u8; 1 << 16];
+            owned[0xfff] = 0x5a;
+            // SAFETY: a fresh anonymous `MAP_JIT` mapping request with no fixed
+            // address.
+            let jit = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    litebox::mm::linux::PAGE_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | MAP_JIT,
+                    -1,
+                    0,
+                )
+            };
+            let code = i32::from(jit == libc::MAP_FAILED || owned[0xfff] != 0x5a);
+            // `_exit`, not `std::process::exit`: the latter runs atexit handlers
+            // registered by the parent's test harness, which is exactly the
+            // class of inherited state a forked child must not touch.
+            // SAFETY: `_exit` performs no cleanup and cannot fail.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a live, uniquely owned out-parameter.
+        let reaped = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        assert_eq!(
+            reaped,
+            pid,
+            "waitpid({pid}) did not reap the child it was asked for: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            status,
+            0,
+            "a child forked from this multithreaded process did not exit cleanly \
+             (raw wait status {status:#x}: exit code {}, killing signal {})",
+            (status >> 8) & 0xff,
+            status & 0x7f
+        );
+        healthy += 1;
+    }
+
+    stop.store(true, Ordering::Release);
+    for h in hammers {
+        h.join().expect("a hammer thread panicked");
+    }
+    assert_eq!(healthy, ROUNDS);
+}
+
+/// [`ForkGate`] only earns its place if a fork genuinely cannot straddle a
+/// declared critical section. This drives a background thread through the gate
+/// continuously and checks the two properties the child's correctness rests on:
+/// `begin_fork` never returns while a section is in progress, and `active` is
+/// zero at that moment -- which is the exact state the child inherits.
+#[cfg(test)]
+#[test]
+fn the_fork_gate_never_lets_a_fork_straddle_a_critical_section() {
+    use core::sync::atomic::AtomicBool;
+
+    let gate = Arc::new(ForkGate::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    // Set for as long as the background thread is inside its critical section.
+    let inside = Arc::new(AtomicBool::new(false));
+
+    let worker = {
+        let (gate, stop, inside) = (Arc::clone(&gate), Arc::clone(&stop), Arc::clone(&inside));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                gate.critical_section(|| {
+                    inside.store(true, Ordering::Release);
+                    // Long enough that a `begin_fork` which ignored the gate
+                    // would land inside this window rather than missing it by
+                    // luck.
+                    for _ in 0..200 {
+                        core::hint::spin_loop();
+                    }
+                    inside.store(false, Ordering::Release);
+                });
+            }
+        })
+    };
+
+    for _ in 0..2000 {
+        gate.begin_fork();
+        assert!(
+            !inside.load(Ordering::Acquire),
+            "begin_fork returned while a critical section was in progress"
+        );
+        // The state a forked child would inherit at exactly this point. It has
+        // to be a zero count, because the child has no thread left that could
+        // ever decrement it, and its own next `fork` waits for it to reach zero.
+        // A separate flag-and-counter gate fails right here.
+        assert_eq!(
+            gate.state.load(Ordering::Acquire) & ForkGate::COUNT,
+            0,
+            "a child forked now would inherit a non-zero in-flight count and hang on its own \
+             next fork"
+        );
+        gate.finish_fork();
+    }
+
+    stop.store(true, Ordering::Release);
+    worker.join().expect("the gated worker panicked");
+}
+
+/// The wait-status translation has to keep Linux's encoding exactly: a normal
+/// exit must survive untouched (the two kernels already agree there), and a
+/// signal death must report the *Linux* signal number, not Darwin's.
+#[cfg(test)]
+#[test]
+fn wait_statuses_are_translated_into_linuxs_encoding() {
+    // Exit statuses are identical on both kernels, so they must pass through
+    // bit for bit -- including a zero exit, and including the high bits.
+    assert_eq!(linux_wait_status(0), 0);
+    assert_eq!(linux_wait_status(42 << 8), 42 << 8);
+    assert_eq!(linux_wait_status(255 << 8), 255 << 8);
+
+    // A signal both kernels number the same way is unchanged...
+    assert_eq!(linux_wait_status(libc::SIGSEGV), 11);
+    assert_eq!(linux_wait_status(libc::SIGKILL), 9);
+    // ...including its core-dump bit.
+    assert_eq!(linux_wait_status(libc::SIGSEGV | 0x80), 0xb | 0x80);
+
+    // A signal they number differently is translated. Darwin's SIGBUS is 10,
+    // Linux's is 7; reporting 10 unchanged would name Linux's SIGUSR1.
+    assert_eq!(libc::SIGBUS, 10, "this test is pinned to Darwin's numbering");
+    assert_eq!(linux_wait_status(libc::SIGBUS), 7);
+    assert_eq!(libc::SIGCHLD, 20, "this test is pinned to Darwin's numbering");
+    assert_eq!(linux_wait_status(libc::SIGCHLD), 17);
+
+    // "Stopped" is not a killing signal and must not be run through the signal
+    // translation at all.
+    let stopped = (libc::SIGTSTP << 8) | 0x7f;
+    assert_eq!(linux_wait_status(stopped), stopped);
+}
+
+/// Rewrites a Darwin `wait` status into the encoding Linux's `wait4` writes.
+///
+/// The layout is already shared -- both put an exit code in bits 8..16 with the
+/// low seven bits clear, and a killing signal in the low seven bits with bit 7
+/// as the core-dump flag -- so only the signal *number* needs translating, and
+/// only when the child actually died from one.
+fn linux_wait_status(status: libc::c_int) -> i32 {
+    let termsig = status & 0x7f;
+    // 0 is a normal exit and 0x7f is "stopped"; neither carries a killing
+    // signal in these bits.
+    if termsig == 0 || termsig == 0x7f {
+        return status;
+    }
+    let core_dumped = status & 0x80;
+    (status & !0xff) | core_dumped | darwin_signal_to_linux(termsig)
+}
+
+/// Maps a Darwin signal number onto the Linux one with the same meaning.
+///
+/// Most of the numbers agree (`SIGSEGV` is 11 on both, `SIGKILL` 9, `SIGTERM`
+/// 15, `SIGPIPE` 13, `SIGINT` 2, `SIGABRT` 6), which is why only the handful
+/// that genuinely differ are listed. Anything unrecognized is passed through
+/// unchanged: reporting the raw number is strictly better than inventing a
+/// different signal for it.
+fn darwin_signal_to_linux(darwin: libc::c_int) -> i32 {
+    match darwin {
+        libc::SIGBUS => 7,     // Linux SIGBUS
+        libc::SIGUSR1 => 10,   // Linux SIGUSR1
+        libc::SIGUSR2 => 12,   // Linux SIGUSR2
+        libc::SIGCHLD => 17,   // Linux SIGCHLD
+        libc::SIGCONT => 18,   // Linux SIGCONT
+        libc::SIGSTOP => 19,   // Linux SIGSTOP
+        libc::SIGTSTP => 20,   // Linux SIGTSTP
+        libc::SIGURG => 23,    // Linux SIGURG
+        libc::SIGIO => 29,     // Linux SIGIO
+        libc::SIGSYS => 31,    // Linux SIGSYS
+        other => other,
     }
 }
 

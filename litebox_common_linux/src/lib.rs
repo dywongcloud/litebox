@@ -1419,6 +1419,38 @@ bitflags::bitflags! {
     }
 }
 
+/// Size in bytes of Linux's `struct rusage` on a 64-bit target: two `timeval`s
+/// (16 bytes each) followed by 14 `long`s.
+///
+/// Only the size matters to this crate's callers -- the shim collects none of
+/// the accounting the struct reports, so it writes the whole thing as zeroes
+/// rather than modelling fields it would have to invent.
+pub const RUSAGE_SIZE: usize = 2 * 16 + 14 * 8;
+
+bitflags::bitflags! {
+    /// The `options` argument of `wait4(2)`/`waitid(2)`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WaitOptions: core::ffi::c_int {
+        /// Return immediately if no child has exited.
+        const WNOHANG = 0x00000001;
+        /// Also report children that have stopped.
+        const WUNTRACED = 0x00000002;
+        /// Also report children that have continued.
+        const WCONTINUED = 0x00000008;
+        /// Leave the child in a waitable state.
+        const WNOWAIT = 0x01000000;
+        /// Wait for "clone" children only (children that deliver a non-`SIGCHLD`
+        /// exit signal).
+        const WCLONE = 0x80000000_u32.cast_signed();
+        /// Wait for every child, whatever its exit signal.
+        const WALL = 0x40000000;
+        /// Wait for "non-clone" children only.
+        const WNOTHREAD = 0x20000000;
+
+        const _ = !0; // Externally defined flags
+    }
+}
+
 /// Arguments for the `clone3` syscall.
 #[repr(C, align(8))]
 #[derive(Clone, Debug, FromBytes, IntoBytes)]
@@ -2650,6 +2682,19 @@ pub enum SyscallRequest {
     Clone3 {
         args: UserPtr<CloneArgs>,
     },
+    /// Wait for a child process to change state, and reap it.
+    Wait4 {
+        /// `< -1`: any child in process group `-pid`. `-1`: any child. `0`: any
+        /// child in the caller's process group. `> 0`: that specific child.
+        pid: i32,
+        /// Where to store the child's wait status, if the caller wants it.
+        wstatus: Option<UserPtrMut<i32>>,
+        options: WaitOptions,
+        /// Where to store the child's resource usage, if the caller wants it.
+        /// Typed as bytes because the shim reports a zeroed `struct rusage`
+        /// rather than synthesizing accounting it does not collect.
+        rusage: Option<UserPtrMut<u8>>,
+    },
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on x86_64.
     SetThreadArea {
@@ -3305,6 +3350,19 @@ impl SyscallRequest {
                     cgroup: 0,
                 };
                 SyscallRequest::Clone { args }
+            }
+            Sysno::wait4 => {
+                let wstatus: usize = ctx.sys_req_arg(1);
+                let rusage: usize = ctx.sys_req_arg(3);
+                SyscallRequest::Wait4 {
+                    pid: ctx.sys_req_arg(0),
+                    // A NULL `wstatus`/`rusage` means "do not report it", which
+                    // is distinct from a pointer the caller expects written, so
+                    // it is modelled as absence rather than as address zero.
+                    wstatus: (wstatus != 0).then(|| ctx.sys_req_ptr(1)),
+                    options: WaitOptions::from_bits_retain(ctx.sys_req_arg(2)),
+                    rusage: (rusage != 0).then(|| ctx.sys_req_ptr(3)),
+                }
             }
             Sysno::clone3 => {
                 debug_assert_eq!(
