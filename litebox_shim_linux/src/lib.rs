@@ -1342,6 +1342,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Getpgid { pid } => self
+                .sys_getpgid(pid)
+                .map(|pgid| pgid.reinterpret_as_unsigned() as usize),
+            SyscallRequest::Setpgid { pid, pgid } => syscall!(sys_setpgid(pid, pgid)),
             SyscallRequest::Wait4 {
                 pid,
                 wstatus,
@@ -1450,16 +1454,19 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `None` when the shim was built with a filesystem that doesn't mount one.
     /// `Task::set_task_comm` publishes the guest task's identity here as it becomes known.
     proc_handle: Option<litebox::fs::proc::Proc<Platform>>,
-    /// The foreground process-group ID of the controlling terminal, as set by `TIOCSPGRP` /
-    /// read by `TIOCGPGRP`.
+    /// The process group ID both of the controlling terminal's foreground group (as set by
+    /// `TIOCSPGRP` / read by `TIOCGPGRP`) and of every guest process (as set by `setpgid` / read
+    /// by `getpgid` -- see `syscalls::process::Task::sys_setpgid`/`sys_getpgid`). All four
+    /// syscalls share this one field.
     ///
-    /// This is a single shim-wide value rather than a per-process one: `fork` (see
+    /// This is a single shim-wide value rather than a per-process-group one: `fork` (see
     /// `syscalls::process::Task::do_fork`) does now produce tasks with distinct pids, but they
-    /// all inherit the one process group, and nothing here implements `setpgid`, so there is only
-    /// ever one group to be in the foreground. [`LinuxShim::load_program`] initializes this to
-    /// the initial task's `pid`, matching real Linux's convention that a freshly started process
-    /// (as opposed to one that inherited an existing group via `fork`) becomes its own
-    /// process-group leader.
+    /// all inherit the one process group, so `setpgid` can only ever move a task into *the*
+    /// group, never a second, distinct one -- matching `WaitFilter::Any`'s existing "this shim
+    /// has a single process group" simplification for `wait4`. [`LinuxShim::load_program`]
+    /// initializes this to the initial task's `pid`, matching real Linux's convention that a
+    /// freshly started process (as opposed to one that inherited an existing group via `fork`)
+    /// becomes its own process-group leader.
     pgid: core::sync::atomic::AtomicI32,
     /// Real termios state for the process's controlling terminal (shared by stdin/stdout/stderr,
     /// like a real Linux `tty_struct`), as read by `TCGETS` and written by `TCSETS`.

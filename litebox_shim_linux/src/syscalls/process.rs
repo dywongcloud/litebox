@@ -883,16 +883,64 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 const ROBUST_LIST_LIMIT: isize = 2048;
 
-/*
- * Process a futex-list entry, check whether it's owned by the
- * dying task, and do notification if so:
- */
-fn handle_futex_death(futex_addr: UserPtr<u32>, _pi: bool, _pending_op: bool) -> Result<(), Errno> {
-    if !futex_addr.as_usize().is_multiple_of(4) {
-        return Err(Errno::EINVAL);
-    }
+/// Bit set in a robust futex word's low bits by the kernel (here, the shim) when the thread
+/// that held the lock dies without releasing it, so the next owner can detect the previous
+/// holder died mid-critical-section. Matches Linux's `FUTEX_OWNER_DIED`.
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+/// Bit set in a robust futex word's low bits when at least one thread is (or might be) sleeping
+/// in `FUTEX_WAIT` on it, so the unlocker knows to `FUTEX_WAKE`. Matches Linux's `FUTEX_WAITERS`.
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+/// Mask isolating the TID stored in a robust futex word's low bits. Matches Linux's
+/// `FUTEX_TID_MASK`.
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
-    todo!("handle_futex_death is not implemented yet");
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Processes a single robust-futex-list entry belonging to a dying thread: if the futex word
+    /// still records this thread as the owner, marks it dead (setting [`FUTEX_OWNER_DIED`] and
+    /// clearing the TID) and, if a waiter may be present, wakes one -- mirroring Linux's
+    /// `handle_futex_death` (`kernel/futex/core.c`). Without this, a thread that dies while
+    /// still holding a robust `pthread_mutex_t` would leave every future waiter on that lock
+    /// blocked forever, since its owner can never call `FUTEX_WAKE` again.
+    fn handle_futex_death(&self, futex_addr: UserPtr<u32>, _pending_op: bool) -> Result<(), Errno> {
+        if !futex_addr.as_usize().is_multiple_of(4) {
+            return Err(Errno::EINVAL);
+        }
+        let futex_addr = UserPtrMut::from_usize(futex_addr.as_usize());
+
+        let Some(word) = futex_addr.read_at_offset::<Platform>(0) else {
+            return Err(Errno::EFAULT);
+        };
+
+        // Only touch the word if it's still (nominally) owned by this dying thread -- a lock
+        // that was already unlocked and re-acquired by someone else, or never actually locked by
+        // us despite being linked into our robust list, must be left alone.
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "tid is always non-negative; only ever compared against another tid read \
+                      back from a futex word, never used arithmetically"
+        )]
+        if (word & FUTEX_TID_MASK) != self.tid as u32 {
+            return Ok(());
+        }
+
+        let had_waiters = word & FUTEX_WAITERS != 0;
+        let new_word = (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        if futex_addr
+            .write_at_offset::<Platform>(0, new_word)
+            .is_none()
+        {
+            return Err(Errno::EFAULT);
+        }
+
+        if had_waiters {
+            let _ = self.sys_futex(FutexArgs::Wake {
+                addr: futex_addr,
+                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                count: 1,
+            });
+        }
+        Ok(())
+    }
 }
 
 fn fetch_robust_entry(
@@ -902,44 +950,42 @@ fn fetch_robust_entry(
     (UserPtr::from_usize(next & !1), next & 1 != 0)
 }
 
-fn wake_robust_list<Platform: ShimPlatform>(
-    head: UserPtr<litebox_common_linux::RobustListHead>,
-) -> Result<(), Errno> {
-    let mut limit = ROBUST_LIST_LIMIT;
-    let head_ptr = head.as_usize();
-    let head = head.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-    let (mut entry, mut pi) = fetch_robust_entry(UserPtr::from_usize(head.list.next));
-    let (pending, ppi) = fetch_robust_entry(UserPtr::from_usize(head.list_op_pending));
-    let futex_offset = head.futex_offset;
-    let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
-    while entry.as_usize() != entry_head && limit > 0 {
-        let nxt = entry
-            .read_at_offset::<Platform>(0)
-            .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
-        if entry.as_usize() != pending.as_usize() {
-            handle_futex_death(
-                UserPtr::from_usize(entry.as_usize() + futex_offset),
-                pi,
-                false,
-            )?;
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn wake_robust_list(
+        &self,
+        head: UserPtr<litebox_common_linux::RobustListHead>,
+    ) -> Result<(), Errno> {
+        let mut limit = ROBUST_LIST_LIMIT;
+        let head_ptr = head.as_usize();
+        let head = head.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let (mut entry, _pi) = fetch_robust_entry(UserPtr::from_usize(head.list.next));
+        let (pending, _ppi) = fetch_robust_entry(UserPtr::from_usize(head.list_op_pending));
+        let futex_offset = head.futex_offset;
+        let entry_head = head_ptr + offset_of!(litebox_common_linux::RobustListHead, list);
+        while entry.as_usize() != entry_head && limit > 0 {
+            let nxt = entry
+                .read_at_offset::<Platform>(0)
+                .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
+            if entry.as_usize() != pending.as_usize() {
+                self.handle_futex_death(
+                    UserPtr::from_usize(entry.as_usize() + futex_offset),
+                    false,
+                )?;
+            }
+            let Some((next_entry, _next_pi)) = nxt else {
+                return Err(Errno::EFAULT);
+            };
+
+            entry = next_entry;
+            limit -= 1;
         }
-        let Some((next_entry, next_pi)) = nxt else {
-            return Err(Errno::EFAULT);
-        };
 
-        entry = next_entry;
-        pi = next_pi;
-        limit -= 1;
+        if pending.as_usize() != 0 {
+            let _ = self
+                .handle_futex_death(UserPtr::from_usize(pending.as_usize() + futex_offset), true);
+        }
+        Ok(())
     }
-
-    if pending.as_usize() != 0 {
-        let _ = handle_futex_death(
-            UserPtr::from_usize(pending.as_usize() + futex_offset),
-            ppi,
-            true,
-        );
-    }
-    Ok(())
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -975,7 +1021,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
         }
         if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = wake_robust_list::<Platform>(robust_list);
+            let _ = self.wake_robust_list(robust_list);
         }
 
         // Every write to guest memory above is done, so a task that shares its address space can
@@ -2292,6 +2338,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.ppid
     }
 
+    /// Whether `pid`, as passed to `setpgid`/`getpgid`, names the calling process or one of its
+    /// recorded children -- the only targets this shim can meaningfully answer for (it has no
+    /// registry of unrelated processes; see [`Self::sys_getpgid`]).
+    fn pgid_target_is_self_or_child(&self, pid: i32) -> bool {
+        pid == 0
+            || pid == self.pid
+            || self
+                .global
+                .processes
+                .has_child(self.pid, WaitFilter::Pid(pid))
+    }
+
+    /// Handle syscall `getpgid`.
+    ///
+    /// `pid == 0` means "the calling process", matching `setpgid`/`getpgid`'s own convention
+    /// (distinct from the `sched_*` family's thread-granularity `pid == 0`; this one is
+    /// process-granularity, compared against `self.pid`).
+    ///
+    /// LiteBox's process group is a single shim-wide value (see [`crate::GlobalState::pgid`])
+    /// rather than a genuine per-process-group model, so any pid this shim can vouch for --
+    /// itself or a recorded child -- reports that same group. A pid it cannot vouch for is
+    /// `ESRCH`, matching what real Linux does for a genuinely nonexistent target (real Linux
+    /// additionally permits querying *any* live pid, not just self/children; we cannot, since we
+    /// keep no general pid registry to check existence against).
+    pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
+        if !self.pgid_target_is_self_or_child(pid) {
+            log_unsupported!("getpgid for a pid that is not self or a known child");
+            return Err(Errno::ESRCH);
+        }
+        Ok(self.global.pgid.load(Ordering::Acquire))
+    }
+
+    /// Handle syscall `setpgid`.
+    ///
+    /// Real Linux additionally restricts this to processes in the same session and forbids
+    /// retargeting a child that has already called `execve` (`EACCES`); LiteBox tracks neither
+    /// sessions nor an exec-generation per child, so only the target-identity check in
+    /// [`Self::pgid_target_is_self_or_child`] is enforced. `pgid == 0` means "use the target's
+    /// own pid as its new group", matching real `setpgid`.
+    #[allow(clippy::similar_names)]
+    pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
+        if pgid < 0 {
+            return Err(Errno::EINVAL);
+        }
+        if !self.pgid_target_is_self_or_child(pid) {
+            log_unsupported!("setpgid for a pid that is not self or a known child");
+            return Err(Errno::ESRCH);
+        }
+        let target_pid = if pid == 0 { self.pid } else { pid };
+        let new_pgid = if pgid == 0 { target_pid } else { pgid };
+        self.global.pgid.store(new_pgid, Ordering::Release);
+        Ok(())
+    }
+
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
         self.credentials.borrow().uid
@@ -2614,6 +2714,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     addr2.to_platform_ptr::<Platform>(),
                     num_to_wake,
                     num_to_requeue,
+                    None,
+                )? as usize
+            }
+            litebox_common_linux::FutexArgs::CmpRequeue {
+                addr,
+                flags,
+                num_to_wake,
+                num_to_requeue,
+                addr2,
+                expected_value,
+            } => {
+                warn_shared_futex!(flags);
+                self.global.futex_manager.requeue(
+                    addr.to_platform_ptr::<Platform>(),
+                    addr2.to_platform_ptr::<Platform>(),
+                    num_to_wake,
+                    num_to_requeue,
+                    Some(expected_value),
                 )? as usize
             }
             _ => {
@@ -2787,7 +2905,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // unmmap all memory mappings and reset brk
         if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = wake_robust_list::<Platform>(robust_list);
+            let _ = self.wake_robust_list(robust_list);
         }
         self.thread.clear_child_tid.set(None);
 
@@ -3356,6 +3474,88 @@ mod tests {
                 set_param_ptr
             ),
             Err(Errno::ESRCH)
+        );
+    }
+
+    /// `setpgid(0, N)` followed by `getpgid` (both `pid == 0` and the caller's own pid) must
+    /// observe `N`.
+    #[test]
+    fn test_setpgid_getpgid_self_round_trip() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
+        assert_eq!(task.sys_getpgid(0), Ok(4242));
+        assert_eq!(task.sys_getpgid(task.pid), Ok(4242));
+    }
+
+    /// `setpgid(pid, 0)` means "make `pid` its own group leader" -- real `setpgid`'s
+    /// well-known zero-pgid convention, used by busybox `ash` to start a new job.
+    #[test]
+    fn test_setpgid_zero_pgid_targets_own_pid() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
+        assert_eq!(task.sys_setpgid(0, 0), Ok(()));
+        assert_eq!(task.sys_getpgid(0), Ok(task.pid));
+    }
+
+    #[test]
+    fn test_setpgid_rejects_negative_pgid() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(task.sys_setpgid(0, -1), Err(Errno::EINVAL));
+    }
+
+    /// A pid this shim cannot vouch for (neither the caller nor a recorded child) is `ESRCH` for
+    /// both syscalls, matching real Linux's response to a genuinely nonexistent target.
+    #[test]
+    fn test_setpgid_getpgid_reject_unrelated_pid() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let unrelated_pid = task.pid.wrapping_add(999_999);
+
+        assert_eq!(task.sys_getpgid(unrelated_pid), Err(Errno::ESRCH));
+        assert_eq!(task.sys_setpgid(unrelated_pid, 4242), Err(Errno::ESRCH));
+    }
+
+    /// A recorded child (see `ProcessTable::add_child`, the same bookkeeping `wait4` reaps from)
+    /// is a permitted `setpgid`/`getpgid` target, matching real Linux allowing a parent to move
+    /// its own child into a group.
+    #[test]
+    fn test_setpgid_getpgid_accept_a_known_child() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = task.pid.wrapping_add(1);
+        task.global.processes.add_child(child, task.pid);
+
+        assert_eq!(task.sys_setpgid(child, 4242), Ok(()));
+        assert_eq!(task.sys_getpgid(child), Ok(4242));
+    }
+
+    /// `setpgid`/`getpgid` and the `TIOCSPGRP`/`TIOCGPGRP` ioctls (`syscalls::file::Task::
+    /// stdio_ioctl`) read/write the exact same `global.pgid` field -- confirm each observes the
+    /// other's writes, without needing the ioctl's own fd plumbing (which has no existing unit
+    /// test harness in this codebase).
+    #[test]
+    fn test_setpgid_getpgid_share_state_with_tiocspgrp_tiocgpgrp() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
+        assert_eq!(
+            task.global.pgid.load(core::sync::atomic::Ordering::Acquire),
+            4242,
+            "a setpgid write must be visible to a TIOCGPGRP read"
+        );
+
+        task.global
+            .pgid
+            .store(99, core::sync::atomic::Ordering::Release);
+        assert_eq!(
+            task.sys_getpgid(0),
+            Ok(99),
+            "a TIOCSPGRP write must be visible to a getpgid read"
         );
     }
 
@@ -3993,6 +4193,145 @@ mod tests {
                 .expect("sys_futex(Wait) should not have errored");
         }
         assert_eq!(completed.load(Ordering::SeqCst), N);
+    }
+
+    /// Real threads, real `sys_futex` syscalls: `FUTEX_CMP_REQUEUE` must actually check the
+    /// futex word before requeuing and fail with `EAGAIN` (never wake or move anyone) once it no
+    /// longer matches -- the documented race-closing behavior that plain `FUTEX_REQUEUE` does
+    /// not perform.
+    #[test]
+    fn test_futex_cmp_requeue_rejects_stale_value_across_real_threads() {
+        use litebox_common_linux::errno::Errno;
+        use litebox_common_linux::{FutexArgs, FutexFlags, TimeParam};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let mut futex1: u32 = 5;
+        let mut futex2: u32 = 0;
+        let futex1_addr = core::ptr::from_mut(&mut futex1) as usize;
+        let futex2_addr = core::ptr::from_mut(&mut futex2) as usize;
+
+        let waiter = task.spawn_clone_for_test(move |task| {
+            task.sys_futex(FutexArgs::Wait {
+                addr: UserPtrMut::from_usize(futex1_addr),
+                flags: FutexFlags::PRIVATE,
+                val: 5,
+                timeout: TimeParam::Milliseconds(10_000),
+            })
+        });
+
+        std::thread::sleep(core::time::Duration::from_millis(100)); // let it genuinely block
+
+        let err = task
+            .sys_futex(FutexArgs::CmpRequeue {
+                addr: UserPtrMut::from_usize(futex1_addr),
+                flags: FutexFlags::PRIVATE,
+                num_to_wake: 1,
+                num_to_requeue: 0,
+                addr2: UserPtrMut::from_usize(futex2_addr),
+                expected_value: 999, // stale on purpose: the real word is still 5
+            })
+            .expect_err("a value-mismatched CMP_REQUEUE must fail, not silently requeue");
+        assert_eq!(err, Errno::EAGAIN);
+
+        // The waiter must still be genuinely blocked on the original address.
+        let woken = task
+            .sys_futex(FutexArgs::Wake {
+                addr: UserPtrMut::from_usize(futex1_addr),
+                flags: FutexFlags::PRIVATE,
+                count: 1,
+            })
+            .expect("wake on futex1 failed");
+        assert_eq!(
+            woken, 1,
+            "the waiter must still be on futex1's own wait queue -- a mismatched CMP_REQUEUE \
+             must not have moved it"
+        );
+
+        waiter
+            .join()
+            .expect("waiter thread panicked")
+            .expect("sys_futex(Wait) should not have errored");
+    }
+
+    /// Regression test for a thread that dies while still recorded as the owner of a robust
+    /// futex: [`Task::handle_futex_death`] must set [`FUTEX_OWNER_DIED`] on the futex word and
+    /// wake a waiter -- mirroring Linux's `handle_futex_death`/`exit_robust_list`
+    /// (`kernel/futex/core.c`). Before this fix, `handle_futex_death` was `todo!()`, so any
+    /// dying thread whose robust list was non-empty would panic mid-teardown instead of
+    /// notifying waiters, permanently stranding a sibling thread blocked in `FUTEX_WAIT` on that
+    /// lock.
+    ///
+    /// This drives `Task::handle_futex_death` directly (rather than round-tripping through a
+    /// hand-built `RobustListHead`/`RobustList` guest-memory layout, which is real guest-ABI
+    /// plumbing already covered by `wake_robust_list`'s straightforward list-walking logic) to
+    /// isolate exactly the piece that was unimplemented: does processing one owned, waited-on
+    /// futex entry correctly mark it dead and wake the waiter, without panicking.
+    #[test]
+    fn test_handle_futex_death_wakes_waiter_and_sets_owner_died() {
+        use litebox_common_linux::{FutexArgs, FutexFlags, TimeParam};
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let mut futex_word: u32 = 0;
+        let futex_addr = core::ptr::from_mut(&mut futex_word) as usize;
+        let barrier = std::sync::Arc::new(Barrier::new(2));
+
+        let bg = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            task.spawn_clone_for_test(move |bg_task| {
+                // Simulate this (cloned) thread having locked a robust mutex: the futex word
+                // records this thread as owner, with the waiters bit set since the main thread
+                // is about to block on it.
+                #[expect(clippy::cast_sign_loss, reason = "tid is always non-negative")]
+                let owner_word = (bg_task.tid as u32) | super::FUTEX_WAITERS;
+                let futex_atomic = unsafe { &*(futex_addr as *const AtomicU32) };
+                futex_atomic.store(owner_word, Ordering::SeqCst);
+
+                barrier.wait();
+                // Give the main thread time to actually park in FUTEX_WAIT before "dying" --
+                // otherwise this would trivially pass even with the pre-fix `todo!()` never
+                // running (there would be nothing parked to prove got woken).
+                std::thread::sleep(core::time::Duration::from_millis(100));
+
+                bg_task
+                    .handle_futex_death(UserPtr::from_usize(futex_addr), false)
+                    .expect("handle_futex_death should not error for a well-formed entry");
+            })
+        };
+
+        barrier.wait();
+        let owner_word = {
+            let futex_atomic = unsafe { &*(futex_addr as *const AtomicU32) };
+            futex_atomic.load(Ordering::SeqCst)
+        };
+        let result = task.sys_futex(FutexArgs::Wait {
+            addr: UserPtrMut::from_usize(futex_addr),
+            flags: FutexFlags::PRIVATE,
+            val: owner_word,
+            timeout: TimeParam::Milliseconds(10_000),
+        });
+        assert_eq!(
+            result,
+            Ok(0),
+            "main thread's FUTEX_WAIT on the robust futex should be woken once \
+             handle_futex_death runs for its dying owner, not hang forever"
+        );
+
+        let final_word = {
+            let futex_atomic = unsafe { &*(futex_addr as *const AtomicU32) };
+            futex_atomic.load(Ordering::SeqCst)
+        };
+        assert_eq!(
+            final_word & super::FUTEX_OWNER_DIED,
+            super::FUTEX_OWNER_DIED,
+            "the futex word should have FUTEX_OWNER_DIED set once its owner dies without \
+             unlocking"
+        );
+
+        bg.join().expect("background thread panicked");
     }
 
     /// Real process-exit teardown (`prepare_for_exit`), a real pipe, and a real epoll

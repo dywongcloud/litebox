@@ -45,6 +45,7 @@ pub const STDERR_FILENO: i32 = 2;
 pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
 pub const FUTEX_REQUEUE: i32 = 3;
+pub const FUTEX_CMP_REQUEUE: i32 = 4;
 
 // linux/time.h
 pub const CLOCK_REALTIME: i32 = 0;
@@ -2008,6 +2009,7 @@ pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
     Requeue = 3,
+    CmpRequeue = 4,
     WaitBitset = 9,
 }
 
@@ -2060,6 +2062,17 @@ pub enum FutexArgs {
         num_to_wake: u32,
         num_to_requeue: u32,
         addr2: UserPtrMut<u32>,
+    },
+    /// `FUTEX_CMP_REQUEUE`: identical to `Requeue`, but first atomically checks that the word at
+    /// `addr` still equals `expected_value`, failing with `EAGAIN` otherwise (closes the race
+    /// where the value changed between userspace's check and this syscall).
+    CmpRequeue {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        num_to_wake: u32,
+        num_to_requeue: u32,
+        addr2: UserPtrMut<u32>,
+        expected_value: u32,
     },
 }
 
@@ -2750,6 +2763,16 @@ pub enum SyscallRequest {
     },
     Getpid,
     Getppid,
+    /// `getpgid(pid)`. `pid == 0` means "the calling process".
+    Getpgid {
+        pid: i32,
+    },
+    /// `setpgid(pid, pgid)`. `pid == 0` means "the calling process"; `pgid == 0` means "use
+    /// `pid`'s own value as the new group id".
+    Setpgid {
+        pid: i32,
+        pgid: i32,
+    },
     /// `wait4(pid, wstatus, options, rusage)`.
     ///
     /// This is the only wait syscall aarch64 offers besides `waitid`; libc's
@@ -3180,6 +3203,8 @@ impl SyscallRequest {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::getpgid => sys_req!(Getpgid { pid }),
+            Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
             Sysno::wait4 => sys_req!(Wait4 {
                 pid,
                 wstatus:*,
@@ -3499,6 +3524,16 @@ impl SyscallRequest {
                 // `sys_req_ptr` at all. See `man 2 futex`.
                 num_to_requeue: ctx.sys_req_arg(3),
                 addr2: ctx.sys_req_ptr(4),
+            },
+            FutexOperation::CmpRequeue => FutexArgs::CmpRequeue {
+                addr,
+                flags,
+                num_to_wake: val,
+                // Same ABI quirk as `FUTEX_REQUEUE`: argument slot 3 is the plain integer
+                // `num_to_requeue`, not a `timeout` pointer. See `man 2 futex`.
+                num_to_requeue: ctx.sys_req_arg(3),
+                addr2: ctx.sys_req_ptr(4),
+                expected_value: ctx.sys_req_arg(5),
             },
         };
         Ok(SyscallRequest::Futex { args })
