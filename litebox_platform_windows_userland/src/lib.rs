@@ -125,40 +125,72 @@ unsafe extern "system" fn vectored_exception_handler(
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
+    // Windows clears this thread's FS_BASE MSR back to 0 on its own initiative, apparently as
+    // part of ordinary scheduling. A guest `mov %fs:...` hit while FS_BASE is 0 reads/writes
+    // through linear address `0 + offset` instead of the real TLS block, which is (almost
+    // always) unmapped and therefore an ordinary #PF here, reported as
+    // `EXCEPTION_ACCESS_VIOLATION` -- indistinguishable, without this check, from a genuine
+    // guest segfault.
+    //
+    // Detect and repair this before `is_in_guest` is cleared and the guest context is saved
+    // below, so the common case (observed to recur many times per second under scheduler
+    // pressure) never pays for either. Repair happens in place, without ever leaving guest mode:
+    // just `wrfsbase` the stored value back and retry the exact same faulting instruction via
+    // `EXCEPTION_CONTINUE_EXECUTION`.
+    //
+    // This used to instead route through the interrupt path (`set_context_to_interrupt_callback`),
+    // which is far more expensive -- it leaves guest mode, saves the full guest context, and
+    // takes a host round trip through `interrupt_callback`/`NtContinue` before the guest is
+    // re-entered and FS_BASE restored. Under the same scheduler pressure that clears FS_BASE in
+    // the first place, that round trip reliably took long enough for FS_BASE to be cleared again
+    // before the guest completed even one more instruction: an unbounded livelock, repeated
+    // access violations with forward progress permanently stalled.
+    //
+    // This forgoes the old rationale for going through the interrupt path ("avoid missing a real
+    // interrupt that arrives while resuming the guest"): the pending-interrupt flag is not
+    // inspected here before resuming. This is safe: `ThreadHandle::interrupt` does not depend on
+    // this path at all -- when interrupting another thread it suspends it directly
+    // (`SuspendThread`/`GetThreadContext`/`SetThreadContext`) and rewrites its saved context
+    // itself, which works correctly regardless of whether this handler happens to run in
+    // between. A same-thread self-interrupt only sets the `interrupt` flag (no context rewrite
+    // is possible on your own running thread) and is picked up the next time this thread reaches
+    // `interrupt_handler`, exactly as it would be had this exact access violation not happened.
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && unsafe { litebox_common_linux::rdfsbase() } == 0
+    {
+        let saved = WindowsUserland::get_thread_fs_base();
+        if saved != 0 {
+            unsafe { litebox_common_linux::wrfsbase(saved) };
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
     tls.is_in_guest.set(false);
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
     save_guest_context(regs, context);
 
-    // If it looks like fs base was cleared, then go through the interrupt path
-    // instead of the exception path to restore the fs base and try again.
-    //
-    // This is done instead of just fixing up fsbase and returning here to avoid
-    // missing a real interrupt that arrives while resuming the guest. Go through
-    // the interrupt path to ensure that any pending interrupts are also handled.
-    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-        && unsafe { litebox_common_linux::rdfsbase() } == 0
-        && WindowsUserland::get_thread_fs_base() != 0
-    {
-        set_context_to_interrupt_callback(tls, context);
-    } else {
-        // Push the exception record onto the host stack.
-        let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
-        assert!(exception_record_ptr.is_aligned());
-        unsafe { exception_record_ptr.write(*exception_record) };
+    // Write the exception record into scratch space below `host_sp`, well clear of the
+    // `thread_ctx` pointer that `run_thread_arch`'s prologue pushed at `[host_sp]`.
+    // `exception_callback` (like `syscall_callback` and `interrupt_callback`) expects
+    // `[rsp] == thread_ctx`, so `Rsp` must land exactly on `host_sp`, unmodified -- it must
+    // NOT be repointed into this scratch area.
+    let exception_record_ptr = tls
+        .host_sp
+        .get()
+        .cast::<EXCEPTION_RECORD>()
+        .wrapping_byte_sub(EXCEPTION_RECORD_RESERVE);
+    assert!(exception_record_ptr.is_aligned());
+    unsafe { exception_record_ptr.write(*exception_record) };
 
-        // Re-align the stack pointer.
-        let rsp = exception_record_ptr as usize & !15;
+    // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
+    let _ = run_thread_arch as *const () as usize;
 
-        // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
-        let _ = run_thread_arch as *const () as usize;
-
-        // Update the thread context to jump to the exception handler.
-        context.Rip = exception_callback as *const () as usize as u64;
-        context.Rsp = rsp as u64;
-        context.Rbp = tls.host_bp.get() as u64;
-        context.Rdx = exception_record_ptr as u64;
-    }
+    // Update the thread context to jump to the exception handler.
+    context.Rip = exception_callback as *const () as usize as u64;
+    context.Rsp = tls.host_sp.get() as u64;
+    context.Rbp = tls.host_bp.get() as u64;
+    context.Rdx = exception_record_ptr as u64;
 
     EXCEPTION_CONTINUE_EXECUTION
 }
@@ -423,6 +455,15 @@ struct TlsState {
     /// waiting.
     waiting_waker: std::sync::atomic::AtomicPtr<litebox::event::wait::Waker<WindowsUserland>>,
 }
+
+/// Scratch space (in bytes) reserved below `host_sp` for the `EXCEPTION_RECORD` that
+/// `vectored_exception_handler` writes when redirecting to `exception_callback`. Must be large
+/// enough to hold a full `EXCEPTION_RECORD` (152 bytes on x86_64) plus alignment slack, and must
+/// keep clear of `[host_sp]`, where `run_thread_arch`'s prologue pushes `thread_ctx` --
+/// `exception_callback` reads `thread_ctx` back via `[rsp]`, so `Rsp` is always set to `host_sp`
+/// itself, unmodified; the exception record lives in this separate reserve instead of overlapping
+/// the `Rsp` landing spot.
+const EXCEPTION_RECORD_RESERVE: usize = 4096;
 
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
