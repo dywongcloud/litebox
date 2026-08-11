@@ -644,6 +644,38 @@ impl LinuxUserland {
             // required by libc allocator
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
+            // `CLOCK_MONOTONIC`/`CLOCK_REALTIME` (used by `now`/`current_time` below) resolve via
+            // vDSO on a modern kernel and never reach this filter at all. `CLOCK_THREAD_CPUTIME_ID`
+            // and `CLOCK_PROCESS_CPUTIME_ID` (used by `thread_cpu_time`/`process_cpu_time`, and by
+            // `Task::prepare_for_exit`'s rusage accounting on every guest thread/process exit) are
+            // dynamic clocks the kernel cannot resolve without a real syscall, so they need an
+            // explicit rule -- restricted to exactly these two clock IDs, not `clock_gettime` in
+            // general.
+            (
+                libc::SYS_clock_gettime,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            0,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::CLOCK_THREAD_CPUTIME_ID.reinterpret_as_unsigned().into(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            0,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::CLOCK_PROCESS_CPUTIME_ID.reinterpret_as_unsigned().into(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
             // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
             (
                 libc::SYS_open,

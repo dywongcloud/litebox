@@ -1,7 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
-#
+
 # LiteBox performance benchmark suite.
 #
 # Measures, separately: cached startup/teardown, pure guest CPU execution, a
