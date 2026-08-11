@@ -58,6 +58,9 @@ pub struct BoxMeta {
     /// Image working directory, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// `EXPOSE`d ports as `port/proto` (e.g. `8080/tcp`), sorted.
+    #[serde(default)]
+    pub exposed_ports: Vec<String>,
     /// Image USER, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,

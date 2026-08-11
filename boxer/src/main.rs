@@ -11,6 +11,7 @@
 
 mod boxfmt;
 mod dockerfile;
+mod publish;
 mod run;
 
 #[cfg(all(
@@ -44,6 +45,21 @@ enum Cli {
     Run {
         /// Path to the .box.wasm artifact.
         box_path: PathBuf,
+        /// Attach the workload to this TUN device so its ports are reachable
+        /// (see litebox_platform_linux_userland/scripts/tun-setup.sh).
+        #[arg(long = "net", value_name = "TUN_DEVICE")]
+        net: Option<String>,
+        /// Publish a port to the host: PORT, HOST:GUEST, or IP:HOST:GUEST.
+        /// Implies --net.
+        #[arg(short = 'p', long = "publish", value_name = "SPEC")]
+        publish: Vec<String>,
+        /// Publish every port the box EXPOSEs, on the same host port.
+        /// Implies --net.
+        #[arg(short = 'P', long = "publish-all")]
+        publish_all: bool,
+        /// Print each published connection as it is forwarded.
+        #[arg(short = 'v', long = "verbose")]
+        verbose: bool,
         /// Arguments overriding the image CMD.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -57,7 +73,8 @@ enum Cli {
 
 #[derive(clap::Args, Debug)]
 struct BuildArgs {
-    /// Build from a Dockerfile.
+    /// Build from a Dockerfile or Containerfile. With no source flag at all,
+    /// the Containerfile or Dockerfile in the build context is used.
     #[arg(
         short = 'f',
         long = "file",
@@ -105,7 +122,23 @@ struct BuildArgs {
 fn main() -> anyhow::Result<()> {
     match Cli::parse() {
         Cli::Build(args) => build_command(&args),
-        Cli::Run { box_path, args } => run::run(&box_path, &args),
+        Cli::Run {
+            box_path,
+            net,
+            publish,
+            publish_all,
+            verbose,
+            args,
+        } => run::run(
+            &box_path,
+            &args,
+            &run::NetOptions {
+                tun_device: net,
+                publish,
+                publish_all,
+                verbose,
+            },
+        ),
         Cli::Inspect { box_path } => run::inspect(&box_path),
     }
 }
@@ -154,9 +187,17 @@ fn build_command(args: &BuildArgs) -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<_>>()?;
 
+    // With no source named at all, fall back to the build context's
+    // Containerfile or Dockerfile, the way podman and docker do.
+    let discovered = match (&args.dockerfile, &args.image, &args.archive) {
+        (None, None, None) => Some(discover_container_file(args.context.as_deref())?),
+        _ => None,
+    };
+    let dockerfile_arg = args.dockerfile.clone().or(discovered);
+
     let multi = platforms.len() > 1;
     for platform in platforms {
-        let (extracted, source_label) = match (&args.dockerfile, &args.image, &args.archive) {
+        let (extracted, source_label) = match (&dockerfile_arg, &args.image, &args.archive) {
             (Some(dockerfile_path), None, None) => {
                 let text = std::fs::read_to_string(dockerfile_path).with_context(|| {
                     format!("cannot read Dockerfile {}", dockerfile_path.display())
@@ -211,6 +252,30 @@ fn build_command(args: &BuildArgs) -> anyhow::Result<()> {
         eprintln!("Built {} ({platform})", output.display());
     }
     Ok(())
+}
+
+/// Find the build file when none was named: `Containerfile` first (podman's
+/// preference), then `Dockerfile`.
+#[cfg(all(
+    unix,
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_vendor = "apple")
+    )
+))]
+fn discover_container_file(context: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+    let dir = context.unwrap_or_else(|| std::path::Path::new("."));
+    for name in ["Containerfile", "Dockerfile"] {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "no Containerfile or Dockerfile in {}; name one with -f, or build an \
+         image with -i/--archive",
+        dir.display()
+    )
 }
 
 #[cfg(all(
@@ -305,7 +370,8 @@ fn emit_box(
         cmd: extracted.config.cmd.clone(),
         env: extracted.config.env.clone().unwrap_or_default(),
         working_dir: extracted.config.working_dir.clone(),
-        user: None,
+        exposed_ports: extracted.config.exposed_ports.clone(),
+        user: extracted.config.user.clone(),
         tar_entries: tar_entries.len() as u64,
         tar_size: tar_bytes.len() as u64,
         tar_sha256: boxfmt::sha256_hex(&tar_bytes),

@@ -39,6 +39,9 @@ pub fn inspect(box_path: &Path) -> anyhow::Result<()> {
     for env in &meta.env {
         println!("env:          {env}");
     }
+    if !meta.exposed_ports.is_empty() {
+        println!("exposed:      {}", meta.exposed_ports.join(", "));
+    }
     println!(
         "rootfs:       {} entries, {} bytes",
         meta.tar_entries, meta.tar_size
@@ -47,8 +50,22 @@ pub fn inspect(box_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Networking for a run: which TUN device the workload attaches to, and which
+/// of its ports are published to the host.
+#[derive(Debug, Default)]
+pub struct NetOptions {
+    pub tun_device: Option<String>,
+    pub publish: Vec<String>,
+    pub publish_all: bool,
+    pub verbose: bool,
+}
+
+/// The TUN device used when ports are published without naming one, matching
+/// the default in `litebox_platform_linux_userland/scripts/tun-setup.sh`.
+const DEFAULT_TUN_DEVICE: &str = "tun99";
+
 /// Run a box: `extra_args` override the image CMD (docker semantics).
-pub fn run(box_path: &Path, extra_args: &[String]) -> anyhow::Result<()> {
+pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::Result<()> {
     let parsed = parse_box_file(box_path)?;
     let meta = &parsed.meta;
 
@@ -62,6 +79,27 @@ pub fn run(box_path: &Path, extra_args: &[String]) -> anyhow::Result<()> {
             "this box targets linux/{} but the host is linux/{host_arch}; \
              build a matching variant with `boxer build --platform linux/{host_arch}`",
             meta.architecture
+        );
+    }
+
+    // Resolve the networking flags before anything else, so a bad -p or an
+    // empty --publish-all is reported without first resolving a workload.
+    let mut mappings: Vec<crate::publish::PortMapping> = net
+        .publish
+        .iter()
+        .map(|spec| crate::publish::PortMapping::parse(spec))
+        .collect::<anyhow::Result<_>>()?;
+    if net.publish_all {
+        if meta.exposed_ports.is_empty() {
+            bail!(
+                "--publish-all was given but this box EXPOSEs no ports; \
+                 publish one explicitly with -p HOST:GUEST"
+            );
+        }
+        mappings.extend(
+            meta.exposed_ports
+                .iter()
+                .filter_map(|port| crate::publish::PortMapping::from_exposed(port)),
         );
     }
 
@@ -83,6 +121,30 @@ pub fn run(box_path: &Path, extra_args: &[String]) -> anyhow::Result<()> {
         return run_wasm_workload(&program_bytes, &argv);
     }
 
+    // Publishing needs the workload on the network, so it selects a TUN device
+    // when none was named rather than binding host ports that reach nothing.
+    let tun_device = match (&net.tun_device, mappings.is_empty()) {
+        (Some(device), _) => Some(device.clone()),
+        (None, false) => Some(String::from(DEFAULT_TUN_DEVICE)),
+        (None, true) => None,
+    };
+
+    // Bind before the workload starts: a taken host port is reported now, not
+    // after the guest is already running.
+    let _published = if mappings.is_empty() {
+        None
+    } else {
+        Some(crate::publish::publish(&mappings, net.verbose)?)
+    };
+
+    if tun_device.is_some() && !meta.exposed_ports.is_empty() {
+        eprintln!(
+            "Box exposes {} on {}",
+            meta.exposed_ports.join(", "),
+            crate::publish::GUEST_IP
+        );
+    }
+
     let (program, program_args): (String, Vec<String>) = if has_shell && has_config_script {
         // The config script exports ENV, cds to WORKDIR, and execs either the
         // caller's command or the image default.
@@ -96,7 +158,7 @@ pub fn run(box_path: &Path, extra_args: &[String]) -> anyhow::Result<()> {
         (argv.remove(0), argv)
     };
 
-    run_native(&parsed, program, program_args)
+    run_native(&parsed, program, program_args, tun_device.as_deref())
 }
 
 /// ENTRYPOINT + (args-or-CMD) merge per OCI semantics.
@@ -114,7 +176,12 @@ fn effective_argv(meta: &BoxMeta, extra_args: &[String]) -> anyhow::Result<Vec<S
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn run_native(parsed: &ParsedBox, program: String, args: Vec<String>) -> anyhow::Result<()> {
+fn run_native(
+    parsed: &ParsedBox,
+    program: String,
+    args: Vec<String>,
+    tun_device: Option<&str>,
+) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     // The runner mmaps the tar from a path and requires a .tar suffix.
@@ -138,7 +205,7 @@ fn run_native(parsed: &ParsedBox, program: String, args: Vec<String>) -> anyhow:
         insert_files: Vec::new(),
         initial_files: Some(tar_file.path().to_path_buf()),
         rewrite_syscalls: false,
-        tun_device_name: None,
+        tun_device_name: tun_device.map(String::from),
         program_from_tar: true,
         broker_control_socket: None,
     };
@@ -146,7 +213,12 @@ fn run_native(parsed: &ParsedBox, program: String, args: Vec<String>) -> anyhow:
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-fn run_native(_parsed: &ParsedBox, _program: String, _args: Vec<String>) -> anyhow::Result<()> {
+fn run_native(
+    _parsed: &ParsedBox,
+    _program: String,
+    _args: Vec<String>,
+    _tun_device: Option<&str>,
+) -> anyhow::Result<()> {
     bail!(
         "running boxes natively is supported on x86_64 Linux hosts today; \
          on macOS use litebox_runner_linux_on_macos_userland with the extracted rootfs tar \

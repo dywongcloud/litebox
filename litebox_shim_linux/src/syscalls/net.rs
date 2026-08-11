@@ -193,6 +193,10 @@ impl SocketAddress {
 }
 
 #[derive(Default, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each field mirrors one boolean socket option Linux defines"
+)]
 pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,
@@ -206,6 +210,9 @@ pub(super) struct SocketOptions {
     /// until all queued messages for the socket have been
     /// successfully sent or the timeout has been reached.
     pub(super) linger_timeout: Option<core::time::Duration>,
+    /// Set by `shutdown(fd, SHUT_RD)`: further receives report end-of-file
+    /// instead of reaching the socket.
+    pub(super) receive_shutdown: bool,
 }
 
 #[derive(Clone)]
@@ -1703,6 +1710,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 &self.global,
                 raw_fd.trunc(),
                 |fd| {
+                    if self
+                        .global
+                        .with_socket_options(fd, |opt| opt.receive_shutdown)
+                    {
+                        // `shutdown(fd, SHUT_RD)` makes every later receive
+                        // report end-of-file without touching the socket.
+                        return Ok((0, None));
+                    }
                     let mut addr = None;
                     let size = self.global.receive(
                         &self.wait_cx(),
@@ -2135,10 +2150,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |_fd| {
-                ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
-                log_unsupported!("shutdown on inet socket");
-                Err(Errno::EOPNOTSUPP)
+            |fd| {
+                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                if how.is_shutdown_read() {
+                    self.global
+                        .with_socket_options_mut(fd, |opt| opt.receive_shutdown = true);
+                }
+                if how.is_shutdown_write() {
+                    self.global
+                        .net
+                        .lock()
+                        .shutdown_send(fd)
+                        .map_err(|e| match e {
+                            litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
+                            // `ShutdownError` is `#[non_exhaustive]`; every
+                            // other variant means the socket had no send half.
+                            _ => Errno::ENOTCONN,
+                        })?;
+                }
+                Ok(())
             },
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;

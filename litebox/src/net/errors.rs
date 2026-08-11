@@ -33,6 +33,16 @@ pub enum CloseError {
     DataPending,
 }
 
+/// Possible errors from [`Network::shutdown_send`]
+#[non_exhaustive]
+#[derive(Error, Clone, Copy, Debug)]
+pub enum ShutdownError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Socket is not connected")]
+    NotConnected,
+}
+
 /// Possible errors from [`Network::connect`]
 #[non_exhaustive]
 #[derive(Error, Clone, Copy, Debug)]

@@ -20,8 +20,8 @@ cargo run -p boxer -- build -f Dockerfile   # or run without installing
 ## Quickstart
 
 ```sh
-# From a Dockerfile
-boxer build -f Dockerfile -o app.box.wasm
+# From a Dockerfile or Containerfile (either name is found automatically)
+boxer build -o app.box.wasm
 
 # From a registry image, for both architectures
 boxer build -i mcr.microsoft.com/cbl-mariner/busybox:2.0 --platform linux/amd64,linux/arm64
@@ -33,7 +33,53 @@ boxer build --archive image.tar
 boxer inspect app.box.wasm
 boxer run app.box.wasm            # image ENTRYPOINT/CMD
 boxer run app.box.wasm /bin/echo hi   # override CMD
+
+# Serve: publish every EXPOSEd port, or map one explicitly
+boxer run -P app.box.wasm
+boxer run -p 8080:80 app.box.wasm
 ```
+
+## Ports
+
+`EXPOSE` is carried end to end. The Dockerfile form accepts a bare port, an
+explicit protocol, and ranges (`EXPOSE 80`, `EXPOSE 53/udp`,
+`EXPOSE 9000-9002`), all normalized to `port/proto`; images pulled from a
+registry contribute their config's `ExposedPorts` the same way. The result
+lands in the box metadata, so `boxer inspect` lists it without running
+anything.
+
+Serving needs the workload on a network. LiteBox reaches the host through a
+TUN device, so create one once:
+
+```sh
+sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh   # tun99, host 10.0.0.1/24
+```
+
+`boxer run -P` (or `-p`) attaches the workload to that device -- the guest
+answers on `10.0.0.2` -- and publishes each mapping on the host, so clients
+connect to `127.0.0.1:<port>` without knowing the guest address. `-p` takes
+docker's shapes: `PORT`, `HOST:GUEST`, `IP:HOST:GUEST`. Only TCP is
+published; a `/udp` mapping is refused rather than quietly forwarded over
+TCP. `--net <device>` selects a different TUN device, and is implied by
+publishing.
+
+Forwarding is async (tokio): every connection is its own task, each direction
+is copied independently so a half-close propagates, and a workload that
+refuses one connection fails only that connection. This is where async earns
+its place -- a published port is concurrent by nature. The carrier wasm
+module deliberately stays a small synchronous WASI command: its job is to
+describe the box under any runtime, and async there would buy nothing real.
+
+Two LiteBox fixes were needed before any of this worked, both witnessed with
+a real HTTP server inside a box:
+
+- `close(2)` on a TCP socket dropped whatever the guest had written but the
+  network worker had not yet moved into the send buffer, so the
+  `write()`-then-`close()` that ends nearly every HTTP response delivered an
+  empty reply. A graceful close now flushes the socket channel first.
+- `shutdown(2)` returned `EOPNOTSUPP` for TCP, so a guest could not even
+  half-close explicitly. It is implemented: `SHUT_WR` flushes and sends FIN,
+  `SHUT_RD` makes later receives report end-of-file.
 
 ## The box format
 
@@ -65,7 +111,7 @@ metadata before running anything.
 | x86-64 Linux | yes | yes (`litebox_runner_linux_userland`, in-process) |
 | arm64 Linux | -- | not yet (no LiteBox arm64-linux userland runner) |
 | macOS Apple Silicon | yes | via `litebox_runner_linux_on_macos_userland` (manual; see docs/macos.md) |
-| anything with a wasm runtime | -- | self-description only |
+| anything with a wasm runtime | -- | self-description only (witnessed under wasmtime 29 and node 22) |
 
 Cross-architecture packaging works because the syscall rewriter dispatches on
 each ELF's own `e_machine`: building `--platform linux/arm64` on an x86-64
@@ -77,6 +123,10 @@ A workload that is itself a wasm binary (detected by magic) is delegated to
 `wasmtime`/`wasmer`/`wasmedge` from `PATH` instead of the native runner.
 
 ## Dockerfile support
+
+`Containerfile` and `Dockerfile` are the same language here; with no source
+flag, `boxer build` uses whichever the build context holds, preferring
+`Containerfile` as podman does.
 
 The parser and evaluator are dependency-free and total (line-numbered errors,
 no panics on user input): parser directives (`# escape=`), comments, line

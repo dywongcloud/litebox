@@ -27,7 +27,7 @@ mod tests;
 
 use errors::{
     AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
-    RemoteAddrError, SendError, SocketError,
+    RemoteAddrError, SendError, ShutdownError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
@@ -826,11 +826,26 @@ where
     }
 
     /// Close the socket at `fd`
+    ///
+    /// Bytes the guest has already written sit in the socket channel until the
+    /// network worker moves them into the smoltcp send buffer. Closing while
+    /// they are still in the channel drops them with it, so they are drained
+    /// first: a graceful close then sends them ahead of the FIN, which is what
+    /// `write()`-then-`close()` (every HTTP response that closes the
+    /// connection) depends on.
     pub fn close(
         &mut self,
         fd: &SocketFd<Platform>,
         behavior: CloseBehavior,
     ) -> Result<(), CloseError> {
+        if !matches!(behavior, CloseBehavior::Immediate) {
+            let now = self.now();
+            let table = self.litebox.descriptor_table();
+            if let Some(entry) = table.get_entry(fd) {
+                Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now);
+            }
+        }
+
         let mut dt = self.litebox.descriptor_table_mut();
         // We close immediately if we can
         match dt
@@ -884,6 +899,44 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Shut down the send half of a connected socket: flush what the guest has
+    /// already written, then send a FIN, leaving the receive half and the file
+    /// descriptor itself alive. This is `shutdown(fd, SHUT_WR)`.
+    ///
+    /// A socket that was never connected has no send half to close, and says so
+    /// rather than silently succeeding.
+    pub fn shutdown_send(&mut self, fd: &SocketFd<Platform>) -> Result<(), ShutdownError> {
+        let now = self.now();
+        let connected = {
+            let table = self.litebox.descriptor_table_mut();
+            let Some(mut entry) = table.get_entry_mut(fd) else {
+                return Err(ShutdownError::InvalidFd);
+            };
+            let socket_handle = &mut entry.entry;
+            if !matches!(socket_handle.protocol(), Protocol::Tcp) {
+                return Err(ShutdownError::NotConnected);
+            }
+            Self::drain_socket_channel_buffers(&mut self.socket_set, socket_handle, now);
+            socket_handle.with_socket_mut(
+                &mut self.socket_set,
+                |tcp_socket| {
+                    let was_open = tcp_socket.is_open();
+                    if was_open {
+                        tcp_socket.close();
+                    }
+                    was_open
+                },
+                |_udp_socket| false,
+            )
+        };
+        self.automated_platform_interaction(PollDirection::Both);
+        if connected {
+            Ok(())
+        } else {
+            Err(ShutdownError::NotConnected)
+        }
     }
 
     /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them

@@ -337,11 +337,13 @@ fn apply_instruction(
         Instruction::User(user) => state.config.user = Some(expand(state, user)),
         Instruction::Expose(ports) => {
             for port in ports {
-                let port = expand(state, port);
-                if !state.config.exposed.contains(&port) {
-                    state.config.exposed.push(port);
+                for normalized in expand_exposed_port(&expand(state, port))? {
+                    if !state.config.exposed.contains(&normalized) {
+                        state.config.exposed.push(normalized);
+                    }
                 }
             }
+            state.config.exposed.sort();
         }
         Instruction::Volume(volumes) => {
             for volume in volumes {
@@ -425,6 +427,48 @@ fn apply_instruction(
         }
     }
     Ok(())
+}
+
+/// Normalize one `EXPOSE` argument into `port/proto` entries: a bare port
+/// means TCP, `port/proto` keeps its protocol, and `lo-hi` expands to every
+/// port in the range. Ports outside 1-65535, empty ranges, reversed ranges and
+/// protocols other than tcp/udp are rejected by name.
+fn expand_exposed_port(spec: &str) -> anyhow::Result<Vec<String>> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        bail!("EXPOSE needs a port");
+    }
+    let (ports, proto) = match spec.split_once('/') {
+        Some((ports, proto)) => (ports, proto.to_ascii_lowercase()),
+        None => (spec, String::from("tcp")),
+    };
+    if proto != "tcp" && proto != "udp" {
+        bail!("EXPOSE protocol must be tcp or udp, got '{proto}' in '{spec}'");
+    }
+
+    let parse_port = |text: &str| -> anyhow::Result<u16> {
+        let port: u32 = text
+            .trim()
+            .parse()
+            .with_context(|| format!("EXPOSE port '{text}' is not a number"))?;
+        u16::try_from(port)
+            .ok()
+            .filter(|p| *p != 0)
+            .with_context(|| format!("EXPOSE port {port} is outside 1-65535"))
+    };
+
+    let (first, last) = if let Some((lo, hi)) = ports.split_once('-') {
+        (parse_port(lo)?, parse_port(hi)?)
+    } else {
+        let only = parse_port(ports)?;
+        (only, only)
+    };
+    if first > last {
+        bail!("EXPOSE range '{spec}' ends before it starts");
+    }
+    Ok((first..=last)
+        .map(|port| format!("{port}/{proto}"))
+        .collect())
 }
 
 fn command_to_argv(command: &Command, config: &ConfigState) -> Vec<String> {
@@ -1015,6 +1059,8 @@ fn finalize_stage(state: StageState, options: &BuildOptions) -> anyhow::Result<E
         } else {
             Some(config.workdir.clone())
         },
+        exposed_ports: config.exposed.clone(),
+        user: config.user.clone(),
     };
 
     Ok(ExtractedImage {

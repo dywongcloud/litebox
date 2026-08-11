@@ -30,6 +30,7 @@ libc = "0.2"
 # itself x86_64-linux-only today.
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 litebox_runner_linux_userland = { version = "0.1.0", path = "../litebox_runner_linux_userland" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 
 [lints]
 workspace = true

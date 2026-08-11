@@ -24,6 +24,10 @@ pub struct ImageConfig {
     pub cmd: Option<Vec<String>>,
     pub env: Option<Vec<String>>,
     pub working_dir: Option<String>,
+    /// `EXPOSE`d ports, normalized to `port/proto` (e.g. `8080/tcp`), sorted.
+    pub exposed_ports: Vec<String>,
+    /// The image's `USER`, if it declares one.
+    pub user: Option<String>,
 }
 
 /// Result of pulling and extracting an OCI image.
@@ -279,11 +283,21 @@ pub fn extract_image_layers(
     let config = match serde_json::from_slice::<ConfigFile>(&config_json) {
         Ok(cf) => {
             let exec_config = cf.config.as_ref();
+            let mut exposed_ports: Vec<String> = exec_config
+                .and_then(|c| c.exposed_ports.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|port| normalize_exposed_port(&port))
+                .collect();
+            exposed_ports.sort();
+            exposed_ports.dedup();
             let ic = ImageConfig {
                 entrypoint: exec_config.and_then(|c| c.entrypoint.clone()),
                 cmd: exec_config.and_then(|c| c.cmd.clone()),
                 env: exec_config.and_then(|c| c.env.clone()),
                 working_dir: exec_config.and_then(|c| c.working_dir.clone()),
+                exposed_ports,
+                user: exec_config.and_then(|c| c.user.clone()),
             };
             if verbose {
                 eprintln!(
@@ -393,6 +407,18 @@ pub fn generate_config_and_run_script(config: &ImageConfig) -> String {
     }
 
     script
+}
+
+/// Normalize an OCI `ExposedPorts` key to `port/proto`. The spec's keys are
+/// already `port/proto`, but images in the wild also carry a bare `port`,
+/// which docker reads as TCP.
+fn normalize_exposed_port(port: &str) -> String {
+    let port = port.trim();
+    if port.contains('/') {
+        port.to_ascii_lowercase()
+    } else {
+        format!("{port}/tcp")
+    }
 }
 
 /// Escape single quotes for use inside single-quoted shell strings.

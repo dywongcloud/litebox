@@ -857,6 +857,20 @@ Both need a real diagnosis rather than a test adjustment: an unmap of an
 unowned range is exactly the class of bug the platform assertions exist to
 catch.
 
+## Consecutive TUN socket tests hang in the same process
+
+`syscalls::net::tests::test_tun_*` pass one at a time, but running two of
+them back to back in one test binary hangs the second: with
+`--test-threads=1`, `test_tun_blocking_recvfrom_tcp_socket` passes and
+`..._with_truncation` never returns. The pair behaves identically at the
+commit before this branch, so it is pre-existing rather than a regression,
+and each test passes when selected with `--exact`.
+
+The tests share one host TUN device and each builds a fresh platform on it,
+so the likely cause is the previous test's interface or its `nc` peer not
+being fully torn down before the next one attaches. Whatever the cause, it
+makes the socket suite unable to run as a suite, which is how CI runs it.
+
 ## The test suite's own macOS gaps
 
 Running `cargo test` on an Apple Silicon machine surfaced defects in the tests
