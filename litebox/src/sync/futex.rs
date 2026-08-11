@@ -167,7 +167,11 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
         // time.
         for entry in entries {
-            entry.done.store(true, Ordering::Relaxed);
+            // `Release` is required to actually pair with `wait`'s `Acquire` load of `done`
+            // above: a `Relaxed` store paired with an `Acquire` load establishes no
+            // happens-before edge, so the waiter waking up would not be guaranteed to observe
+            // this write.
+            entry.done.store(true, Ordering::Release);
             entry.waker.wake();
         }
         Ok(woken)
@@ -185,19 +189,34 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     ///
     /// Returns the number of waiters actually woken (matching Linux's `futex(2)` return value
     /// for `FUTEX_REQUEUE`, which is the wake count, not the requeue count).
+    ///
+    /// If `expected_value` is `Some`, this implements `FUTEX_CMP_REQUEUE` instead of plain
+    /// `FUTEX_REQUEUE`: the futex word at `addr1` must still equal it, or this returns
+    /// [`FutexError::ImmediatelyWokenBecauseValueMismatch`] without waking or requeuing anyone
+    /// (closing the race where the word changed between userspace's check and this call).
     pub fn requeue(
         &self,
         addr1: Platform::RawMutPointer<u32>,
         addr2: Platform::RawMutPointer<u32>,
         num_to_wake: u32,
         num_to_requeue: u32,
+        expected_value: Option<u32>,
     ) -> Result<u32, FutexError> {
-        let addr1 = addr1.as_usize();
-        let addr2 = addr2.as_usize();
-        if !addr1.is_multiple_of(align_of::<u32>()) || !addr2.is_multiple_of(align_of::<u32>()) {
+        if !addr1.as_usize().is_multiple_of(align_of::<u32>())
+            || !addr2.as_usize().is_multiple_of(align_of::<u32>())
+        {
             return Err(FutexError::NotAligned);
         }
 
+        if let Some(expected_value) = expected_value {
+            let value = addr1.read_at_offset(0).ok_or(FutexError::Fault)?;
+            if value != expected_value {
+                return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
+            }
+        }
+
+        let addr1 = addr1.as_usize();
+        let addr2 = addr2.as_usize();
         let source = self.bucket(addr1);
         let total_to_take = num_to_wake.saturating_add(num_to_requeue);
         let mut taken = 0u32;
@@ -228,7 +247,9 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         let mut requeued = 0u32;
         for entry in entries {
             if woken < num_to_wake {
-                entry.done.store(true, Ordering::Relaxed);
+                // See the identical comment in `wake` above: `Release` is required to pair with
+                // `wait`'s `Acquire` load of `done`.
+                entry.done.store(true, Ordering::Release);
                 entry.waker.wake();
                 woken += 1;
             } else {
@@ -493,7 +514,7 @@ mod tests {
             );
 
         // Wake 2, requeue the remaining 3 onto `futex2`'s wait queue.
-        let woken_by_requeue = futex_manager.requeue(addr1, addr2, 2, 3).unwrap();
+        let woken_by_requeue = futex_manager.requeue(addr1, addr2, 2, 3, None).unwrap();
         assert_eq!(
             woken_by_requeue, 2,
             "requeue's return value is the wake count, not the requeue count"
@@ -570,7 +591,7 @@ mod tests {
                 futex2.as_ptr() as usize,
             );
 
-        let woken = futex_manager.requeue(addr1, addr2, 0, 1).unwrap();
+        let woken = futex_manager.requeue(addr1, addr2, 0, 1, None).unwrap();
         assert_eq!(woken, 0);
 
         // A `wake` still targeting the *old* address must find nobody -- the waiter has
@@ -589,6 +610,77 @@ mod tests {
             .wake(addr2, NonZeroU32::new(1).unwrap(), None)
             .unwrap();
         assert_eq!(woken_on_addr2, 1);
+
+        assert!(waiter.join().unwrap().is_ok());
+    }
+
+    /// `FUTEX_CMP_REQUEUE`'s documented race-closing check: if the futex word no longer matches
+    /// `expected_value` by the time this call runs (e.g. another thread already unlocked and
+    /// re-locked it between userspace's read and this syscall), the call must fail with
+    /// [`FutexError::ImmediatelyWokenBecauseValueMismatch`] and touch neither the woken-count nor
+    /// any waiter -- never silently fall back to a plain `FUTEX_REQUEUE`.
+    #[test]
+    fn test_futex_cmp_requeue_rejects_stale_value_and_touches_nothing() {
+        let platform = MockPlatform::new();
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = Arc::new(FutexManager::new());
+
+        let futex1 = Arc::new(AtomicU32::new(5));
+        let futex2 = Arc::new(AtomicU32::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let waiter = {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex1 = Arc::clone(&futex1);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let futex_addr =
+                    <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                        futex1.as_ptr() as usize,
+                    );
+                barrier.wait();
+                futex_manager.wait(
+                    &WaitState::new(platform)
+                        .context()
+                        .with_timeout(Duration::from_secs(10)),
+                    futex_addr,
+                    5,
+                    None,
+                )
+            })
+        };
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(50));
+
+        let addr1 =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex1.as_ptr() as usize,
+            );
+        let addr2 =
+            <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                futex2.as_ptr() as usize,
+            );
+
+        let result = futex_manager.requeue(addr1, addr2, 1, 1, Some(999));
+        assert!(matches!(
+            result,
+            Err(FutexError::ImmediatelyWokenBecauseValueMismatch)
+        ));
+
+        assert!(
+            !waiter.is_finished(),
+            "a value-mismatched CMP_REQUEUE must not wake the waiter"
+        );
+
+        let woken = futex_manager
+            .wake(addr1, NonZeroU32::new(1).unwrap(), None)
+            .unwrap();
+        assert_eq!(
+            woken, 1,
+            "the waiter must still be on addr1's own wait queue -- a mismatched CMP_REQUEUE \
+             must not have requeued it onto addr2 either"
+        );
 
         assert!(waiter.join().unwrap().is_ok());
     }
