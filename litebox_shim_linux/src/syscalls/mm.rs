@@ -440,8 +440,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // MAP_SHARED is partially supported:
         // - Anonymous shared mappings are fully supported (no backing file concerns).
-        //   Note: since fork is not yet supported, shared anonymous mappings behave
-        //   identically to private ones (no cross-process sharing occurs).
+        //   Note: a `fork`ed child shares its parent's address space outright until it `exec`s
+        //   (see `syscalls::process::VforkParent`), so `MAP_SHARED` is not what carries sharing
+        //   across processes here, and after an `exec` nothing is shared at all.
         // - File-backed shared mappings are read-only: writable permission is rejected
         //   upfront and cannot be added later via mprotect, because writes cannot be
         //   propagated back to the underlying file.
@@ -481,6 +482,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
+        .inspect(|ptr| self.record_mapped(ptr.as_usize(), aligned_len))
         .map_err(Errno::from)
     }
 
@@ -490,6 +492,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
             self.clear_file_mappings_for_range(addr.as_usize(), len);
+            self.record_unmapped(addr.as_usize(), align_up(len, PAGE_SIZE));
         }
         result
     }
@@ -579,12 +582,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             flags,
             new_addr,
         )
+        .inspect(|ptr| {
+            self.record_unmapped(old_addr.as_usize(), align_up(old_size, PAGE_SIZE));
+            self.record_mapped(ptr.as_usize(), align_up(new_size, PAGE_SIZE));
+        })
     }
 
-    /// Handle syscall `brk`
-    #[inline]
+    /// Handle syscall `brk`.
+    ///
+    /// The page manager is shared by every guest process in this shim but tracks only one program
+    /// break, so this swaps in the calling process's own break for the duration of the call and
+    /// takes the updated value back out afterwards, under a lock that keeps two processes from
+    /// interleaving. See [`crate::syscalls::process::Process::brk`].
     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(&self.global.pm, addr)
+        use core::sync::atomic::Ordering;
+
+        let _guard = self.global.brk_lock.lock();
+        let process = self.process();
+        let old_brk = process.brk.load(Ordering::Relaxed);
+        let stashed = self.global.pm.swap_brk(old_brk);
+        debug_assert_eq!(stashed, 0, "the page manager's break is only live in here");
+        let result = litebox_common_linux::mm::sys_brk(&self.global.pm, addr);
+        let new_brk = self.global.pm.swap_brk(0);
+        process.brk.store(new_brk, Ordering::Relaxed);
+        // The break's backing pages are this process's mappings like any other.
+        let (old_page, new_page) = (align_up(old_brk, PAGE_SIZE), align_up(new_brk, PAGE_SIZE));
+        if new_page > old_page {
+            self.record_mapped(old_page, new_page - old_page);
+        } else if new_page < old_page {
+            self.record_unmapped(new_page, old_page - new_page);
+        }
+        result
     }
 
     /// Handle syscall `madvise`

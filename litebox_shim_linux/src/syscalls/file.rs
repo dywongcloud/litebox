@@ -97,6 +97,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         self.max_fd.store(max_fd, Ordering::Relaxed);
     }
 
+    /// Returns the file-descriptor table a `fork`ed child starts with: every descriptor of this
+    /// table, duplicated at the same number.
+    ///
+    /// "Duplicated" is `dup(2)`'s sense, which is `fork(2)`'s too: the new descriptor refers to
+    /// the same open file description, so the file offset and status flags stay shared with the
+    /// parent, while the descriptor itself -- and, crucially, the number it is filed under -- is
+    /// the child's alone. That independence is the whole point: a shell between `fork` and `exec`
+    /// rearranges fds 0/1/2 for the command it is about to run, and none of that may reach back
+    /// into the shell.
+    ///
+    /// `FD_CLOEXEC` is per descriptor rather than per description, so it is copied explicitly.
+    pub(crate) fn fork_copy(&self, task: &Task<Platform, FS>) -> Result<Self, Errno> {
+        fn dup_into<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
+            task: &Task<Platform, FS>,
+            new: &FilesState<Platform, FS>,
+            fd: &TypedFd<S>,
+            raw_fd: usize,
+            cloexec: bool,
+        ) -> Result<(), Errno> {
+            let mut dt = task.global.litebox.descriptor_table_mut();
+            let fd: TypedFd<S> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+            if cloexec {
+                let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
+                assert!(old.is_none());
+            }
+            drop(dt);
+            let inserted = new
+                .raw_descriptor_store
+                .write()
+                .fd_into_specific_raw_integer(fd, raw_fd);
+            assert!(inserted, "the new table cannot already have fd {raw_fd}");
+            Ok(())
+        }
+
+        let new = Self::new(self.fs.clone());
+        new.set_max_fd(self.max_fd.load(Ordering::Relaxed));
+        let alive_fds: alloc::vec::Vec<usize> =
+            self.raw_descriptor_store.read().iter_alive().collect();
+        for raw_fd in alive_fds {
+            let cloexec = get_file_descriptor_flags(raw_fd, &task.global, self)
+                .is_ok_and(|flags| flags.contains(FileDescriptorFlags::FD_CLOEXEC));
+            self.run_on_raw_fd(
+                raw_fd,
+                |fd| dup_into(task, &new, fd, raw_fd, cloexec),
+                |fd| dup_into(task, &new, fd, raw_fd, cloexec),
+                |fd| dup_into(task, &new, fd, raw_fd, cloexec),
+                |fd| dup_into(task, &new, fd, raw_fd, cloexec),
+                |fd| dup_into(task, &new, fd, raw_fd, cloexec),
+                |fd| dup_into(task, &new, fd, raw_fd, cloexec),
+            )??;
+        }
+        Ok(new)
+    }
+
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
     // Err(typed_fd)
     pub(crate) fn insert_raw_fd<Subsystem: FdEnabledSubsystem>(

@@ -296,6 +296,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             // so it's an obviously-uninitialized placeholder if ever observed.
             pgid: 0.into(),
             termios: litebox::sync::Mutex::new(litebox_common_linux::Termios::default_cooked()),
+            processes: syscalls::process::ProcessTable::new(),
+            brk_lock: litebox::sync::Mutex::new(()),
         });
         LinuxShim(global)
     }
@@ -333,6 +335,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
+        // Keep the pid/tid allocator clear of the initial task's own pid, so that no `fork`ed
+        // child can ever collide with it.
+        self.0
+            .next_thread_id
+            .fetch_max(pid.saturating_add(1), core::sync::atomic::Ordering::Relaxed);
+
         // A freshly started process becomes its own process-group (and session) leader, absent
         // some other mechanism (e.g. a shell explicitly calling `setpgid`) putting it into an
         // existing group -- matching real Linux's default for the first process in a new job.
@@ -362,6 +370,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                vfork_parent: RefCell::new(None),
             },
         };
 
@@ -1316,6 +1325,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Wait4 {
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self
+                .sys_wait4(pid, wstatus, options, rusage)
+                .map(|pid| pid.reinterpret_as_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -1419,17 +1436,24 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// The foreground process-group ID of the controlling terminal, as set by `TIOCSPGRP` /
     /// read by `TIOCGPGRP`.
     ///
-    /// This is a single process-wide value rather than a per-task one because `do_clone`
-    /// requires `CLONE_THREAD` for every new task this shim creates (there is no `fork`-like path
-    /// that produces a task with a different `pid`), so every task in the shim is a thread of the
-    /// same single process -- matching real Linux's "the whole process shares the terminal's
-    /// pgrp" semantics. [`LinuxShim::load_program`] initializes this to the initial task's `pid`,
-    /// matching real Linux's convention that a freshly started process (as opposed to one that
-    /// inherited an existing group via `fork`) becomes its own process-group leader.
+    /// This is a single shim-wide value rather than a per-process one: `fork` (see
+    /// `syscalls::process::Task::do_fork`) does now produce tasks with distinct pids, but they
+    /// all inherit the one process group, and nothing here implements `setpgid`, so there is only
+    /// ever one group to be in the foreground. [`LinuxShim::load_program`] initializes this to
+    /// the initial task's `pid`, matching real Linux's convention that a freshly started process
+    /// (as opposed to one that inherited an existing group via `fork`) becomes its own
+    /// process-group leader.
     pgid: core::sync::atomic::AtomicI32,
     /// Real termios state for the process's controlling terminal (shared by stdin/stdout/stderr,
     /// like a real Linux `tty_struct`), as read by `TCGETS` and written by `TCSETS`.
     termios: litebox::sync::Mutex<Platform, litebox_common_linux::Termios>,
+    /// Parent/child relationships and exit statuses for every guest process, so that `fork`ed
+    /// children can be reaped by `wait4`.
+    processes: syscalls::process::ProcessTable<Platform>,
+    /// Serializes the swap-operate-restore sequence that gives each guest process its own program
+    /// break on top of the single break [`litebox::mm::PageManager`] tracks. See
+    /// `Task::sys_brk`.
+    brk_lock: litebox::sync::Mutex<Platform, ()>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
@@ -1457,6 +1481,13 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
+    /// Set on a task created by `fork` for as long as it still runs in its parent's address
+    /// space, with the parent suspended inside its own `fork` call.
+    ///
+    /// See `syscalls::process::VforkParent` for why `fork` has to work this way here, and
+    /// `Task::release_vfork_parent` for the two places (`execve` and task exit) that hand the
+    /// address space back.
+    vfork_parent: RefCell<Option<syscalls::process::VforkParent<Platform>>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
@@ -1497,6 +1528,7 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                vfork_parent: RefCell::new(None),
                 global: self,
             }
         }
@@ -1521,6 +1553,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
+                vfork_parent: RefCell::new(None),
             };
             Some(task)
         }

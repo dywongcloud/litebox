@@ -84,6 +84,31 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
     }
 
+    /// Returns the signal state a `fork`ed child starts with.
+    ///
+    /// Unlike [`Self::clone_for_new_task`], which models `CLONE_THREAD` and therefore keeps the
+    /// process-wide parts shared, a new process gets private copies: its own pending queues (a
+    /// child does not inherit pending signals) and its own handler table (so a later
+    /// `rt_sigaction` in either process cannot be seen by the other). The blocked mask *is*
+    /// inherited, as `fork(2)` specifies.
+    pub fn clone_for_new_process(&self) -> Self {
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            blocked: Cell::new(self.blocked.get()),
+            handlers: RefCell::new(Arc::new((**self.handlers.borrow()).clone())),
+            altstack: SigAltStack {
+                flags: SsFlags::DISABLE,
+                sp: 0,
+                size: 0,
+                #[cfg(target_pointer_width = "64")]
+                __pad: 0,
+            }
+            .into(),
+            last_exception: Cell::new(arch::NO_EXCEPTION),
+        }
+    }
+
     /// Resets signal state for an `execve` call.
     pub(crate) fn reset_for_exec(&self) {
         let mut handlers = self.handlers.borrow_mut();

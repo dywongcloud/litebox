@@ -292,6 +292,25 @@ where
         vmem.brk = brk;
     }
 
+    /// Installs `brk` as the current program break, returning the value it
+    /// replaced.
+    ///
+    /// [`Self::set_initial_brk`] and [`Self::brk`] together model a *single*
+    /// program break, which is correct only while one page manager backs
+    /// exactly one guest process. A shim that runs more than one guest process
+    /// against a shared page manager (litebox's Linux shim does, once `fork`
+    /// exists: every guest process shares one host address space, at disjoint
+    /// addresses) needs one break *per process*, so it keeps the authoritative
+    /// value itself and swaps it in around each break operation. Returning the
+    /// old value is what lets the caller both save and restore in one call, so
+    /// the manager's own field can be left at the "no break set" sentinel of 0
+    /// between operations and [`Self::set_initial_brk`]'s assertion keeps
+    /// meaning what it says.
+    pub fn swap_brk(&self, brk: usize) -> usize {
+        let mut vmem = self.vmem.write();
+        core::mem::replace(&mut vmem.brk, brk)
+    }
+
     /// Set the program break to the given address.
     ///
     /// Increasing the program break has the effect of allocating memory to the process;

@@ -2714,6 +2714,18 @@ pub enum SyscallRequest {
     },
     Getpid,
     Getppid,
+    /// `wait4(pid, wstatus, options, rusage)`.
+    ///
+    /// This is the only wait syscall aarch64 offers besides `waitid`; libc's
+    /// `wait`/`waitpid`/`wait3` all funnel into it. `rusage` is carried as a raw
+    /// address rather than a typed pointer because the shim has no `struct
+    /// rusage` accounting to report -- see `Task::sys_wait4`.
+    Wait4 {
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: i32,
+        rusage: usize,
+    },
     Getuid,
     Geteuid,
     Getgid,
@@ -3131,6 +3143,12 @@ impl SyscallRequest {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::wait4 => sys_req!(Wait4 {
+                pid,
+                wstatus:*,
+                options,
+                rusage
+            }),
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,

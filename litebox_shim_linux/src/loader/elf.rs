@@ -315,6 +315,12 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };
+        // Mapped directly through the page manager rather than through `sys_mmap`, so record it
+        // as this process's the same way `sys_mmap` would (see `Process::owned_ranges`).
+        self.main.file.task.record_mapped(
+            litebox::platform::RawConstPointer::as_usize(&sp),
+            super::DEFAULT_STACK_SIZE,
+        );
         let mut stack = UserStack::<Platform>::new(
             UserPtrMut::from_platform_ptr::<Platform>(sp),
             super::DEFAULT_STACK_SIZE,

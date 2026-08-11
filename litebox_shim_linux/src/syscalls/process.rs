@@ -130,6 +130,264 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     pub(crate) limits: ResourceLimits,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
+    /// The address ranges this process (as opposed to some other guest process sharing the same
+    /// host address space) had mapped.
+    ///
+    /// Needed because `fork` has to be able to save and restore *this* process's memory without
+    /// touching a sibling's -- see [`Task::save_address_space`]. The page manager's own view is
+    /// process-blind: it is one flat map of every guest mapping in the shim.
+    pub(crate) owned_ranges: Mutex<Platform, OwnedRanges>,
+    /// This process's program break.
+    ///
+    /// Every guest process shares one [`litebox::mm::PageManager`] (they live at disjoint
+    /// addresses in the one host address space), and that manager tracks a single break, so the
+    /// authoritative per-process value has to live here and be swapped into the manager around
+    /// each break operation. See `Task::sys_brk`.
+    pub(crate) brk: core::sync::atomic::AtomicUsize,
+}
+
+/// A set of address ranges, kept sorted and non-overlapping.
+///
+/// Small and linear on purpose: it holds one entry per live mapping of a single guest process,
+/// which is a handful for the programs this shim runs, and it is only walked when that process
+/// `fork`s.
+#[derive(Clone, Default)]
+pub(crate) struct OwnedRanges {
+    ranges: Vec<Range<usize>>,
+}
+
+impl OwnedRanges {
+    /// Adds `range`, replacing anything it overlaps.
+    pub(crate) fn insert(&mut self, range: Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        self.remove(range.clone());
+        let at = self.ranges.partition_point(|r| r.start < range.start);
+        self.ranges.insert(at, range);
+    }
+
+    /// Removes `range`, splitting any entry that only partially overlaps it.
+    pub(crate) fn remove(&mut self, range: Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.ranges.len() + 1);
+        for r in self.ranges.drain(..) {
+            if r.end <= range.start || r.start >= range.end {
+                out.push(r);
+                continue;
+            }
+            if r.start < range.start {
+                out.push(r.start..range.start);
+            }
+            if r.end > range.end {
+                out.push(range.end..r.end);
+            }
+        }
+        self.ranges = out;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ranges.clear();
+    }
+
+    /// The parts of `range` that this set covers.
+    fn intersect(&self, range: &Range<usize>) -> impl Iterator<Item = Range<usize>> + '_ {
+        let range = range.clone();
+        self.ranges.iter().filter_map(move |r| {
+            let start = r.start.max(range.start);
+            let end = r.end.min(range.end);
+            (start < end).then_some(start..end)
+        })
+    }
+}
+
+/// The parent side of a `fork` whose child still shares the parent's address space.
+///
+/// LiteBox executes guest code natively, so a guest virtual address *is* a host virtual address
+/// (see `litebox::mm::linux::Vmem::insert_mapping`, which passes the guest's own range straight to
+/// the platform allocator). One host address space therefore cannot hold two guest processes that
+/// both believe they own the same addresses, which is exactly what a copying `fork` would have to
+/// produce. What *is* representable is the other classic answer to the same problem: the child
+/// runs in the parent's address space, on the parent's stack, with the parent suspended until the
+/// child either `execve`s into an image of its own (at fresh addresses -- guest binaries here are
+/// `ET_DYN`, so the loader is free to place them anywhere) or exits. That is `vfork(2)`'s
+/// contract, and it is what this shim's `fork` provides.
+///
+/// The child holds one of these; [`Task::release_vfork_parent`] flips the flag and wakes the
+/// parent blocked in [`Task::wait_for_vfork_child`].
+pub(crate) struct VforkParent<Platform: ShimPlatform> {
+    released: Arc<AtomicBool>,
+    waker: litebox::event::wait::Waker<Platform>,
+}
+
+/// Parent/child relationships and exit statuses of every guest process in the shim.
+///
+/// This is the bookkeeping `wait4` reaps from. It is deliberately separate from [`Process`],
+/// which models a *thread group*: a zombie has to outlive its `Process` (the parent may not call
+/// `wait4` until long after the child's last thread is gone), and a waiting parent has to be able
+/// to name a child it holds no reference to.
+pub(crate) struct ProcessTable<Platform: ShimPlatform> {
+    inner: Mutex<Platform, ProcessTableInner<Platform>>,
+}
+
+struct ProcessTableInner<Platform: ShimPlatform> {
+    /// Every live or zombie child, keyed by its pid.
+    children: BTreeMap<i32, ChildRecord>,
+    /// Parents currently blocked in `wait4`, as (parent pid, registration token, waker).
+    waiters: Vec<(i32, u64, litebox::event::wait::Waker<Platform>)>,
+    next_waiter_token: u64,
+}
+
+struct ChildRecord {
+    ppid: i32,
+    /// `None` while the child is still running; `Some` once it is a zombie awaiting `wait4`.
+    status: Option<ExitStatus>,
+}
+
+impl<Platform: ShimPlatform> ProcessTable<Platform> {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(ProcessTableInner {
+                children: BTreeMap::new(),
+                waiters: Vec::new(),
+                next_waiter_token: 0,
+            }),
+        }
+    }
+
+    /// Records a newly `fork`ed child of `parent`.
+    fn add_child(&self, child: i32, parent: i32) {
+        let old = self.inner.lock().children.insert(
+            child,
+            ChildRecord {
+                ppid: parent,
+                status: None,
+            },
+        );
+        assert!(old.is_none(), "pid {child} is already live");
+    }
+
+    /// Turns `child` into a zombie carrying `status`, and wakes its parent if one is waiting.
+    ///
+    /// Does nothing for a pid with no recorded parent (the initial process, or a child whose
+    /// parent already exited and dropped it).
+    fn record_exit(&self, child: i32, status: ExitStatus) {
+        let mut inner = self.inner.lock();
+        let Some(record) = inner.children.get_mut(&child) else {
+            return;
+        };
+        record.status = Some(status);
+        let parent = record.ppid;
+        let wakers: Vec<_> = inner
+            .waiters
+            .iter()
+            .filter(|(waiting, _, _)| *waiting == parent)
+            .map(|(_, _, waker)| waker.clone())
+            .collect();
+        drop(inner);
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Drops every record naming `parent` as a parent.
+    ///
+    /// Real Linux reparents orphans to init, which then reaps them; this shim has no init, and a
+    /// record nobody can ever wait on is just a leak, so they are discarded instead.
+    fn discard_children_of(&self, parent: i32) {
+        self.inner.lock().children.retain(|_, r| r.ppid != parent);
+    }
+
+    /// Whether `parent` has any child matching `filter`, zombie or not.
+    fn has_child(&self, parent: i32, filter: WaitFilter) -> bool {
+        self.inner
+            .lock()
+            .children
+            .iter()
+            .any(|(&child, r)| r.ppid == parent && filter.matches(child))
+    }
+
+    /// Reaps one zombie child of `parent` matching `filter`, removing it from the table.
+    fn reap(&self, parent: i32, filter: WaitFilter) -> Option<(i32, ExitStatus)> {
+        let mut inner = self.inner.lock();
+        let (child, status) = inner.children.iter().find_map(|(&child, r)| {
+            (r.ppid == parent && filter.matches(child))
+                .then_some(r.status)
+                .flatten()
+                .map(|status| (child, status))
+        })?;
+        inner.children.remove(&child);
+        Some((child, status))
+    }
+
+    /// Whether [`Self::reap`] would find something right now, without consuming it.
+    fn reap_ready(&self, parent: i32, filter: WaitFilter) -> bool {
+        self.inner
+            .lock()
+            .children
+            .iter()
+            .any(|(&child, r)| r.ppid == parent && filter.matches(child) && r.status.is_some())
+    }
+
+    /// Drops `child`'s record entirely, waited for or not.
+    fn forget(&self, child: i32) {
+        self.inner.lock().children.remove(&child);
+    }
+
+    fn register_waiter(&self, parent: i32, waker: litebox::event::wait::Waker<Platform>) -> u64 {
+        let mut inner = self.inner.lock();
+        let token = inner.next_waiter_token;
+        inner.next_waiter_token += 1;
+        inner.waiters.push((parent, token, waker));
+        token
+    }
+
+    fn unregister_waiter(&self, token: u64) {
+        self.inner.lock().waiters.retain(|(_, t, _)| *t != token);
+    }
+}
+
+/// The guest stack pointer recorded in a saved register context.
+fn guest_stack_pointer(ctx: &litebox_common_linux::PtRegs) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.rsp
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        ctx.sp
+    }
+}
+
+/// Packs an exit status into the `int` layout `wait4`'s `wstatus` uses, as decoded by libc's
+/// `WIFEXITED`/`WEXITSTATUS`/`WTERMSIG` macros: a normal exit puts the code in bits 8..16 and
+/// leaves the low seven bits (the terminating signal) zero, while a signal death puts the signal
+/// number in those low bits.
+fn encode_wait_status(status: ExitStatus) -> i32 {
+    match status {
+        ExitStatus::Exit(code) => (i32::from(code) & 0xff) << 8,
+        ExitStatus::Signal(signal) => signal.as_i32() & 0x7f,
+    }
+}
+
+/// Which children a `wait4` call is willing to reap.
+#[derive(Clone, Copy)]
+enum WaitFilter {
+    /// `pid < -1` and `pid == 0` (process-group waits) are not distinguished from `-1` here:
+    /// this shim has a single process group.
+    Any,
+    Pid(i32),
+}
+
+impl WaitFilter {
+    fn matches(self, pid: i32) -> bool {
+        match self {
+            WaitFilter::Any => true,
+            WaitFilter::Pid(p) => p == pid,
+        }
+    }
 }
 
 pub(crate) struct Alarm<Platform: ShimPlatform> {
@@ -190,6 +448,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 handle: None,
                 deadline: None,
             }),
+            brk: core::sync::atomic::AtomicUsize::new(0),
+            owned_ranges: Mutex::new(OwnedRanges::default()),
         }
     }
 
@@ -371,10 +631,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.comm.set(new_comm);
 
         // Publish to `/proc/<pid>/{stat,status,comm}`, if a `/proc` is mounted. `pid`/`ppid`
-        // never change after task construction (this process model has no `fork`), and live
-        // `setuid`/`setgid` credential changes are not tracked here (out of this call's scope);
-        // re-publishing them on every `comm` change is simply cheaper than a separate
-        // first-publish flag, not a claim that they can change.
+        // never change after task construction, and live `setuid`/`setgid` credential changes
+        // are not tracked here (out of this call's scope); re-publishing them on every `comm`
+        // change is simply cheaper than a separate first-publish flag, not a claim that they can
+        // change. Note that this backend is shim-wide while pids now are not: with `fork`, the
+        // last task to publish wins, so `/proc/self` describes whichever process most recently
+        // `exec`ed rather than the reader.
         if let Some(proc) = &self.global.proc_handle {
             let credentials = self.credentials.borrow();
             proc.set_identity(self.pid, self.ppid, credentials.uid, credentials.gid);
@@ -521,6 +783,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn prepare_for_exit(&mut self) {
         let is_last_thread = self.thread.detach_from_process();
 
+        // A forked child that never reached `execve` -- because it exited, or because something
+        // killed it -- still owes its parent the address space back. Do this first: the parent is
+        // blocked and cannot make progress until it happens.
+        self.release_vfork_parent();
+
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
@@ -552,6 +819,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // multithreaded process exiting must NOT close fds out from under its siblings).
         if is_last_thread {
             self.close_all_fds_on_exit();
+            // The process is gone: become a zombie its parent can `wait4`, and let go of any
+            // children of our own (nothing can ever reap them now).
+            let status = self.thread.process.inner.lock().exit_status;
+            self.global.processes.record_exit(self.pid, status);
+            self.global.processes.discard_children_of(self.pid);
         }
     }
 
@@ -654,6 +926,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
+        // A `fork(2)`: libc issues it as a bare `clone(exit_signal, 0)` with no sharing flags at
+        // all. `vfork(2)` and `posix_spawn` add `CLONE_VM | CLONE_VFORK`, which asks for exactly
+        // the semantics this shim implements anyway (see `VforkParent`), so accept those too --
+        // but only together, and only without `CLONE_THREAD`, which would mean a thread rather
+        // than a process.
+        let fork_optional_flags = CloneFlags::VM | CloneFlags::VFORK;
+        if !flags.intersects(!fork_optional_flags)
+            && (flags & fork_optional_flags).bits() != CloneFlags::VM.bits()
+        {
+            return self.do_fork(ctx, args);
+        }
+
         let required_clone_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
 
@@ -695,7 +979,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
+        // `exit_signal` is validated but otherwise ignored: it names the signal to send the
+        // parent when this task dies, and this shim does not deliver signals across processes.
+        // A parent learns of its children through `wait4` instead (see `Task::sys_wait4`).
         if exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
         }
@@ -787,6 +1073,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
+                        vfork_parent: RefCell::new(None),
                     },
                 }),
             )
@@ -800,6 +1087,302 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         Ok(usize::try_from(child_tid).unwrap())
+    }
+
+    /// Creates a new *process* sharing this one's address space, and suspends the caller until
+    /// that child `execve`s or exits -- `vfork(2)` semantics. See [`VforkParent`] for why a
+    /// copying `fork` is not representable here.
+    ///
+    /// Unlike `vfork`, and like `fork`, the child gets its own copy of everything that is not
+    /// memory: its own pid, its own file-descriptor table (so the shell's `dup2`/`close` dance
+    /// between `fork` and `exec` cannot reach back into the parent's stdio), its own working
+    /// directory and umask, and its own signal dispositions.
+    fn do_fork(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        args: &litebox_common_linux::CloneArgs,
+    ) -> Result<usize, Errno> {
+        const MAX_SIGNAL_NUMBER: u64 = 64;
+        if args.exit_signal > MAX_SIGNAL_NUMBER {
+            return Err(Errno::EINVAL);
+        }
+        if args.stack != 0 || args.set_tid != 0 || args.cgroup != 0 {
+            log_unsupported!("fork with a stack, set_tid or cgroup");
+            return Err(Errno::EINVAL);
+        }
+
+        // The child runs on this thread's guest stack, below this thread's current `sp`, so the
+        // parent must not touch guest memory again until the child gives the address space back.
+        // Everything else about the child is copied here, in the parent, before it can run.
+        let child_pid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        let files = self.files.borrow().fork_copy(self)?;
+        let fs = alloc::sync::Arc::new((**self.fs.borrow()).clone());
+
+        // The guest's thread pointer lives in a per-host-thread slot, so the new host thread has
+        // to be told the value the parent is running with -- the libc data it points at is in the
+        // address space the child is about to share.
+        let tls = self
+            .global
+            .platform
+            .get_arch_specific_register(&GUEST_TLS_REGISTER)
+            .ok()
+            .filter(|tls| *tls != 0)
+            .map(ThreadLocalDescriptor::from_usize);
+
+        let released = Arc::new(AtomicBool::new(false));
+        let vfork_parent = VforkParent {
+            released: released.clone(),
+            waker: self.wait_cx().waker().clone(),
+        };
+
+        let thread = ThreadState::new_process(child_pid);
+        thread.init_state.set(ThreadInitState::NewThread {
+            // No stack of its own: that is what makes this a `vfork`.
+            stack: None,
+            tls,
+            set_child_tid: None,
+        });
+
+        let child = Task {
+            global: self.global.clone(),
+            wait_state: crate::wait::WaitState::new(self.global.platform),
+            thread,
+            pid: child_pid,
+            tid: child_pid,
+            ppid: self.pid,
+            credentials: RefCell::new(self.credentials.borrow().clone()),
+            comm: self.comm.clone(),
+            fs: fs.into(),
+            files: Arc::new(files).into(),
+            signals: self.signals.clone_for_new_process(),
+            vfork_parent: RefCell::new(Some(vfork_parent)),
+        };
+        child.process().brk.store(
+            self.process().brk.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        // The child is running on this memory, so it owns it in the same sense the parent does --
+        // which matters if the child `fork`s again before it `exec`s.
+        *child.process().owned_ranges.lock() = self.process().owned_ranges.lock().clone();
+        self.global.processes.add_child(child_pid, self.pid);
+
+        // Saved last, so that it captures memory exactly as the child will find it.
+        let saved = self.save_address_space(guest_stack_pointer(ctx));
+
+        let r = unsafe {
+            self.global
+                .platform
+                .spawn_thread(ctx, Box::new(NewThreadArgs { task: child }))
+        };
+        if let Err(err) = r {
+            litebox_util_log::error!(err:% = err; "failed to spawn forked process");
+            // Dropping the child's `Task` on the way out of `spawn_thread` already released this
+            // parent and turned the child into a zombie; since the child never existed as far as
+            // the guest is concerned, drop the record too rather than leave an unwaitable pid.
+            self.global.processes.forget(child_pid);
+            self.restore_address_space(saved);
+            return Err(Errno::ENOMEM);
+        }
+
+        self.wait_for_vfork_child(&released);
+        self.restore_address_space(saved);
+        Ok(usize::try_from(child_pid).unwrap())
+    }
+
+    /// Copies this process's private writable memory out into host memory.
+    ///
+    /// This is what makes a shared-address-space `fork` behave like a real one for a guest that
+    /// was built for a real one. The child necessarily runs on the parent's memory (see
+    /// [`VforkParent`]), and `vfork(2)`'s contract -- "the child may only `exec` or `_exit`" --
+    /// is one a `fork(2)`-using program has no reason to honour. busybox's shell, for instance,
+    /// *returns* out of the function that called `fork`, overwriting the frames its parent is
+    /// suspended in, and its `forkchild` frees the parent's job list on the shared heap. But the
+    /// parent cannot run until the child is finished with the address space, so none of that has
+    /// to be visible to it: this saves the memory, and [`Task::restore_address_space`] puts it
+    /// back before the parent executes a single guest instruction. The parent then sees exactly
+    /// what `fork(2)` promises -- its own memory, untouched -- while the child saw a faithful
+    /// copy of it, because it *was* it.
+    ///
+    /// Two deliberate limits on what is saved:
+    ///
+    /// * Only ranges this process owns, so that a sibling guest process running concurrently at
+    ///   other addresses is never rolled back. See [`Process::owned_ranges`].
+    /// * Of the mapping holding the stack pointer, only `[sp, end)`. Everything below `sp` is
+    ///   dead memory on both supported architectures (neither the AArch64 nor the x86-64 Linux
+    ///   ABI keeps live data below the stack pointer across a call), and it is where the child
+    ///   does most of its work -- saving the whole 8 MiB stack mapping would make every `fork`
+    ///   pointlessly expensive to preserve nothing.
+    fn save_address_space(&self, sp: usize) -> Vec<(usize, alloc::boxed::Box<[u8]>)> {
+        let owned = self.process().owned_ranges.lock();
+        let mut saved = Vec::new();
+        for (range, flags) in self.global.pm.mappings() {
+            if !flags.contains(VmFlags::VM_WRITE) || flags.contains(VmFlags::VM_SHARED) {
+                continue;
+            }
+            let stack = range.contains(&sp);
+            for part in owned.intersect(&range) {
+                let start = if stack {
+                    part.start.max(sp)
+                } else {
+                    part.start
+                };
+                if start >= part.end {
+                    continue;
+                }
+                match UserPtr::<u8>::from_usize(start).to_owned_slice::<Platform>(part.end - start)
+                {
+                    Some(bytes) => saved.push((start, bytes)),
+                    None => litebox_util_log::warn!(
+                        start:? = start, end:? = part.end;
+                        "could not save a mapping across fork; the child's writes to it will be \
+                         visible to the parent"
+                    ),
+                }
+            }
+        }
+        saved
+    }
+
+    /// Puts back what [`Task::save_address_space`] took, undoing everything a forked child did to
+    /// its parent's memory.
+    fn restore_address_space(&self, saved: Vec<(usize, alloc::boxed::Box<[u8]>)>) {
+        for (start, bytes) in saved {
+            if UserPtrMut::<u8>::from_usize(start)
+                .copy_from_slice::<Platform>(0, &bytes)
+                .is_none()
+            {
+                // Only reachable if the child unmapped or write-protected memory belonging to its
+                // parent, which no correct program does; the parent is left with whatever the
+                // child made of it.
+                litebox_util_log::error!(
+                    pid:? = self.pid, start:? = start;
+                    "failed to restore a mapping after fork"
+                );
+            }
+        }
+    }
+
+    /// Blocks until the forked child hands the address space back.
+    ///
+    /// This wait is deliberately not interruptible by guest signals: the caller cannot run guest
+    /// code again until the child is done with its stack, so returning early would corrupt it.
+    /// It still ends if this task is being torn down, which is the only way the child can fail to
+    /// arrive (its own teardown releases the parent -- see [`Task::release_vfork_parent`]).
+    fn wait_for_vfork_child(&self, released: &AtomicBool) {
+        while !released.load(Ordering::Acquire) && !self.is_exiting() {
+            // Ignore interruptions: the loop condition, not the wait, decides when this ends.
+            let _ = self
+                .wait_state_uninterruptible()
+                .wait_until(|| released.load(Ordering::Acquire) || self.is_exiting());
+        }
+    }
+
+    /// Hands the parent's address space back, if this task is a forked child that still holds it.
+    ///
+    /// Called from `execve` (once the new image is loaded, so the parent never observes a
+    /// half-built address space) and from task teardown (so a child that exits without ever
+    /// `exec`ing, or that dies, cannot strand its parent).
+    pub(crate) fn release_vfork_parent(&self) {
+        if let Some(parent) = self.vfork_parent.borrow_mut().take() {
+            parent.released.store(true, Ordering::Release);
+            parent.waker.wake();
+        }
+    }
+
+    /// Whether this task is still running in its parent's address space.
+    pub(crate) fn shares_parent_address_space(&self) -> bool {
+        self.vfork_parent.borrow().is_some()
+    }
+
+    /// Handle syscall `wait4`.
+    pub(crate) fn sys_wait4(
+        &self,
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: i32,
+        rusage: usize,
+    ) -> Result<i32, Errno> {
+        /// `WNOHANG`: return immediately if no child has exited.
+        const WNOHANG: u32 = 0x1;
+        /// `WUNTRACED`/`WCONTINUED`: accepted and then never acted on, because this shim has no
+        /// way to stop or continue a process in the first place, so a wait for either event
+        /// simply never has one to report.
+        const WUNTRACED: u32 = 0x2;
+        const WCONTINUED: u32 = 0x8;
+        /// `__WNOTHREAD`/`__WALL`/`__WCLONE`: which *kinds* of child to consider. Every child
+        /// here is an ordinary one belonging to the caller alone, so all three are no-ops.
+        const WNOTHREAD: u32 = 0x2000_0000;
+        const WALL: u32 = 0x4000_0000;
+        const WCLONE: u32 = 0x8000_0000;
+        /// Deliberately absent: `WNOWAIT` (leave the child reapable), which this cannot honour
+        /// -- the reap below is destructive -- and `WEXITED`/`WSTOPPED`, which are `waitid`'s,
+        /// not `wait4`'s.
+        const SUPPORTED: u32 = WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE;
+
+        let options = options.cast_unsigned();
+        if options & !SUPPORTED != 0 {
+            log_unsupported!("wait4 with options {options:#x}");
+            return Err(Errno::EINVAL);
+        }
+        if rusage != 0 {
+            // Reporting zeroed usage would be a lie that some callers act on; refusing is not,
+            // and no caller in sight asks for it.
+            log_unsupported!("wait4 with a rusage buffer");
+        }
+
+        let filter = if pid > 0 {
+            WaitFilter::Pid(pid)
+        } else {
+            // `-1` (any child), `0` (any child in my process group) and `< -1` (a named process
+            // group) all mean the same thing in a shim with one process group.
+            WaitFilter::Any
+        };
+        let table = &self.global.processes;
+
+        // Registered before the first check so that a child exiting in the gap between the check
+        // and the block cannot be missed.
+        let token = table.register_waiter(self.pid, self.wait_cx().waker().clone());
+        let _unregister = litebox::utils::defer(|| table.unregister_waiter(token));
+
+        loop {
+            if let Some((pid, status)) = table.reap(self.pid, filter) {
+                if let Some(wstatus) = wstatus {
+                    wstatus
+                        .write_at_offset::<Platform>(0, encode_wait_status(status))
+                        .ok_or(Errno::EFAULT)?;
+                }
+                return Ok(pid);
+            }
+            if !table.has_child(self.pid, filter) {
+                return Err(Errno::ECHILD);
+            }
+            if options & WNOHANG != 0 {
+                return Ok(0);
+            }
+            self.wait_cx()
+                .wait_until(|| table.reap_ready(self.pid, filter))
+                .map_err(|_| Errno::EINTR)?;
+        }
+    }
+
+    /// Records `range` as mapped by this process. See [`Process::owned_ranges`].
+    pub(crate) fn record_mapped(&self, start: usize, len: usize) {
+        if len != 0 {
+            self.process()
+                .owned_ranges
+                .lock()
+                .insert(start..start.saturating_add(len));
+        }
+    }
+
+    /// Records `range` as no longer mapped by this process.
+    pub(crate) fn record_unmapped(&self, start: usize, len: usize) {
+        if len != 0 {
+            self.process()
+                .owned_ranges
+                .lock()
+                .remove(start..start.saturating_add(len));
+        }
     }
 
     /// Handle syscall `set_tid_address`.
@@ -1857,10 +2440,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         self.signals.reset_for_exec();
 
-        // Don't release reserved mappings.
-        let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.global.pm.release_memory(release) }
-            .expect("failed to release memory mappings");
+        if self.shares_parent_address_space() {
+            // This task is a `fork`ed child still running in its parent's address space (see
+            // `VforkParent`), so those mappings belong to the suspended parent, not to us:
+            // tearing them down here would destroy the process we are about to hand control back
+            // to. The new image is loaded alongside them instead -- it is position-independent,
+            // and `Vmem::get_unmmaped_area` places it wherever the parent is not.
+        } else {
+            // Don't release reserved mappings.
+            let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
+            unsafe { self.global.pm.release_memory(release) }
+                .expect("failed to release memory mappings");
+        }
+
+        // Either the old mappings are gone or (for a `fork`ed child) they were never this
+        // process's to begin with. `load_program` re-populates this as it maps the new image.
+        self.process().owned_ranges.lock().clear();
 
         self.global
             .platform
@@ -1871,6 +2466,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .expect("TODO: terminate the process cleanly");
 
         self.init_thread_context(ctx);
+        // The new image is fully built, so the parent can safely run again -- and must, since
+        // this is the point at which we stopped needing its address space.
+        self.release_vfork_parent();
         Ok(0)
     }
 
@@ -1890,7 +2488,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             proc.set_cmdline(&argv_bytes);
         }
 
-        let load_info = loader.load(argv, envp, self.init_auxv())?;
+        // The loader publishes the new image's initial break through the (single, shared) page
+        // manager; take it back out into this process's own slot, restoring the manager's
+        // "no break set" sentinel, so that a sibling process's break is unaffected. See
+        // `Process::brk`.
+        let load_info = {
+            let _guard = self.global.brk_lock.lock();
+            let load_info = loader.load(argv, envp, self.init_auxv())?;
+            self.process()
+                .brk
+                .store(self.global.pm.swap_brk(0), Ordering::Relaxed);
+            load_info
+        };
 
         self.set_task_comm(loader.comm());
 
@@ -3127,5 +3736,181 @@ mod tests {
             "the reader should observe EOF (a 0-byte read) once the writer's process exits, not \
              hang forever"
         );
+    }
+
+    /// [`super::OwnedRanges`] has to be a real set -- inserting over, and removing out of the
+    /// middle of, an existing range must split rather than drop or duplicate it -- because a
+    /// stale entry would let `fork`'s snapshot roll back memory that by then belongs to a
+    /// different guest process.
+    #[test]
+    fn owned_ranges_splits_on_partial_overlap() {
+        let mut ranges = super::OwnedRanges::default();
+        ranges.insert(0x1000..0x5000);
+
+        // A hole punched out of the middle leaves the two ends.
+        ranges.remove(0x2000..0x3000);
+        assert_eq!(
+            ranges
+                .intersect(&(0..0x10000))
+                .collect::<std::vec::Vec<_>>(),
+            std::vec![0x1000..0x2000, 0x3000..0x5000]
+        );
+
+        // Re-inserting across the hole coalesces back into one entry, replacing what it overlaps
+        // rather than duplicating it.
+        ranges.insert(0x1000..0x5000);
+        assert_eq!(
+            ranges
+                .intersect(&(0..0x10000))
+                .collect::<std::vec::Vec<_>>(),
+            std::vec![0x1000..0x5000]
+        );
+
+        // `intersect` clips to the queried range, since callers use it to pick the owned parts of
+        // a mapping that may extend past them.
+        assert_eq!(
+            ranges
+                .intersect(&(0x4000..0x9000))
+                .collect::<std::vec::Vec<_>>(),
+            std::vec![0x4000..0x5000]
+        );
+
+        ranges.remove(0..usize::MAX);
+        assert_eq!(ranges.intersect(&(0..0x10000)).count(), 0);
+    }
+
+    /// The `wstatus` word `wait4` writes is what libc's `WIFEXITED`/`WEXITSTATUS`/`WTERMSIG`
+    /// decode, so the packing has to match theirs exactly -- a shell reports `$?` straight out of
+    /// it.
+    #[test]
+    fn wait_status_matches_the_libc_macros() {
+        use litebox_common_linux::signal::Signal;
+
+        let exited = super::encode_wait_status(super::ExitStatus::Exit(42));
+        assert_eq!(exited & 0x7f, 0, "WIFEXITED: low seven bits clear");
+        assert_eq!((exited >> 8) & 0xff, 42, "WEXITSTATUS");
+
+        let zero = super::encode_wait_status(super::ExitStatus::Exit(0));
+        assert_eq!(zero, 0);
+
+        // An exit code is truncated to 8 bits by the kernel, so `exit(-1)` reads back as 255.
+        assert_eq!(
+            (super::encode_wait_status(super::ExitStatus::Exit(-1)) >> 8) & 0xff,
+            255
+        );
+
+        let killed = super::encode_wait_status(super::ExitStatus::Signal(Signal::SIGSEGV));
+        assert_eq!(killed & 0x7f, Signal::SIGSEGV.as_i32(), "WTERMSIG");
+        assert_ne!(
+            killed & 0x7f,
+            0,
+            "WIFEXITED must be false for a signal death"
+        );
+    }
+
+    /// `wait4` has to distinguish "no children at all" (`ECHILD`) from "children, none finished"
+    /// (block, or return 0 under `WNOHANG`), and must reap exactly once.
+    #[test]
+    fn wait4_reports_no_children_children_running_and_a_finished_child() {
+        use litebox_common_linux::errno::Errno;
+        const WNOHANG: i32 = 1;
+        let task = crate::syscalls::tests::init_platform(None);
+        let table = &task.global.processes;
+
+        assert_eq!(
+            task.sys_wait4(-1, None, 0, 0).unwrap_err(),
+            Errno::ECHILD,
+            "a task with no children cannot wait for one"
+        );
+
+        let child = 0x4242;
+        table.add_child(child, task.pid);
+        assert_eq!(
+            task.sys_wait4(-1, None, WNOHANG, 0).unwrap(),
+            0,
+            "a running child is not reapable, and WNOHANG must not block for it"
+        );
+        assert_eq!(
+            task.sys_wait4(child + 1, None, WNOHANG, 0).unwrap_err(),
+            Errno::ECHILD,
+            "waiting for a pid that is not our child is ECHILD even though we have one"
+        );
+
+        table.record_exit(child, super::ExitStatus::Exit(7));
+        let mut status = 0i32;
+        let status_ptr = UserPtrMut::from_ptr(&raw mut status);
+        assert_eq!(task.sys_wait4(-1, Some(status_ptr), 0, 0).unwrap(), child);
+        assert_eq!((status >> 8) & 0xff, 7);
+
+        assert_eq!(
+            task.sys_wait4(-1, None, 0, 0).unwrap_err(),
+            Errno::ECHILD,
+            "a reaped child is gone: waiting again is ECHILD, not a second reap"
+        );
+    }
+
+    /// A `fork`ed child gets its own descriptor *table* over the same open file *descriptions*.
+    /// The shell relies on both halves: it rearranges fds 0/1/2 for the command it is about to
+    /// `exec` (which must not reach back into the shell), and it expects the descriptions
+    /// themselves -- offsets, pipe ends -- to be shared with what it forked from.
+    #[test]
+    fn fork_copies_the_descriptor_table_but_shares_the_descriptions() {
+        let _guard = crate::syscalls::tests::address_space_guard();
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let (read_fd, write_fd) = task.sys_pipe2(litebox::fs::OFlags::empty()).unwrap();
+        let (read_fd, write_fd) = (
+            i32::try_from(read_fd).unwrap(),
+            i32::try_from(write_fd).unwrap(),
+        );
+
+        let child_files = task.files.borrow().fork_copy(&task).unwrap();
+        let child_fds: std::vec::Vec<usize> = child_files
+            .raw_descriptor_store
+            .read()
+            .iter_alive()
+            .collect();
+        let parent_fds: std::vec::Vec<usize> = task
+            .files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .iter_alive()
+            .collect();
+        assert_eq!(
+            child_fds, parent_fds,
+            "every descriptor is duplicated at the same number"
+        );
+
+        // Closing in the child's table leaves the parent's number alive...
+        let parent_files = task.files.replace(alloc::sync::Arc::new(child_files));
+        task.sys_close(write_fd).unwrap();
+        let child_files = task.files.replace(parent_files);
+        assert!(
+            !child_files
+                .raw_descriptor_store
+                .read()
+                .iter_alive()
+                .any(|fd| fd == usize::try_from(write_fd).unwrap())
+        );
+        assert!(
+            task.files
+                .borrow()
+                .raw_descriptor_store
+                .read()
+                .iter_alive()
+                .any(|fd| fd == usize::try_from(write_fd).unwrap()),
+            "the parent's write end must survive the child closing its own"
+        );
+
+        // ...and the shared description is still open, so the read end has not seen EOF: a write
+        // through the parent's still-open write end is readable.
+        assert_eq!(task.sys_write(write_fd, b"hi", None).unwrap(), 2);
+        let mut buf = [0u8; 2];
+        assert_eq!(task.sys_read(read_fd, &mut buf, None).unwrap(), 2);
+        assert_eq!(&buf, b"hi");
+
+        task.sys_close(read_fd).unwrap();
+        task.sys_close(write_fd).unwrap();
     }
 }

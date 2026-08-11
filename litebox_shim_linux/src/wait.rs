@@ -27,6 +27,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.wait_state.0.context().with_check_for_interrupt(self)
     }
 
+    /// Returns a wait context that ignores pending guest signals.
+    ///
+    /// Almost every wait in the shim should be interruptible; use [`Task::wait_cx`] for those.
+    /// This exists for the one wait that must not be: the parent side of `fork`, which cannot
+    /// return to guest code while the child is still running on its stack (see
+    /// `syscalls::process::VforkParent`).
+    pub(crate) fn wait_state_uninterruptible(
+        &self,
+    ) -> litebox::event::wait::WaitContext<'_, Platform> {
+        self.wait_state.0.context()
+    }
+
     /// Marks that the task has just returned from running guest code.
     pub(crate) fn enter_from_guest(&self) {
         self.wait_state.0.finish_running_guest();
