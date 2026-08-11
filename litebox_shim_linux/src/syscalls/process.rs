@@ -4228,8 +4228,7 @@ mod tests {
         let rusage_ptr = UserPtrMut::<Rusage>::from_ptr(buf.as_mut_ptr().cast());
 
         assert_eq!(
-            task.sys_wait4(-1, None, 0, rusage_ptr.as_usize())
-                .unwrap(),
+            task.sys_wait4(-1, None, 0, rusage_ptr.as_usize()).unwrap(),
             child
         );
 
@@ -4245,10 +4244,12 @@ mod tests {
             "ru_stime is honestly zero (this shim has no meaningful kernel time of its own to \
              attribute), not the sentinel"
         );
-        assert_eq!(rusage.ru_maxrss, 0, "unmeasured fields are zeroed, not sentinel garbage");
         assert_eq!(
-            rusage._reserved,
-            [0i64; 16],
+            rusage.ru_maxrss, 0,
+            "unmeasured fields are zeroed, not sentinel garbage"
+        );
+        assert_eq!(
+            rusage._reserved, [0i64; 16],
             "the musl reserved tail is zeroed too, not left as sentinel garbage"
         );
     }

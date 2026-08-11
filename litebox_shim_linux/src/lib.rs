@@ -50,6 +50,7 @@ pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
+pub mod vsock_transport;
 mod wait;
 
 use crate::syscalls::file::get_file_descriptor_flags;

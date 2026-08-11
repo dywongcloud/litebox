@@ -1041,7 +1041,12 @@ a real, multi-day project on its own:
   per-principal rights.
 * **`litebox_runner_snp`'s TCP+9P bootstrap migrated to a vsock-style
   channel**, following Firecracker's precedent, to avoid exposing the boot
-  channel on a real network interface.
+  channel on a real network interface. The guest-side half (a
+  transport-agnostic `ByteChannel`/`PointToPointTransport` abstraction,
+  tested) is done; the rest needs a new hypercall implemented in the
+  out-of-repo privileged `sandbox_driver` component, which this repo can't
+  add or verify. See `docs/vsock-boot-channel.md` for the exact remaining
+  contract.
 * **Process-level jailing of `litebox_broker_host`** itself (Firecracker's
   jailer, or crosvm's minijail, are the precedents), so a broken broker isn't
   a fully-privileged process.
