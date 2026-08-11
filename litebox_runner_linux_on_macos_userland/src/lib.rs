@@ -132,6 +132,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
+    // Drop into the Seatbelt sandbox before any guest-controlled byte is parsed.
+    // This is the exact counterpart, and the exact lifecycle position, of the
+    // Linux runner's `enable_seccomp_filter` call: every host resource this
+    // process will ever need has been acquired by now (the tar archive is read
+    // into memory above, the `utun` device was opened in `Platform::new`, stdio
+    // was sampled there too), and the very next thing that happens is
+    // `load_program` running an ELF parser over attacker-chosen bytes.
+    //
+    // This panics rather than warning if the sandbox cannot be installed; see
+    // `enable_seatbelt_sandbox`'s doc comment for the fail-safe argument.
+    litebox_platform_macos_userland::enable_seatbelt_sandbox();
+
     let program = shim.load_program(
         initial_file_system,
         platform.init_task(),

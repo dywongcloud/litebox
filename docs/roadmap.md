@@ -981,9 +981,17 @@ These came out of researching how comparable sandboxes (gVisor, Firecracker,
 WASI/wasmtime, Seatbelt/Landlock) solve problems LiteBox has today. Each is
 a real, multi-day project on its own:
 
-* **Seatbelt (`sandbox_init`) defense-in-depth for the macOS platform**,
-  mirroring the existing Linux seccomp filter -- macOS currently has no
-  second sandboxing layer behind LiteBox's own guest/host boundary.
+* **Widening the macOS Seatbelt profile's coverage.** The second sandboxing
+  layer behind LiteBox's own guest/host boundary now exists on macOS --
+  `litebox_platform_macos_userland::enable_seatbelt_sandbox` installs a
+  `(deny default)` SBPL profile, mirroring the Linux seccomp filter's posture
+  and lifecycle -- but Seatbelt mediates *operations*, not syscalls, and there
+  are three things it structurally cannot reach: descriptors that were already
+  open when the profile was installed (stdio, and the `utun` tap when guest
+  networking is on), the whole `mmap`/`mprotect`/`MAP_JIT` surface, and this
+  process's own address space. Narrowing those needs a different mechanism
+  (a separate broker process holding the `utun` descriptor, for instance), not
+  a bigger profile.
 * **Landlock integration** for the existing Linux seccomp filter, which
   currently has no path-scoping: a compromised guest that finds a seccomp
   gap can still reach any path the host process can.

@@ -547,15 +547,32 @@ fn extract_tar<R: Read>(
         }
 
         // Normal file/directory: use the standard unpack.
-        // If a previous layer recorded a symlink at this path, as a child of
-        // this path, or as an ancestor of this path, the real file/directory
-        // from an upper layer takes precedence — remove the stale symlink
-        // entries. The ancestor check prevents stale symlinks from being
-        // resolved during scan_rootfs and incorrectly pulling in lower-layer
-        // content.
-        symlinks.retain(|s| {
-            s.rel_path != path && !s.rel_path.starts_with(&path) && !path.starts_with(&s.rel_path)
-        });
+        //
+        // A *non-directory* entry from an upper layer replaces whatever the
+        // lower layers put at that path, so any deferred symlink recorded at
+        // this path, below it, or above it is now stale and must be dropped.
+        // The ancestor check prevents stale symlinks from being resolved
+        // during scan_rootfs and incorrectly pulling in lower-layer content.
+        //
+        // A *directory* entry must not prune anything. Directories in OCI
+        // layers merge rather than replace: image layers routinely carry bare
+        // `usr/`, `lib/`, `etc/` entries purely to record ownership/mode, and
+        // deletion is expressed exclusively through whiteouts (handled above).
+        // Pruning on a directory entry therefore wiped every symlink under the
+        // named directory -- e.g. a `usr/` entry in the node:alpine layer
+        // deleted the base layer's `usr/lib/libz.so.1 -> libz.so.1.3.2`, so
+        // the SONAME the dynamic linker asks for was absent from the output
+        // tar and dynamically-linked guests failed to load their libraries.
+        // It also clobbers a lower-layer symlink that a directory entry lands
+        // on exactly (the usr-merge `lib -> usr/lib` shape), which `mkdir -p`
+        // semantics would have left alone.
+        if entry_type != tar::EntryType::Directory {
+            symlinks.retain(|s| {
+                s.rel_path != path
+                    && !s.rel_path.starts_with(&path)
+                    && !path.starts_with(&s.rel_path)
+            });
+        }
         entry
             .unpack(&target)
             .with_context(|| format!("failed to unpack entry: {path_str}"))?;
@@ -1008,6 +1025,219 @@ fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One entry of a synthetic OCI image layer.
+    enum LayerEntry<'a> {
+        Dir(&'a str),
+        File(&'a str, &'a [u8]),
+        Symlink(&'a str, &'a str),
+    }
+
+    /// Build an uncompressed in-memory tar that looks like an OCI image layer.
+    fn build_layer(entries: &[LayerEntry<'_>]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for entry in entries {
+            let mut header = tar::Header::new_gnu();
+            match *entry {
+                LayerEntry::Dir(path) => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_mode(0o755);
+                    header.set_size(0);
+                    builder
+                        .append_data(&mut header, path, std::io::empty())
+                        .unwrap();
+                }
+                LayerEntry::File(path, data) => {
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_mode(0o755);
+                    header.set_size(data.len() as u64);
+                    builder.append_data(&mut header, path, data).unwrap();
+                }
+                LayerEntry::Symlink(path, target) => {
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    header.set_mode(0o777);
+                    header.set_size(0);
+                    builder.append_link(&mut header, path, target).unwrap();
+                }
+            }
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// Apply layers bottom-up into a fresh rootfs, then materialize symlinks,
+    /// exactly like `pull_and_extract` does.
+    fn apply_layers(
+        rootfs: &Path,
+        layers: &[Vec<u8>],
+    ) -> (HashMap<PathBuf, PathBuf>, HashMap<PathBuf, u32>) {
+        let mut symlinks: Vec<DeferredSymlink> = Vec::new();
+        let mut permissions: HashMap<PathBuf, u32> = HashMap::new();
+        for layer in layers {
+            extract_tar(layer.as_slice(), rootfs, &mut symlinks, &mut permissions).unwrap();
+        }
+        let symlink_map: HashMap<PathBuf, PathBuf> = symlinks
+            .iter()
+            .map(|s| (s.rel_path.clone(), s.link_target.clone()))
+            .collect();
+        materialize_symlinks(&symlink_map, rootfs, &mut permissions, false).unwrap();
+        (symlink_map, permissions)
+    }
+
+    /// Read back what a packaged tar would contain for `tar_path`.
+    fn packaged_contents(file_map: &RootfsFileMap, tar_path: &str) -> Option<Vec<u8>> {
+        let entry = file_map.files.values().find(|e| e.tar_path == tar_path)?;
+        Some(std::fs::read(&entry.read_path).unwrap())
+    }
+
+    /// Regression test for versioned `.so` symlinks being lost during packaging.
+    ///
+    /// A bare `usr/` directory entry in an upper layer (node:alpine has one)
+    /// used to prune every deferred symlink under `usr/`, which deleted the
+    /// base layer's `usr/lib/libz.so.1 -> libz.so.1.3.2`. The concrete
+    /// `libz.so.1.3.2` survived, but the SONAME the dynamic linker asks for did
+    /// not, so `/sbin/apk` in the packaged guest died with
+    /// "Error loading shared library libz.so.1: No such file or directory".
+    #[test]
+    fn upper_layer_directory_entry_keeps_lower_layer_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+
+        let base = build_layer(&[
+            LayerEntry::Dir("usr/"),
+            LayerEntry::Dir("usr/lib/"),
+            LayerEntry::File("usr/lib/libz.so.1.3.2", b"ZLIB-ELF"),
+            LayerEntry::Symlink("usr/lib/libz.so.1", "libz.so.1.3.2"),
+            LayerEntry::Dir("lib/"),
+            LayerEntry::File("lib/ld-musl-aarch64.so.1", b"LDSO-ELF"),
+            LayerEntry::Symlink("lib/libc.musl-aarch64.so.1", "/lib/ld-musl-aarch64.so.1"),
+        ]);
+        // An upper layer that only re-declares directories and adds one file,
+        // the way a language-runtime layer on top of a distro base does.
+        let upper = build_layer(&[
+            LayerEntry::Dir("usr/"),
+            LayerEntry::Dir("usr/lib/"),
+            LayerEntry::File("usr/lib/libstdc++.so.6.0.34", b"STDCXX-ELF"),
+            LayerEntry::Dir("lib/"),
+        ]);
+
+        let (symlink_map, permissions) = apply_layers(rootfs, &[base, upper]);
+
+        assert!(
+            symlink_map.contains_key(Path::new("usr/lib/libz.so.1")),
+            "a bare `usr/` directory entry must not delete symlinks under it"
+        );
+        assert!(
+            symlink_map.contains_key(Path::new("lib/libc.musl-aarch64.so.1")),
+            "a bare `lib/` directory entry must not delete symlinks under it"
+        );
+
+        // The symlink must be materialized on disk with its target's contents.
+        assert_eq!(
+            std::fs::read(rootfs.join("usr/lib/libz.so.1")).unwrap(),
+            b"ZLIB-ELF"
+        );
+
+        // ... and must end up in the packaged tar under the SONAME path.
+        let file_map = scan_rootfs(rootfs, &symlink_map, &permissions, false).unwrap();
+        assert_eq!(
+            packaged_contents(&file_map, "usr/lib/libz.so.1").as_deref(),
+            Some(&b"ZLIB-ELF"[..])
+        );
+        assert_eq!(
+            packaged_contents(&file_map, "lib/libc.musl-aarch64.so.1").as_deref(),
+            Some(&b"LDSO-ELF"[..])
+        );
+        // The upper layer's own content is still there.
+        assert_eq!(
+            packaged_contents(&file_map, "usr/lib/libstdc++.so.6.0.34").as_deref(),
+            Some(&b"STDCXX-ELF"[..])
+        );
+    }
+
+    /// A directory entry landing exactly on a lower-layer symlink-to-directory
+    /// (the usr-merge `lib -> usr/lib` shape) must keep the link, because
+    /// `mkdir -p` through a symlink is a no-op rather than a replacement.
+    #[test]
+    fn directory_entry_over_symlinked_directory_keeps_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+
+        let base = build_layer(&[
+            LayerEntry::Dir("usr/"),
+            LayerEntry::Dir("usr/lib/"),
+            LayerEntry::File("usr/lib/libz.so.1.3.2", b"ZLIB-ELF"),
+            LayerEntry::Symlink("lib", "usr/lib"),
+        ]);
+        let upper = build_layer(&[LayerEntry::Dir("lib/")]);
+
+        let (symlink_map, permissions) = apply_layers(rootfs, &[base, upper]);
+        assert!(symlink_map.contains_key(Path::new("lib")));
+
+        let file_map = scan_rootfs(rootfs, &symlink_map, &permissions, false).unwrap();
+        assert_eq!(
+            packaged_contents(&file_map, "lib/libz.so.1.3.2").as_deref(),
+            Some(&b"ZLIB-ELF"[..]),
+            "content reachable through the directory symlink must be packaged"
+        );
+    }
+
+    /// The pruning that *is* correct must stay: a regular file from an upper
+    /// layer replaces a lower layer's symlink at the same path.
+    #[test]
+    fn upper_layer_file_entry_replaces_lower_layer_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+
+        let base = build_layer(&[
+            LayerEntry::Dir("usr/"),
+            LayerEntry::Dir("usr/lib/"),
+            LayerEntry::File("usr/lib/libz.so.1.3.2", b"ZLIB-ELF"),
+            LayerEntry::Symlink("usr/lib/libz.so.1", "libz.so.1.3.2"),
+        ]);
+        let upper = build_layer(&[LayerEntry::File("usr/lib/libz.so.1", b"REAL-FILE")]);
+
+        let (symlink_map, permissions) = apply_layers(rootfs, &[base, upper]);
+        assert!(
+            !symlink_map.contains_key(Path::new("usr/lib/libz.so.1")),
+            "a real file from an upper layer must win over a lower-layer symlink"
+        );
+
+        let file_map = scan_rootfs(rootfs, &symlink_map, &permissions, false).unwrap();
+        assert_eq!(
+            packaged_contents(&file_map, "usr/lib/libz.so.1").as_deref(),
+            Some(&b"REAL-FILE"[..])
+        );
+    }
+
+    /// Whiteouts, not directory entries, are how a layer deletes things: an
+    /// upper-layer whiteout must still remove a lower-layer symlink.
+    #[test]
+    fn whiteout_still_removes_lower_layer_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+
+        let base = build_layer(&[
+            LayerEntry::Dir("usr/"),
+            LayerEntry::Dir("usr/lib/"),
+            LayerEntry::File("usr/lib/libz.so.1.3.2", b"ZLIB-ELF"),
+            LayerEntry::Symlink("usr/lib/libz.so.1", "libz.so.1.3.2"),
+        ]);
+        let upper = build_layer(&[
+            LayerEntry::Dir("usr/"),
+            LayerEntry::File("usr/lib/.wh.libz.so.1", b""),
+        ]);
+
+        let (symlink_map, permissions) = apply_layers(rootfs, &[base, upper]);
+        assert!(!symlink_map.contains_key(Path::new("usr/lib/libz.so.1")));
+        assert!(!rootfs.join("usr/lib/libz.so.1").exists());
+
+        let file_map = scan_rootfs(rootfs, &symlink_map, &permissions, false).unwrap();
+        assert!(packaged_contents(&file_map, "usr/lib/libz.so.1").is_none());
+        assert_eq!(
+            packaged_contents(&file_map, "usr/lib/libz.so.1.3.2").as_deref(),
+            Some(&b"ZLIB-ELF"[..])
+        );
+    }
 
     #[test]
     fn resolve_symlink_in_rootfs_happy_paths() {
