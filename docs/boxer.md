@@ -48,12 +48,12 @@ registry contribute their config's `ExposedPorts` the same way. The result
 lands in the box metadata, so `boxer inspect` lists it without running
 anything.
 
-Serving needs the workload on a network. LiteBox reaches the host through a
-TUN device, so create one once:
-
-```sh
-sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh   # tun99, host 10.0.0.1/24
-```
+Serving needs the workload on a network, which LiteBox reaches through a TUN
+device -- and boxer creates that device itself, with the same ioctls `ip`
+uses, so serving a box is one command with no setup step and no `iproute2` on
+the host. Creating a network interface needs `CAP_NET_ADMIN` (usually root);
+that is a kernel requirement, not a missing feature, and boxer says so when it
+is absent. An interface that already exists is reused rather than replaced.
 
 `boxer run -P` (or `-p`) attaches the workload to that device -- the guest
 answers on `10.0.0.2` -- and publishes each mapping on the host, so clients
@@ -119,8 +119,22 @@ host rewrites the aarch64 binaries (anchored per `--rewrite-host`, default
 `linux`; use `macos` for boxes that will run under the macOS runner).
 `boxer run` refuses a box whose platform differs from the host, naming both.
 
-A workload that is itself a wasm binary (detected by magic) is delegated to
-`wasmtime`/`wasmer`/`wasmedge` from `PATH` instead of the native runner.
+A workload that is itself a wasm binary (detected by magic) runs in boxer's
+own embedded wasmtime instead of the native runner, so it needs no wasm
+runtime installed. It gets WASI preview 1 with the box's argv, the box's
+environment and the host's stdio -- but no filesystem and no network, because
+a box does not yet describe those capabilities and granting them silently
+would be worse than refusing.
+
+## What boxer needs from the host
+
+Nothing but a kernel. Image pulls, layer decompression, Dockerfile
+evaluation, `ADD <url>` fetches, TUN device creation, port publishing, the
+native sandbox and the wasm runtime are all in the binary: no `curl`, no
+`iproute2`, no `docker`/`podman`, no wasm runtime on `PATH`. Two things still
+come from outside, both by nature rather than by omission: `RUN` executes
+programs from the image itself and needs root for `chroot`, and creating a
+network device needs `CAP_NET_ADMIN`.
 
 ## Dockerfile support
 

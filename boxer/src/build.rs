@@ -625,8 +625,8 @@ fn apply_copy(
     Ok(())
 }
 
-/// ADD with a URL source: fetch via curl (which honors the proxy environment)
-/// into the destination.
+/// ADD with a URL source: fetch it in-process, following redirects and
+/// honouring the proxy environment, so the build host needs no `curl`.
 fn add_url(
     url: &str,
     dest_host: &Path,
@@ -646,15 +646,24 @@ fn add_url(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let status = std::process::Command::new("curl")
-        .args(["-fsSL", "-o"])
-        .arg(&target)
-        .arg(url)
-        .status()
-        .context("ADD <url> requires curl on the build host")?;
-    if !status.success() {
-        bail!("ADD {url} failed: curl exited with {status}");
+
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .context("failed to build the HTTP client for ADD")?;
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("ADD {url} failed"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("ADD {url} failed: server returned {status}");
     }
+    let body = response
+        .bytes()
+        .with_context(|| format!("ADD {url} failed while reading the response"))?;
+    std::fs::write(&target, &body)
+        .with_context(|| format!("failed to write {}", target.display()))?;
+
     set_mode(&target, chmod.unwrap_or(0o600))?;
     Ok(())
 }

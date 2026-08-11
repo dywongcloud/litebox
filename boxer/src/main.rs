@@ -13,6 +13,8 @@ mod boxfmt;
 mod dockerfile;
 mod publish;
 mod run;
+#[cfg(target_os = "linux")]
+mod tun;
 
 #[cfg(all(
     unix,

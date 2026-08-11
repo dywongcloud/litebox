@@ -118,7 +118,7 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
     if let Some(program_bytes) = tar_entry_bytes(&parsed.rootfs_tar, &program_tar_path)?
         && program_bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d])
     {
-        return run_wasm_workload(&program_bytes, &argv);
+        return run_wasm_workload(&program_bytes, &argv, &meta.env);
     }
 
     // Publishing needs the workload on the network, so it selects a TUN device
@@ -128,6 +128,16 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
         (None, false) => Some(String::from(DEFAULT_TUN_DEVICE)),
         (None, true) => None,
     };
+
+    // Create the network device before anything binds to it, so serving a box
+    // takes one command rather than a privileged setup step first.
+    #[cfg(target_os = "linux")]
+    if let Some(device) = &tun_device {
+        let created = crate::tun::ensure_device(device)?;
+        if created {
+            eprintln!("Created network device {device} ({})", crate::tun::HOST_IP);
+        }
+    }
 
     // Bind before the workload starts: a taken host port is reported now, not
     // after the guest is already running.
@@ -226,37 +236,69 @@ fn run_native(
     );
 }
 
-/// The workload is itself a wasm module: hand it to a wasm runtime on PATH.
-fn run_wasm_workload(program_bytes: &[u8], argv: &[String]) -> anyhow::Result<()> {
-    let runtime = ["wasmtime", "wasmer", "wasmedge"]
-        .iter()
-        .find(|name| which(name).is_some())
-        .context(
-            "the box workload is a wasm binary but no wasm runtime \
-             (wasmtime, wasmer, wasmedge) is on PATH",
-        )?;
-    let dir = std::env::temp_dir();
-    let wasm_path = dir.join(format!("boxer-workload-{}.wasm", std::process::id()));
-    std::fs::write(&wasm_path, program_bytes).context("failed to stage wasm workload")?;
-    let status = std::process::Command::new(runtime)
-        .arg("run")
-        .arg(&wasm_path)
-        .arg("--")
-        .args(&argv[1..])
-        .status()
-        .with_context(|| format!("failed to launch {runtime}"))?;
-    let _ = std::fs::remove_file(&wasm_path);
-    if !status.success() {
-        bail!("{runtime} exited with {status}");
+/// The workload is itself a wasm module: run it in boxer's own embedded
+/// runtime, so a wasm box needs nothing installed on the host.
+///
+/// The module gets WASI preview 1 with the box's argv, the box's environment,
+/// and the host's stdio. It gets no filesystem and no network: a wasm workload
+/// that needs those wants capabilities this box format does not describe yet,
+/// and silently granting them would be worse than refusing.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn run_wasm_workload(program_bytes: &[u8], argv: &[String], env: &[String]) -> anyhow::Result<()> {
+    use wasmtime::{Config, Engine, Linker, Module, Store};
+    use wasmtime_wasi::WasiCtxBuilder;
+    use wasmtime_wasi::p1::{self, WasiP1Ctx};
+
+    let mut config = Config::new();
+    config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
+    let engine = Engine::new(&config).context("failed to start the embedded wasm engine")?;
+    let module = Module::from_binary(&engine, program_bytes)
+        .context("the box workload is not a valid wasm module")?;
+
+    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
+    p1::add_to_linker_sync(&mut linker, |ctx: &mut WasiP1Ctx| ctx)
+        .context("failed to provide WASI to the workload")?;
+
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.inherit_stdio().args(argv);
+    for pair in env {
+        if let Some((key, value)) = pair.split_once('=') {
+            wasi.env(key, value);
+        }
     }
-    Ok(())
+    let mut store = Store::new(&engine, wasi.build_p1());
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .context("failed to instantiate the wasm workload")?;
+    let start = instance
+        .get_typed_func::<(), ()>(&mut store, "_start")
+        .context("the wasm workload exports no _start; it is a library, not a command")?;
+
+    match start.call(&mut store, ()) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // A WASI command that calls proc_exit unwinds with an exit status
+            // rather than a trap; a zero status is a normal return.
+            if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                let status: i32 = exit.0;
+                if status == 0 {
+                    return Ok(());
+                }
+                bail!("wasm workload exited with status {status}");
+            }
+            Err(e).context("the wasm workload trapped")
+        }
+    }
 }
 
-fn which(name: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn run_wasm_workload(
+    _program_bytes: &[u8],
+    _argv: &[String],
+    _env: &[String],
+) -> anyhow::Result<()> {
+    bail!("running a wasm workload needs the x86_64 Linux build of boxer")
 }
 
 fn parse_box_file(path: &Path) -> anyhow::Result<ParsedBox> {

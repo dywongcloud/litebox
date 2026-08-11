@@ -19,6 +19,9 @@ tar = "0.4"
 [target.'cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", target_vendor = "apple")))'.dependencies]
 flate2 = "1.1"
 oci-spec = { version = "0.9", features = ["image"] }
+# Same client and TLS backend the registry pull already uses, so `ADD <url>`
+# needs no `curl` on the build host and no second TLS stack.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "blocking"] }
 ruzstd = "0.8"
 tempfile = "3"
 walkdir = "2.0"
@@ -31,6 +34,10 @@ libc = "0.2"
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 litebox_runner_linux_userland = { version = "0.1.0", path = "../litebox_runner_linux_userland" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+# A box whose workload is already wasm runs here rather than through whatever
+# happens to be installed on the host.
+wasmtime = { version = "37", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "37", default-features = false, features = ["p1"] }
 
 [lints]
 workspace = true
