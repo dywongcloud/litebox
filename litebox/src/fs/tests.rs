@@ -2288,8 +2288,11 @@ mod layered_stdio {
         // permissions on one file can't spuriously break a later assertion on another.
         fn build_fs_with_lower_only_file(
             path: &str,
-        ) -> layered::FileSystem<MockPlatform, in_mem::FileSystem<MockPlatform>, in_mem::FileSystem<MockPlatform>>
-        {
+        ) -> layered::FileSystem<
+            MockPlatform,
+            in_mem::FileSystem<MockPlatform>,
+            in_mem::FileSystem<MockPlatform>,
+        > {
             let litebox = LiteBox::new(MockPlatform::new());
             let lower = {
                 let mut lower = in_mem::FileSystem::new(&litebox);
@@ -2300,7 +2303,11 @@ mod layered_stdio {
                 // already fully populated before the layered FS (and thus the guest) ever
                 // touches it.
                 let fd = lower
-                    .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RUSR | Mode::WUSR)
+                    .open(
+                        path,
+                        OFlags::CREAT | OFlags::WRONLY,
+                        Mode::RUSR | Mode::WUSR,
+                    )
                     .expect("Failed to create lower-layer file");
                 lower.close(&fd).expect("Failed to close lower-layer file");
                 lower
@@ -2312,7 +2319,12 @@ mod layered_stdio {
                 });
                 upper
             };
-            layered::FileSystem::new(&litebox, upper, lower, LayeringSemantics::LowerLayerWritableFiles)
+            layered::FileSystem::new(
+                &litebox,
+                upper,
+                lower,
+                LayeringSemantics::LowerLayerWritableFiles,
+            )
         }
 
         let fs = build_fs_with_lower_only_file("/motd");
@@ -2332,8 +2344,7 @@ mod layered_stdio {
         assert_eq!(status.owner.group, 43);
 
         let fs = build_fs_with_lower_only_file("/motd");
-        fs.utimensat("/motd", None, None).expect(
-            "utimensat on a lower-only file must not panic under LowerLayerWritableFiles",
-        );
+        fs.utimensat("/motd", None, None)
+            .expect("utimensat on a lower-only file must not panic under LowerLayerWritableFiles");
     }
 }
