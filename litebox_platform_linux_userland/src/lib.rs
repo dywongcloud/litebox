@@ -659,7 +659,9 @@ impl LinuxUserland {
                             0,
                             SeccompCmpArgLen::Dword,
                             SeccompCmpOp::Eq,
-                            libc::CLOCK_THREAD_CPUTIME_ID.reinterpret_as_unsigned().into(),
+                            libc::CLOCK_THREAD_CPUTIME_ID
+                                .reinterpret_as_unsigned()
+                                .into(),
                         )
                         .unwrap(),
                     ])
@@ -669,7 +671,9 @@ impl LinuxUserland {
                             0,
                             SeccompCmpArgLen::Dword,
                             SeccompCmpOp::Eq,
-                            libc::CLOCK_PROCESS_CPUTIME_ID.reinterpret_as_unsigned().into(),
+                            libc::CLOCK_PROCESS_CPUTIME_ID
+                                .reinterpret_as_unsigned()
+                                .into(),
                         )
                         .unwrap(),
                     ])
