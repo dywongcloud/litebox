@@ -144,6 +144,13 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// authoritative per-process value has to live here and be swapped into the manager around
     /// each break operation. See `Task::sys_brk`.
     pub(crate) brk: core::sync::atomic::AtomicUsize,
+    /// Total host CPU time (nanoseconds) consumed by every thread of this process so far.
+    ///
+    /// Each thread adds its own [`ShimPlatform::thread_cpu_time`] reading here as it exits (see
+    /// `Task::prepare_for_exit`), since that clock is only readable by the thread it measures.
+    /// Reported to a `wait4(..., &rusage)` caller as `ru_utime` once the whole process is a
+    /// zombie -- see `Task::sys_wait4`.
+    pub(crate) cpu_time_nanos: core::sync::atomic::AtomicU64,
 }
 
 /// A set of address ranges, kept sorted and non-overlapping.
@@ -362,6 +369,9 @@ struct ChildRecord {
     ppid: i32,
     /// `None` while the child is still running; `Some` once it is a zombie awaiting `wait4`.
     status: Option<ExitStatus>,
+    /// Total host CPU time (nanoseconds) the child consumed, set alongside `status`. See
+    /// `Process::cpu_time_nanos`.
+    cpu_time_nanos: u64,
 }
 
 impl<Platform: ShimPlatform> ProcessTable<Platform> {
@@ -383,6 +393,7 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
             ChildRecord {
                 ppid: parent,
                 status: None,
+                cpu_time_nanos: 0,
             },
         );
         assert!(old.is_none(), "pid {child} is already live");
@@ -407,12 +418,13 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
     ///
     /// Does nothing for a pid with no recorded parent (the initial process, or a child whose
     /// parent already exited and dropped it).
-    fn record_exit(&self, child: i32, status: ExitStatus) {
+    fn record_exit(&self, child: i32, status: ExitStatus, cpu_time_nanos: u64) {
         let mut inner = self.inner.lock();
         let Some(record) = inner.children.get_mut(&child) else {
             return;
         };
         record.status = Some(status);
+        record.cpu_time_nanos = cpu_time_nanos;
         let parent = record.ppid;
         let wakers: Vec<_> = inner
             .waiters
@@ -457,16 +469,16 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
     }
 
     /// Reaps one zombie child of `parent` matching `filter`, removing it from the table.
-    fn reap(&self, parent: i32, filter: WaitFilter) -> Option<(i32, ExitStatus)> {
+    fn reap(&self, parent: i32, filter: WaitFilter) -> Option<(i32, ExitStatus, u64)> {
         let mut inner = self.inner.lock();
-        let (child, status) = inner.children.iter().find_map(|(&child, r)| {
+        let (child, status, cpu_time_nanos) = inner.children.iter().find_map(|(&child, r)| {
             (r.ppid == parent && filter.matches(child))
                 .then_some(r.status)
                 .flatten()
-                .map(|status| (child, status))
+                .map(|status| (child, status, r.cpu_time_nanos))
         })?;
         inner.children.remove(&child);
-        Some((child, status))
+        Some((child, status, cpu_time_nanos))
     }
 
     /// Whether [`Self::reap`] would find something right now, without consuming it.
@@ -601,6 +613,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             }),
             brk: core::sync::atomic::AtomicUsize::new(0),
             owned_ranges: Mutex::new(OwnedRanges::default()),
+            cpu_time_nanos: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -932,6 +945,21 @@ fn wake_robust_list<Platform: ShimPlatform>(
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
+        // `CLOCK_THREAD_CPUTIME_ID` only ever reads the calling thread's own clock, so this has
+        // to happen here, on the exiting thread itself, rather than later from whichever thread
+        // ends up reaping it. Accumulated into the process (rather than overwritten) so that a
+        // multithreaded process's rusage reflects every thread that has exited so far, not just
+        // the last one.
+        self.thread.process.cpu_time_nanos.fetch_add(
+            self.global
+                .platform
+                .thread_cpu_time()
+                .as_nanos()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+
         let is_last_thread = self.thread.detach_from_process();
 
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
@@ -973,8 +1001,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // The process is gone: become a zombie its parent can `wait4`, and let go of any
             // children of our own (nothing can ever reap them now).
             let status = self.thread.process.inner.lock().exit_status;
+            let cpu_time_nanos = self.thread.process.cpu_time_nanos.load(Ordering::Relaxed);
             self.global.processes.unregister_process(self.pid);
-            self.global.processes.record_exit(self.pid, status);
+            self.global
+                .processes
+                .record_exit(self.pid, status, cpu_time_nanos);
             self.global.processes.discard_children_of(self.pid);
         }
     }
@@ -1629,11 +1660,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             log_unsupported!("wait4 with options {options:#x}");
             return Err(Errno::EINVAL);
         }
-        if rusage != 0 {
-            // Reporting zeroed usage would be a lie that some callers act on; refusing is not,
-            // and no caller in sight asks for it.
-            log_unsupported!("wait4 with a rusage buffer");
-        }
+        let rusage =
+            (rusage != 0).then(|| UserPtrMut::<litebox_common_linux::Rusage>::from_usize(rusage));
 
         let filter = if pid > 0 {
             WaitFilter::Pid(pid)
@@ -1650,10 +1678,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let _unregister = litebox::utils::defer(|| table.unregister_waiter(token));
 
         loop {
-            if let Some((pid, status)) = table.reap(self.pid, filter) {
+            if let Some((pid, status, cpu_time_nanos)) = table.reap(self.pid, filter) {
                 if let Some(wstatus) = wstatus {
                     wstatus
                         .write_at_offset::<Platform>(0, encode_wait_status(status))
+                        .ok_or(Errno::EFAULT)?;
+                }
+                if let Some(rusage) = rusage {
+                    // `ru_utime` is the one field real scripts actually consume (`busybox time`
+                    // among them) and the one this shim can measure honestly: real, host-metered
+                    // CPU time summed across every thread the child ever ran (see
+                    // `Process::cpu_time_nanos`). `ru_stime` is left at zero rather than
+                    // fabricated -- guest syscalls run as ordinary host user-mode Rust, so this
+                    // shim has no meaningful "kernel time" of its own to attribute, and reporting
+                    // a fake nonzero value would be worse than reporting none. Every other field
+                    // (`ru_maxrss` etc.) is zeroed for the same reason. This is still a strict
+                    // improvement over leaving the caller's buffer untouched: reading uninitialized
+                    // guest memory back as a `struct rusage` is both a correctness bug (nonsensical
+                    // output, as seen from `busybox time`) and an information disclosure.
+                    let value = litebox_common_linux::Rusage {
+                        ru_utime: core::time::Duration::from_nanos(cpu_time_nanos).into(),
+                        ..Default::default()
+                    };
+                    rusage
+                        .write_at_offset::<Platform>(0, value)
                         .ok_or(Errno::EFAULT)?;
                 }
                 return Ok(pid);
@@ -4142,7 +4190,7 @@ mod tests {
             "waiting for a pid that is not our child is ECHILD even though we have one"
         );
 
-        table.record_exit(child, super::ExitStatus::Exit(7));
+        table.record_exit(child, super::ExitStatus::Exit(7), 0);
         let mut status = 0i32;
         let status_ptr = UserPtrMut::from_ptr(&raw mut status);
         assert_eq!(task.sys_wait4(-1, Some(status_ptr), 0, 0).unwrap(), child);
@@ -4152,6 +4200,56 @@ mod tests {
             task.sys_wait4(-1, None, 0, 0).unwrap_err(),
             Errno::ECHILD,
             "a reaped child is gone: waiting again is ECHILD, not a second reap"
+        );
+    }
+
+    /// Regression test for a `wait4(..., &rusage)` bug: the buffer used to be left completely
+    /// untouched whenever a caller passed one, so a reader like `busybox time` printed whatever
+    /// was already sitting in that guest memory -- observed in practice as `sys 2367004162h 16m
+    /// 32s`. `sys_wait4` must now populate it for real, using each thread's host-measured CPU
+    /// time (see `Process::cpu_time_nanos`), and must not leave any field -- including the ones
+    /// this shim cannot measure -- as leftover uninitialized memory.
+    #[test]
+    fn wait4_populates_real_rusage_instead_of_leaving_it_uninitialized() {
+        use litebox_common_linux::{Rusage, TimeVal};
+        use zerocopy::{FromBytes as _, IntoBytes as _};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let table = &task.global.processes;
+
+        let child = 0x4343;
+        table.add_child(child, task.pid);
+        // As if the child had genuinely consumed 2.5s of host CPU time across its threads.
+        table.record_exit(child, super::ExitStatus::Exit(0), 2_500_000_000);
+
+        // A sentinel fill: if `sys_wait4` ever again leaves the buffer untouched, this pattern
+        // survives every assertion below rather than silently reading back as zero.
+        let mut buf = [0xAAu8; core::mem::size_of::<Rusage>()];
+        let rusage_ptr = UserPtrMut::<Rusage>::from_ptr(buf.as_mut_ptr().cast());
+
+        assert_eq!(
+            task.sys_wait4(-1, None, 0, rusage_ptr.as_usize())
+                .unwrap(),
+            child
+        );
+
+        let rusage = Rusage::read_from_bytes(&buf).unwrap();
+        assert_eq!(
+            rusage.ru_utime.as_bytes(),
+            TimeVal::from(Duration::from_nanos(2_500_000_000)).as_bytes(),
+            "ru_utime must be the real, host-measured CPU time, not the sentinel or garbage"
+        );
+        assert_eq!(
+            rusage.ru_stime.as_bytes(),
+            TimeVal::default().as_bytes(),
+            "ru_stime is honestly zero (this shim has no meaningful kernel time of its own to \
+             attribute), not the sentinel"
+        );
+        assert_eq!(rusage.ru_maxrss, 0, "unmeasured fields are zeroed, not sentinel garbage");
+        assert_eq!(
+            rusage._reserved,
+            [0i64; 16],
+            "the musl reserved tail is zeroed too, not left as sentinel garbage"
         );
     }
 
@@ -4265,7 +4363,7 @@ mod tests {
 
         // With the default disposition (ignore), the signal must not make blocking syscalls
         // return `EINTR`, exactly as on Linux, where an ignored signal is never queued at all.
-        table.record_exit(child, super::ExitStatus::Exit(0));
+        table.record_exit(child, super::ExitStatus::Exit(0), 0);
         assert!(
             !task.has_pending_signals(),
             "an ignored SIGCHLD must not count as deliverable"

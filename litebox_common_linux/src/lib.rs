@@ -1172,6 +1172,38 @@ pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
 }
+/// Linux's `struct rusage` (`resource.h`), padded to musl's LP64 layout, which reserves 16 extra
+/// `long`s past the POSIX-visible fields. `#[repr(C)]` is load-bearing here for the same reason
+/// as `Sysinfo`: this is written into guest memory as raw bytes for the guest's libc to read back
+/// as the real ABI struct. Only `ru_utime`/`ru_stime` currently carry a real, host-measured value
+/// (see `Task::sys_wait4`); every other field is explicitly zeroed rather than left as
+/// guest-visible uninitialized memory.
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+pub struct Rusage {
+    pub ru_utime: TimeVal,
+    pub ru_stime: TimeVal,
+    pub ru_maxrss: i64,
+    pub ru_ixrss: i64,
+    pub ru_idrss: i64,
+    pub ru_isrss: i64,
+    pub ru_minflt: i64,
+    pub ru_majflt: i64,
+    pub ru_nswap: i64,
+    pub ru_inblock: i64,
+    pub ru_oublock: i64,
+    pub ru_msgsnd: i64,
+    pub ru_msgrcv: i64,
+    pub ru_nsignals: i64,
+    pub ru_nvcsw: i64,
+    pub ru_nivcsw: i64,
+    /// Past the POSIX-visible fields; matches musl's LP64 `struct rusage`, which reserves this
+    /// space. Kept and zeroed explicitly (rather than omitted) so a copy of this struct's full
+    /// size never leaves any byte of the guest's buffer uninitialized.
+    #[allow(clippy::pub_underscore_fields)]
+    pub _reserved: [i64; 16],
+}
+
 #[repr(C)]
 #[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]
 pub struct ItimerVal {
