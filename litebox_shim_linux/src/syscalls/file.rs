@@ -178,7 +178,6 @@ enum FsPath {
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
-    #[expect(dead_code, reason = "currently unused, might want to use later")]
     FdRelative { fd: u32, path: CString },
     /// Fd
     Fd(u32),
@@ -186,6 +185,16 @@ enum FsPath {
 
 /// Maximum size of a file path
 pub const PATH_MAX: usize = 4096;
+
+/// The absolute path a file-backed fd was opened with, attached as entry metadata (see
+/// [`litebox::fd::Descriptors::set_entry_metadata`]) so `openat`/`fstatat`-family syscalls can
+/// resolve a path given relative to that fd (`dirfd`-relative resolution).
+///
+/// Entry metadata -- unlike fd metadata -- is shared across every descriptor that refers to the
+/// same open file description, so a `dup`/`dup2`/`dup3`/`fcntl(F_DUPFD)` copy of a `dirfd`
+/// resolves relative paths identically to the original without any extra propagation code.
+#[derive(Clone, Debug)]
+struct FdPath(CString);
 
 impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
@@ -261,6 +270,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// Join a directory's absolute path with a path given relative to it, matching the semantics
+    /// `openat`/`fstatat`-family syscalls need for a `dirfd`-relative lookup.
+    fn join_dir_relative_path(dir_path: &CString, relative: &CString) -> Result<CString, Errno> {
+        let mut joined = dir_path.to_str().map_err(|_| Errno::EINVAL)?.to_string();
+        if !joined.ends_with('/') {
+            joined.push('/');
+        }
+        joined.push_str(relative.to_str().map_err(|_| Errno::EINVAL)?);
+        CString::new(joined).map_err(|_| Errno::EINVAL)
+    }
+
+    /// Resolve `dirfd` to the absolute path it was opened with (see [`FdPath`]), for
+    /// `dirfd`-relative resolution. Any fd without a recorded path -- a closed fd, or one that is
+    /// not a regular file/directory `open`/`openat` fd (a socket, pipe, etc, which cannot serve
+    /// as a `dirfd`) -- is reported as `EBADF`.
+    fn resolve_dirfd_path(&self, fd: u32) -> Result<CString, Errno> {
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                fd as usize,
+                |fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |path: &FdPath| path.0.clone())
+                        .map_err(|_| Errno::EBADF)
+                },
+                |_fd| Err(Errno::EBADF),
+                |_fd| Err(Errno::EBADF),
+                |_fd| Err(Errno::EBADF),
+                |_fd| Err(Errno::EBADF),
+                |_fd| Err(Errno::EBADF),
+            )
+            .flatten()
+    }
+
     /// Resolve a path relative to a dirfd.
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
@@ -270,9 +315,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match fs_path {
             FsPath::Absolute { path } => Ok(path),
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { fd: _, path: _ } => {
-                log_unsupported!("path resolution with FsPath::FdRelative");
-                Err(Errno::EINVAL)
+            FsPath::FdRelative { fd, path } => {
+                let dir_path = self.resolve_dirfd_path(fd)?;
+                Self::join_dir_relative_path(&dir_path, &path)
             }
         }
     }
@@ -302,7 +347,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_open(path, flags, mode)
     }
 
-    fn insert_raw_file_fd(&self, file: TypedFd<FS>, flags: OFlags) -> Result<u32, Errno> {
+    /// Insert a freshly-opened file into the raw fd table, optionally recording the absolute
+    /// path it was opened with (see [`FdPath`]) so it can later serve as a `dirfd` for
+    /// `openat`/`fstatat`-family syscalls.
+    fn insert_raw_file_fd(
+        &self,
+        file: TypedFd<FS>,
+        flags: OFlags,
+        path: Option<CString>,
+    ) -> Result<u32, Errno> {
         if flags.contains(OFlags::CLOEXEC) {
             let None = self
                 .global
@@ -312,6 +365,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             else {
                 unreachable!()
             };
+        }
+        if let Some(path) = path {
+            let old = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, FdPath(path));
+            debug_assert!(old.is_none());
         }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
@@ -335,8 +396,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
-        let file = self.do_open(path, flags, mode)?;
-        self.insert_raw_file_fd(file, flags)
+        let file = self.do_open(path.clone(), flags, mode)?;
+        self.insert_raw_file_fd(file, flags, Some(path))
     }
 
     /// Handle syscall `openat`
@@ -347,8 +408,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: OFlags,
         mode: Mode,
     ) -> Result<u32, Errno> {
-        let file = self.do_openat(dirfd, pathname, flags, mode)?;
-        self.insert_raw_file_fd(file, flags)
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        let file = self.do_open(path.clone(), flags, mode)?;
+        self.insert_raw_file_fd(file, flags, Some(path))
     }
 
     /// Handle syscall `ftruncate`
@@ -1481,9 +1543,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { .. } => {
-                log_unsupported!("fd-relative faccessat is not supported yet");
-                Err(Errno::EINVAL)
+            FsPath::FdRelative { fd, path } => {
+                let dir_path = self.resolve_dirfd_path(fd)?;
+                let joined = Self::join_dir_relative_path(&dir_path, &path)?;
+                self.do_access(joined, mode, caller)
             }
         }
     }
@@ -1742,9 +1805,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 descriptor_stat(fd as usize, self)
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
-            FsPath::FdRelative { .. } => {
-                log_unsupported!("relative fstatat with AT_EMPTY_PATH unset is not supported yet");
-                Err(Errno::EINVAL)
+            FsPath::FdRelative { fd, path } => {
+                let dir_path = self.resolve_dirfd_path(fd)?;
+                let joined = Self::join_dir_relative_path(&dir_path, &path)?;
+                self.do_stat(joined, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
         }
     }
@@ -3464,6 +3528,84 @@ mod tests {
         assert_eq!(
             task.sys_stat("/cwd_test/subdir").unwrap_err(),
             Errno::ENOENT
+        );
+    }
+
+    /// Verify `openat`/`newfstatat`/`faccessat` resolve a relative path against a real `dirfd`
+    /// (as opposed to `AT_FDCWD`), including across a `dup`'d copy of that `dirfd`, and reject a
+    /// closed or non-directory `dirfd` the way real Linux does.
+    #[test]
+    fn dirfd_relative_resolution_via_real_dirfd() {
+        use litebox_common_linux::{AccessFlags, AtFlags};
+
+        let task = crate::syscalls::tests::init_platform(None);
+
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/dirfd_test", 0o777)
+            .unwrap();
+        let dirfd = task
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "/dirfd_test",
+                litebox::fs::OFlags::RDONLY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let dirfd = i32::try_from(dirfd).unwrap();
+
+        // openat(dirfd, "inner.txt", ...) creates the file inside the directory the dirfd
+        // refers to, not relative to CWD (which is still "/").
+        let file_fd = task
+            .sys_openat(
+                dirfd,
+                "inner.txt",
+                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(file_fd).unwrap()).unwrap();
+        task.sys_stat("/dirfd_test/inner.txt")
+            .expect("openat(dirfd, relative) should have created the file under /dirfd_test");
+
+        // newfstatat(dirfd, "inner.txt", ...) resolves the same way.
+        task.sys_newfstatat(dirfd, "inner.txt", AtFlags::empty())
+            .unwrap();
+
+        // faccessat(dirfd, "inner.txt", ...) resolves the same way.
+        task.sys_faccessat(dirfd, "inner.txt", AccessFlags::F_OK, AtFlags::empty())
+            .unwrap();
+
+        // A dup'd dirfd resolves relative paths identically, since the recorded path lives on
+        // the shared open-file-description entry, not the per-descriptor fd metadata.
+        let dup_dirfd = task.sys_dup(dirfd, None, None).unwrap();
+        let dup_dirfd = i32::try_from(dup_dirfd).unwrap();
+        task.sys_faccessat(dup_dirfd, "inner.txt", AccessFlags::F_OK, AtFlags::empty())
+            .unwrap();
+        task.sys_close(dup_dirfd).unwrap();
+
+        // A non-directory dirfd (a regular file) is rejected by the underlying filesystem's own
+        // path resolution once "inner.txt" is joined under it, matching real Linux's ENOTDIR.
+        let non_dir_fd = task
+            .sys_openat(
+                dirfd,
+                "inner.txt",
+                litebox::fs::OFlags::RDONLY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let non_dir_fd = i32::try_from(non_dir_fd).unwrap();
+        assert_eq!(
+            task.sys_faccessat(non_dir_fd, "x", AccessFlags::F_OK, AtFlags::empty())
+                .unwrap_err(),
+            Errno::ENOTDIR
+        );
+        task.sys_close(non_dir_fd).unwrap();
+
+        // An unknown/closed dirfd is rejected with EBADF, not treated as AT_FDCWD.
+        task.sys_close(dirfd).unwrap();
+        assert_eq!(
+            task.sys_faccessat(dirfd, "inner.txt", AccessFlags::F_OK, AtFlags::empty())
+                .unwrap_err(),
+            Errno::EBADF
         );
     }
 
