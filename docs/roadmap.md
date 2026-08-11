@@ -1032,9 +1032,23 @@ a real, multi-day project on its own:
   process's own address space. Narrowing those needs a different mechanism
   (a separate broker process holding the `utun` descriptor, for instance), not
   a bigger profile.
-* **Landlock integration** for the existing Linux seccomp filter, which
+* ~~**Landlock integration** for the existing Linux seccomp filter, which
   currently has no path-scoping: a compromised guest that finds a seccomp
-  gap can still reach any path the host process can.
+  gap can still reach any path the host process can.~~ Done:
+  `LinuxUserland::enable_landlock_filesystem_ruleset`
+  (`litebox_platform_linux_userland/src/lib.rs`), installed before
+  `enable_seccomp_filter` in `litebox_runner_linux_userland`'s startup,
+  restricts the process to exactly the paths it still opens post-lockdown
+  (today, just the program binary's path). Real, live test
+  (`test_landlock_filesystem_ruleset`) asserts actual `EACCES` on a
+  never-granted path. Implemented and cross-compile-verified
+  (`cargo check`/`clippy --target x86_64-unknown-linux-gnu`) from a macOS
+  host, where this Linux-only code cannot be built natively; live-kernel
+  execution wasn't witnessed locally this session (the project's local
+  x86_64 Linux VM was unresponsive under extreme host CPU contention at
+  the time) -- CI's `ubuntu-latest` runner is the first real-kernel
+  execution of this code, same as any other Linux-only change landed from
+  this host.
 * **A WASI-style capability redesign for `litebox_broker_host`'s filesystem
   and socket authorization** -- preopen-style directory capabilities and a
   per-destination socket policy hook, replacing today's coarser

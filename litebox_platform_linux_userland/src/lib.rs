@@ -29,6 +29,38 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
+/// Landlock ABI types and constants (`<linux/landlock.h>`), hand-transcribed because no
+/// `landlock` crate is vendored in this workspace and these are simple enough not to need one --
+/// see `LinuxUserland::enable_landlock_filesystem_ruleset`, the only user.
+///
+/// Values verified against the kernel's own `include/uapi/linux/landlock.h`.
+mod landlock {
+    /// The original (ABI 1) two-field `landlock_ruleset_attr`, not the modern six-field struct
+    /// with network/scoping fields -- deliberately minimal so the exact same bytes are a valid
+    /// `landlock_create_ruleset` argument on every kernel that has Landlock at all. Both fields
+    /// are naturally 8-byte aligned, so (unlike `LandlockPathBeneathAttr`) no explicit `packed`
+    /// representation is needed to match the kernel's C layout.
+    #[repr(C)]
+    pub(super) struct LandlockRulesetAttr {
+        pub(super) handled_access_fs: u64,
+        pub(super) handled_access_net: u64,
+    }
+
+    /// The kernel's own layout is `__attribute__((packed))`: `parent_fd` sits at byte offset 8,
+    /// not the offset 16 that Rust's normal 8-byte alignment for the preceding `u64` field would
+    /// otherwise insert. `#[repr(C, packed)]` mirrors that -- callers must pass a pointer to the
+    /// whole struct (never a reference to `parent_fd` alone, which would be unaligned).
+    #[repr(C, packed)]
+    pub(super) struct LandlockPathBeneathAttr {
+        pub(super) allowed_access: u64,
+        pub(super) parent_fd: i32,
+    }
+
+    pub(super) const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+    pub(super) const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+    pub(super) const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
+}
+
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
 //
@@ -434,6 +466,123 @@ impl LinuxUserland {
                 }),
             )
         };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "landlock_add_rule/landlock_restrict_self are not expected to fail once ruleset \
+                   construction has gotten this far -- a genuine failure there is exactly the \
+                   kind of surprise this function exists to fail loudly on, not swallow"
+    )]
+    /// Installs a Landlock filesystem ruleset restricting this process to exactly the paths it
+    /// still needs after [`Self::enable_seccomp_filter`] locks it down.
+    ///
+    /// Closes a gap seccomp cannot: a BPF filter only ever sees syscall *scalars*, never the
+    /// bytes a pointer argument points to, so `enable_seccomp_filter`'s `open` rule can only
+    /// check the `O_RDONLY` flag -- it structurally cannot restrict *which* path gets opened. A
+    /// compromised guest that reaches a raw host `open()` from inside this shared-address-space
+    /// process could otherwise read any path the process's real uid can read. Landlock is a real
+    /// Linux LSM: it does see the path, and (unlike seccomp) enforcement survives even a
+    /// guest-triggered bug in this process's own syscall-argument decoding.
+    ///
+    /// Must run *before* [`Self::enable_seccomp_filter`]: building the ruleset needs an
+    /// `open(O_PATH)` on each allowed path, and the seccomp filter's own `open` rule (`O_RDONLY`
+    /// only) would itself block an `O_PATH` open if installed first.
+    ///
+    /// `allowed_read_paths` should be exactly the paths this process still opens after lockdown
+    /// -- today, only the program binary's path, re-opened by `try_allocate_cow_pages`. Each is
+    /// expected to be a regular file, not a directory (that is what every caller today actually
+    /// passes), so this grants only `LANDLOCK_ACCESS_FS_READ_FILE`, not `READ_DIR` -- widening to
+    /// directories, should a future caller need one, should re-add `READ_DIR` deliberately rather
+    /// than inherit it unused. Grants read access only, not execute: nothing in this process
+    /// calls `execve` on these paths (the guest binary runs natively in-process, not via a
+    /// host-level exec), so execute access is unneeded privilege, not a conservative default.
+    ///
+    /// Does nothing on a kernel without Landlock (older than 5.13, or disabled at boot): this is
+    /// defense-in-depth layered on top of an already-default-deny seccomp filter, not the sole
+    /// enforcement mechanism, so an old kernel keeps today's protection level rather than
+    /// failing to start over a hardening feature it cannot provide.
+    pub fn enable_landlock_filesystem_ruleset(allowed_read_paths: &[&std::path::Path]) {
+        // ABI-version query: `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`.
+        // A negative return means no Landlock support at all (ENOSYS) or disabled at boot
+        // (EOPNOTSUPP) -- either way, there is nothing to build.
+        let abi_supported = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::landlock_create_ruleset,
+                0,
+                0,
+                landlock::LANDLOCK_CREATE_RULESET_VERSION as usize,
+            )
+        }
+        .is_ok();
+        if !abi_supported {
+            return;
+        }
+
+        // Deliberately the minimal, original (Landlock ABI 1) two-field ruleset-attr shape --
+        // not the newer 6-field struct with network/scoping fields -- so the exact same bytes
+        // are valid on every kernel that has Landlock at all, not just recent ones. This shim
+        // only needs filesystem restriction.
+        let attr = landlock::LandlockRulesetAttr {
+            handled_access_fs: landlock::LANDLOCK_ACCESS_FS_READ_FILE,
+            handled_access_net: 0,
+        };
+        let ruleset_fd = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::landlock_create_ruleset,
+                core::ptr::from_ref(&attr) as usize,
+                core::mem::size_of::<landlock::LandlockRulesetAttr>(),
+                0,
+            )
+        }
+        .expect("landlock_create_ruleset failed despite a successful ABI-version query");
+
+        for path in allowed_read_paths {
+            let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .expect("path must not contain a NUL byte");
+            let parent_fd = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::open,
+                    cpath.as_ptr() as usize,
+                    (libc::O_PATH | libc::O_CLOEXEC) as usize,
+                    0,
+                )
+            }
+            .unwrap_or_else(|e| {
+                panic!("failed to open {} for a landlock rule: {e}", path.display())
+            });
+
+            let rule_attr = landlock::LandlockPathBeneathAttr {
+                allowed_access: landlock::LANDLOCK_ACCESS_FS_READ_FILE,
+                parent_fd: i32::try_from(parent_fd).expect("fd must fit in i32"),
+            };
+            unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::landlock_add_rule,
+                    ruleset_fd,
+                    landlock::LANDLOCK_RULE_PATH_BENEATH as usize,
+                    core::ptr::from_ref(&rule_attr) as usize,
+                    0,
+                )
+            }
+            .unwrap_or_else(|e| panic!("landlock_add_rule failed for {}: {e}", path.display()));
+
+            unsafe { syscalls::syscall1(syscalls::Sysno::close, parent_fd) }.expect("close failed");
+        }
+
+        // `landlock_restrict_self` requires `PR_SET_NO_NEW_PRIVS` to already be set.
+        // `enable_seccomp_filter`'s own `apply_filter` sets it too, but that call happens after
+        // this one in the runner's startup sequence, so set it explicitly here rather than
+        // depending on lifecycle order between two otherwise-unrelated modules.
+        // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` takes no pointer arguments.
+        let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        assert_eq!(rc, 0, "prctl(PR_SET_NO_NEW_PRIVS) failed");
+
+        unsafe { syscalls::syscall2(syscalls::Sysno::landlock_restrict_self, ruleset_fd, 0) }
+            .expect("landlock_restrict_self failed after a successful ruleset build");
+
+        unsafe { syscalls::syscall1(syscalls::Sysno::close, ruleset_fd) }.expect("close failed");
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2810,6 +2959,50 @@ mod tests {
             open_res.unwrap_err(),
             syscalls::Errno::EINVAL,
             "open with RDWR should be blocked by seccomp filter"
+        );
+    }
+
+    /// Real, live test of [`LinuxUserland::enable_landlock_filesystem_ruleset`] -- like
+    /// `test_seccomp_filter` above, this genuinely and irreversibly locks down *this test's own
+    /// process* via a real `landlock_restrict_self`, which is only safe because CI runs tests
+    /// under `cargo nextest` (a fresh forked process per test), so this cannot poison any other
+    /// test. Deliberately does not call `enable_seccomp_filter`: the two mechanisms are
+    /// independent, and this test only needs to prove Landlock's own enforcement.
+    #[test]
+    fn test_landlock_filesystem_ruleset() {
+        let _platform: &LinuxUserland = LinuxUserland::new(None);
+
+        let dir =
+            std::env::temp_dir().join(format!("litebox-landlock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let allowed_path = dir.join("allowed");
+        let denied_path = dir.join("denied");
+        std::fs::write(&allowed_path, b"allowed contents").unwrap();
+        std::fs::write(&denied_path, b"denied contents").unwrap();
+
+        // Sanity check, before lockdown: both files are actually readable right now, so the
+        // denial asserted below is Landlock's doing, not some unrelated permissions problem.
+        std::fs::read(&allowed_path).unwrap();
+        std::fs::read(&denied_path).unwrap();
+
+        LinuxUserland::enable_landlock_filesystem_ruleset(&[allowed_path.as_path()]);
+
+        assert_eq!(
+            std::fs::read(&allowed_path).unwrap(),
+            b"allowed contents",
+            "the exact path passed to enable_landlock_filesystem_ruleset must remain readable"
+        );
+
+        // `denied_path` sits in the very same directory as `allowed_path` and was created the
+        // same way -- the only difference is which one was passed to
+        // `enable_landlock_filesystem_ruleset`. This is what proves per-file granularity rather
+        // than an accidental directory-wide allowance.
+        let denied_err = std::fs::read(&denied_path).unwrap_err();
+        assert_eq!(
+            denied_err.raw_os_error(),
+            Some(libc::EACCES),
+            "a path never granted to the ruleset must be denied with EACCES, not silently \
+             allowed or denied with some other errno"
         );
     }
 }
