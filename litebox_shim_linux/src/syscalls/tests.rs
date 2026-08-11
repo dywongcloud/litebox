@@ -167,6 +167,20 @@ fn test_fcntl() {
         Err(Errno::EIO)
     );
 
+    // Regular (non-stdio) files carry no `StdioStatusFlags` metadata; SETFL on one must be a
+    // real-Linux-matching no-op rather than panicking.
+    let regular_fd = task
+        .sys_open(
+            "/fcntl_setfl_regular_file.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create regular file for SETFL no-op check");
+    let regular_fd = i32::try_from(regular_fd).unwrap();
+    task.sys_fcntl(regular_fd, FcntlArg::SETFL(OFlags::NONBLOCK))
+        .expect("SETFL on a regular file should be a no-op, not panic");
+    let _ = task.sys_close(regular_fd);
+
     // Test fcntl with DUPFD
     let fd = task
         .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())

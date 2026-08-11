@@ -337,6 +337,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     _ => panic!(),
                 }
             }
+
+            // Standard FHS directories that guest tools expect to already exist (e.g. `apk`
+            // opens a log file under `/var/log`) but that don't survive as empty-directory
+            // entries when an OCI image's rootfs is scanned into a file-based tar: an empty
+            // directory has no file contents, so it produces no tar entry, and `TarRo`'s
+            // directory tree is inferred purely from file paths. A program-from-tar ancestor
+            // directory (created above) may already occupy one of these paths, so tolerate
+            // `AlreadyExists` the same way `/tmp` does.
+            for dir in ["/run", "/var", "/var/log", "/var/cache", "/var/tmp"] {
+                if let Err(err) = fs.mkdir(dir, mode) {
+                    match err {
+                        litebox::fs::errors::MkdirError::AlreadyExists => {
+                            fs.chmod(dir, mode).expect("Failed to call chmod");
+                        }
+                        other => panic!("unexpected error creating {dir}: {other:?}"),
+                    }
+                }
+            }
         });
 
         shim_builder.default_fs(in_mem, tar_data.into())
