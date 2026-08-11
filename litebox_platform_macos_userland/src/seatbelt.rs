@@ -496,7 +496,11 @@ fn the_runner_profile_denies_host_access_without_breaking_jit_or_hwcap() {
         assert_eq!(libc::sigwait(&raw const blocked, &raw mut consumed), 0);
         assert_eq!(consumed, libc::SIGUSR1);
         assert_eq!(
-            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const previous, core::ptr::null_mut()),
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const previous,
+                core::ptr::null_mut()
+            ),
             0
         );
     }

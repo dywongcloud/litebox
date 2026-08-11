@@ -1448,9 +1448,8 @@ pub(crate) fn run_thread(
         //
         // SAFETY: `ctx` is a valid writable PtRegs, and `state` is this
         // thread's own live state, the one just published in its TSD slot.
-        let exit = GuestExit::from_asm_return(unsafe {
-            enter_guest_asm(core::ptr::from_mut(ctx), state)
-        });
+        let exit =
+            GuestExit::from_asm_return(unsafe { enter_guest_asm(core::ptr::from_mut(ctx), state) });
 
         let op = match exit {
             GuestExit::Syscall => shim.syscall(ctx),
@@ -3200,10 +3199,8 @@ pub(crate) mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let exit_code = std::sync::Arc::new(std::sync::Mutex::new(None));
         let interrupts_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let hammer_live: HammerLive = std::sync::Arc::new((
-            std::sync::Mutex::new(false),
-            std::sync::Condvar::new(),
-        ));
+        let hammer_live: HammerLive =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let shim = StressRecordingShim {
             ready: std::sync::Arc::clone(&ready),
             hammer_live: std::sync::Arc::clone(&hammer_live),

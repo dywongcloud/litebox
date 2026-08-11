@@ -1555,39 +1555,39 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
 /// platform's own guest-entry control flow) are included -- see [`SystemInfoProvider::get_hwcap`]'s
 /// doc comment for why any *included* bit is always safe to report.
 const HWCAP_SYSCTLS: &[(&str, u8, bool)] = &[
-    ("hw.optional.floatingpoint", 0, false), // HWCAP_FP
-    ("hw.optional.neon", 1, false),          // HWCAP_ASIMD
-    ("hw.optional.arm.FEAT_AES", 3, false),  // HWCAP_AES
-    ("hw.optional.arm.FEAT_PMULL", 4, false), // HWCAP_PMULL
-    ("hw.optional.arm.FEAT_SHA1", 5, false), // HWCAP_SHA1
-    ("hw.optional.arm.FEAT_SHA256", 6, false), // HWCAP_SHA2
-    ("hw.optional.arm.FEAT_CRC32", 7, false), // HWCAP_CRC32
-    ("hw.optional.arm.FEAT_LSE", 8, false),  // HWCAP_ATOMICS
-    ("hw.optional.arm.FEAT_FP16", 9, false), // HWCAP_FPHP
-    ("hw.optional.neon_hpfp", 10, false),    // HWCAP_ASIMDHP
-    ("hw.optional.arm.FEAT_RDM", 12, false), // HWCAP_ASIMDRDM
-    ("hw.optional.arm.FEAT_JSCVT", 13, false), // HWCAP_JSCVT
-    ("hw.optional.arm.FEAT_FCMA", 14, false), // HWCAP_FCMA
-    ("hw.optional.arm.FEAT_LRCPC", 15, false), // HWCAP_LRCPC
-    ("hw.optional.arm.FEAT_DPB", 16, false), // HWCAP_DCPOP
-    ("hw.optional.arm.FEAT_SHA3", 17, false), // HWCAP_SHA3
+    ("hw.optional.floatingpoint", 0, false),     // HWCAP_FP
+    ("hw.optional.neon", 1, false),              // HWCAP_ASIMD
+    ("hw.optional.arm.FEAT_AES", 3, false),      // HWCAP_AES
+    ("hw.optional.arm.FEAT_PMULL", 4, false),    // HWCAP_PMULL
+    ("hw.optional.arm.FEAT_SHA1", 5, false),     // HWCAP_SHA1
+    ("hw.optional.arm.FEAT_SHA256", 6, false),   // HWCAP_SHA2
+    ("hw.optional.arm.FEAT_CRC32", 7, false),    // HWCAP_CRC32
+    ("hw.optional.arm.FEAT_LSE", 8, false),      // HWCAP_ATOMICS
+    ("hw.optional.arm.FEAT_FP16", 9, false),     // HWCAP_FPHP
+    ("hw.optional.neon_hpfp", 10, false),        // HWCAP_ASIMDHP
+    ("hw.optional.arm.FEAT_RDM", 12, false),     // HWCAP_ASIMDRDM
+    ("hw.optional.arm.FEAT_JSCVT", 13, false),   // HWCAP_JSCVT
+    ("hw.optional.arm.FEAT_FCMA", 14, false),    // HWCAP_FCMA
+    ("hw.optional.arm.FEAT_LRCPC", 15, false),   // HWCAP_LRCPC
+    ("hw.optional.arm.FEAT_DPB", 16, false),     // HWCAP_DCPOP
+    ("hw.optional.arm.FEAT_SHA3", 17, false),    // HWCAP_SHA3
     ("hw.optional.arm.FEAT_DotProd", 20, false), // HWCAP_ASIMDDP
-    ("hw.optional.arm.FEAT_SHA512", 21, false), // HWCAP_SHA512
-    ("hw.optional.arm.FEAT_FHM", 23, false), // HWCAP_ASIMDFHM
-    ("hw.optional.arm.FEAT_DIT", 24, false), // HWCAP_DIT
-    ("hw.optional.arm.FEAT_LSE2", 25, false), // HWCAP_USCAT
-    ("hw.optional.arm.FEAT_LRCPC2", 26, false), // HWCAP_ILRCPC
-    ("hw.optional.arm.FEAT_FlagM", 27, false), // HWCAP_FLAGM
-    ("hw.optional.arm.FEAT_SSBS", 28, false), // HWCAP_SSBS
-    ("hw.optional.arm.FEAT_SB", 29, false),  // HWCAP_SB
-    ("hw.optional.arm.FEAT_DPB2", 0, true),  // HWCAP2_DCPODP
-    ("hw.optional.arm.FEAT_FlagM2", 7, true), // HWCAP2_FLAGM2
-    ("hw.optional.arm.FEAT_FRINTTS", 8, true), // HWCAP2_FRINT
-    ("hw.optional.arm.FEAT_I8MM", 13, true), // HWCAP2_I8MM
-    ("hw.optional.arm.FEAT_BF16", 14, true), // HWCAP2_BF16
-    ("hw.optional.arm.FEAT_ECV", 19, true),  // HWCAP2_ECV
-    ("hw.optional.arm.FEAT_AFP", 20, true),  // HWCAP2_AFP
-    ("hw.optional.arm.FEAT_RPRES", 21, true), // HWCAP2_RPRES
+    ("hw.optional.arm.FEAT_SHA512", 21, false),  // HWCAP_SHA512
+    ("hw.optional.arm.FEAT_FHM", 23, false),     // HWCAP_ASIMDFHM
+    ("hw.optional.arm.FEAT_DIT", 24, false),     // HWCAP_DIT
+    ("hw.optional.arm.FEAT_LSE2", 25, false),    // HWCAP_USCAT
+    ("hw.optional.arm.FEAT_LRCPC2", 26, false),  // HWCAP_ILRCPC
+    ("hw.optional.arm.FEAT_FlagM", 27, false),   // HWCAP_FLAGM
+    ("hw.optional.arm.FEAT_SSBS", 28, false),    // HWCAP_SSBS
+    ("hw.optional.arm.FEAT_SB", 29, false),      // HWCAP_SB
+    ("hw.optional.arm.FEAT_DPB2", 0, true),      // HWCAP2_DCPODP
+    ("hw.optional.arm.FEAT_FlagM2", 7, true),    // HWCAP2_FLAGM2
+    ("hw.optional.arm.FEAT_FRINTTS", 8, true),   // HWCAP2_FRINT
+    ("hw.optional.arm.FEAT_I8MM", 13, true),     // HWCAP2_I8MM
+    ("hw.optional.arm.FEAT_BF16", 14, true),     // HWCAP2_BF16
+    ("hw.optional.arm.FEAT_ECV", 19, true),      // HWCAP2_ECV
+    ("hw.optional.arm.FEAT_AFP", 20, true),      // HWCAP2_AFP
+    ("hw.optional.arm.FEAT_RPRES", 21, true),    // HWCAP2_RPRES
 ];
 
 /// Queries this host's real ARM64 feature set via Darwin's `hw.optional.*` sysctls and
@@ -1638,7 +1638,9 @@ fn sysctl_bool(name: &str) -> bool {
 #[cfg(test)]
 #[test]
 fn sysctl_bool_is_false_for_a_nonexistent_sysctl() {
-    assert!(!sysctl_bool("hw.optional.litebox_does_not_define_this_sysctl"));
+    assert!(!sysctl_bool(
+        "hw.optional.litebox_does_not_define_this_sysctl"
+    ));
 }
 
 /// Every real Apple Silicon Mac (the only hardware this platform targets) implements
@@ -1695,7 +1697,11 @@ fn allocate_pages_no_longer_refuses_shared_anonymous_mappings() {
     unsafe {
         let raw = ptr.as_usize() as *mut u8;
         raw.write_volatile(0xab);
-        assert_eq!(raw.read_volatile(), 0xab, "a SHARED mapping must be genuinely writable");
+        assert_eq!(
+            raw.read_volatile(),
+            0xab,
+            "a SHARED mapping must be genuinely writable"
+        );
     }
 
     // SAFETY: `ptr`'s range was returned by the matching `allocate_pages` call above and has
