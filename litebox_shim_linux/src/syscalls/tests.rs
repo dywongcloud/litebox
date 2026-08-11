@@ -846,8 +846,13 @@ fn test_utimensat_futimens_round_trip() {
         before.as_secs(),
         after.as_secs()
     );
+    // Copied to locals before comparing: `assert_eq!` takes references to its arguments, and a
+    // reference straight into a packed struct's field is unaligned (UB) even if never
+    // dereferenced -- see the tuple-literal comparisons above, which sidestep this by
+    // constructing a new, properly-aligned tuple value instead of referencing the field in place.
+    let (atime, mtime) = (stat.st_atime, stat.st_mtime);
     assert_eq!(
-        stat.st_atime, stat.st_mtime,
+        atime, mtime,
         "UTIME_NOW applied to both fields should produce matching timestamps"
     );
 
