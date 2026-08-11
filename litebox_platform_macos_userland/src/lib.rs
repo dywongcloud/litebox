@@ -1878,15 +1878,16 @@ pub(crate) fn install_async_signal_handlers() {
         );
     }
     // `SA_RESTART` is deliberately absent: interrupting a blocking call is the
-    // entire purpose of this signal. `SIGSEGV`/`SIGBUS` are masked for the
-    // duration of this handler -- see `darwin::install_handler`'s doc comment
-    // -- so a guest fault can never nest atop an in-flight interrupt delivery
-    // and race the same process-global guest-entry state.
+    // entire purpose of this signal. Every signal `install_fault_handlers`
+    // routes -- `SIGSEGV`/`SIGBUS`, and `SIGILL` for a guest's deliberate
+    // CPU-feature probe -- is masked for the duration of this handler (see
+    // `darwin::install_handler`'s doc comment), so a guest fault can never nest
+    // atop an in-flight interrupt delivery and race the same guest-entry state.
     darwin::install_handler(
         INTERRUPT_SIGNAL,
         interrupt_signal_handler as *const () as usize,
         true,
-        &[libc::SIGSEGV, libc::SIGBUS],
+        &[libc::SIGSEGV, libc::SIGBUS, libc::SIGILL],
     );
 }
 
@@ -2582,8 +2583,19 @@ fn guest_tp_tsd_key_is_disjoint_across_threads() {
 /// atop an in-flight fault delivery and race the same process-global
 /// guest-entry state (`guest::GUEST_OWNS_CPU`/`LIVE_PTREGS`/`GUEST_FP`/
 /// `PENDING_EXCEPTION_INFO`).
+/// `SIGILL` is installed alongside the memory faults because a guest can raise
+/// it deliberately and expect to survive: probing for an optional CPU feature by
+/// executing an instruction from it and catching the resulting `SIGILL` is a
+/// real, widespread idiom. Node's bundled OpenSSL does exactly this with
+/// `sm3partw1` (`_armv8_sm3_probe`), and Apple Silicon implements no
+/// FEAT_SM3/FEAT_SM4, so the instruction genuinely traps. Without a handler here
+/// that trap killed the whole runner instead of reaching the guest's own
+/// handler. Nothing downstream needed changing: an undefined instruction raises
+/// ESR exception class 0 (`UNKNOWN`), which
+/// `litebox_shim_linux::syscalls::signal::aarch64::exception_signal` already
+/// maps to `Signal::SIGILL`, mirroring the kernel's own `do_el0_undef`.
 pub(crate) fn install_fault_handlers() {
-    for signum in [libc::SIGSEGV, libc::SIGBUS] {
+    for signum in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL] {
         darwin::install_handler(
             signum,
             fault_handler as *const () as usize,

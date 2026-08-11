@@ -1892,6 +1892,111 @@ pub(crate) mod tests {
         );
     }
 
+    /// Same shape as [`faulting_guest`], but the deliberate fault is an
+    /// *undefined instruction* rather than a bad load. The instruction is the
+    /// real one this matters for: `sm3partw1 v4.4s, v0.4s, v3.4s`, encoding
+    /// `0xce63c004`, which is what OpenSSL's `_armv8_sm3_probe` executes to
+    /// discover whether the CPU implements FEAT_SM3. Apple Silicon does not, so
+    /// it genuinely traps. Emitted as a raw `.inst` because the assembler will
+    /// not accept the mnemonic without `+sm4` enabled, and enabling it here
+    /// would say something untrue about the host.
+    #[unsafe(naked)]
+    unsafe extern "C" fn undefined_instruction_guest() {
+        core::arch::naked_asm!(
+            "movz x9,  #0xCAFE",
+            "movz x30, #0xBEEF",
+            // write(1, &50f, 0): report the address about to trap.
+            "movz x8, #64",
+            "movz x0, #1",
+            "adr  x1, 50f",
+            "movz x2, #0",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 50f@PAGE",
+            "add  x16, x16, 50f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
+            "br   x16",
+            "50:",
+            ".inst 0xce63c004", // sm3partw1 v4.4s, v0.4s, v3.4s -- undefined here
+            "brk  #0",          // unreachable
+            cb = sym TEST_SYSCALL_ENTRY,
+        )
+    }
+
+    /// A guest that executes an undefined instruction must have it delivered to
+    /// the guest, not kill the runner.
+    ///
+    /// Probing for an optional CPU feature by executing an instruction from it
+    /// and catching the resulting `SIGILL` is a real, widespread idiom; Node's
+    /// bundled OpenSSL does exactly this with `sm3partw1`. Before `SIGILL` was
+    /// added to `install_fault_handlers`, that probe killed the whole runner
+    /// process, because only `SIGSEGV`/`SIGBUS` were routed.
+    ///
+    /// The delivered exception class must be `UNKNOWN` (ESR EC 0), which is
+    /// what an undefined instruction raises and what
+    /// `litebox_shim_linux::syscalls::signal::aarch64::exception_signal`
+    /// already turns into `Signal::SIGILL` -- so this platform-level routing was
+    /// the only missing piece.
+    #[test]
+    fn delivers_an_undefined_instruction_to_the_shim_as_a_guest_exception() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
+        crate::install_fault_handlers();
+        let mut stack = vec![0u8; 1 << 16];
+        let top = stack.as_mut_ptr() as usize + stack.len();
+        let sp = (top - 256) & !15;
+
+        let mut ctx = PtRegs {
+            pc: undefined_instruction_guest as *const () as usize,
+            sp,
+            ..Default::default()
+        };
+        let shim = FaultRecordingShim {
+            reported_pc: core::cell::Cell::new(0),
+            delivered: RefCell::new(None),
+        };
+        // Without the `SIGILL` handler this call takes the whole test process
+        // down with a raw signal, so reaching the assertions is most of the
+        // proof.
+        run_thread(&shim, &mut ctx);
+
+        let reported_pc = shim.reported_pc.get();
+        assert_ne!(reported_pc, 0, "guest never reported its expected trap pc");
+
+        let (info, regs, pc) = shim
+            .delivered
+            .into_inner()
+            .expect("EnterShim::exception was never invoked for an undefined instruction");
+
+        assert_eq!(
+            pc, reported_pc,
+            "delivered pc must be the guest's own undefined instruction, never a host address"
+        );
+        assert_eq!(
+            regs[9], 0xCAFE,
+            "delivered x9 must be the guest's own sentinel, not host garbage"
+        );
+        assert_eq!(
+            regs[30], 0xBEEF,
+            "delivered x30 must be the guest's own sentinel, never a host return address"
+        );
+        assert!(
+            !info.kernel_mode,
+            "this platform's guest never runs kernel-mode"
+        );
+        assert_eq!(
+            info.exception,
+            Exception::UNKNOWN,
+            "an undefined instruction must arrive as ESR exception class 0 (UNKNOWN), \
+             which is what the shim maps to SIGILL"
+        );
+    }
+
     /// Everything `lib.rs`'s `fault_handler` reaches runs inside a POSIX
     /// signal handler, so none of it may allocate: Darwin's allocator takes a
     /// non-reentrant `os_unfair_lock`, and a fault taken on a thread that was
