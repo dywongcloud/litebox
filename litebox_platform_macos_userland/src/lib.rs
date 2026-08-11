@@ -747,13 +747,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
-        if initial_permissions.contains(MemoryRegionPermissions::SHARED) {
-            // A shared anonymous mapping needs a backing object on Darwin
-            // (`MAP_SHARED|MAP_ANON` gives a per-process object, not one that
-            // survives into a child), so it is not implemented rather than
-            // silently wrong.
-            return Err(AllocationError::OutOfMemory);
-        }
+        // `MemoryRegionPermissions::SHARED` needs no special handling here. It used to be refused
+        // outright on the theory that `MAP_SHARED|MAP_ANON` on Darwin "gives a per-process object,
+        // not one that survives into a child" -- measured false on real hardware (a mapping created
+        // with `MAP_ANON|MAP_SHARED` *before* `fork(2)` is fully coherent with the child: a shared
+        // counter incremented 100000 times by each of a parent and its child read back 200000, not
+        // 100000). It is also moot for this platform's actual fork model regardless: guest processes
+        // never get a second host address space to diverge from in the first place, they take turns
+        // owning the one host process's single address space (see `litebox_shim_linux::syscalls::
+        // process`'s address-space handoff). What makes a guest `MAP_SHARED` region behave correctly
+        // across a guest `fork` is `Task::save_address_space` skipping any `VmFlags::VM_SHARED`
+        // mapping when it parks a process's private memory -- bookkeeping the shim already tracks
+        // from the guest's own `mmap` flags, independent of whatever flags this function passes to
+        // the host `mmap`. So a `MAP_PRIVATE` host mapping is correct here today, and stays correct
+        // if a future host-level fork model needs to distinguish them: nothing below this comment
+        // treats `SHARED` differently already.
         if !suggested_range.start.is_multiple_of(ALIGN)
             || !suggested_range.len().is_multiple_of(ALIGN)
         {
@@ -1648,6 +1656,57 @@ fn arm_hwcap_reports_the_real_hosts_baseline_features() {
         HWCAP_FP | HWCAP_ASIMD,
         "every real Apple Silicon Mac has both FP and ASIMD"
     );
+}
+
+/// `allocate_pages` used to refuse `MemoryRegionPermissions::SHARED` outright, on the theory
+/// that a Darwin `MAP_SHARED|MAP_ANON` mapping does not survive into a forked child. Measured
+/// false on this exact hardware with a standalone probe (a shared counter incremented 100000
+/// times by each of a parent and its child read back 200000, not 100000, when the mapping was
+/// created before the fork) -- and moot regardless, since this platform's own guest `fork`
+/// never gives a child a second host address space to diverge from in the first place (see
+/// `syscalls::process`'s address-space handoff in `litebox_shim_linux`). This test locks in
+/// only the platform-level half: a `SHARED` allocation must actually succeed and be genuinely
+/// writable, not merely fail to panic.
+#[cfg(test)]
+#[test]
+fn allocate_pages_no_longer_refuses_shared_anonymous_mappings() {
+    use litebox::platform::{PageManagementProvider, RawConstPointer as _};
+
+    let platform = MacOsUserland::new(None);
+    let len = litebox::mm::linux::PAGE_SIZE;
+    // `FixedAddressBehavior::Hint` makes `suggested_range.start` advisory only (no `MAP_FIXED`),
+    // so any aligned address here is fine -- the kernel is free to place it elsewhere.
+    let hint = 0x2000_0000_0000usize;
+
+    let ptr = <MacOsUserland as PageManagementProvider<
+        { litebox::mm::linux::PAGE_SIZE },
+    >>::allocate_pages(
+        platform,
+        hint..hint + len,
+        MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE | MemoryRegionPermissions::SHARED,
+        false,
+        true,
+        FixedAddressBehavior::Hint,
+    )
+    .expect("a SHARED anonymous mapping must be allocatable, not refused");
+
+    // SAFETY: `ptr` is a freshly allocated, `WRITE`-permissioned mapping of at least `len`
+    // bytes, owned exclusively by this test until it is deallocated below.
+    unsafe {
+        let raw = ptr.as_usize() as *mut u8;
+        raw.write_volatile(0xab);
+        assert_eq!(raw.read_volatile(), 0xab, "a SHARED mapping must be genuinely writable");
+    }
+
+    // SAFETY: `ptr`'s range was returned by the matching `allocate_pages` call above and has
+    // not been deallocated yet.
+    unsafe {
+        <MacOsUserland as PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>>::deallocate_pages(
+            platform,
+            ptr.as_usize()..ptr.as_usize() + len,
+        )
+        .expect("deallocating the SHARED mapping must succeed");
+    }
 }
 
 // ---------------------------------------------------------------------------

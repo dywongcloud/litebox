@@ -439,10 +439,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         // MAP_SHARED is partially supported:
-        // - Anonymous shared mappings are fully supported (no backing file concerns).
-        //   Note: a `fork`ed child shares its parent's address space outright until it `exec`s
-        //   (see `syscalls::process::VforkParent`), so `MAP_SHARED` is not what carries sharing
-        //   across processes here, and after an `exec` nothing is shared at all.
+        // - Anonymous shared mappings are fully supported (no backing file concerns). A forked
+        //   child takes turns owning the same host address space as its parent rather than
+        //   getting a second one of its own (see the address-space handoff in
+        //   `syscalls::process`), so every guest process the shim ever hosts already sees the
+        //   same underlying memory for a `MAP_SHARED` range regardless of this flag; what the
+        //   flag actually controls is `Task::save_address_space` not private-copying that range
+        //   out when its owner's turn ends, which is what keeps a `MAP_PRIVATE` region from
+        //   leaking into the same sharing a `MAP_SHARED` one gets.
         // - File-backed shared mappings are read-only: writable permission is rejected
         //   upfront and cannot be added later via mprotect, because writes cannot be
         //   propagated back to the underlying file.
