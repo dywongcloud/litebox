@@ -299,6 +299,8 @@ impl RawPointerProvider for MockPlatform {
         super::trivial_providers::TransparentMutPtr<T>;
 }
 
+impl crate::platform::HostProcessProvider for MockPlatform {}
+
 impl StdioProvider for MockPlatform {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
         let Some(front) = self.stdin_queue.write().unwrap().pop_front() else {

@@ -86,6 +86,7 @@ pub trait ShimPlatform:
     + litebox::platform::CrngProvider
     + litebox::platform::SystemInfoProvider
     + litebox::platform::StdioProvider
+    + litebox::platform::HostProcessProvider
     + litebox::platform::ArchSpecificProvider
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
@@ -105,6 +106,7 @@ impl<T> ShimPlatform for T where
         + litebox::platform::CrngProvider
         + litebox::platform::SystemInfoProvider
         + litebox::platform::StdioProvider
+        + litebox::platform::HostProcessProvider
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
@@ -296,6 +298,10 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             // so it's an obviously-uninitialized placeholder if ever observed.
             pgid: 0.into(),
             termios: litebox::sync::Mutex::new(litebox_common_linux::Termios::default_cooked()),
+            children: litebox::sync::Mutex::new(syscalls::fork::ChildTable::new()),
+            // Overwritten with the initial task's pid in `load_program`, like
+            // `pgid` above.
+            next_pid: 1.into(),
         });
         LinuxShim(global)
     }
@@ -339,6 +345,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         self.0
             .pgid
             .store(pid, core::sync::atomic::Ordering::Relaxed);
+        // `fork`ed children are numbered from just above the initial task.
+        self.0
+            .next_pid
+            .store(pid + 1, core::sync::atomic::Ordering::Relaxed);
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
@@ -362,6 +372,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                forked: None,
             },
         };
 
@@ -1264,6 +1275,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Ok(0)
                 })
             }
+            SyscallRequest::Wait4 {
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::SetThreadArea { user_desc } => {
@@ -1427,6 +1444,17 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// matching real Linux's convention that a freshly started process (as opposed to one that
     /// inherited an existing group via `fork`) becomes its own process-group leader.
     pgid: core::sync::atomic::AtomicI32,
+    /// Next pid to hand to a process created by `fork`.
+    ///
+    /// Separate from [`Self::next_thread_id`], and started just above the
+    /// initial task's pid by [`LinuxShim::load_program`], so that a forked
+    /// child can never be handed the pid the initial task already has -- which
+    /// is what [`syscalls::fork`]'s child table is keyed on.
+    next_pid: core::sync::atomic::AtomicI32,
+    /// Every child process created by `fork`, across every guest process this
+    /// runner hosts. See [`syscalls::fork`] for why this is one process-wide
+    /// table rather than a list hanging off each [`syscalls::process::Process`].
+    children: litebox::sync::Mutex<Platform, syscalls::fork::ChildTable>,
     /// Real termios state for the process's controlling terminal (shared by stdin/stdout/stderr,
     /// like a real Linux `tty_struct`), as read by `TCGETS` and written by `TCSETS`.
     termios: litebox::sync::Mutex<Platform, litebox_common_linux::Termios>,
@@ -1457,6 +1485,10 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
+    /// Set on a task created by `fork` (see [`syscalls::fork`]), holding the
+    /// gate its suspended parent is blocked on. `None` on the runner's initial
+    /// task, and shared with any thread that task later `clone`s.
+    forked: Option<Arc<syscalls::fork::ForkGate<Platform>>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
@@ -1497,6 +1529,7 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
+                forked: None,
                 global: self,
             }
         }
@@ -1521,6 +1554,7 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
+                forked: self.forked.clone(),
             };
             Some(task)
         }

@@ -85,6 +85,36 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     }
 
     /// Resets signal state for an `execve` call.
+    /// Signal state for a `fork`ed child, as opposed to a `clone`d thread.
+    ///
+    /// The difference from [`Self::clone_for_new_task`] is exactly the
+    /// difference `CLONE_SIGHAND` and `CLONE_THREAD` make: a new *process*
+    /// gets its own copy of the dispositions rather than sharing them (so the
+    /// child's `signal()` cannot reach into the parent), and its own
+    /// process-wide pending queue rather than the parent's. `fork(2)` also
+    /// specifies that the child starts with no pending signals at all, which
+    /// falls out of both queues being fresh.
+    pub fn clone_for_new_process(&self) -> Self {
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            // The blocked mask is inherited across `fork`.
+            blocked: Cell::new(self.blocked.get()),
+            handlers: RefCell::new(Arc::new(SignalHandlers {
+                inner: Mutex::new(self.handlers.borrow().inner.lock().clone()),
+            })),
+            altstack: SigAltStack {
+                flags: SsFlags::DISABLE,
+                sp: 0,
+                size: 0,
+                #[cfg(target_pointer_width = "64")]
+                __pad: 0,
+            }
+            .into(),
+            last_exception: self.last_exception.clone(),
+        }
+    }
+
     pub(crate) fn reset_for_exec(&self) {
         let mut handlers = self.handlers.borrow_mut();
         // Ensure that the signal handlers are no longer shared.

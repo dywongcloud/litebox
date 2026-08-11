@@ -84,9 +84,11 @@ extern crate alloc;
 
 mod darwin;
 mod guest;
+pub mod hostproc;
 mod net;
 mod seatbelt;
 
+pub use hostproc::{ChildSpec, SPAWNED_CHILD_ARG, SPAWN_HELPER_ARG, read_child_spec, run_spawn_helper};
 pub use seatbelt::enable_seatbelt_sandbox;
 
 use darwin::{
@@ -127,6 +129,11 @@ pub struct MacOsUserland {
     stderr_lock: std::sync::Mutex<()>,
     /// The `utun` socket used for guest networking, if one was requested.
     tun: Option<std::os::fd::OwnedFd>,
+    /// The connection to the out-of-jail spawn helper, once
+    /// [`Self::enable_host_process_support`] has been called. `None` until then,
+    /// which is what makes the guest's `fork` fail with `EINVAL` exactly as it
+    /// did before host-process support existed.
+    host_processes: OnceLock<alloc::sync::Arc<hostproc::HostProcesses>>,
     /// CoW-eligible memory regions registered via [`Self::register_cow_region`].
     /// Maps the start address of the static slice to the info needed to re-mmap
     /// the backing file. Mirrors `litebox_platform_linux_userland`'s identical
@@ -185,6 +192,7 @@ impl MacOsUserland {
             stderr_lock: std::sync::Mutex::new(()),
             tun,
             cow_regions: std::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            host_processes: OnceLock::new(),
         };
 
         // A platform must outlive every guest thread that can reach it, and
@@ -193,6 +201,50 @@ impl MacOsUserland {
         let platform: &'static Self = alloc::boxed::Box::leak(alloc::boxed::Box::new(platform));
         spawn_stdin_pump_thread(platform);
         platform
+    }
+
+    /// Start the out-of-jail spawn helper that gives the guest a real `fork`.
+    ///
+    /// This is the *only* `exec` the runner ever performs, and it has to happen
+    /// here, during start-up, for the same reason the tar archive is read and
+    /// the `utun` device is opened here: [`enable_seatbelt_sandbox`] denies
+    /// `process-fork` and `process-exec` outright, and deliberately keeps
+    /// denying them (see `hostproc`'s module docs for what re-admitting `exec`
+    /// would have cost). Call it before the sandbox goes up; calling it
+    /// afterwards fails, and calling it twice is a no-op that keeps the first
+    /// helper.
+    ///
+    /// `initial_files` is the host path of the tar archive holding the guest
+    /// root filesystem, which every spawned child re-loads for itself.
+    ///
+    /// Without this call the platform reports no host-process support, and the
+    /// shim fails a guest `fork()` with `EINVAL` -- the behavior that predates
+    /// this mechanism.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host error if the socket pair or the helper process could not
+    /// be created.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the helper connection this call just installed is not readable
+    /// back out immediately afterwards, which would mean the `OnceLock` was
+    /// concurrently cleared -- something nothing in this crate does.
+    pub fn enable_host_process_support(&'static self, initial_files: &[u8]) -> std::io::Result<()> {
+        if self.host_processes.get().is_some() {
+            return Ok(());
+        }
+        let support = alloc::sync::Arc::new(hostproc::HostProcesses::start(initial_files)?);
+        // A concurrent caller may have won; keep whichever helper is installed.
+        if self.host_processes.set(support).is_err() {
+            return Ok(());
+        }
+        let support = alloc::sync::Arc::clone(self.host_processes.get().expect("just set"));
+        std::thread::Builder::new()
+            .name("litebox-spawn-helper-reader".into())
+            .spawn(move || support.reader_loop())?;
+        Ok(())
     }
 
     /// Populate the root key used by [`litebox::platform::DerivedKeyProvider`].
@@ -1397,6 +1449,97 @@ impl MacOsUserland {
         let (lock, cvar) = &self.stdin_doorbell;
         drop(lock.lock().unwrap());
         cvar.notify_all();
+    }
+}
+
+impl litebox::platform::HostProcessProvider for MacOsUserland {
+    fn supports_host_processes(&self) -> bool {
+        self.host_processes.get().is_some()
+    }
+
+    fn create_host_pipe(
+        &self,
+    ) -> Result<
+        (
+            litebox::platform::HostFd,
+            litebox::platform::HostFd,
+        ),
+        litebox::platform::HostProcessError,
+    > {
+        hostproc::create_pipe()
+    }
+
+    fn duplicate_host_stdio(
+        &self,
+        stream: litebox::platform::StdioStream,
+    ) -> Result<litebox::platform::HostFd, litebox::platform::HostProcessError> {
+        hostproc::duplicate_stdio(stream)
+    }
+
+    fn read_host_fd(
+        &self,
+        fd: &litebox::platform::HostFd,
+        buf: &mut [u8],
+    ) -> Result<usize, litebox::platform::HostProcessError> {
+        hostproc::read_fd(fd, buf)
+    }
+
+    fn write_host_fd(
+        &self,
+        fd: &litebox::platform::HostFd,
+        buf: &[u8],
+    ) -> Result<usize, litebox::platform::HostProcessError> {
+        hostproc::write_fd(fd, buf)
+    }
+
+    fn close_host_fd(&self, fd: litebox::platform::HostFd) {
+        hostproc::close_host_fd(fd);
+    }
+
+    fn spawn_host_process(
+        &self,
+        spec: &litebox::platform::HostProcessSpec<'_>,
+    ) -> Result<i64, litebox::platform::HostProcessError> {
+        let Some(support) = self.host_processes.get() else {
+            return Err(litebox::platform::HostProcessError::Unsupported);
+        };
+        support.spawn(spec)
+    }
+
+    fn spawn_host_helper_thread(
+        &self,
+        f: alloc::boxed::Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), litebox::platform::HostProcessError> {
+        std::thread::Builder::new()
+            .name("litebox-fd-relay".into())
+            // The relay runs shim code that performs interruptible waits, which
+            // need this thread's `ThreadHandle` to exist -- the same wrapper
+            // every guest thread gets in `spawn_thread`.
+            .spawn(move || ThreadHandle::run_with_handle(f))
+            .map(|_| ())
+            .map_err(|e| {
+                litebox::platform::HostProcessError::Host(e.raw_os_error().unwrap_or(0))
+            })
+    }
+
+    fn take_exited_host_process(&self) -> Option<(i64, i32)> {
+        self.host_processes.get()?.take_exited()
+    }
+
+    fn host_process_event_generation(&self) -> u32 {
+        self.host_processes.get().map_or(0, |s| s.generation())
+    }
+
+    fn notify_host_process_event(&self) {
+        if let Some(support) = self.host_processes.get() {
+            support.notify();
+        }
+    }
+
+    fn block_on_host_process_event(&self, seen: u32) {
+        if let Some(support) = self.host_processes.get() {
+            support.block_on_event(seen);
+        }
     }
 }
 

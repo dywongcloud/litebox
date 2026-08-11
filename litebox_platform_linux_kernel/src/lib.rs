@@ -339,6 +339,8 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
     }
 }
 
+impl<Host: HostInterface> litebox::platform::HostProcessProvider for LinuxKernel<Host> {}
+
 impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host> {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         Host::read_from_stdin(buf).map_err(|err| match err {

@@ -273,6 +273,17 @@ pub fn enable_seatbelt_sandbox() {
     }
 }
 
+/// Installs [`RUNNER_PROFILE`] on the calling process, for tests in sibling
+/// modules that need to measure behavior *inside* the real jail (see
+/// `hostproc`'s `scm_rights_and_pipes_still_work_inside_the_runner_jail`).
+///
+/// Test-only, and irreversible: like [`enable_seatbelt_sandbox`], every caller
+/// must already be in a process it is willing to jail for good.
+#[cfg(test)]
+pub(crate) fn apply_runner_profile_for_test() {
+    apply_profile(RUNNER_PROFILE).expect("the runner profile must install on this host");
+}
+
 /// The fail-safe path in [`enable_seatbelt_sandbox`] is only correct if
 /// [`apply_profile`] actually *reports* a bad profile rather than quietly
 /// returning success -- otherwise the panic would be unreachable and the runner

@@ -541,6 +541,138 @@ pub enum StdioStream {
     Stderr = 2,
 }
 
+/// An owned host-side file descriptor (or the platform's equivalent handle),
+/// handed out by [`HostProcessProvider`].
+///
+/// The platform owns the underlying resource; the shim only ever moves this
+/// value around and hands it back through [`HostProcessProvider::close_host_fd`]
+/// or [`HostProcessSpec`]. It deliberately has no `Drop` impl: the shim is
+/// `no_std` and cannot close a host descriptor by itself, so leaking one is a
+/// resource leak rather than a soundness problem, and every path that creates
+/// one is expected to hand it back.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct HostFd(pub i32);
+
+/// Why a [`HostProcessProvider`] operation could not be carried out.
+#[derive(Debug, Error)]
+pub enum HostProcessError {
+    /// This platform has no notion of spawning a host process for the guest.
+    #[error("host process support is not available on this platform")]
+    Unsupported,
+    /// The host refused the operation; the payload is the host's raw error
+    /// number where one exists.
+    #[error("host process operation failed (os error {0})")]
+    Host(i32),
+}
+
+/// What a spawned host process should run, and which descriptors it inherits.
+///
+/// `argv` and `envp` are raw byte strings rather than `str` because a Linux
+/// guest's are: neither is required to be UTF-8, and silently lossy-converting
+/// them would corrupt arguments.
+pub struct HostProcessSpec<'a> {
+    /// Guest-visible path of the program to run, resolved inside the *guest*
+    /// filesystem (not the host's).
+    pub program: &'a str,
+    /// Full `argv`, including `argv[0]`.
+    pub argv: &'a [&'a [u8]],
+    /// Full environment, as `KEY=VALUE` byte strings.
+    pub envp: &'a [&'a [u8]],
+    /// Descriptors the child starts with, as `(fd number in the child, host fd
+    /// to install there)`. The provider takes ownership of every [`HostFd`]
+    /// listed here.
+    pub fds: &'a [(i32, HostFd)],
+}
+
+/// Creating and supervising real *host* processes on the guest's behalf.
+///
+/// This exists for `fork(2)`: LiteBox runs guest instructions natively in the
+/// host process, so a guest that forks and then `execve`s cannot be served by a
+/// thread. The platform that can create a second host process running a second
+/// guest image implements this; every other platform inherits the defaults,
+/// which report the facility as absent so the shim can fail `fork` with `EINVAL`
+/// exactly as it did before this trait existed.
+///
+/// Every method has a default implementation, so adding a platform costs a bare
+/// `impl HostProcessProvider for MyPlatform {}`.
+pub trait HostProcessProvider {
+    /// Whether this platform can spawn host processes at all. The shim checks
+    /// this before taking any fork-related path.
+    fn supports_host_processes(&self) -> bool {
+        false
+    }
+
+    /// Creates a host pipe, returning `(read end, write end)`.
+    fn create_host_pipe(&self) -> Result<(HostFd, HostFd), HostProcessError> {
+        Err(HostProcessError::Unsupported)
+    }
+
+    /// Duplicates the *host's* own standard stream, for handing to a child.
+    fn duplicate_host_stdio(&self, stream: StdioStream) -> Result<HostFd, HostProcessError> {
+        let _ = stream;
+        Err(HostProcessError::Unsupported)
+    }
+
+    /// Reads from a host descriptor, blocking until at least one byte is
+    /// available. `Ok(0)` means end of file.
+    fn read_host_fd(&self, fd: &HostFd, buf: &mut [u8]) -> Result<usize, HostProcessError> {
+        let _ = (fd, buf);
+        Err(HostProcessError::Unsupported)
+    }
+
+    /// Writes to a host descriptor.
+    fn write_host_fd(&self, fd: &HostFd, buf: &[u8]) -> Result<usize, HostProcessError> {
+        let _ = (fd, buf);
+        Err(HostProcessError::Unsupported)
+    }
+
+    /// Closes a host descriptor.
+    fn close_host_fd(&self, fd: HostFd) {
+        let _ = fd;
+    }
+
+    /// Spawns a host process running the described guest program, returning an
+    /// opaque, platform-chosen identifier for it.
+    fn spawn_host_process(&self, spec: &HostProcessSpec<'_>) -> Result<i64, HostProcessError> {
+        let _ = spec;
+        Err(HostProcessError::Unsupported)
+    }
+
+    /// Runs `f` on a fresh host thread that never executes guest code.
+    ///
+    /// Used for the descriptor relays that connect a spawned child's real host
+    /// pipes to the shim's in-process pipe objects.
+    fn spawn_host_helper_thread(
+        &self,
+        f: alloc::boxed::Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), HostProcessError> {
+        let _ = f;
+        Err(HostProcessError::Unsupported)
+    }
+
+    /// Pops one already-exited spawned process, as `(identifier, wait status)`,
+    /// where the status is encoded the way `wait4(2)` encodes it.
+    fn take_exited_host_process(&self) -> Option<(i64, i32)> {
+        None
+    }
+
+    /// A counter bumped every time something a `wait4` caller might care about
+    /// happens (a spawned process exits, or the shim calls
+    /// [`Self::notify_host_process_event`]).
+    fn host_process_event_generation(&self) -> u32 {
+        0
+    }
+
+    /// Bumps the generation and wakes everyone blocked in
+    /// [`Self::block_on_host_process_event`].
+    fn notify_host_process_event(&self) {}
+
+    /// Blocks until [`Self::host_process_event_generation`] differs from `seen`.
+    fn block_on_host_process_event(&self, seen: u32) {
+        let _ = seen;
+    }
+}
+
 /// A provider of standard input/output functionality.
 pub trait StdioProvider {
     /// Read from standard input. Returns number of bytes read.

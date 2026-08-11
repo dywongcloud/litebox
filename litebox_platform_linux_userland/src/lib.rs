@@ -1824,6 +1824,8 @@ impl LinuxUserland {
     }
 }
 
+impl litebox::platform::HostProcessProvider for LinuxUserland {}
+
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         loop {

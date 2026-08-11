@@ -1906,6 +1906,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     }
 }
 
+impl litebox::platform::HostProcessProvider for WindowsUserland {}
+
 impl litebox::platform::StdioProvider for WindowsUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         use std::io::Read as _;

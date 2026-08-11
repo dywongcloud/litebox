@@ -552,6 +552,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // multithreaded process exiting must NOT close fds out from under its siblings).
         if is_last_thread {
             self.close_all_fds_on_exit();
+            // Only now, with this child's descriptors closed (so a pipe peer
+            // already sees the write end go away), tell the parent it can stop
+            // waiting and collect a status.
+            self.finish_forked_child(self.thread.process.inner.lock().exit_status);
         }
     }
 
@@ -580,9 +584,9 @@ type ThreadLocalDescriptor = UserPtrMut<u8>;
 /// guest's view of it, so the shim always goes through [`ArchSpecificRegister`]
 /// rather than touching it directly.
 #[cfg(target_arch = "x86_64")]
-const GUEST_TLS_REGISTER: ArchSpecificRegister = ArchSpecificRegister::FsBase;
+pub(crate) const GUEST_TLS_REGISTER: ArchSpecificRegister = ArchSpecificRegister::FsBase;
 #[cfg(target_arch = "aarch64")]
-const GUEST_TLS_REGISTER: ArchSpecificRegister = ArchSpecificRegister::TpidrEl0;
+pub(crate) const GUEST_TLS_REGISTER: ArchSpecificRegister = ArchSpecificRegister::TpidrEl0;
 
 struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
     /// Task struct that maintains all per-thread data
@@ -602,6 +606,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThread
             task,
             _not_send: core::marker::PhantomData,
         })
+    }
+}
+
+/// Wraps a task as the platform's thread-initialization payload.
+///
+/// `NewThreadArgs` is private to this module; `syscalls::fork` needs to build
+/// one for the child task it spawns, and goes through here rather than making
+/// the type public.
+pub(crate) fn new_thread_args<Platform: ShimPlatform, FS: ShimFS>(
+    task: Task<Platform, FS>,
+) -> impl litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs> {
+    NewThreadArgs { task }
+}
+
+impl<Platform: ShimPlatform> ThreadState<Platform> {
+    /// Arranges for this thread to start as a `clone`d thread would: `x0`/`rax`
+    /// zero, and the stack and TLS overridden only where asked.
+    ///
+    /// `syscalls::fork` uses it with all three `None`, which is what gives a
+    /// forked child the parent's own stack pointer and a `fork()` return of 0.
+    pub(crate) fn set_new_thread_init_state(
+        &self,
+        stack: Option<usize>,
+        tls: Option<UserPtrMut<u8>>,
+        set_child_tid: Option<UserPtrMut<i32>>,
+    ) {
+        self.init_state.set(ThreadInitState::NewThread {
+            stack,
+            tls,
+            set_child_tid,
+        });
     }
 }
 
@@ -654,6 +689,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
+        // A `clone` that does not ask for a shared thread group is asking for a
+        // new *process*: `fork()` (no flags at all) and `vfork()`. That path is
+        // `syscalls::fork`'s, and it is deliberately checked before the
+        // thread-only flag validation below, which would reject both.
+        if !flags.contains(CloneFlags::THREAD) {
+            let mut fork_args = args.clone();
+            fork_args.flags = flags;
+            fork_args.exit_signal = exit_signal;
+            return self.do_fork(ctx, &fork_args);
+        }
+
         let required_clone_flags =
             CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
 
@@ -695,7 +741,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
+        // `exit_signal` only matters for a `fork`-like clone, which
+        // `syscalls::fork` handled above; a `CLONE_THREAD` task has no exit
+        // signal to deliver, so this only validates it.
         if exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
         }
@@ -787,6 +835,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
+                        // A thread of a forked child is still part of that
+                        // child, so it shares the gate its parent waits on.
+                        forked: self.forked.clone(),
                     },
                 }),
             )
@@ -1834,6 +1885,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
+
+        // A `fork`ed child shares this address space with its suspended parent,
+        // so it must not load the new image over it. `syscalls::fork` starts a
+        // real host process for the program instead.
+        if self.is_forked_child() {
+            return self.spawn_execve(&path, argv_vec, envp_vec);
+        }
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
 

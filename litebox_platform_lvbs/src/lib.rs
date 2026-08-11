@@ -1089,6 +1089,8 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
     }
 }
 
+impl<Host: HostInterface> litebox::platform::HostProcessProvider for LinuxKernel<Host> {}
+
 impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
     fn read_from_stdin(&self, _buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         unimplemented!()

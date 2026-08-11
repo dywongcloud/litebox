@@ -1419,6 +1419,40 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// The `options` argument of `wait4(2)`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WaitOptions: i32 {
+        /// Return immediately if no child has exited.
+        const WNOHANG = 0x00000001;
+        /// Also report children stopped by a signal.
+        const WUNTRACED = 0x00000002;
+        /// Also report children continued by `SIGCONT`.
+        const WCONTINUED = 0x00000008;
+        /// Do not reap the child; leave it waitable.
+        const WNOWAIT = 0x01000000;
+        /// Wait only for `clone` children (ones with a non-`SIGCHLD` exit signal).
+        /// Linux spells this `0x80000000`, which is `i32::MIN` in this field's
+        /// signed type.
+        const WCLONE = i32::MIN;
+        /// Wait only for non-`clone` children.
+        const WALL = 0x40000000;
+        /// Wait for `clone` children too, even in a different thread group.
+        const WNOTHREAD = 0x20000000;
+    }
+}
+
+impl TryFrom<i32> for WaitOptions {
+    type Error = errno::Errno;
+
+    /// Rejects any bit outside the documented set with `EINVAL`, exactly as
+    /// Linux's `kernel_wait4` does, so an option this shim has never heard of
+    /// fails loudly instead of being silently ignored.
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        Self::from_bits(value).ok_or(errno::Errno::EINVAL)
+    }
+}
+
 /// Arguments for the `clone3` syscall.
 #[repr(C, align(8))]
 #[derive(Clone, Debug, FromBytes, IntoBytes)]
@@ -2650,6 +2684,21 @@ pub enum SyscallRequest {
     Clone3 {
         args: UserPtr<CloneArgs>,
     },
+    /// Wait for a child process to change state.
+    ///
+    /// This is the only wait-family entry point the shim implements. glibc's and
+    /// musl's `wait`, `waitpid` and (on musl) `waitid` all funnel into `wait4`
+    /// on aarch64, which has no `waitpid` syscall of its own.
+    Wait4 {
+        /// `-1` for any child, `> 0` for one specific child; process-group forms
+        /// (`0`, `< -1`) are recognized here and rejected by the shim.
+        pid: i32,
+        /// Where to store the wait status, or null to discard it.
+        wstatus: UserPtrMut<i32>,
+        options: WaitOptions,
+        /// Where to store resource usage, or null. The shim does not fill it in.
+        rusage: UserPtrMut<u8>,
+    },
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on x86_64.
     SetThreadArea {
@@ -3306,6 +3355,7 @@ impl SyscallRequest {
                 };
                 SyscallRequest::Clone { args }
             }
+            Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options:?, rusage:* }),
             Sysno::clone3 => {
                 debug_assert_eq!(
                     ctx.sys_req_arg::<usize>(1),
