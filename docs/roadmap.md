@@ -1032,23 +1032,29 @@ a real, multi-day project on its own:
   process's own address space. Narrowing those needs a different mechanism
   (a separate broker process holding the `utun` descriptor, for instance), not
   a bigger profile.
-* ~~**Landlock integration** for the existing Linux seccomp filter, which
+* **Landlock integration** for the existing Linux seccomp filter, which
   currently has no path-scoping: a compromised guest that finds a seccomp
-  gap can still reach any path the host process can.~~ Done:
+  gap can still reach any path the host process can. Partially done:
   `LinuxUserland::enable_landlock_filesystem_ruleset`
-  (`litebox_platform_linux_userland/src/lib.rs`), installed before
-  `enable_seccomp_filter` in `litebox_runner_linux_userland`'s startup,
-  restricts the process to exactly the paths it still opens post-lockdown
-  (today, just the program binary's path). Real, live test
-  (`test_landlock_filesystem_ruleset`) asserts actual `EACCES` on a
-  never-granted path. Implemented and cross-compile-verified
+  (`litebox_platform_linux_userland/src/lib.rs`) exists, is unit-tested
+  (`test_landlock_filesystem_ruleset`, a real, live test asserting actual
+  `EACCES` on a never-granted path), and cross-compile-verified
   (`cargo check`/`clippy --target x86_64-unknown-linux-gnu`) from a macOS
-  host, where this Linux-only code cannot be built natively; live-kernel
-  execution wasn't witnessed locally this session (the project's local
-  x86_64 Linux VM was unresponsive under extreme host CPU contention at
-  the time) -- CI's `ubuntu-latest` runner is the first real-kernel
-  execution of this code, same as any other Linux-only change landed from
-  this host.
+  host, where this Linux-only code cannot be built natively -- but it is
+  **not called** from `litebox_runner_linux_userland`'s startup. Wiring it
+  in broke a real, working integration test
+  (`test_runner_broker_integration_with_rewriter`, exit status 14, no
+  seccomp-trap warning -- consistent with Landlock returning a plain
+  `EACCES` somewhere in the broker/rewriter path) the one time real Linux
+  CI actually exercised it end to end, and this macOS host's local x86_64
+  Linux VM was unresponsive under host load for the entire session that
+  attempted this, leaving no way to live-debug which specific access
+  Landlock was denying before shipping it. Left disabled rather than
+  merged in a state that broke real functionality and was never actually
+  verified working -- see the call site's own comment in
+  `litebox_runner_linux_userland/src/lib.rs` for exactly what wiring it
+  back in needs. Re-enabling this needs a session with working local
+  Linux execution.
 * **A WASI-style capability redesign for `litebox_broker_host`'s filesystem
   and socket authorization** -- preopen-style directory capabilities and a
   per-destination socket policy hook, replacing today's coarser

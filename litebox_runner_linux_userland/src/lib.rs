@@ -218,16 +218,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
 
-    // Captured before the loop below consumes `cow_eligible_regions`: these are exactly the
-    // paths `try_allocate_cow_pages` will still `open()` after seccomp/Landlock lockdown, so
-    // they're also exactly the paths the Landlock ruleset (installed further down, right before
-    // `enable_seccomp_filter`) needs to allow. Empty when `--rewrite-syscalls` is set, since
-    // that path never registers a COW region and so needs no post-lockdown host file access at
-    // all.
-    let cow_region_paths: Vec<PathBuf> = cow_eligible_regions
-        .iter()
-        .map(|file| file.abs_path.clone())
-        .collect();
     for file in cow_eligible_regions {
         platform.register_cow_region(file.data, file.abs_path);
     }
@@ -424,15 +414,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    // Landlock first: it needs `open(O_PATH)` on the allowed paths, which the seccomp filter's
-    // own `open` rule (installed next, `O_RDONLY` only) would itself block if installed first.
-    #[cfg(target_arch = "x86_64")]
-    litebox_platform_linux_userland::LinuxUserland::enable_landlock_filesystem_ruleset(
-        &cow_region_paths
-            .iter()
-            .map(PathBuf::as_path)
-            .collect::<Vec<_>>(),
-    );
+    // `LinuxUserland::enable_landlock_filesystem_ruleset` exists and is unit-testable (see its
+    // own `test_landlock_filesystem_ruleset`), but is deliberately not called here yet: wiring it
+    // in broke a real, working test (`test_runner_broker_integration_with_rewriter`, exit status
+    // 14, no seccomp-trap warning -- consistent with Landlock returning a plain EACCES somewhere
+    // in the broker/rewriter path this session did not have time to isolate) the one time real
+    // Linux CI actually exercised it end to end. This macOS host cannot run the Linux-only runner
+    // at all, and the project's local x86_64 Linux VM was unresponsive under host load for this
+    // entire session, so there was no way to live-debug which specific access Landlock was
+    // denying before shipping it. Left uncalled rather than merged in a state that broke real
+    // functionality and was never actually verified working -- see
+    // docs/roadmap.md's Landlock entry. Re-enabling this needs a session with working local Linux
+    // execution to find the missing rule; the paths to pass are `cow_eligible_regions`' abs
+    // paths, captured before the loop above consumes it.
 
     #[cfg(target_arch = "x86_64")]
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
