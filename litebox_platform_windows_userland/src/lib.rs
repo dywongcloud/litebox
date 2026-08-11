@@ -1996,6 +1996,46 @@ impl litebox::platform::StdioProvider for WindowsUserland {
             StdioStream::Stderr => std::io::stderr().is_terminal(),
         }
     }
+
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        use windows_sys::Win32::System::Console::{
+            CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
+        };
+
+        // SAFETY: `STD_OUTPUT_HANDLE` is a well-known pseudo-handle constant; `GetStdHandle`
+        // takes no pointer arguments.
+        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        if handle.is_null() || handle == Win32_Foundation::INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { core::mem::zeroed() };
+        // SAFETY: `handle` was just validated non-null/non-invalid above; `info` is a plain
+        // fixed-size struct valid to write into for the duration of the call.
+        if unsafe { GetConsoleScreenBufferInfo(handle, &raw mut info) } == 0 {
+            // Not a real console (e.g. redirected stdout): let the caller fall back to a
+            // reasonable default rather than reporting a fake size.
+            return None;
+        }
+        // `srWindow` is the visible window rectangle, not the full (possibly larger,
+        // scrollback-including) screen buffer size -- this matches what a real Linux tty's
+        // `TIOCGWINSZ` reports: the visible terminal dimensions, not a scrollback buffer size.
+        let cols = info
+            .srWindow
+            .Right
+            .saturating_sub(info.srWindow.Left)
+            .saturating_add(1);
+        let rows = info
+            .srWindow
+            .Bottom
+            .saturating_sub(info.srWindow.Top)
+            .saturating_add(1);
+        let cols = u16::try_from(cols).ok()?;
+        let rows = u16::try_from(rows).ok()?;
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        Some((rows, cols))
+    }
 }
 
 #[global_allocator]

@@ -1501,6 +1501,25 @@ impl litebox::platform::StdioProvider for MacOsUserland {
             let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const term);
         }
     }
+
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        if !self.stdio_is_tty[litebox::platform::StdioStream::Stdout as usize] {
+            return None;
+        }
+        // SAFETY: `STDOUT_FILENO` is valid for the process lifetime; `ws` is fully initialized
+        // by the kernel before any field is read, or the call fails and `ws` is left unread.
+        let ws = unsafe {
+            let mut ws: libc::winsize = core::mem::zeroed();
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &raw mut ws) != 0 {
+                return None;
+            }
+            ws
+        };
+        if ws.ws_row == 0 || ws.ws_col == 0 {
+            return None;
+        }
+        Some((ws.ws_row, ws.ws_col))
+    }
 }
 
 // ---------------------------------------------------------------------------

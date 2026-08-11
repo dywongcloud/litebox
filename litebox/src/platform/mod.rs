@@ -571,6 +571,20 @@ pub trait StdioProvider {
     fn set_terminal_raw_mode(&self, stream: StdioStream, raw: bool, echo: bool) {
         let _ = (stream, raw, echo);
     }
+
+    /// Best-effort: returns the real terminal's current `(rows, cols)`, for platforms that can
+    /// query it (e.g. `TIOCGWINSZ` on the real host fd, or `GetConsoleScreenBufferInfo` on
+    /// Windows). `None` means this platform has no real terminal to query (headless, redirected,
+    /// or a platform without host-level tty access) -- callers should then fall back to a
+    /// reasonable default `Winsize` rather than treating `None` as an error.
+    ///
+    /// Backing `TIOCGWINSZ`: guests (notably `ash`'s line editor) use this to decide the column
+    /// width at which to wrap their own echoed-input redisplay, so a fake, too-narrow size here
+    /// causes the guest to insert spurious wraps well before the real terminal would ever need
+    /// to.
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 /// A provider for system information.

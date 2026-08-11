@@ -2122,6 +2122,35 @@ impl litebox::platform::StdioProvider for LinuxUserland {
             )
         };
     }
+
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        if !self.stdio_is_tty[litebox::platform::StdioStream::Stdout as usize] {
+            return None;
+        }
+        // The host is real Linux, so the kernel's real `winsize` layout is exactly
+        // `litebox_common_linux::Winsize` -- no translation needed, unlike the macOS platform.
+        let mut ws = litebox_common_linux::Winsize {
+            row: 0,
+            col: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        // `STDOUT_FILENO` is a fixed, non-negative constant (`1`), so the fallback here is
+        // never actually reached -- it exists only to keep this conversion panic-free.
+        let stdout_fd = usize::try_from(litebox_common_linux::STDOUT_FILENO).unwrap_or(1);
+        let got = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::ioctl,
+                stdout_fd,
+                litebox_common_linux::TIOCGWINSZ as usize,
+                (&raw mut ws) as usize,
+            )
+        };
+        if got.is_err() || ws.row == 0 || ws.col == 0 {
+            return None;
+        }
+        Some((ws.row, ws.col))
+    }
 }
 
 unsafe extern "C" {
