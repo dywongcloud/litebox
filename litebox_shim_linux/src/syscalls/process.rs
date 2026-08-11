@@ -146,7 +146,8 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     pub(crate) brk: core::sync::atomic::AtomicUsize,
     /// Total host CPU time (nanoseconds) consumed by every thread of this process so far.
     ///
-    /// Each thread adds its own [`ShimPlatform::thread_cpu_time`] reading here as it exits (see
+    /// Each thread adds its own [`litebox::platform::TimeProvider::thread_cpu_time`] reading
+    /// here as it exits (see
     /// `Task::prepare_for_exit`), since that clock is only readable by the thread it measures.
     /// Reported to a `wait4(..., &rusage)` caller as `ru_utime` once the whole process is a
     /// zombie -- see `Task::sys_wait4`.
