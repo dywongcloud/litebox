@@ -447,15 +447,16 @@ pub(crate) fn sysctl_string(
 /// `extra_mask` names signals to block for the duration of this handler,
 /// beyond `signum` itself (which the kernel already blocks by default absent
 /// `SA_NODEFER`). This matters whenever two handlers installed through this
-/// function touch the same process-global guest-entry state
-/// (`litebox_platform_macos_userland::guest`'s `GUEST_OWNS_CPU`/
-/// `LIVE_PTREGS`/`GUEST_FP`/`PENDING_EXCEPTION_INFO`/`PENDING_INTERRUPT`):
-/// unlike `SIGSEGV`/`SIGBUS`/`SIGUSR2` being merely reentrant-safe Rust code in
-/// isolation, none of those globals is protected against a *second* handler
-/// invocation nesting on top of a first one still in flight on the same
-/// thread (the single-guest-thread invariant these globals otherwise rely on
-/// only rules out a second *concurrent* guest thread, not the same thread's
-/// own signal handler being interrupted by a different signal). The fault
+/// function touch the same thread's guest-entry state
+/// (`litebox_platform_macos_userland::guest`'s `GuestThreadState`: its
+/// `owns_cpu`, `live_ptregs`, `guest_fp`, `pending_exception_info` and
+/// `pending_interrupt` fields). Unlike `SIGSEGV`/`SIGBUS`/`SIGUSR2` being
+/// merely reentrant-safe Rust code in isolation, none of those fields is
+/// protected against a *second* handler invocation nesting on top of a first
+/// one still in flight on the same thread. Per-thread storage is exactly what
+/// does *not* help here: it rules out a *different* guest thread racing this
+/// one, which was never the hazard, and says nothing about this same thread's
+/// own signal handler being interrupted by a different signal. The fault
 /// handler and the interrupt handler are exactly this pair -- a real guest
 /// hardware fault and an unrelated cross-thread `ThreadHandle::interrupt`
 /// call can race, and without masking, the second signal would nest atop the

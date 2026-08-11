@@ -22,50 +22,96 @@
 //! and the `NZCV` flags from a [`PtRegs`], then branches through `X16` to the
 //! guest `PC`.
 //!
-//! The vector registers travel separately, in [`GUEST_FP`], because [`PtRegs`]
-//! has nowhere to put them: it mirrors Linux's `struct pt_regs`, which carries
-//! no FP state because the kernel is built without it. Leaving them in the
-//! hardware would not work either -- the shim is ordinary Rust and uses vector
-//! registers freely -- and Linux preserves user FPSIMD across a syscall, so a
-//! guest may hold live values in any of them across its `SVC`.
+//! The vector registers travel separately, in [`GuestThreadState::guest_fp`],
+//! because [`PtRegs`] has nowhere to put them: it mirrors Linux's `struct
+//! pt_regs`, which carries no FP state because the kernel is built without it.
+//! Leaving them in the hardware would not work either -- the shim is ordinary
+//! Rust and uses vector registers freely -- and Linux preserves user FPSIMD
+//! across a syscall, so a guest may hold live values in any of them across its
+//! `SVC`.
 //!
 //! Coming back is the reverse. A rewritten guest `SVC` branches (via its gate
-//! and the shared handler) to [`syscall_callback`], which captures the full
-//! guest register file into the run loop's `PtRegs`, restores the host's
-//! callee-saved registers and stack, and returns *normally* into the run loop
-//! -- a hand-rolled `swapcontext`. The run loop ([`run_thread`]) then calls the
-//! shim and, on [`ContinueOperation::Resume`], re-enters with the updated
+//! and the shared handler) to this module's syscall entry point, which captures
+//! the full guest register file into the run loop's `PtRegs`, restores the
+//! host's callee-saved registers and stack, and returns *normally* into the run
+//! loop -- a hand-rolled `swapcontext`. The run loop ([`run_thread`]) then calls
+//! the shim and, on [`ContinueOperation::Resume`], re-enters with the updated
 //! `PtRegs`. This avoids `setjmp`/`longjmp` (unsound across Rust frames) and
 //! the deprecated `ucontext` API (whose `setcontext` resumes via `__lr`, which
 //! would clobber the guest's live `X30` -- worse than clobbering `X16`).
 //!
+//! # Per-thread bookkeeping: the one-register `TPIDRRO_EL0` reach
+//!
+//! Everything the switch has to remember across a guest's syscall -- the host
+//! save area, the live-[`PtRegs`] pointer, the guest's vector file, the
+//! "guest owns the CPU" flag and the pending-interrupt flag -- lives in a
+//! single per-thread [`GuestThreadState`], so this platform runs **as many
+//! concurrent guest threads as the host will give it**. Reaching it is the
+//! whole difficulty, and it is worth spelling out why the obvious answers do
+//! not work:
+//!
+//! * A Rust `thread_local!` needs a function call, and
+//!   [`syscall_entry_stubs`]'s callback body runs on the *guest's* stack with
+//!   every guest register live -- there is nothing to call with and nowhere to
+//!   spill to.
+//! * `litebox_platform_linux_userland`'s x86_64 switch reads its equivalent
+//!   state from `fs:`-relative local-exec TLS, a link-time-fixed offset with no
+//!   call. Mach-O has no equivalent addressing mode.
+//! * Darwin *does* expose exactly the right primitive: a `pthread_key_create`
+//!   key `N`'s value sits at `[(TPIDRRO_EL0 & !7) + N*8]`, the same "direct
+//!   TSD" read libSystem's own `errno` accessor uses. But `N` is only known at
+//!   run time (this process's first dynamic key is not a fixed number -- see
+//!   `lib.rs`'s `reserve_guest_tpidr_tsd_slot`), and materialising a run-time
+//!   offset costs a *second* scratch register. At the syscall callback, the
+//!   rewriter's `SVC` gate has left exactly **one** register free (`X16`);
+//!   `X17` still holds the guest's real value.
+//! * Staging the pointer below the guest `SP` at resume time buys the second
+//!   register, and is **wrong**: the guest's own `SP` moves between a resume
+//!   and its next syscall (any compiled function that opens a stack frame does
+//!   this), so the staged word is at a stale address. That design was built,
+//!   tested and hardware-disproven; see `docs/roadmap.md`.
+//!
+//! What this module does instead is make the offset a *compile-time* constant
+//! by enumerating every possible one. [`syscall_entry_stubs`] is a table of
+//! [`TSD_SLOT_COUNT`] identical four-instruction stubs, stub `N` being
+//!
+//! ```text
+//! mrs x16, tpidrro_el0
+//! and x16, x16, #~7
+//! ldr x16, [x16, #(N * 8)]     // N is an assemble-time immediate
+//! b   <callback body>
+//! ```
+//!
+//! and [`syscall_entry_point`] hands the guest's loader the address of the one
+//! stub matching the key this process actually reserved. One register, no call,
+//! no guest-`SP` dependence, no self-modifying code, and no change to the
+//! ahead-of-time-rewritten guest binary format: the guest is already told the
+//! entry point at load time (`SystemInfoProvider::get_syscall_entry_point`), so
+//! choosing *which* stub is free. The table costs `TSD_SLOT_COUNT * 16` bytes
+//! of `.text` and is otherwise inert.
+//!
+//! The other five naked functions here are reached with registers to spare
+//! (three of them by a signal handler's `pc` redirect, so *every* register is
+//! free), and simply do the two-register lookup -- `MRS` plus a load of
+//! [`GUEST_STATE_TSD_BYTE_OFFSET`] -- inline.
+//!
 //! # Current limitations
 //!
-//! * **One guest thread at a time.** The host save area and the live-`PtRegs`
-//!   pointer are process-global, reached from [`syscall_callback`] by absolute
-//!   (`ADRP`) address because a naked callback on the guest stack cannot read a
-//!   Rust `thread_local!` without a call. A second concurrent guest thread
-//!   panics loudly ([`GUEST_ACTIVE`]) rather than corrupting the first. Lifting
-//!   this needs a per-thread save area reached without a function call -- the
-//!   same `TPIDRRO_EL0`-relative direct-TSD mechanism the rewriter's gates need
-//!   (see `docs/roadmap.md`); it is deliberately out of scope here. This
-//!   includes [`GUEST_OWNS_CPU`] and [`PENDING_INTERRUPT`]: lifting the
-//!   single-thread restriction would need both to become per-thread state
-//!   too, reached the same `TPIDRRO_EL0`-relative way.
 //! * **Guest hardware faults (`SIGSEGV`/`SIGBUS`) are routed** to
-//!   [`litebox::shim::EnterShim::exception`] via [`GUEST_OWNS_CPU`] and
-//!   `lib.rs`'s `fault_handler`. A delivered exception's captured general
-//!   registers/`PSTATE`/vector state are all exact, read straight from the
-//!   kernel's own signal `mcontext` (see [`prepare_exception_delivery`]).
+//!   [`litebox::shim::EnterShim::exception`] via
+//!   [`GuestThreadState::owns_cpu`] and `lib.rs`'s `fault_handler`. A delivered
+//!   exception's captured general registers/`PSTATE`/vector state are all
+//!   exact, read straight from the kernel's own signal `mcontext` (see
+//!   [`prepare_exception_delivery`]).
 //! * **The interrupt path (`SIGUSR2`) is routed** to
 //!   [`litebox::shim::EnterShim::interrupt`] via `lib.rs`'s
 //!   `interrupt_signal_handler`, [`interrupted_pc_is_in_guest_entry_restore`]/
-//!   [`interrupted_pc_is_in_guest_exit_prologue`], [`PENDING_INTERRUPT`] and
+//!   [`interrupted_pc_is_in_guest_exit_prologue`],
+//!   [`GuestThreadState::pending_interrupt`] and
 //!   [`prepare_interrupt_delivery`]/[`abandon_guest_entry_for_interrupt`] --
 //!   see those items' own doc comments for the four-case dispatch this needed
 //!   (mirroring `litebox_platform_linux_userland`'s and
-//!   `litebox_platform_windows_userland`'s own four-case interrupt handling,
-//!   adapted to this platform's process-global `GUEST_OWNS_CPU` bookkeeping).
+//!   `litebox_platform_windows_userland`'s own four-case interrupt handling).
 //! * **Below-`SP` staging.** [`enter_guest_asm`] stages the guest `PC` and `X0`
 //!   in the 16 bytes just below the guest `SP` before branching. AArch64 Linux
 //!   has no red zone, so a signal delivered in that window could clobber them;
@@ -74,11 +120,13 @@
 //!   installs carries `SA_ONSTACK` (`darwin::install_handler`), and both
 //!   entry points that can reach here (`ThreadProvider::spawn_thread` and the
 //!   free `run_thread`) install the alternate stack itself
-//!   (`with_signal_alt_stack`) before either can run. The same below-`SP`
-//!   reads are also the last guest-memory touches inside [`GUEST_OWNS_CPU`]'s
-//!   "owns" window before the branch to guest code; a fault there is caught by
-//!   an exception-table entry (see [`GUEST_OWNS_CPU`]) rather than ever being
-//!   weighed as a guest-delivery candidate.
+//!   (`with_signal_alt_stack`) before either can run. Unlike the disproven
+//!   per-thread-pointer staging described above, these two words are consumed
+//!   by the very next instructions, before the guest can move `SP` at all.
+//!   The same below-`SP` reads are also the last guest-memory touches inside
+//!   [`GuestThreadState::owns_cpu`]'s "owns" window before the branch to guest
+//!   code; a fault there is caught by an exception-table entry rather than ever
+//!   being weighed as a guest-delivery candidate.
 //!
 //! Darwin's W^X rules still apply: the guest's executable pages are `MAP_JIT`
 //! mappings and every patch is bracketed by
@@ -86,8 +134,7 @@
 //! code-writing paths already do this), with the host binary signed for the
 //! `com.apple.security.cs.allow-jit` entitlement.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use litebox::shim::ContinueOperation;
 use litebox::utils::TruncateExt as _;
@@ -103,38 +150,6 @@ const _: () = assert!(core::mem::offset_of!(PtRegs, pstate) == 264);
 const _: () = assert!(core::mem::offset_of!(PtRegs, orig_x0) == 272);
 const _: () = assert!(core::mem::offset_of!(PtRegs, syscallno) == 280);
 const _: () = assert!(core::mem::size_of::<PtRegs>() == 288);
-
-/// A `Sync` cell for state that only the single active guest thread touches,
-/// mutated from naked assembly by absolute address.
-#[repr(transparent)]
-struct RawCell<T>(UnsafeCell<T>);
-// SAFETY: access is serialized by the single-guest-thread invariant enforced by
-// `GUEST_ACTIVE`; there is no concurrent reader/writer.
-unsafe impl<T> Sync for RawCell<T> {}
-
-/// Host callee-saved state, saved by [`enter_guest_asm`] and restored by
-/// [`syscall_callback`]. Byte layout: `x19..x28` at 0..72, `x29` at 80, `lr` at
-/// 88, `sp` at 96, `d8..d15` at 104..160, `FPCR` at 168, `FPSR` at 176.
-///
-/// `d8`-`d15` are here because AAPCS makes their low 64 bits callee-saved, so
-/// `run_thread`'s caller is entitled to find them intact; the guest is free to
-/// write every vector register.
-static HOST_SAVE: RawCell<[u64; HOST_SAVE_SLOTS]> = RawCell(UnsafeCell::new([0; HOST_SAVE_SLOTS]));
-
-/// `u64` slots in [`HOST_SAVE`]; see its layout.
-const HOST_SAVE_SLOTS: usize = 23;
-/// Byte offsets the naked assembly hard-codes. `HOST_SAVE` is a flat array
-/// rather than a struct, so there is no `offset_of!` to check these against;
-/// the assertions below check instead that the regions are contiguous and that
-/// the last one ends exactly at the end of the array, which is what would break
-/// if a slot were added without resizing it.
-const HOST_SAVE_OFF_D8: usize = 104;
-const HOST_SAVE_OFF_FPCR: usize = 168;
-const HOST_SAVE_OFF_FPSR: usize = 176;
-/// `d8`-`d15`, eight 64-bit slots, run from `HOST_SAVE_OFF_D8` up to `FPCR`.
-const _: () = assert!(HOST_SAVE_OFF_D8 + 8 * 8 == HOST_SAVE_OFF_FPCR);
-const _: () = assert!(HOST_SAVE_OFF_FPCR + 8 == HOST_SAVE_OFF_FPSR);
-const _: () = assert!(HOST_SAVE_OFF_FPSR + 8 == HOST_SAVE_SLOTS * 8);
 
 /// The guest's floating-point and SIMD state, held across a syscall.
 ///
@@ -156,34 +171,355 @@ struct GuestFpState {
     fpsr: u64,
 }
 
-/// The live guest's FP/SIMD state while the host runs. Restored by
-/// [`enter_guest_asm`], captured by [`syscall_callback`]. Zero is the correct
-/// initial value: a fresh guest thread starts with a cleared vector file and the
-/// default rounding mode, which is what `FPCR == 0` means.
-static GUEST_FP: RawCell<GuestFpState> = RawCell(UnsafeCell::new(GuestFpState {
-    v: [0; 32],
-    fpcr: 0,
-    fpsr: 0,
-}));
+/// Everything one guest thread's context switch has to remember while the host
+/// runs, reached from naked assembly by a `TPIDRRO_EL0`-relative direct-TSD
+/// read (see this module's own doc comment for why that specific mechanism).
+///
+/// One of these lives on each guest thread's own host stack for exactly as long
+/// as [`run_thread`] is running there, and a pointer to it is published in the
+/// pthread TSD slot [`GUEST_STATE_TSD_BYTE_OFFSET`] names. Nothing here is
+/// shared between threads, so nothing here needs cross-thread synchronisation
+/// -- but [`Self::owns_cpu`] and [`Self::pending_interrupt`] are still atomics,
+/// because a *signal handler on this same thread* reads and writes them
+/// asynchronously with respect to the mainline code, which a plain field would
+/// let the compiler cache or reorder across.
+///
+/// The byte offsets are hard-coded in six naked `asm!` blocks; the assertions
+/// below pin them to this definition so a layout change fails the build instead
+/// of silently miscompiling the switch.
+#[repr(C, align(16))]
+pub(crate) struct GuestThreadState {
+    /// Host callee-saved state, saved by [`enter_guest_asm`] and restored by
+    /// the syscall/exception/interrupt callbacks. Byte layout, relative to
+    /// this field: `x19..x28` at 0..72, `x29` at 80, `lr` at 88, `sp` at 96,
+    /// `d8..d15` at 104..160, `FPCR` at 168, `FPSR` at 176.
+    ///
+    /// `d8`-`d15` are here because AAPCS makes their low 64 bits callee-saved,
+    /// so `run_thread`'s caller is entitled to find them intact; the guest is
+    /// free to write every vector register.
+    host_save: [u64; HOST_SAVE_SLOTS],
+    /// Pads [`Self::guest_fp`] out to its own 16-byte alignment. Explicit
+    /// rather than implicit so the offset assertions below read as a layout
+    /// specification rather than a restatement of the compiler's choice.
+    _align_pad: u64,
+    /// The live guest's FP/SIMD state while the host runs. Restored by
+    /// [`enter_guest_asm`], captured by the syscall callback. Zero is the
+    /// correct initial value: a fresh guest thread starts with a cleared vector
+    /// file and the default rounding mode, which is what `FPCR == 0` means.
+    guest_fp: GuestFpState,
+    /// Pointer to the run loop's live [`PtRegs`], stashed by
+    /// [`enter_guest_asm`] so the syscall callback can write the captured guest
+    /// state back into it.
+    live_ptregs: *mut PtRegs,
+    /// Whether the CPU is genuinely executing guest instructions right now, as
+    /// opposed to running this platform's own [`enter_guest_asm`]/syscall-
+    /// callback switch code with the guest's registers not yet (or no longer)
+    /// authoritative. `lib.rs`'s `fault_handler` consults this -- *after* its
+    /// existing exception-table check, which always takes priority -- to decide
+    /// whether a captured `mcontext` is safe to hand to the guest via
+    /// [`litebox::shim::EnterShim::exception`], or must instead be left alone
+    /// as an internal/unattributable fault (today's behavior: the process
+    /// dies).
+    ///
+    /// Set `true` by [`enter_guest_asm`] once every guest register but the
+    /// branch vehicle has been restored, and cleared `false` as the first
+    /// memory write of the syscall callback body and of
+    /// [`sigreturn_trampoline`], and by `fault_handler` itself when it delivers
+    /// an exception. Both entry points still touch a couple of guest-stack
+    /// bytes *inside* that window (the below-`SP` staging reads at the end of
+    /// `enter_guest_asm`, and the `SVC`-gate-stashed-word reads in the callback
+    /// body) -- deliberately, because by the time every other guest register is
+    /// live there is no register left free to place this flag's own store with
+    /// any tighter precision. Both windows are covered instead by an
+    /// exception-table entry recovering to [`abort_on_boundary_stack_fault`],
+    /// which the exception-table check `fault_handler` runs first always finds
+    /// before this flag is ever consulted -- so a fault there can never be
+    /// misattributed to the guest, regardless of what this flag reads at the
+    /// time.
+    owns_cpu: AtomicBool,
+    /// Set by `lib.rs`'s `interrupt_signal_handler` whenever a `SIGUSR2`
+    /// arrives at a moment it cannot redirect immediately (this thread was not
+    /// genuinely executing guest code -- [`Self::owns_cpu`] false, or `SIGUSR2`
+    /// landed inside the syscall callback's/[`sigreturn_trampoline`]'s own
+    /// brief ownership-clearing prologue), so the delivery is not simply lost.
+    /// Checked and cleared by [`enter_guest_asm`] immediately after it sets
+    /// [`Self::owns_cpu`] true for a fresh entry, *before* restoring any guest
+    /// register -- mirroring `litebox_platform_linux_userland::switch_to_guest`'s
+    /// own `cmp .../jne interrupt_callback` placed immediately after its
+    /// `in_guest := 1` store, for the identical reason: without this re-check,
+    /// an interrupt that races the narrow window between the shim deciding a
+    /// thread is "running in guest" (and so signalling it) and this platform's
+    /// own `owns_cpu` actually becoming true for *that* entry would be silently
+    /// dropped until the guest's next syscall -- arbitrarily far away for a
+    /// compute-bound guest, defeating the entire point of interrupting one.
+    pending_interrupt: AtomicBool,
+    /// Pads the two flags out to the pointer-sized tail below. No naked code
+    /// addresses this.
+    _flag_pad: [u8; 6],
+    /// The [`litebox::shim::ExceptionInfo`] for the fault [`exception_callback`]
+    /// is about to report to the run loop, filled in by
+    /// [`prepare_exception_delivery`] before `lib.rs`'s `fault_handler`
+    /// redirects there. Touched only from ordinary Rust, never from naked
+    /// assembly, so it needs no pinned offset.
+    pending_exception_info: litebox::shim::ExceptionInfo,
+}
 
+/// `u64` slots in [`GuestThreadState::host_save`]; see its layout.
+const HOST_SAVE_SLOTS: usize = 23;
+/// Byte offsets the naked assembly hard-codes. `host_save` is a flat array
+/// rather than a struct, so there is no `offset_of!` to check these against;
+/// the assertions below check instead that the regions are contiguous and that
+/// the last one ends exactly at the end of the array, which is what would break
+/// if a slot were added without resizing it.
+const HOST_SAVE_OFF_D8: usize = 104;
+const HOST_SAVE_OFF_FPCR: usize = 168;
+const HOST_SAVE_OFF_FPSR: usize = 176;
+/// `d8`-`d15`, eight 64-bit slots, run from `HOST_SAVE_OFF_D8` up to `FPCR`.
+const _: () = assert!(HOST_SAVE_OFF_D8 + 8 * 8 == HOST_SAVE_OFF_FPCR);
+const _: () = assert!(HOST_SAVE_OFF_FPCR + 8 == HOST_SAVE_OFF_FPSR);
+const _: () = assert!(HOST_SAVE_OFF_FPSR + 8 == HOST_SAVE_SLOTS * 8);
+
+/// Byte offset of [`GuestThreadState::host_save`]; zero, so every `host_save`
+/// offset above doubles as an offset from the state pointer itself.
+const TS_OFF_HOST_SAVE: usize = 0;
+/// Byte offset of [`GuestThreadState::guest_fp`].
+const TS_OFF_GUEST_FP: usize = 192;
+/// Byte offset of [`GuestThreadState::live_ptregs`].
+const TS_OFF_LIVE_PTREGS: usize = 720;
+/// Byte offset of [`GuestThreadState::owns_cpu`].
+const TS_OFF_OWNS_CPU: usize = 728;
+/// Byte offset of [`GuestThreadState::pending_interrupt`].
+const TS_OFF_PENDING_INTERRUPT: usize = 729;
+
+const _: () = assert!(core::mem::offset_of!(GuestThreadState, host_save) == TS_OFF_HOST_SAVE);
+const _: () = assert!(core::mem::offset_of!(GuestThreadState, guest_fp) == TS_OFF_GUEST_FP);
+const _: () = assert!(core::mem::offset_of!(GuestThreadState, live_ptregs) == TS_OFF_LIVE_PTREGS);
+const _: () = assert!(core::mem::offset_of!(GuestThreadState, owns_cpu) == TS_OFF_OWNS_CPU);
+const _: () =
+    assert!(core::mem::offset_of!(GuestThreadState, pending_interrupt) == TS_OFF_PENDING_INTERRUPT);
+
+/// Byte offsets *within* [`GuestThreadState::guest_fp`], plus the whole-state
+/// offsets the assembly actually uses for the FP control/status words.
 const GUEST_FP_OFF_FPCR: usize = 512;
 const GUEST_FP_OFF_FPSR: usize = 520;
 const _: () = assert!(core::mem::offset_of!(GuestFpState, v) == 0);
 const _: () = assert!(core::mem::offset_of!(GuestFpState, fpcr) == GUEST_FP_OFF_FPCR);
 const _: () = assert!(core::mem::offset_of!(GuestFpState, fpsr) == GUEST_FP_OFF_FPSR);
+/// `TS_OFF_GUEST_FP + GUEST_FP_OFF_FPCR`, spelled out because the assembly
+/// needs the literal.
+const TS_OFF_GUEST_FPCR: usize = 704;
+/// `TS_OFF_GUEST_FP + GUEST_FP_OFF_FPSR`.
+const TS_OFF_GUEST_FPSR: usize = 712;
+const _: () = assert!(TS_OFF_GUEST_FP + GUEST_FP_OFF_FPCR == TS_OFF_GUEST_FPCR);
+const _: () = assert!(TS_OFF_GUEST_FP + GUEST_FP_OFF_FPSR == TS_OFF_GUEST_FPSR);
+/// The 128-bit `LDP`/`STP` the vector save/restore uses has a signed 7-bit
+/// immediate scaled by 16, i.e. `-1024..=1008`. The last pair (`q30`/`q31`)
+/// sits at `TS_OFF_GUEST_FP + 480`, so this must stay in range or the assembly
+/// silently fails to assemble.
+const _: () = assert!(TS_OFF_GUEST_FP + 480 <= 1008);
 
-/// Reads [`GUEST_FP`] in the shim-facing shape, for `lib.rs`'s
-/// `ThreadProvider::get_fp_state` implementation.
+impl GuestThreadState {
+    /// A freshly-zeroed state for one guest thread. Zero is the correct start
+    /// for every field: no host state saved yet, a cleared vector file with the
+    /// default rounding mode, no live `PtRegs`, not owning the CPU, no pending
+    /// interrupt.
+    const fn new() -> Self {
+        Self {
+            host_save: [0; HOST_SAVE_SLOTS],
+            _align_pad: 0,
+            guest_fp: GuestFpState {
+                v: [0; 32],
+                fpcr: 0,
+                fpsr: 0,
+            },
+            live_ptregs: core::ptr::null_mut(),
+            owns_cpu: AtomicBool::new(false),
+            pending_interrupt: AtomicBool::new(false),
+            _flag_pad: [0; 6],
+            pending_exception_info: litebox::shim::ExceptionInfo {
+                exception: litebox::shim::Exception(0),
+                fault_address: 0,
+                esr: 0,
+                kernel_mode: false,
+            },
+        }
+    }
+}
+
+/// How many pthread TSD slots [`syscall_entry_stubs`] emits a stub for.
 ///
-/// Callable any time no guest is concurrently mutating [`GUEST_FP`] via
-/// `enter_guest_asm`/`syscall_callback`/`exception_callback` -- i.e. whenever an
-/// `EnterShim` method is running, which is the only time the shim can call
-/// this, since [`GUEST_OWNS_CPU`] is false throughout.
+/// Darwin's dynamic `pthread_key_create` range is bounded and small: measured
+/// on this hardware (Apple M3 Pro, macOS 26.3.1) the first dynamic key a Rust
+/// binary gets is 259 and the pool is exhausted at key 767, matching
+/// apple-oss-distributions/libpthread's `_INTERNAL_POSIX_THREAD_KEYS_END`/
+/// `_EXTERNAL_POSIX_THREAD_KEYS_MAX` split. 768 stubs therefore cover every key
+/// the system can hand out; [`syscall_entry_point`] asserts rather than
+/// silently indexing past the table if that ever stops being true.
+///
+/// The cost is `768 * 16` = 12 KiB of otherwise-inert `.text`.
+const TSD_SLOT_COUNT: usize = 768;
+
+/// Bytes per stub in [`syscall_entry_stubs`]: four fixed-width A64
+/// instructions.
+const TSD_STUB_BYTES: usize = 16;
+
+/// The byte offset (`key * 8`) of this process's per-thread-state pthread TSD
+/// slot, or `0` before [`reserve_guest_state_tsd_slot`] has run.
+///
+/// Read directly out of `.text`-adjacent data by five of this module's naked
+/// functions -- the ones with a register to spare for it. The sixth, the
+/// syscall callback body, cannot afford that second register and reaches the
+/// same slot through [`syscall_entry_stubs`]'s baked immediate instead; the two
+/// are kept consistent by both deriving from the same key.
+///
+/// `0` is an unambiguous "not reserved yet" sentinel: TSD slot 0 is
+/// libpthread's own `pthread_self` pointer, which `pthread_key_create` never
+/// hands out.
+static GUEST_STATE_TSD_BYTE_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+/// Reserves (once per process) the pthread TSD slot this module's per-thread
+/// state pointer lives in, returning its key.
+///
+/// This is a *second* key, independent of the one `lib.rs`'s
+/// `reserve_guest_tpidr_tsd_slot` reserves for the guest's own `TPIDR_EL0`
+/// shadow: that one is the *guest's* thread pointer, this one is the *host's*
+/// context-switch bookkeeping, and a guest is entitled to write anything it
+/// likes into its own.
+///
+/// Idempotent and race-free: the loser of a concurrent first call keeps its
+/// key allocated rather than deleting it, because `pthread_key_delete` returns
+/// the key to the pool where an unrelated `pthread_key_create` could pick it up
+/// while this module is still using the winner's -- a one-key leak in a race
+/// that can only happen once per process is the cheaper trade.
+///
+/// # Panics
+///
+/// Panics if `pthread_key_create` fails (genuine key exhaustion), or if the key
+/// falls outside [`TSD_SLOT_COUNT`] -- both unrecoverable, and both far better
+/// as a loud failure at startup than as a wild pointer in a naked callback.
+fn reserve_guest_state_tsd_slot() -> libc::pthread_key_t {
+    let existing = GUEST_STATE_TSD_BYTE_OFFSET.load(Ordering::Acquire);
+    if existing != 0 {
+        return key_from_byte_offset(existing);
+    }
+
+    let mut key: libc::pthread_key_t = 0;
+    // SAFETY: `key` is a valid, uniquely-owned out-parameter. No destructor is
+    // wanted: `run_thread` clears the slot itself on the way out, and the
+    // pointer addresses a stack frame that is gone by thread exit anyway.
+    let rc = unsafe { libc::pthread_key_create(&raw mut key, None) };
+    assert_eq!(
+        rc, 0,
+        "failed to reserve the guest-entry per-thread-state TSD slot: \
+         pthread_key_create returned {rc}"
+    );
+    let slot = usize::try_from(key).expect("a pthread key is never negative");
+    assert!(
+        slot < TSD_SLOT_COUNT,
+        "pthread_key_create handed out TSD key {slot}, past the {TSD_SLOT_COUNT} \
+         stubs syscall_entry_stubs emits; the table needs widening"
+    );
+    let byte_offset = slot * size_of::<usize>();
+
+    match GUEST_STATE_TSD_BYTE_OFFSET.compare_exchange(
+        0,
+        byte_offset,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => key,
+        // Another thread got there first; keep its key (see the doc comment on
+        // why the loser's key is deliberately not returned to the pool).
+        Err(winner) => key_from_byte_offset(winner),
+    }
+}
+
+/// Inverts [`reserve_guest_state_tsd_slot`]'s `key * 8` scaling.
+fn key_from_byte_offset(byte_offset: usize) -> libc::pthread_key_t {
+    libc::pthread_key_t::try_from(byte_offset / size_of::<usize>())
+        .expect("the reserved key round-trips through its own byte offset")
+}
+
+/// The calling thread's [`GuestThreadState`], or null if this thread is not
+/// inside [`run_thread`].
+///
+/// Deliberately the same raw `MRS`-based direct-TSD read the naked assembly
+/// does, rather than `pthread_getspecific`: `lib.rs`'s signal handlers call
+/// this, and an inline three-instruction sequence with no call is
+/// unambiguously async-signal-safe where a libSystem call is only safe by
+/// inspection. (Both were checked to observe the same storage on this
+/// hardware; see `direct_tsd_read_sees_pthread_setspecific`.)
+pub(crate) fn current_guest_state() -> *mut GuestThreadState {
+    let byte_offset = GUEST_STATE_TSD_BYTE_OFFSET.load(Ordering::Relaxed);
+    if byte_offset == 0 {
+        // No key reserved yet, so no thread can be running a guest.
+        return core::ptr::null_mut();
+    }
+    let state: usize;
+    // SAFETY: reads one pointer-sized word out of this thread's own pthread TSD
+    // array at a slot `pthread_key_create` reserved for this module. The array
+    // is part of the live `pthread_t` and is always mapped; the low-bit mask
+    // matches libSystem's own `_os_tsd_get_base`.
+    unsafe {
+        core::arch::asm!(
+            "mrs {base}, tpidrro_el0",
+            "and {base}, {base}, #0xfffffffffffffff8",
+            "ldr {state}, [{base}, {offset}]",
+            base = out(reg) _,
+            state = out(reg) state,
+            offset = in(reg) byte_offset,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    core::ptr::with_exposed_provenance_mut(state)
+}
+
+/// Whether the given thread state says the guest genuinely owns the CPU. Null
+/// (a thread that never entered [`run_thread`]) reads as `false`.
+pub(crate) fn guest_owns_cpu(state: *mut GuestThreadState) -> bool {
+    if state.is_null() {
+        return false;
+    }
+    // SAFETY: non-null here means `run_thread` published this thread's own live
+    // stack-allocated state, which outlives every signal handler that can
+    // observe it (the handler runs on that same thread, inside that frame).
+    unsafe { (*state).owns_cpu.load(Ordering::Relaxed) }
+}
+
+/// Records a `SIGUSR2` that could not be redirected immediately, for
+/// [`enter_guest_asm`] to honor at the next entry. A null state (no guest on
+/// this thread) has nothing to record against and is a no-op -- the signal's
+/// other job, `EINTR`-ing a blocking host call, has already happened simply by
+/// being delivered.
+pub(crate) fn record_pending_interrupt(state: *mut GuestThreadState) {
+    if state.is_null() {
+        return;
+    }
+    // SAFETY: as `guest_owns_cpu`.
+    unsafe { (*state).pending_interrupt.store(true, Ordering::Relaxed) };
+}
+
+/// Reads the calling thread's guest FP/SIMD state in the shim-facing shape, for
+/// `lib.rs`'s `ThreadProvider::get_fp_state` implementation.
+///
+/// Callable any time no guest is concurrently mutating it via
+/// `enter_guest_asm`/the syscall callback/`exception_callback` -- i.e. whenever
+/// an `EnterShim` method is running on this thread, which is the only time the
+/// shim can call this, since `owns_cpu` is false throughout.
+///
+/// # Panics
+///
+/// Panics if the calling thread is not running a guest, which would mean the
+/// shim asked for a guest's vector state on a thread that has none.
 pub(crate) fn guest_fp_state() -> litebox::platform::FpSimdState64 {
-    // SAFETY: single-guest-thread invariant (`GUEST_ACTIVE`), as for every
-    // other `GUEST_FP` access in this file; not concurrently written while an
-    // `EnterShim` method (and therefore this function) can run.
-    let fp = unsafe { &*GUEST_FP.0.get() };
+    let state = current_guest_state();
+    assert!(
+        !state.is_null(),
+        "get_fp_state called on a thread that is not running a guest"
+    );
+    // SAFETY: non-null, and not concurrently written while an `EnterShim`
+    // method (and therefore this function) can run on this thread.
+    let fp = unsafe { &(*state).guest_fp };
     litebox::platform::FpSimdState64 {
         v: fp.v,
         fpsr: fp.fpsr.trunc(),
@@ -191,169 +527,109 @@ pub(crate) fn guest_fp_state() -> litebox::platform::FpSimdState64 {
     }
 }
 
-/// Writes [`GUEST_FP`] from the shim-facing shape, for `lib.rs`'s
-/// `ThreadProvider::set_fp_state` implementation (e.g. restoring what a guest
-/// signal handler left in its frame on `rt_sigreturn`).
+/// Writes the calling thread's guest FP/SIMD state from the shim-facing shape,
+/// for `lib.rs`'s `ThreadProvider::set_fp_state` implementation (e.g. restoring
+/// what a guest signal handler left in its frame on `rt_sigreturn`).
 ///
-/// Same calling window as [`guest_fp_state`].
+/// Same calling window, and same panic, as [`guest_fp_state`].
 pub(crate) fn set_guest_fp_state(state: &litebox::platform::FpSimdState64) {
+    let thread_state = current_guest_state();
+    assert!(
+        !thread_state.is_null(),
+        "set_fp_state called on a thread that is not running a guest"
+    );
     // SAFETY: as `guest_fp_state`.
-    let fp = unsafe { &mut *GUEST_FP.0.get() };
+    let fp = unsafe { &mut (*thread_state).guest_fp };
     fp.v = state.v;
     fp.fpcr = u64::from(state.fpcr);
     fp.fpsr = u64::from(state.fpsr);
 }
 
-/// Pointer to the run loop's live [`PtRegs`], stashed by [`enter_guest_asm`] so
-/// [`syscall_callback`] can write the captured guest state back into it.
-static LIVE_PTREGS: RawCell<*mut PtRegs> = RawCell(UnsafeCell::new(core::ptr::null_mut()));
-
-/// Whether the CPU is genuinely executing guest instructions right now, as
-/// opposed to running this platform's own [`enter_guest_asm`]/
-/// [`syscall_callback`] switch code with the guest's registers not yet (or no
-/// longer) authoritative. `lib.rs`'s `fault_handler` consults this -- *after*
-/// its existing exception-table check, which always takes priority -- to
-/// decide whether a captured `mcontext` is safe to hand to the guest via
-/// [`litebox::shim::EnterShim::exception`], or must instead be left alone as
-/// an internal/unattributable fault (today's behavior: the process dies).
-///
-/// Set `true` by [`enter_guest_asm`] once every guest register but the branch
-/// vehicle has been restored, and cleared `false` as the first instructions of
-/// [`syscall_callback`] and by `fault_handler` itself when it delivers an
-/// exception. Both entry points still touch a couple of guest-stack bytes
-/// *inside* that window (the below-`SP` staging reads at the end of
-/// `enter_guest_asm`, and the `SVC`-gate-stashed-word reads at the start of
-/// `syscall_callback`) -- deliberately, because by the time every other guest
-/// register is live there is no register left free to place this flag's own
-/// store with any tighter precision. Both windows are covered instead by an
-/// exception-table entry recovering to [`abort_on_boundary_stack_fault`],
-/// which the exception-table check `fault_handler` runs first always finds
-/// before this flag is ever consulted -- so a fault there can never be
-/// misattributed to the guest, regardless of what this flag reads at the time.
-///
-/// A future per-thread port needs this to move to the same `TPIDRRO_EL0`-
-/// relative direct-TSD storage [`GUEST_ACTIVE`]'s doc comment describes for
-/// the rest of this file's process-global state; it is not a new obstacle
-/// beyond what was already true here.
-pub(crate) static GUEST_OWNS_CPU: AtomicBool = AtomicBool::new(false);
-
-/// Set by `lib.rs`'s `interrupt_signal_handler` whenever a `SIGUSR2` arrives
-/// at a moment it cannot redirect immediately (the thread was not genuinely
-/// executing guest code -- [`GUEST_OWNS_CPU`] false, or `SIGUSR2` landed
-/// inside [`syscall_callback`]'s/[`sigreturn_trampoline`]'s own brief
-/// ownership-clearing prologue), so the delivery is not simply lost. Checked
-/// and cleared by [`enter_guest_asm`] immediately after it sets
-/// [`GUEST_OWNS_CPU`] true for a fresh entry, *before* restoring any guest
-/// register -- mirroring `litebox_platform_linux_userland::switch_to_guest`'s
-/// own `cmp .../jne interrupt_callback` placed immediately after its `in_guest
-/// := 1` store, for the identical reason: without this re-check, an interrupt
-/// that races the narrow window between the shim deciding a thread is
-/// "running in guest" (and so signalling it) and this platform's own
-/// `GUEST_OWNS_CPU` actually becoming true for *that* entry would be silently
-/// dropped until the guest's next syscall -- arbitrarily far away for a
-/// compute-bound guest, defeating the entire point of interrupting one.
-pub(crate) static PENDING_INTERRUPT: AtomicBool = AtomicBool::new(false);
-
-/// The [`litebox::shim::ExceptionInfo`] for the fault [`exception_callback`]
-/// is about to report to the run loop, filled in by [`prepare_exception_delivery`]
-/// before `lib.rs`'s `fault_handler` redirects there. Like
-/// [`HOST_SAVE`]/[`LIVE_PTREGS`]/[`GUEST_FP`], this relies on the single-
-/// guest-thread invariant [`GUEST_ACTIVE`] enforces: at most one exception is
-/// ever in flight.
-static PENDING_EXCEPTION_INFO: RawCell<litebox::shim::ExceptionInfo> =
-    RawCell(UnsafeCell::new(litebox::shim::ExceptionInfo {
-        exception: litebox::shim::Exception(0),
-        fault_address: 0,
-        esr: 0,
-        kernel_mode: false,
-    }));
-
-/// Guards the single-guest-thread invariant the process-global save area relies
-/// on: a second concurrent [`run_thread`] is a hard error, not silent
-/// corruption.
-static GUEST_ACTIVE: AtomicBool = AtomicBool::new(false);
-
 /// Enter (or resume) the guest with the register state in `ctx`.
 ///
-/// Saves the host's callee-saved registers, `LR` and `SP` into [`HOST_SAVE`],
-/// records `ctx` in [`LIVE_PTREGS`], restores every guest register from `ctx`,
-/// and branches to `ctx.pc` through `X16`. It "returns" -- with callee-saved
-/// registers preserved, ABI-correctly -- only when [`syscall_callback`] or
-/// [`exception_callback`] restores the host context after a guest syscall or a
-/// genuine guest hardware fault, at which point `*ctx` holds the guest state
-/// at that event and the return value says which kind it was: `0` for a
-/// syscall, `1` for an exception (see [`GuestExit`]).
+/// Saves the host's callee-saved registers, `LR` and `SP` into `state`'s host
+/// save area, records `ctx` in `state`, restores every guest register from
+/// `ctx`, and branches to `ctx.pc` through `X16`. It "returns" -- with
+/// callee-saved registers preserved, ABI-correctly -- only when the syscall
+/// callback, [`exception_callback`] or [`interrupt_callback`] restores the host
+/// context, at which point `*ctx` holds the guest state at that event and the
+/// return value says which kind it was (see [`GuestExit`]).
+///
+/// `state` is passed in rather than looked up: this function is reached by an
+/// ordinary Rust call with every argument register free, so it has no need of
+/// the `TPIDRRO_EL0` reach the callbacks depend on.
 ///
 /// # Safety
 ///
 /// `ctx` must point to a valid, writable [`PtRegs`] describing a runnable guest
 /// context whose `sp` addresses a valid guest stack with 16 usable bytes below
-/// it. Only one guest thread may be active (see [`GUEST_ACTIVE`]).
+/// it. `state` must point to this thread's own live [`GuestThreadState`], the
+/// one published in its TSD slot.
 #[unsafe(naked)]
-unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) -> u64 {
+unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs, state: *mut GuestThreadState) -> u64 {
     core::arch::naked_asm!(
+        // x16 holds the per-thread state for the whole of this function: it is
+        // the one register that survives the guest-register restore below
+        // (every other register is either restored from `ctx` or is `ctx`
+        // itself), and it is free until the very last two instructions, where
+        // it becomes the branch vehicle.
+        "mov  x16, x1",
         // Save host callee-saved registers, LR and SP.
-        "adrp x1, {host_save}@PAGE",
-        "add  x1, x1, {host_save}@PAGEOFF",
-        "stp  x19, x20, [x1, #0]",
-        "stp  x21, x22, [x1, #16]",
-        "stp  x23, x24, [x1, #32]",
-        "stp  x25, x26, [x1, #48]",
-        "stp  x27, x28, [x1, #64]",
-        "str  x29, [x1, #80]",
-        "str  x30, [x1, #88]",
+        "stp  x19, x20, [x16, #0]",
+        "stp  x21, x22, [x16, #16]",
+        "stp  x23, x24, [x16, #32]",
+        "stp  x25, x26, [x16, #48]",
+        "stp  x27, x28, [x16, #64]",
+        "str  x29, [x16, #80]",
+        "str  x30, [x16, #88]",
         "mov  x2, sp",
-        "str  x2, [x1, #96]",
+        "str  x2, [x16, #96]",
         // Save the host's callee-saved FP registers and its FP control/status.
-        "stp  d8,  d9,  [x1, #104]",
-        "stp  d10, d11, [x1, #120]",
-        "stp  d12, d13, [x1, #136]",
-        "stp  d14, d15, [x1, #152]",
+        "stp  d8,  d9,  [x16, #104]",
+        "stp  d10, d11, [x16, #120]",
+        "stp  d12, d13, [x16, #136]",
+        "stp  d14, d15, [x16, #152]",
         "mrs  x2, fpcr",
-        "str  x2, [x1, #168]",
+        "str  x2, [x16, #168]",
         "mrs  x2, fpsr",
-        "str  x2, [x1, #176]",
-        // Restore the guest's whole vector file and FP control/status. Done here,
-        // while x1 is still scratch and before any guest GPR is live.
-        "adrp x1, {guest_fp}@PAGE",
-        "add  x1, x1, {guest_fp}@PAGEOFF",
-        "ldp  q0,  q1,  [x1, #0]",
-        "ldp  q2,  q3,  [x1, #32]",
-        "ldp  q4,  q5,  [x1, #64]",
-        "ldp  q6,  q7,  [x1, #96]",
-        "ldp  q8,  q9,  [x1, #128]",
-        "ldp  q10, q11, [x1, #160]",
-        "ldp  q12, q13, [x1, #192]",
-        "ldp  q14, q15, [x1, #224]",
-        "ldp  q16, q17, [x1, #256]",
-        "ldp  q18, q19, [x1, #288]",
-        "ldp  q20, q21, [x1, #320]",
-        "ldp  q22, q23, [x1, #352]",
-        "ldp  q24, q25, [x1, #384]",
-        "ldp  q26, q27, [x1, #416]",
-        "ldp  q28, q29, [x1, #448]",
-        "ldp  q30, q31, [x1, #480]",
-        "ldr  x2, [x1, #512]",
+        "str  x2, [x16, #176]",
+        // Restore the guest's whole vector file and FP control/status. Done
+        // here, before any guest GPR is live.
+        "ldp  q0,  q1,  [x16, #192]",
+        "ldp  q2,  q3,  [x16, #224]",
+        "ldp  q4,  q5,  [x16, #256]",
+        "ldp  q6,  q7,  [x16, #288]",
+        "ldp  q8,  q9,  [x16, #320]",
+        "ldp  q10, q11, [x16, #352]",
+        "ldp  q12, q13, [x16, #384]",
+        "ldp  q14, q15, [x16, #416]",
+        "ldp  q16, q17, [x16, #448]",
+        "ldp  q18, q19, [x16, #480]",
+        "ldp  q20, q21, [x16, #512]",
+        "ldp  q22, q23, [x16, #544]",
+        "ldp  q24, q25, [x16, #576]",
+        "ldp  q26, q27, [x16, #608]",
+        "ldp  q28, q29, [x16, #640]",
+        "ldp  q30, q31, [x16, #672]",
+        "ldr  x2, [x16, #704]",
         "msr  fpcr, x2",
-        "ldr  x2, [x1, #520]",
+        "ldr  x2, [x16, #712]",
         "msr  fpsr, x2",
         // Record the live PtRegs pointer for the callback.
-        "adrp x2, {live}@PAGE",
-        "add  x2, x2, {live}@PAGEOFF",
-        "str  x0, [x2]",
+        "str  x0, [x16, #720]",
         // Stage guest PC and X0 in the 16 bytes below the guest SP.
         "ldr  x1, [x0, #248]",       // guest sp
-        "ldr  x16, [x0, #256]",      // guest pc
-        "str  x16, [x1, #-8]",
-        "ldr  x16, [x0, #0]",        // guest x0
-        "str  x16, [x1, #-16]",
-        "ldr  x16, [x0, #264]",      // pstate -> NZCV
-        "msr  nzcv, x16",
+        "ldr  x2, [x0, #256]",       // guest pc
+        "str  x2, [x1, #-8]",
+        "ldr  x2, [x0, #0]",         // guest x0
+        "str  x2, [x1, #-16]",
+        "ldr  x2, [x0, #264]",       // pstate -> NZCV
+        "msr  nzcv, x2",
         "mov  sp, x1",
         // switch_to_guest_start: from here on, a SIGUSR2 arriving must not be
-        // treated as "genuinely executing guest code" even once GUEST_OWNS_CPU
-        // reads true below -- interrupted_pc_is_in_guest_entry_restore checks
-        // this exact range (up to switch_to_guest_end) for that reason. See
+        // treated as "genuinely executing guest code" even once owns_cpu reads
+        // true below -- interrupted_pc_is_in_guest_entry_restore checks this
+        // exact range (up to switch_to_guest_end) for that reason. See
         // `lib.rs`'s `interrupt_signal_handler` doc comment for the full
         // four-case dispatch this label range is one input to.
         //
@@ -364,36 +640,26 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) -> u64 {
         ".globl _switch_to_guest_start",
         "_switch_to_guest_start:",
         // Mark the guest as genuinely owning the CPU from here on (see
-        // GUEST_OWNS_CPU's doc comment for why this is not placed immediately
-        // before the branch instead: by the time every guest register but the
-        // branch vehicle is restored, no register is left free to compute
-        // this store's address with). x1 and x16 are the only registers still
-        // free at this specific point (x1's job above is done; x16 has not
-        // been loaded with a real guest value yet).
-        "adrp x16, {owns}@PAGE",
-        "add  x16, x16, {owns}@PAGEOFF",
+        // GuestThreadState::owns_cpu's doc comment for why this is not placed
+        // immediately before the branch instead).
         "mov  w1, #1",
-        "strb w1, [x16]",
-        // Re-check PENDING_INTERRUPT immediately after opening the "owns"
+        "strb w1, [x16, #728]",
+        // Re-check pending_interrupt immediately after opening the "owns"
         // window, before restoring any guest register -- mirrors
         // litebox_platform_linux_userland::switch_to_guest's own pending-
         // interrupt check placed right after its `in_guest := 1` store (see
-        // PENDING_INTERRUPT's doc comment for why this re-check exists at
-        // all). x1 and x16 are still free for the same reason as above; ctx
-        // (x0) is untouched, so abandoning the entry here needs no capture --
-        // interrupt_callback is reached with `*ctx` exactly as the caller left
-        // it.
-        "adrp x16, {pending}@PAGE",
-        "add  x16, x16, {pending}@PAGEOFF",
-        "ldrb w1, [x16]",
+        // GuestThreadState::pending_interrupt's doc comment for why this
+        // re-check exists at all). ctx (x0) is untouched, so abandoning the
+        // entry here needs no capture -- interrupt_callback is reached with
+        // `*ctx` exactly as the caller left it, and re-derives the per-thread
+        // state itself.
+        "ldrb w1, [x16, #729]",
         "cbz  w1, 92f",
-        "strb wzr, [x16]",
-        "adrp x16, {owns}@PAGE",
-        "add  x16, x16, {owns}@PAGEOFF",
-        "strb wzr, [x16]",
-        "adrp x16, {interrupt_cb}@PAGE",
-        "add  x16, x16, {interrupt_cb}@PAGEOFF",
-        "br   x16",
+        "strb wzr, [x16, #729]",
+        "strb wzr, [x16, #728]",
+        "adrp x1, {interrupt_cb}@PAGE",
+        "add  x1, x1, {interrupt_cb}@PAGEOFF",
+        "br   x1",
         "92:",
         // Restore x1..x30 (x0 and x16 handled last; skip regs[16]).
         "ldr  x1,  [x0, #8]",
@@ -415,8 +681,8 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) -> u64 {
         // Restore x0 and branch to the guest PC through the X16 vehicle. These
         // two below-SP reads are the last guest-memory touches inside the
         // "owns" window opened above; a fault here is redirected to
-        // {abort} instead of ever reaching the GUEST_OWNS_CPU check (see that
-        // flag's doc comment) -- the exception table is always consulted
+        // {abort} instead of ever reaching the owns_cpu check (see that
+        // field's doc comment) -- the exception table is always consulted
         // first.
         "90:",
         "ldr  x0,  [sp, #-16]",
@@ -435,17 +701,12 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs) -> u64 {
         // range starting at switch_to_guest_start.
         ".globl _switch_to_guest_end",
         "_switch_to_guest_end:",
-        host_save = sym HOST_SAVE,
-        live = sym LIVE_PTREGS,
-        guest_fp = sym GUEST_FP,
-        owns = sym GUEST_OWNS_CPU,
-        pending = sym PENDING_INTERRUPT,
         interrupt_cb = sym interrupt_callback,
         abort = sym abort_on_boundary_stack_fault,
     )
 }
 
-/// Which of [`syscall_callback`], [`exception_callback`] or
+/// Which of the syscall callback, [`exception_callback`] or
 /// [`interrupt_callback`] restored the host context, i.e. what
 /// [`enter_guest_asm`]'s return value means. `run_thread`'s loop dispatches on
 /// this instead of always assuming a syscall -- the second return path
@@ -471,51 +732,70 @@ impl GuestExit {
     }
 }
 
-/// The entry point a rewritten guest's `SVC` gate branches to.
+/// The per-TSD-slot entry stubs a rewritten guest's `SVC` gate branches to,
+/// followed by the shared callback body they all reach.
 ///
-/// [`litebox::platform::SystemInfoProvider::get_syscall_entry_point`] hands this
-/// address to the loader, which writes it into the trampoline the rewriter
-/// appended to the guest image. On entry the [`litebox_syscall_rewriter`] `SVC`
-/// gate has: saved the guest `X16` at `[SP]` and the post-`SVC` return address
-/// at `[SP, #8]`, decremented `SP` by 16, and left every other guest register
-/// (and `NZCV`) intact. This captures that state into the live [`PtRegs`],
-/// restores the host context from [`HOST_SAVE`], and returns into the run loop.
+/// [`syscall_entry_point`] picks the stub matching this process's reserved key
+/// and [`litebox::platform::SystemInfoProvider::get_syscall_entry_point`] hands
+/// *that* address to the loader, which writes it into the trampoline the
+/// rewriter appended to the guest image. Stub `N` resolves this thread's
+/// [`GuestThreadState`] out of pthread TSD slot `N` using its single free
+/// register and falls into the shared body; see this module's own doc comment
+/// for why a table of baked immediates is what it takes to do that with one
+/// register and no dependence on the guest's `SP`.
+///
+/// On entry to the body the [`litebox_syscall_rewriter`] `SVC` gate has: saved
+/// the guest `X16` at `[SP]` and the post-`SVC` return address at `[SP, #8]`,
+/// decremented `SP` by 16, and left every other guest register (and `NZCV`)
+/// intact -- and the stub has replaced the now-dead `X16` with the per-thread
+/// state pointer. The body captures that state into the live [`PtRegs`],
+/// restores the host context, and returns into the run loop.
+///
+/// The stubs branch to the body with a plain `B` to a *local* (`L`-prefixed)
+/// label in the same assembly fragment, so it is resolved by the assembler with
+/// no relocation and no possibility of a linker-inserted veneer -- which would
+/// clobber `X16`, the one register carrying the whole mechanism.
 ///
 /// # Safety
 ///
 /// Reached only from a guest `SVC` gate with the register/stack state described
 /// above; not callable as an ordinary function.
 #[unsafe(naked)]
-pub(crate) unsafe extern "C" fn syscall_callback() {
+unsafe extern "C" fn syscall_entry_stubs() {
     core::arch::naked_asm!(
-        // syscall_callback_start: covers this whole function, used by
-        // interrupted_pc_is_in_guest_exit_prologue. Only the first couple of
-        // instructions below (before GUEST_OWNS_CPU is cleared) are the
-        // window that check actually needs to distinguish -- the rest of this
-        // function already reads GUEST_OWNS_CPU false by the time it runs, so
-        // `lib.rs`'s `interrupt_signal_handler` never reaches the PC-range
-        // check for it (see that function's case-1 priority ordering); using
-        // the whole function as the range is simpler than a second, tighter
-        // label pair and no less correct.
+        // syscall_callback_start/_end bracket the stubs *and* the body, used by
+        // interrupted_pc_is_in_guest_exit_prologue. Only the stub plus the
+        // first instruction of the body (before owns_cpu is cleared) are the
+        // window that check actually needs to distinguish -- the rest already
+        // reads owns_cpu false by the time it runs, so `lib.rs`'s
+        // `interrupt_signal_handler` never reaches the PC-range check for it
+        // (see that function's case-1 priority ordering); using the whole
+        // range is simpler than a second, tighter label pair and no less
+        // correct.
         ".globl _syscall_callback_start",
         "_syscall_callback_start:",
-        // Clear ownership before touching anything else -- see GUEST_OWNS_CPU's
-        // doc comment. This is the very first memory write this function makes,
-        // and it targets a fixed host address that never depends on the
-        // (possibly-corrupt) guest sp read below.
-        "adrp x16, {owns}@PAGE",
-        "add  x16, x16, {owns}@PAGEOFF",
-        "strb wzr, [x16]",
-        // Load the destination PtRegs (host-owned, set by enter_guest_asm) and
-        // capture every guest GPR straight into it through this dedicated base
-        // register, x16, held for the whole capture. sp is deliberately never
-        // used as the capture buffer -- it still holds the guest's own
-        // (possibly-corrupt) value at this point -- so nothing below can fault
-        // by dereferencing it, other than the two gate-stashed-word reads
-        // further down.
-        "adrp x16, {live}@PAGE",
-        "add  x16, x16, {live}@PAGEOFF",
-        "ldr  x16, [x16]",
+        ".set litebox_tsd_slot, 0",
+        ".rept {slots}",
+        "mrs  x16, tpidrro_el0",
+        "and  x16, x16, #0xfffffffffffffff8",
+        "ldr  x16, [x16, #(litebox_tsd_slot * 8)]",
+        "b    Lsyscall_callback_body",
+        ".set litebox_tsd_slot, litebox_tsd_slot + 1",
+        ".endr",
+        "Lsyscall_callback_body:",
+        // Clear ownership before touching anything else -- see
+        // GuestThreadState::owns_cpu's doc comment. This is the very first
+        // memory write the body makes, and it targets this thread's own state,
+        // never the (possibly-corrupt) guest sp read below.
+        "strb wzr, [x16, #728]",
+        // Swap the state pointer for the destination PtRegs (host-owned, set by
+        // enter_guest_asm) and capture every guest GPR straight into it through
+        // this same dedicated base register, x16, held for the whole capture.
+        // sp is deliberately never used as the capture buffer -- it still holds
+        // the guest's own (possibly-corrupt) value at this point -- so nothing
+        // below can fault by dereferencing it, other than the two gate-stashed-
+        // word reads further down.
+        "ldr  x16, [x16, #720]",
         "stp  x0,  x1,  [x16, #0]",
         "stp  x2,  x3,  [x16, #16]",
         "stp  x4,  x5,  [x16, #32]",
@@ -529,9 +809,9 @@ pub(crate) unsafe extern "C" fn syscall_callback() {
         // sp by 16 first) -- the only guest-memory reads in this function, and
         // the only reason a bad guest sp can still fault inside it. x9 and x11
         // are free to use as scratch: their real guest values are already
-        // captured above. GUEST_OWNS_CPU is already false by this point (see
-        // above), so if either fault, fault_handler's fallback (today's
-        // behavior: the process dies) runs, never guest delivery.
+        // captured above. owns_cpu is already false by this point (see above),
+        // so if either fault, fault_handler's fallback (today's behavior: the
+        // process dies) runs, never guest delivery.
         "80:",
         "ldr  x9,  [sp]",
         "ldr  x11, [sp, #8]",
@@ -565,86 +845,111 @@ pub(crate) unsafe extern "C" fn syscall_callback() {
         // still exactly their original guest values: nothing above wrote them.
         "str  x0, [x16, #272]",      // orig_x0
         "str  w8, [x16, #280]",      // syscallno (32-bit field)
+        // Re-derive the per-thread state. Every guest GPR is captured by now,
+        // so x9/x10 are ordinary scratch and the two-register lookup the entry
+        // stub could not afford is free here.
+        "mrs  x9, tpidrro_el0",
+        "and  x9, x9, #0xfffffffffffffff8",
+        "adrp x10, {tsd_off}@PAGE",
+        "add  x10, x10, {tsd_off}@PAGEOFF",
+        "ldr  x10, [x10]",
+        "ldr  x9, [x9, x10]",
         // Capture the guest's whole vector file and FP control/status before any
         // host code runs, since the host is free to use every vector register.
-        "adrp x9, {guest_fp}@PAGE",
-        "add  x9, x9, {guest_fp}@PAGEOFF",
-        "stp  q0,  q1,  [x9, #0]",
-        "stp  q2,  q3,  [x9, #32]",
-        "stp  q4,  q5,  [x9, #64]",
-        "stp  q6,  q7,  [x9, #96]",
-        "stp  q8,  q9,  [x9, #128]",
-        "stp  q10, q11, [x9, #160]",
-        "stp  q12, q13, [x9, #192]",
-        "stp  q14, q15, [x9, #224]",
-        "stp  q16, q17, [x9, #256]",
-        "stp  q18, q19, [x9, #288]",
-        "stp  q20, q21, [x9, #320]",
-        "stp  q22, q23, [x9, #352]",
-        "stp  q24, q25, [x9, #384]",
-        "stp  q26, q27, [x9, #416]",
-        "stp  q28, q29, [x9, #448]",
-        "stp  q30, q31, [x9, #480]",
+        "stp  q0,  q1,  [x9, #192]",
+        "stp  q2,  q3,  [x9, #224]",
+        "stp  q4,  q5,  [x9, #256]",
+        "stp  q6,  q7,  [x9, #288]",
+        "stp  q8,  q9,  [x9, #320]",
+        "stp  q10, q11, [x9, #352]",
+        "stp  q12, q13, [x9, #384]",
+        "stp  q14, q15, [x9, #416]",
+        "stp  q16, q17, [x9, #448]",
+        "stp  q18, q19, [x9, #480]",
+        "stp  q20, q21, [x9, #512]",
+        "stp  q22, q23, [x9, #544]",
+        "stp  q24, q25, [x9, #576]",
+        "stp  q26, q27, [x9, #608]",
+        "stp  q28, q29, [x9, #640]",
+        "stp  q30, q31, [x9, #672]",
         "mrs  x10, fpcr",
-        "str  x10, [x9, #512]",
+        "str  x10, [x9, #704]",
         "mrs  x10, fpsr",
-        "str  x10, [x9, #520]",
+        "str  x10, [x9, #712]",
         // Restore host callee-saved registers, LR and SP, then return into the
         // run loop (as though enter_guest_asm had returned), reporting a syscall.
-        "adrp x1, {host_save}@PAGE",
-        "add  x1, x1, {host_save}@PAGEOFF",
-        "ldp  x19, x20, [x1, #0]",
-        "ldp  x21, x22, [x1, #16]",
-        "ldp  x23, x24, [x1, #32]",
-        "ldp  x25, x26, [x1, #48]",
-        "ldp  x27, x28, [x1, #64]",
-        "ldr  x29, [x1, #80]",
-        "ldr  x30, [x1, #88]",
+        "ldp  x19, x20, [x9, #0]",
+        "ldp  x21, x22, [x9, #16]",
+        "ldp  x23, x24, [x9, #32]",
+        "ldp  x25, x26, [x9, #48]",
+        "ldp  x27, x28, [x9, #64]",
+        "ldr  x29, [x9, #80]",
+        "ldr  x30, [x9, #88]",
         // Hand the host back its callee-saved FP registers and FP control/status.
-        "ldp  d8,  d9,  [x1, #104]",
-        "ldp  d10, d11, [x1, #120]",
-        "ldp  d12, d13, [x1, #136]",
-        "ldp  d14, d15, [x1, #152]",
-        "ldr  x9, [x1, #168]",
-        "msr  fpcr, x9",
-        "ldr  x9, [x1, #176]",
-        "msr  fpsr, x9",
-        "ldr  x2, [x1, #96]",
-        "mov  sp, x2",
+        "ldp  d8,  d9,  [x9, #104]",
+        "ldp  d10, d11, [x9, #120]",
+        "ldp  d12, d13, [x9, #136]",
+        "ldp  d14, d15, [x9, #152]",
+        "ldr  x10, [x9, #168]",
+        "msr  fpcr, x10",
+        "ldr  x10, [x9, #176]",
+        "msr  fpsr, x10",
+        "ldr  x10, [x9, #96]",
+        "mov  sp, x10",
         "mov  x0, #0",
         "ret",
         // syscall_callback_end: never reached (the `ret` above always leaves
         // first); see syscall_callback_start's comment.
         ".globl _syscall_callback_end",
         "_syscall_callback_end:",
-        live = sym LIVE_PTREGS,
-        host_save = sym HOST_SAVE,
-        guest_fp = sym GUEST_FP,
-        owns = sym GUEST_OWNS_CPU,
+        slots = const TSD_SLOT_COUNT,
+        tsd_off = sym GUEST_STATE_TSD_BYTE_OFFSET,
         abort = sym abort_on_boundary_stack_fault,
     )
+}
+
+/// The address a guest's `SVC` gate must branch to on this process: the
+/// [`syscall_entry_stubs`] stub for the pthread TSD slot this process reserved
+/// for its per-thread guest-entry state.
+///
+/// Reserves the slot on first call, so this is safe to ask for before any guest
+/// thread starts (which is exactly when the loader asks).
+pub(crate) fn syscall_entry_point() -> usize {
+    let key = reserve_guest_state_tsd_slot();
+    let slot = usize::try_from(key).expect("a pthread key is never negative");
+    // `reserve_guest_state_tsd_slot` already rejected an out-of-range key; this
+    // is the second half of that same invariant, stated where the arithmetic
+    // that depends on it happens.
+    assert!(slot < TSD_SLOT_COUNT, "TSD slot {slot} has no entry stub");
+    (syscall_entry_stubs as *const () as usize) + slot * TSD_STUB_BYTES
 }
 
 /// The recovery target [`lib.rs`'s `fault_handler`] redirects a genuine guest
 /// hardware fault to, once [`prepare_exception_delivery`] has already copied
 /// the guest's captured register file (from the signal `mcontext`, not from
-/// any guest-stack dereference) into `*`[`LIVE_PTREGS`] and filled in
-/// [`PENDING_EXCEPTION_INFO`]. Unlike [`syscall_callback`], this never touches
+/// any guest-stack dereference) into the live [`PtRegs`] and filled in
+/// `pending_exception_info`. Unlike the syscall callback, this never touches
 /// guest memory at all -- everything it needs was already captured in Rust --
-/// so it is simply [`syscall_callback`]'s host-state-restore tail, reporting
-/// exception (`1`) instead of syscall (`0`).
+/// so it is simply that callback's host-state-restore tail, reporting exception
+/// (`1`) instead of syscall (`0`), prefixed by its own per-thread-state lookup
+/// (free to do the two-register way: it is reached by a `pc` redirect, so every
+/// register is dead).
 ///
 /// # Safety
 ///
-/// Reached only via a `pc` redirect from `fault_handler`, with
-/// [`GUEST_OWNS_CPU`] already cleared and `*`[`LIVE_PTREGS`]/
-/// [`PENDING_EXCEPTION_INFO`] already populated by [`prepare_exception_delivery`];
-/// not callable as an ordinary function.
+/// Reached only via a `pc` redirect from `fault_handler`, with `owns_cpu`
+/// already cleared and the live [`PtRegs`]/`pending_exception_info` already
+/// populated by [`prepare_exception_delivery`]; not callable as an ordinary
+/// function.
 #[unsafe(naked)]
 unsafe extern "C" fn exception_callback() {
     core::arch::naked_asm!(
-        "adrp x1, {host_save}@PAGE",
-        "add  x1, x1, {host_save}@PAGEOFF",
+        "mrs  x1, tpidrro_el0",
+        "and  x1, x1, #0xfffffffffffffff8",
+        "adrp x2, {tsd_off}@PAGE",
+        "add  x2, x2, {tsd_off}@PAGEOFF",
+        "ldr  x2, [x2]",
+        "ldr  x1, [x1, x2]",
         "ldp  x19, x20, [x1, #0]",
         "ldp  x21, x22, [x1, #16]",
         "ldp  x23, x24, [x1, #32]",
@@ -656,15 +961,15 @@ unsafe extern "C" fn exception_callback() {
         "ldp  d10, d11, [x1, #120]",
         "ldp  d12, d13, [x1, #136]",
         "ldp  d14, d15, [x1, #152]",
-        "ldr  x9, [x1, #168]",
-        "msr  fpcr, x9",
-        "ldr  x9, [x1, #176]",
-        "msr  fpsr, x9",
+        "ldr  x2, [x1, #168]",
+        "msr  fpcr, x2",
+        "ldr  x2, [x1, #176]",
+        "msr  fpsr, x2",
         "ldr  x2, [x1, #96]",
         "mov  sp, x2",
         "mov  x0, #1",
         "ret",
-        host_save = sym HOST_SAVE,
+        tsd_off = sym GUEST_STATE_TSD_BYTE_OFFSET,
     )
 }
 
@@ -672,21 +977,29 @@ unsafe extern "C" fn exception_callback() {
 /// interrupted guest thread to, once either [`prepare_interrupt_delivery`]
 /// (genuinely-executing-guest case) has captured state or
 /// [`abandon_guest_entry_for_interrupt`] (mid-restore case) has decided no
-/// capture is needed. Identical in structure to [`exception_callback`] --
-/// [`syscall_callback`]'s host-state-restore tail -- reporting interrupt (`2`)
-/// instead of exception (`1`) or syscall (`0`).
+/// capture is needed. Identical in structure to [`exception_callback`],
+/// reporting interrupt (`2`) instead of exception (`1`) or syscall (`0`).
+///
+/// Also reached directly by [`enter_guest_asm`]'s pending-interrupt re-check,
+/// which is why it re-derives the per-thread state rather than expecting it in
+/// a register: the two callers arrive with completely different register state
+/// and only the `TPIDRRO_EL0` reach is common to both.
 ///
 /// # Safety
 ///
-/// Reached only via a `pc` redirect from `interrupt_signal_handler`, with
-/// [`GUEST_OWNS_CPU`] already cleared and `*`[`LIVE_PTREGS`] already either
-/// left as the caller's still-accurate context or freshly populated; not
-/// callable as an ordinary function.
+/// Reached only via a `pc` redirect from `interrupt_signal_handler` or from
+/// [`enter_guest_asm`]'s own re-check, with `owns_cpu` already cleared and the
+/// live [`PtRegs`] already either left as the caller's still-accurate context
+/// or freshly populated; not callable as an ordinary function.
 #[unsafe(naked)]
 unsafe extern "C" fn interrupt_callback() {
     core::arch::naked_asm!(
-        "adrp x1, {host_save}@PAGE",
-        "add  x1, x1, {host_save}@PAGEOFF",
+        "mrs  x1, tpidrro_el0",
+        "and  x1, x1, #0xfffffffffffffff8",
+        "adrp x2, {tsd_off}@PAGE",
+        "add  x2, x2, {tsd_off}@PAGEOFF",
+        "ldr  x2, [x2]",
+        "ldr  x1, [x1, x2]",
         "ldp  x19, x20, [x1, #0]",
         "ldp  x21, x22, [x1, #16]",
         "ldp  x23, x24, [x1, #32]",
@@ -698,15 +1011,15 @@ unsafe extern "C" fn interrupt_callback() {
         "ldp  d10, d11, [x1, #120]",
         "ldp  d12, d13, [x1, #136]",
         "ldp  d14, d15, [x1, #152]",
-        "ldr  x9, [x1, #168]",
-        "msr  fpcr, x9",
-        "ldr  x9, [x1, #176]",
-        "msr  fpsr, x9",
+        "ldr  x2, [x1, #168]",
+        "msr  fpcr, x2",
+        "ldr  x2, [x1, #176]",
+        "msr  fpsr, x2",
         "ldr  x2, [x1, #96]",
         "mov  sp, x2",
         "mov  x0, #2",
         "ret",
-        host_save = sym HOST_SAVE,
+        tsd_off = sym GUEST_STATE_TSD_BYTE_OFFSET,
     )
 }
 
@@ -725,23 +1038,24 @@ const AARCH64_RT_SIGRETURN: u32 = 139;
 /// return address (`x30`) when the guest registered the handler without
 /// `SA_RESTORER`. There is no vDSO on macOS to fall back to the way a real
 /// Linux kernel does (see `darwin.rs`'s and `lib.rs`'s `get_vdso_address`
-/// docs), so this *is* the fallback -- reached the same way
-/// [`syscall_callback`] is, by handing a host code address to a
-/// guest-controlled register (there `x16` via the rewriter's gate, here `x30`
-/// via the signal frame `litebox_shim_linux` builds), an "absolute address"
-/// reachable from any guest regardless of branch-range limits (see
-/// `litebox_syscall_rewriter::arm64`'s "Signal returns" module-doc section,
-/// which anticipated exactly this).
+/// docs), so this *is* the fallback -- reached the same way the syscall
+/// callback is, by handing a host code address to a guest-controlled register
+/// (there `x16` via the rewriter's gate, here `x30` via the signal frame
+/// `litebox_shim_linux` builds), an "absolute address" reachable from any guest
+/// regardless of branch-range limits (see `litebox_syscall_rewriter::arm64`'s
+/// "Signal returns" module-doc section, which anticipated exactly this).
 ///
-/// Unlike [`syscall_callback`], this never touches guest memory at all, and
+/// Unlike the syscall callback, this never touches guest memory at all, and
 /// needs no exception-table entry: a real `SVC` gate stashes the guest's `x16`
 /// and a return address below `sp` because it has no free register to carry
 /// them in, but this trampoline is reached directly by `RET` (no gate ran),
-/// so nothing needs recovering from the guest stack. It captures only `sp`
-/// (via the real `SP` register, exactly as the guest's `ret` left it) and sets
-/// `syscallno` to [`AARCH64_RT_SIGRETURN`] -- deliberately capturing *no other
-/// register*, unlike every other guest-exit path in this file. This is safe
-/// only because of what `sys_rt_sigreturn`/`restore_sigcontext`
+/// so nothing needs recovering from the guest stack -- which also means every
+/// register is free here, so it resolves its own per-thread state the
+/// two-register way rather than needing an entry-stub table of its own. It
+/// captures only `sp` (via the real `SP` register, exactly as the guest's `ret`
+/// left it) and sets `syscallno` to [`AARCH64_RT_SIGRETURN`] -- deliberately
+/// capturing *no other register*, unlike every other guest-exit path in this
+/// file. This is safe only because of what `sys_rt_sigreturn`/`restore_sigcontext`
 /// (`litebox_shim_linux/src/syscalls/signal/{mod.rs,aarch64.rs}`) actually do
 /// with the `PtRegs` this hands them: `Sysno::rt_sigreturn` takes no register
 /// arguments (confirmed against `SyscallRequest::try_from_raw`'s dispatch, which
@@ -758,8 +1072,7 @@ const AARCH64_RT_SIGRETURN: u32 = 139;
 ///
 /// Reached only via a guest `RET` with `x30` holding this function's own
 /// address (installed by `litebox_shim_linux` as a signal frame's return
-/// slot) and [`GUEST_OWNS_CPU`] genuinely true; not callable as an ordinary
-/// function.
+/// slot) and `owns_cpu` genuinely true; not callable as an ordinary function.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn sigreturn_trampoline() {
     core::arch::naked_asm!(
@@ -767,94 +1080,98 @@ pub(crate) unsafe extern "C" fn sigreturn_trampoline() {
         // reasoning as syscall_callback_start.
         ".globl _sigreturn_trampoline_start",
         "_sigreturn_trampoline_start:",
-        // Clear ownership before touching anything else -- see
-        // GUEST_OWNS_CPU's doc comment; same first-instruction placement and
-        // reasoning as syscall_callback.
-        "adrp x9, {owns}@PAGE",
-        "add  x9, x9, {owns}@PAGEOFF",
-        "strb wzr, [x9]",
+        // Resolve this thread's state, then clear ownership before touching
+        // anything else -- see GuestThreadState::owns_cpu's doc comment. The
+        // five instructions ahead of that clear read only a system register and
+        // this process's own TSD array, never guest memory, so they cannot
+        // fault; an interrupt landing on them is screened by this function's
+        // own PC range (interrupted_pc_is_in_guest_exit_prologue).
+        "mrs  x9, tpidrro_el0",
+        "and  x9, x9, #0xfffffffffffffff8",
+        "adrp x10, {tsd_off}@PAGE",
+        "add  x10, x10, {tsd_off}@PAGEOFF",
+        "ldr  x10, [x10]",
+        "ldr  x9, [x9, x10]",
+        "strb wzr, [x9, #728]",
         // Load the destination PtRegs (host-owned, set by enter_guest_asm).
-        "adrp x9, {live}@PAGE",
-        "add  x9, x9, {live}@PAGEOFF",
-        "ldr  x9, [x9]",
+        "ldr  x10, [x9, #720]",
         // sp: the guest's real SP, exactly as its own `ret` left it (SP
-        // cannot be a direct STR source operand, hence the mov through x10).
-        "mov  x10, sp",
-        "str  x10, [x9, #248]",
+        // cannot be a direct STR source operand, hence the mov through x11).
+        "mov  x11, sp",
+        "str  x11, [x10, #248]",
         // syscallno: force dispatch to sys_rt_sigreturn regardless of
         // whatever this guest's x8 last held (no real SVC ran).
-        "movz w10, #{rt_sigreturn}",
-        "str  w10, [x9, #280]",
+        "movz w11, #{rt_sigreturn}",
+        "str  w11, [x10, #280]",
         // Restore host state and return reporting a syscall (0), exactly like
-        // syscall_callback's own tail, so run_thread's loop calls
+        // the syscall callback's own tail, so run_thread's loop calls
         // shim.syscall -- which dispatches sys_rt_sigreturn purely from the
         // sp/syscallno just written (see this function's own doc comment for
         // why nothing else needs capturing).
-        "adrp x1, {host_save}@PAGE",
-        "add  x1, x1, {host_save}@PAGEOFF",
-        "ldp  x19, x20, [x1, #0]",
-        "ldp  x21, x22, [x1, #16]",
-        "ldp  x23, x24, [x1, #32]",
-        "ldp  x25, x26, [x1, #48]",
-        "ldp  x27, x28, [x1, #64]",
-        "ldr  x29, [x1, #80]",
-        "ldr  x30, [x1, #88]",
-        "ldp  d8,  d9,  [x1, #104]",
-        "ldp  d10, d11, [x1, #120]",
-        "ldp  d12, d13, [x1, #136]",
-        "ldp  d14, d15, [x1, #152]",
-        "ldr  x9, [x1, #168]",
-        "msr  fpcr, x9",
-        "ldr  x9, [x1, #176]",
-        "msr  fpsr, x9",
-        "ldr  x2, [x1, #96]",
-        "mov  sp, x2",
+        "ldp  x19, x20, [x9, #0]",
+        "ldp  x21, x22, [x9, #16]",
+        "ldp  x23, x24, [x9, #32]",
+        "ldp  x25, x26, [x9, #48]",
+        "ldp  x27, x28, [x9, #64]",
+        "ldr  x29, [x9, #80]",
+        "ldr  x30, [x9, #88]",
+        "ldp  d8,  d9,  [x9, #104]",
+        "ldp  d10, d11, [x9, #120]",
+        "ldp  d12, d13, [x9, #136]",
+        "ldp  d14, d15, [x9, #152]",
+        "ldr  x10, [x9, #168]",
+        "msr  fpcr, x10",
+        "ldr  x10, [x9, #176]",
+        "msr  fpsr, x10",
+        "ldr  x10, [x9, #96]",
+        "mov  sp, x10",
         "mov  x0, #0",
         "ret",
         // sigreturn_trampoline_end: never reached, same reasoning as
         // syscall_callback_end.
         ".globl _sigreturn_trampoline_end",
         "_sigreturn_trampoline_end:",
-        host_save = sym HOST_SAVE,
-        live = sym LIVE_PTREGS,
-        owns = sym GUEST_OWNS_CPU,
+        tsd_off = sym GUEST_STATE_TSD_BYTE_OFFSET,
         rt_sigreturn = const AARCH64_RT_SIGRETURN,
     )
 }
 
 /// Reached only via one of the exception-table entries emitted inline within
-/// [`enter_guest_asm`] and [`syscall_callback`]: a fault at one of the handful
-/// of instructions where this platform's own switch code must still touch the
-/// bytes at/below a *guest*-controlled `sp`, before the guest is genuinely
-/// executing (or after it has stopped). `lib.rs`'s `fault_handler` always
-/// checks the exception table before [`GUEST_OWNS_CPU`], so a fault here is
-/// redirected to this recovery point instead of ever being weighed as a
-/// candidate for guest delivery -- the `pc`/`x30` a naive "guest owns the CPU"
-/// check would otherwise see there point inside this platform's own binary,
-/// which is exactly the ASLR-disclosure/return-to-host-code hazard this file
-/// exists to avoid. Every such window is only a couple of instructions wide
-/// and touches bytes this same code (or the syscall-rewriter's `SVC` gate)
-/// just finished proving mapped, so reaching here at all means something
-/// beyond an ordinary bad guest pointer has gone wrong; a loud, unambiguous
-/// abort is safer than guessing whose fault it was.
+/// [`enter_guest_asm`] and [`syscall_entry_stubs`]'s callback body: a fault at
+/// one of the handful of instructions where this platform's own switch code
+/// must still touch the bytes at/below a *guest*-controlled `sp`, before the
+/// guest is genuinely executing (or after it has stopped). `lib.rs`'s
+/// `fault_handler` always checks the exception table before `owns_cpu`, so a
+/// fault here is redirected to this recovery point instead of ever being
+/// weighed as a candidate for guest delivery -- the `pc`/`x30` a naive "guest
+/// owns the CPU" check would otherwise see there point inside this platform's
+/// own binary, which is exactly the ASLR-disclosure/return-to-host-code hazard
+/// this file exists to avoid. Every such window is only a couple of
+/// instructions wide and touches bytes this same code (or the syscall-
+/// rewriter's `SVC` gate) just finished proving mapped, so reaching here at all
+/// means something beyond an ordinary bad guest pointer has gone wrong; a loud,
+/// unambiguous abort is safer than guessing whose fault it was.
 #[unsafe(naked)]
 unsafe extern "C" fn abort_on_boundary_stack_fault() -> ! {
     core::arch::naked_asm!(
+        // Reached by a `pc` redirect, so every register is free; resolve this
+        // thread's state the ordinary two-register way.
+        "mrs  x2, tpidrro_el0",
+        "and  x2, x2, #0xfffffffffffffff8",
+        "adrp x0, {tsd_off}@PAGE",
+        "add  x0, x0, {tsd_off}@PAGEOFF",
+        "ldr  x0, [x0]",
+        "ldr  x2, [x2, x0]",
         // Belt-and-suspenders: this path is headed for a fatal abort
-        // regardless, but clearing GUEST_OWNS_CPU here too (rather than
-        // leaving it however it read at the fault) closes the otherwise-real
-        // possibility of a SIGUSR2 landing in the couple of instructions
-        // between here and the abort call and misreading a stale `true`.
-        "adrp x2, {owns}@PAGE",
-        "add  x2, x2, {owns}@PAGEOFF",
-        "strb wzr, [x2]",
-        "adrp x0, {host_save}@PAGE",
-        "add  x0, x0, {host_save}@PAGEOFF",
-        "ldr  x1, [x0, #96]",
+        // regardless, but clearing owns_cpu here too (rather than leaving it
+        // however it read at the fault) closes the otherwise-real possibility
+        // of a SIGUSR2 landing in the couple of instructions between here and
+        // the abort call and misreading a stale `true`.
+        "strb wzr, [x2, #728]",
+        "ldr  x1, [x2, #96]",
         "mov  sp, x1",
         "b {abort}",
-        host_save = sym HOST_SAVE,
-        owns = sym GUEST_OWNS_CPU,
+        tsd_off = sym GUEST_STATE_TSD_BYTE_OFFSET,
         abort = sym abort_boundary_stack_fault,
     )
 }
@@ -877,35 +1194,39 @@ extern "C" fn abort_boundary_stack_fault() -> ! {
 /// Delivers a genuine guest hardware fault as a
 /// [`litebox::shim::EnterShim::exception`] event. Called by `lib.rs`'s
 /// `fault_handler` only after its exception-table check has already missed
-/// and [`GUEST_OWNS_CPU`] reads true (so this instant's `pc` is guest code,
-/// not this platform's own switch code -- see that flag's doc comment for why
+/// and `state`'s `owns_cpu` reads true (so this instant's `pc` is guest code,
+/// not this platform's own switch code -- see that field's doc comment for why
 /// the ordering matters).
 ///
 /// Copies the guest's captured GPRs/`SP`/`PC`/`PSTATE` straight from
 /// `thread_state` into the run loop's live [`PtRegs`] (never re-deriving them
-/// from the guest's own stack, unlike `syscall_callback` -- the kernel already
+/// from the guest's own stack, unlike the syscall callback -- the kernel already
 /// captured the true hardware state into `thread_state` at the moment of the
 /// fault, a strictly more trustworthy source than anything this function could
-/// read back off guest memory), refreshes [`GUEST_FP`] from `neon_state` for
-/// the same reason (the kernel's own capture, not whatever `GUEST_FP` held
-/// from the guest's last syscall), records `info` for [`exception_callback`]
-/// to hand to the run loop, clears the ownership flag, and returns the address
-/// the caller should redirect the faulting `pc` to.
+/// read back off guest memory), refreshes the guest FP state from `neon_state`
+/// for the same reason (the kernel's own capture, not whatever it held from the
+/// guest's last syscall), records `info` for [`exception_callback`] to hand to
+/// the run loop, clears the ownership flag, and returns the address the caller
+/// should redirect the faulting `pc` to.
 ///
 /// # Safety
 ///
-/// Must be called with [`GUEST_OWNS_CPU`] genuinely true and `thread_state`/
-/// `neon_state` genuinely describing the interrupted guest, per the caller's
-/// own exception-table-then-flag check.
+/// Must be called with `state` this thread's own live [`GuestThreadState`], its
+/// `owns_cpu` genuinely true, and `thread_state`/`neon_state` genuinely
+/// describing the interrupted guest, per the caller's own exception-table-then-
+/// flag check.
 pub(crate) unsafe fn prepare_exception_delivery(
+    state: *mut GuestThreadState,
     thread_state: &crate::darwin::ArmThreadState64,
     neon_state: &crate::darwin::ArmNeonState64,
     info: litebox::shim::ExceptionInfo,
 ) -> usize {
-    // SAFETY: `GUEST_OWNS_CPU` was true (the caller's precondition), so
-    // LIVE_PTREGS points at the one live PtRegs for the single active guest
-    // thread, per the single-guest-thread invariant GUEST_ACTIVE enforces.
-    let live = unsafe { &mut *(*LIVE_PTREGS.0.get()) };
+    // SAFETY: the caller's precondition -- `state` is this thread's own live
+    // state, published by `run_thread` on the frame this signal interrupted.
+    let state = unsafe { &mut *state };
+    // SAFETY: `owns_cpu` was true (the caller's precondition), so `live_ptregs`
+    // points at this thread's live `PtRegs`.
+    let live = unsafe { &mut *state.live_ptregs };
     for (dst, src) in live.regs[..29].iter_mut().zip(thread_state.x.iter()) {
         *dst = src.trunc();
     }
@@ -919,37 +1240,26 @@ pub(crate) unsafe fn prepare_exception_delivery(
     // `NO_SYSCALL` convention `litebox_shim_linux` relies on elsewhere.
     live.syscallno = -1;
 
-    // Logs the full guest register state whenever a hardware fault is
-    // delivered to the guest. Gated behind trace level
-    // (`LITEBOX_LOG=litebox_platform_macos_userland=trace`), so it is inert by
-    // default; kept as a permanent debug aid (originally added for the
-    // macos-concurrent-guest-entry-sigsegv investigation, see
-    // `docs/roadmap.md`) since a guest fault's registers are otherwise not
-    // observable without an attached debugger, and the previous investigation
-    // passes on that bug were slowed down by not having this.
-    litebox_util_log::trace!(
-        regs:? = &live.regs, sp:? = live.sp, pc:? = live.pc,
-        fault_address:? = info.fault_address, esr:? = info.esr,
-        exception:? = info.exception;
-        "guest fault: captured register state"
-    );
+    // NB: the "guest fault: captured register state" trace this function used
+    // to emit here now lives in [`run_thread`]'s `GuestExit::Exception` arm.
+    // Nothing async-signal-unsafe may run here: this function is called from
+    // `lib.rs`'s `fault_handler`, i.e. from inside a POSIX signal handler. See
+    // that call site's comment for the full reasoning and for why moving it
+    // loses no information.
 
-    // SAFETY: single-guest-thread invariant, as for HOST_SAVE/GUEST_FP/LIVE_PTREGS.
-    let fp = unsafe { &mut *GUEST_FP.0.get() };
-    fp.v = neon_state.v;
-    fp.fpsr = u64::from(neon_state.fpsr);
-    fp.fpcr = u64::from(neon_state.fpcr);
+    state.guest_fp.v = neon_state.v;
+    state.guest_fp.fpsr = u64::from(neon_state.fpsr);
+    state.guest_fp.fpcr = u64::from(neon_state.fpcr);
 
-    // SAFETY: single-guest-thread invariant, as for HOST_SAVE/GUEST_FP/LIVE_PTREGS.
-    unsafe { *PENDING_EXCEPTION_INFO.0.get() = info };
+    state.pending_exception_info = info;
 
-    GUEST_OWNS_CPU.store(false, Ordering::Relaxed);
+    state.owns_cpu.store(false, Ordering::Relaxed);
 
     exception_callback as *const () as usize
 }
 
 // Address markers this file's own naked `asm!` blocks define (see
-// `enter_guest_asm`'s `switch_to_guest_start`/`_end`, `syscall_callback`'s
+// `enter_guest_asm`'s `switch_to_guest_start`/`_end`, `syscall_entry_stubs`'s
 // `syscall_callback_start`/`_end` and `sigreturn_trampoline`'s
 // `sigreturn_trampoline_start`/`_end`), never called -- only their addresses
 // are taken, by `interrupted_pc_is_in_guest_entry_restore`/
@@ -966,25 +1276,26 @@ unsafe extern "C" {
 /// Whether an interrupted `pc` falls inside [`enter_guest_asm`]'s own
 /// restore range -- "mid-restoring a [`PtRegs`] that is still authoritative,"
 /// in `lib.rs`'s `interrupt_signal_handler` doc comment's terms. Used only
-/// while [`GUEST_OWNS_CPU`] already reads true (that flag is checked first,
-/// same ordering as `fault_handler`'s exception-table-before-flag priority);
-/// this function does not re-check it.
+/// while `owns_cpu` already reads true (that flag is checked first, same
+/// ordering as `fault_handler`'s exception-table-before-flag priority); this
+/// function does not re-check it.
 pub(crate) fn interrupted_pc_is_in_guest_entry_restore(pc: usize) -> bool {
     let start = switch_to_guest_start as *const () as usize;
     let end = switch_to_guest_end as *const () as usize;
     (start..end).contains(&pc)
 }
 
-/// Whether an interrupted `pc` falls inside [`syscall_callback`]'s or
-/// [`sigreturn_trampoline`]'s own address range -- the exit-side counterpart
-/// of [`interrupted_pc_is_in_guest_entry_restore`]. Only the first couple of
-/// instructions of either function are the genuine hazard window (before
-/// [`GUEST_OWNS_CPU`] is cleared); the rest of each function's range is
-/// screened out by that flag already reading false by the time `pc` lands
-/// there, so `interrupt_signal_handler` never reaches this check for it. Using
-/// the whole function as the range is deliberately imprecise in the caller's
-/// favor: it can only make this function return `true` in cases where the
-/// flag-based check would already have returned early, never the reverse.
+/// Whether an interrupted `pc` falls inside [`syscall_entry_stubs`]'s (stubs
+/// *and* shared callback body) or [`sigreturn_trampoline`]'s own address range
+/// -- the exit-side counterpart of
+/// [`interrupted_pc_is_in_guest_entry_restore`]. Only each entry stub plus the
+/// first instruction of the body, and the first few instructions of the
+/// trampoline, are the genuine hazard window (before `owns_cpu` is cleared);
+/// the rest of each range is screened out by that flag already reading false by
+/// the time `pc` lands there, so `interrupt_signal_handler` never reaches this
+/// check for it. Using the whole range is deliberately imprecise in the
+/// caller's favor: it can only make this function return `true` in cases where
+/// the flag-based check would already have returned early, never the reverse.
 pub(crate) fn interrupted_pc_is_in_guest_exit_prologue(pc: usize) -> bool {
     let syscall_start = syscall_callback_start as *const () as usize;
     let syscall_end = syscall_callback_end as *const () as usize;
@@ -996,14 +1307,14 @@ pub(crate) fn interrupted_pc_is_in_guest_exit_prologue(pc: usize) -> bool {
 /// Delivers a genuine guest interrupt (`SIGUSR2` arriving while the guest is
 /// truly executing, not mid-switch) as a [`litebox::shim::EnterShim::interrupt`]
 /// event. Called by `lib.rs`'s `interrupt_signal_handler` only after
-/// [`GUEST_OWNS_CPU`] reads true and `pc` falls outside every switch-code
-/// range (see [`interrupted_pc_is_in_guest_entry_restore`]/
+/// `owns_cpu` reads true and `pc` falls outside every switch-code range (see
+/// [`interrupted_pc_is_in_guest_entry_restore`]/
 /// [`interrupted_pc_is_in_guest_exit_prologue`]).
 ///
 /// Structurally [`prepare_exception_delivery`] minus the [`ExceptionInfo`]:
 /// same register/vector-state copy from the kernel's own captured `mcontext`,
 /// same ownership-flag clear, same "return the recovery address" contract.
-/// There is no [`PENDING_EXCEPTION_INFO`]-equivalent to fill in --
+/// There is no `pending_exception_info`-equivalent to fill in --
 /// [`litebox::shim::EnterShim::interrupt`] takes only a `ctx`, no side
 /// channel.
 ///
@@ -1011,18 +1322,20 @@ pub(crate) fn interrupted_pc_is_in_guest_exit_prologue(pc: usize) -> bool {
 ///
 /// # Safety
 ///
-/// Must be called with [`GUEST_OWNS_CPU`] genuinely true and `thread_state`/
-/// `neon_state` genuinely describing the interrupted guest, and with `pc`
-/// already confirmed outside every switch-code range, per the caller's own
-/// checks.
+/// Must be called with `state` this thread's own live [`GuestThreadState`], its
+/// `owns_cpu` genuinely true, and `thread_state`/`neon_state` genuinely
+/// describing the interrupted guest, and with `pc` already confirmed outside
+/// every switch-code range, per the caller's own checks.
 pub(crate) unsafe fn prepare_interrupt_delivery(
+    state: *mut GuestThreadState,
     thread_state: &crate::darwin::ArmThreadState64,
     neon_state: &crate::darwin::ArmNeonState64,
 ) -> usize {
-    // SAFETY: `GUEST_OWNS_CPU` was true (the caller's precondition), so
-    // LIVE_PTREGS points at the one live PtRegs for the single active guest
-    // thread, per the single-guest-thread invariant GUEST_ACTIVE enforces.
-    let live = unsafe { &mut *(*LIVE_PTREGS.0.get()) };
+    // SAFETY: the caller's precondition, as in `prepare_exception_delivery`.
+    let state = unsafe { &mut *state };
+    // SAFETY: `owns_cpu` was true (the caller's precondition), so `live_ptregs`
+    // points at this thread's live `PtRegs`.
+    let live = unsafe { &mut *state.live_ptregs };
     for (dst, src) in live.regs[..29].iter_mut().zip(thread_state.x.iter()) {
         *dst = src.trunc();
     }
@@ -1036,18 +1349,17 @@ pub(crate) unsafe fn prepare_interrupt_delivery(
     // convention as prepare_exception_delivery.
     live.syscallno = -1;
 
-    litebox_util_log::trace!(
-        regs:? = &live.regs, sp:? = live.sp, pc:? = live.pc;
-        "guest interrupt: captured register state"
-    );
+    // NB: the "guest interrupt: captured register state" trace this function
+    // used to emit here now lives in [`run_thread`]'s `GuestExit::Interrupt`
+    // arm, for the same async-signal-safety reason spelled out in
+    // [`prepare_exception_delivery`] and at that call site: this function runs
+    // inside `lib.rs`'s `interrupt_signal_handler`.
 
-    // SAFETY: single-guest-thread invariant, as for HOST_SAVE/GUEST_FP/LIVE_PTREGS.
-    let fp = unsafe { &mut *GUEST_FP.0.get() };
-    fp.v = neon_state.v;
-    fp.fpsr = u64::from(neon_state.fpsr);
-    fp.fpcr = u64::from(neon_state.fpcr);
+    state.guest_fp.v = neon_state.v;
+    state.guest_fp.fpsr = u64::from(neon_state.fpsr);
+    state.guest_fp.fpcr = u64::from(neon_state.fpcr);
 
-    GUEST_OWNS_CPU.store(false, Ordering::Relaxed);
+    state.owns_cpu.store(false, Ordering::Relaxed);
 
     interrupt_callback as *const () as usize
 }
@@ -1055,7 +1367,7 @@ pub(crate) unsafe fn prepare_interrupt_delivery(
 /// Abandons an in-flight [`enter_guest_asm`] call for interrupt delivery
 /// without capturing anything: called by `lib.rs`'s `interrupt_signal_handler`
 /// only when [`interrupted_pc_is_in_guest_entry_restore`] says `pc` is inside
-/// [`enter_guest_asm`]'s own restore range, where `*`[`LIVE_PTREGS`] has not
+/// [`enter_guest_asm`]'s own restore range, where the live [`PtRegs`] has not
 /// been consumed by anything yet and so is still exactly the context the
 /// guest would have resumed with -- see that function's own doc comment for
 /// why no register capture is needed or correct here (capturing the
@@ -1065,32 +1377,63 @@ pub(crate) unsafe fn prepare_interrupt_delivery(
 ///
 /// # Safety
 ///
-/// Must be called with [`GUEST_OWNS_CPU`] genuinely true and `pc` already
-/// confirmed inside [`enter_guest_asm`]'s restore range, per the caller's own
-/// check.
-pub(crate) unsafe fn abandon_guest_entry_for_interrupt() -> usize {
-    GUEST_OWNS_CPU.store(false, Ordering::Relaxed);
+/// Must be called with `state` this thread's own live [`GuestThreadState`], its
+/// `owns_cpu` genuinely true, and `pc` already confirmed inside
+/// [`enter_guest_asm`]'s restore range, per the caller's own check.
+pub(crate) unsafe fn abandon_guest_entry_for_interrupt(state: *mut GuestThreadState) -> usize {
+    // SAFETY: the caller's precondition, as in `prepare_exception_delivery`.
+    unsafe { (*state).owns_cpu.store(false, Ordering::Relaxed) };
     interrupt_callback as *const () as usize
 }
 
 /// Runs a guest thread with the given shim and initial context.
 ///
-/// Calls [`litebox::shim::EnterShim::init`], then loops: enter the guest, and
-/// dispatch to [`litebox::shim::EnterShim::syscall`] or
-/// [`litebox::shim::EnterShim::exception`] depending on why it returned,
-/// resuming until a handler returns [`ContinueOperation::Terminate`].
+/// Allocates this thread's [`GuestThreadState`] on its own host stack and
+/// publishes it in the reserved pthread TSD slot for the duration, calls
+/// [`litebox::shim::EnterShim::init`], then loops: enter the guest, and
+/// dispatch to [`litebox::shim::EnterShim::syscall`]/`exception`/`interrupt`
+/// depending on why it returned, resuming until a handler returns
+/// [`ContinueOperation::Terminate`].
+///
+/// Any number of threads may be inside this function at once; all the state the
+/// switch keeps is per-thread and reached the `TPIDRRO_EL0` way (see this
+/// module's own doc comment).
+///
+/// # Panics
+///
+/// Panics if this thread is *already* inside `run_thread` (a guest cannot host
+/// a nested guest on the same thread; the inner one would overwrite the outer's
+/// published state), or if the TSD slot cannot be reserved or written.
 pub(crate) fn run_thread(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = PtRegs>,
     ctx: &mut PtRegs,
 ) {
-    // The host save area and live-PtRegs pointer are process-global, so exactly
-    // one guest thread may run at a time. Make a second one a loud failure.
+    let key = reserve_guest_state_tsd_slot();
     assert!(
-        !GUEST_ACTIVE.swap(true, Ordering::Acquire),
-        "a second concurrent guest thread reached macOS guest entry; only one \
-         is supported today (see litebox_platform_macos_userland::guest)"
+        current_guest_state().is_null(),
+        "this thread is already running a guest; macOS guest entry is \
+         per-thread but not reentrant (see litebox_platform_macos_userland::guest)"
     );
-    let _reset = litebox::utils::defer(|| GUEST_ACTIVE.store(false, Ordering::Release));
+
+    // On this thread's own stack, so it lives exactly as long as this call and
+    // costs no allocation on the guest-entry path.
+    let mut state = GuestThreadState::new();
+    let state = &raw mut state;
+
+    // SAFETY: `key` was just reserved for this module's exclusive use, and
+    // `state` addresses a live local that outlives the `defer` below (which
+    // clears the slot before the frame goes away).
+    let rc = unsafe { libc::pthread_setspecific(key, state.cast::<libc::c_void>()) };
+    assert_eq!(
+        rc, 0,
+        "failed to publish this thread's guest-entry state: \
+         pthread_setspecific returned {rc}"
+    );
+    let _clear = litebox::utils::defer(|| {
+        // SAFETY: same live key; clearing it is what keeps a stale pointer to
+        // this (about to be dead) stack frame from outliving the frame.
+        unsafe { libc::pthread_setspecific(key, core::ptr::null()) };
+    });
 
     if shim.init(ctx) == ContinueOperation::Terminate {
         return;
@@ -1099,26 +1442,76 @@ pub(crate) fn run_thread(
     loop {
         // Enter/resume the guest. Returns after a guest syscall, a genuine
         // guest hardware fault, or a genuine guest interrupt, with `*ctx`
-        // holding the guest state captured by `syscall_callback`,
+        // holding the guest state captured by the syscall callback,
         // `prepare_exception_delivery`, `prepare_interrupt_delivery` or
         // `abandon_guest_entry_for_interrupt` respectively.
         //
-        // SAFETY: `ctx` is a valid writable PtRegs; `GUEST_ACTIVE` guarantees
-        // this is the only active guest thread, so the global save area is not
-        // raced.
-        let exit = GuestExit::from_asm_return(unsafe { enter_guest_asm(core::ptr::from_mut(ctx)) });
+        // SAFETY: `ctx` is a valid writable PtRegs, and `state` is this
+        // thread's own live state, the one just published in its TSD slot.
+        let exit = GuestExit::from_asm_return(unsafe {
+            enter_guest_asm(core::ptr::from_mut(ctx), state)
+        });
 
         let op = match exit {
             GuestExit::Syscall => shim.syscall(ctx),
             GuestExit::Exception => {
                 // SAFETY: `prepare_exception_delivery` filled this in just
-                // before redirecting here, and the single-guest-thread
-                // invariant `GUEST_ACTIVE` enforces means nothing else can
-                // have overwritten it since.
-                let info = unsafe { *PENDING_EXCEPTION_INFO.0.get() };
+                // before redirecting here, on this same thread.
+                let info = unsafe { (*state).pending_exception_info };
+                // Logs the full guest register state whenever a hardware fault
+                // is delivered to the guest. Gated behind trace level
+                // (`LITEBOX_LOG=litebox_platform_macos_userland=trace`), so it
+                // is inert by default; kept as a permanent debug aid
+                // (originally added for the
+                // macos-concurrent-guest-entry-sigsegv investigation, see
+                // `docs/roadmap.md`) since a guest fault's registers are
+                // otherwise not observable without an attached debugger.
+                //
+                // It is emitted *here*, and deliberately not in
+                // `prepare_exception_delivery` where it used to live, because
+                // that function runs inside `lib.rs`'s `fault_handler` -- a
+                // POSIX signal handler, where only async-signal-safe code may
+                // run. Neither logging backend qualifies: measured on this
+                // hardware with the real runner, `LITEBOX_LOG=...=trace` plus a
+                // real guest fault reaches `tracing_core::event::Event::dispatch`
+                // (and, on the first fault, `DefaultCallsite::register`) from
+                // inside the handler, which takes the global callsite lock,
+                // touches a `thread_local!` with a destructor, and reallocates
+                // the subscriber's format buffer -- an interposed `realloc` was
+                // observed being called with `SIGSEGV`+`SIGUSR2` still masked,
+                // i.e. genuinely inside the handler.
+                //
+                // Moving it costs no information at all: `ctx` *is* the
+                // `PtRegs` that `prepare_exception_delivery` filled in on this
+                // thread (nothing between the handler's redirect and here
+                // writes it), `info` is the `pending_exception_info` it
+                // recorded in this thread's own `GuestThreadState`, and
+                // `exception_callback` unconditionally returns into this loop,
+                // so no fault that used to be logged goes unlogged.
+                litebox_util_log::trace!(
+                    regs:? = &ctx.regs, sp:? = ctx.sp, pc:? = ctx.pc,
+                    fault_address:? = info.fault_address, esr:? = info.esr,
+                    exception:? = info.exception;
+                    "guest fault: captured register state"
+                );
                 shim.exception(ctx, &info)
             }
-            GuestExit::Interrupt => shim.interrupt(ctx),
+            GuestExit::Interrupt => {
+                // Same reasoning as the exception arm above: this used to be
+                // emitted from `prepare_interrupt_delivery`, which runs inside
+                // `lib.rs`'s `interrupt_signal_handler`. Unlike the exception
+                // arm, this also now covers the
+                // `abandon_guest_entry_for_interrupt` case (an interrupt that
+                // landed inside `enter_guest_asm`'s restore range, which
+                // captures nothing because `*ctx` is already authoritative) --
+                // previously invisible, and the register state it prints there
+                // is exactly the context the guest would have resumed with.
+                litebox_util_log::trace!(
+                    regs:? = &ctx.regs, sp:? = ctx.sp, pc:? = ctx.pc;
+                    "guest interrupt: captured register state"
+                );
+                shim.interrupt(ctx)
+            }
         };
         if op == ContinueOperation::Terminate {
             return;
@@ -1145,15 +1538,34 @@ pub(crate) mod tests {
     /// called with, shared the same way [`ReadySignal`] is.
     type DeliveredInterrupt = std::sync::Arc<std::sync::Mutex<Option<([usize; 31], usize)>>>;
 
-    /// Only one guest thread may run at a time (see [`GUEST_ACTIVE`]), so the
-    /// guest-entry tests must not run concurrently with each other under the
-    /// parallel test harness. `pub(crate)` and reused by every test
-    /// elsewhere in this crate that does real host `mmap`/`munmap`
+    /// Serializes the guest-entry tests against each other and against the
+    /// tests elsewhere in this crate that do real host `mmap`/`munmap`
     /// (`allocate_jit_pages_hint_honors_the_suggested_address` and
     /// `with_signal_alt_stack_actually_registers_one` in `lib.rs`) -- those
     /// mutate the same real address space guest-entry tests do, and would
-    /// otherwise race it.
+    /// otherwise race it. It is *not* a single-guest-thread lock any more:
+    /// [`run_thread`] is per-thread now, and
+    /// [`concurrent_guest_threads_each_keep_their_own_context`] deliberately
+    /// runs several guests at once while holding this.
     pub(crate) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Stands in for the word the rewriter's trampoline header holds and every
+    /// real `SVC` gate loads its branch target from
+    /// (`litebox_syscall_rewriter::arm64`'s `HEADER_CALLBACK_OFFSET`): the
+    /// syscall entry point this process actually resolved, which is now a
+    /// per-TSD-slot stub rather than one fixed function address. The
+    /// hand-assembled guests below load through it exactly as a real gate does
+    /// -- deliberately a `LDR` rather than the `ADRP`/`ADD` they used while the
+    /// entry point was a plain symbol, because that is what the real emitted
+    /// gate does.
+    static TEST_SYSCALL_ENTRY: AtomicUsize = AtomicUsize::new(0);
+
+    /// Publishes [`syscall_entry_point`] into [`TEST_SYSCALL_ENTRY`] so the
+    /// hand-assembled guests below reach this process's own entry stub.
+    /// Idempotent; every test that runs a guest calls it first.
+    fn publish_test_syscall_entry() {
+        TEST_SYSCALL_ENTRY.store(syscall_entry_point(), Ordering::Relaxed);
+    }
 
     /// A stub shim that records the syscalls a guest makes. `write` (nr 64)
     /// returns its length and resumes; `exit` (nr 93) terminates.
@@ -1186,7 +1598,8 @@ pub(crate) mod tests {
 
     /// A hand-assembled guest reproducing exactly what the rewriter emits: two
     /// syscalls whose `SVC`s have been replaced by the `SVC`-gate sequence
-    /// (`emit_svc_gate` + shared handler) branching to [`syscall_callback`].
+    /// (`emit_svc_gate` + shared handler) branching to this process's own
+    /// [`syscall_entry_point`].
     /// `write(1, 0xABC, 7)` then `exit(42)`.
     #[unsafe(naked)]
     unsafe extern "C" fn test_guest() {
@@ -1204,6 +1617,7 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "20:", // resume point after the write syscall
             // exit(42)
@@ -1216,10 +1630,11 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "21:",
             "brk  #0",
-            cb = sym syscall_callback,
+            cb = sym TEST_SYSCALL_ENTRY,
         )
     }
 
@@ -1228,6 +1643,7 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         let mut stack = vec![0u8; 1 << 16];
         let top = stack.as_mut_ptr() as usize + stack.len();
         let sp = (top - 256) & !15;
@@ -1318,6 +1734,7 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
 
         let stack = GuardedStack::new();
         let sp = stack.valid_floor() + 16;
@@ -1397,11 +1814,12 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "50:",
             "ldr  x3, [x4]",  // deliberate fault: load through a null pointer
             "brk  #0",        // unreachable
-            cb = sym syscall_callback,
+            cb = sym TEST_SYSCALL_ENTRY,
         )
     }
 
@@ -1413,6 +1831,7 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         // Unlike the other tests in this module, this one deliberately faults,
         // so the platform's SIGSEGV/SIGBUS handler must actually be installed
         // -- production always does this via `MacOsUserland::new`, which this
@@ -1470,6 +1889,66 @@ pub(crate) mod tests {
             ),
             "expected a data-abort exception class for a null-pointer load, got {:?}",
             info.exception
+        );
+    }
+
+    /// Everything `lib.rs`'s `fault_handler` reaches runs inside a POSIX
+    /// signal handler, so none of it may allocate: Darwin's allocator takes a
+    /// non-reentrant `os_unfair_lock`, and a fault taken on a thread that was
+    /// already inside `malloc` would deadlock the process rather than being
+    /// delivered to the guest. This drives a *real* guest fault through the
+    /// *real* handler with `crate::PROBE_ALLOCATOR` armed and
+    /// requires the fault-delivery path to have allocated nothing while the
+    /// handler's own signal mask was in force.
+    ///
+    /// Honest scope: this is a forward-looking guard, not a reproduction of
+    /// the defect that motivated it. `prepare_exception_delivery` used to emit
+    /// its `trace!` from inside the handler, which really does allocate --
+    /// measured on the real runner, where `litebox_util_log`'s `tracing`
+    /// backend is enabled -- but this crate's own test binary links the `log`
+    /// backend with no logger installed, so `log::max_level()` is `Off` and
+    /// the macro compiles down to a level check either way. What this test
+    /// does lock in is that nothing on the handler path allocates
+    /// *unconditionally*, which is what a future `format!`/`Vec`/`to_string`
+    /// slipping into `fault_handler` or `prepare_exception_delivery` would do.
+    ///
+    /// The delivery assertion at the end is what keeps a pass from being
+    /// vacuous: a zero count would otherwise also be satisfied by the handler
+    /// never running at all.
+    #[test]
+    fn delivering_a_guest_fault_allocates_nothing_inside_the_signal_handler() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::install_fault_handlers();
+        let mut stack = vec![0u8; 1 << 16];
+        let top = stack.as_mut_ptr() as usize + stack.len();
+        let sp = (top - 256) & !15;
+
+        let mut ctx = PtRegs {
+            pc: faulting_guest as *const () as usize,
+            sp,
+            ..Default::default()
+        };
+        let shim = FaultRecordingShim {
+            reported_pc: core::cell::Cell::new(0),
+            delivered: RefCell::new(None),
+        };
+
+        crate::PROBE_ALLOCATOR.arm();
+        run_thread(&shim, &mut ctx);
+        let allocations_inside_handler = crate::PROBE_ALLOCATOR.disarm();
+
+        assert!(
+            shim.delivered.borrow().is_some(),
+            "the guest fault was never delivered, so an allocation-free result \
+             would prove nothing about the handler"
+        );
+        assert_eq!(
+            allocations_inside_handler, 0,
+            "the SIGSEGV/SIGBUS handler allocated on the host heap while \
+             delivering a guest fault; every allocator call reachable from a \
+             signal handler can deadlock against the thread it interrupted"
         );
     }
 
@@ -1538,6 +2017,7 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "30:",
             // syscall 2: write(2, x19, 0) -- x19 must still hold its sentinel.
@@ -1552,6 +2032,7 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "31:",
             // exit(0)
@@ -1564,10 +2045,11 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "32:",
             "brk  #0",
-            cb = sym syscall_callback,
+            cb = sym TEST_SYSCALL_ENTRY,
         )
     }
 
@@ -1598,6 +2080,7 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "40:",
             // syscall 2: write(2, v8_low, fpcr) -- both must have survived.
@@ -1612,6 +2095,7 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "41:",
             // exit(0)
@@ -1624,10 +2108,11 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "42:",
             "brk  #0",
-            cb = sym syscall_callback,
+            cb = sym TEST_SYSCALL_ENTRY,
         )
     }
 
@@ -1655,6 +2140,7 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         let mut stack = vec![0u8; 1 << 16];
         let top = stack.as_mut_ptr() as usize + stack.len();
         let sp = (top - 256) & !15;
@@ -1720,6 +2206,7 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         let mut stack = vec![0u8; 1 << 16];
         let top = stack.as_mut_ptr() as usize + stack.len();
         let sp = (top - 256) & !15;
@@ -1750,6 +2237,76 @@ pub(crate) mod tests {
             "x19 survived the enter/capture/resume round trip"
         );
         assert_eq!(shim.calls.get(), 3, "expected write, write, exit");
+    }
+
+    /// Pins the one host behavior that bounds how faithfully this platform can
+    /// run a guest at all: XNU zeroes `x18` on every return to EL0, so no
+    /// value the guest leaves in `x18` survives an arbitrary instruction
+    /// boundary.
+    ///
+    /// [`enter_guest_asm`] and [`syscall_callback`] do save and restore guest
+    /// `x18` (`ldp x18, x19, [x0, #144]` / `stp x18, x19, [x16, #144]`), so
+    /// LiteBox's *own* guest-boundary crossings preserve it -- the sibling
+    /// fidelity tests above cover that class of round trip. What no amount of
+    /// save/restore can cover is the kernel's own crossings: a timer
+    /// interrupt, a page fault, any exception at all taken while the guest is
+    /// executing natively returns to EL0 with `x18` set to zero, and LiteBox
+    /// is never notified. A guest whose compiler allocated `x18` as an
+    /// ordinary general-purpose register therefore has it silently become
+    /// `NULL` at a random point, at a rate proportional to the host's
+    /// preemption rate.
+    ///
+    /// This is not hypothetical: it is the root cause of the intermittent
+    /// concurrent-launch `SIGSEGV` tracked as
+    /// `macos-concurrent-guest-entry-sigsegv` in `docs/roadmap.md`. Alpine's
+    /// `ld-musl-aarch64.so.1` keeps `find_sym2`'s `name` argument in `x18`
+    /// across its symbol search, so when the zeroing lands there the guest
+    /// dereferences `NULL` in `gnu_lookup`'s name comparison.
+    ///
+    /// A syscall is used here because it is the one kernel entry a test can
+    /// make happen on demand; the zeroing is a property of the *return to
+    /// EL0*, not of syscalls specifically, which is why the asynchronous case
+    /// above is the one that actually bites. If this test ever starts failing,
+    /// Apple changed that behavior and the `x18` restriction documented on
+    /// `litebox_syscall_rewriter::arm64::Host::MacOs` can be revisited.
+    #[test]
+    fn xnu_zeroes_guest_x18_on_every_return_to_el0() {
+        const MAGIC: u64 = 0xABCD_1234_5678_EF01;
+        // One kernel entry is enough to show the behavior; the repetition is
+        // there to show it is unconditional rather than occasional.
+        const ROUNDS: usize = 256;
+
+        let mut observed = [MAGIC; ROUNDS];
+        for slot in &mut observed {
+            let after: u64;
+            // SAFETY: `x18` is reserved by the Darwin AArch64 ABI, so no
+            // compiler-generated code holds anything in it and writing it here
+            // cannot disturb the caller. The `svc` is Darwin's `SYS_getpid`
+            // (20), which takes no arguments, has no side effects, and clobbers
+            // only the registers declared below plus the flags (`asm!` assumes
+            // flags are clobbered by default).
+            unsafe {
+                core::arch::asm!(
+                    "mov x18, {magic}",
+                    "mov x16, #20",
+                    "svc #0x80",
+                    "mov {after}, x18",
+                    magic = in(reg) MAGIC,
+                    after = out(reg) after,
+                    out("x0") _,
+                    out("x1") _,
+                    out("x16") _,
+                    out("x17") _,
+                    options(nostack),
+                );
+            }
+            *slot = after;
+        }
+
+        assert!(
+            observed.iter().all(|&v| v == 0),
+            "expected XNU to zero x18 on every return to EL0, got {observed:?}"
+        );
     }
 
     /// A shim that captures [`guest_fp_state`] the instant a fault is
@@ -1814,9 +2371,10 @@ pub(crate) mod tests {
     /// doc comment used to describe as open: a delivered exception's vector
     /// state must be the guest's own real state *at the moment of the fault*,
     /// read from the kernel's own `mcontext` (`darwin::ArmNeonState64`), not
-    /// whatever [`GUEST_FP`] happened to hold from the guest's last syscall.
+    /// whatever the thread's saved `guest_fp` happened to hold from the guest's
+    /// last syscall.
     /// If [`prepare_exception_delivery`] ever again skipped refreshing
-    /// [`GUEST_FP`] from `neon_state`, this test would still pass by
+    /// `guest_fp` from `neon_state`, this test would still pass by
     /// accident only if the guest's last syscall (there is none here) had
     /// coincidentally left the same sentinels -- it does not, so a regression
     /// here is a hard failure, not a flake.
@@ -1825,6 +2383,7 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         crate::install_fault_handlers();
         let mut stack = vec![0u8; 1 << 16];
         let top = stack.as_mut_ptr() as usize + stack.len();
@@ -1919,6 +2478,7 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         let mut stack = vec![0u8; 1 << 16];
         let top = stack.as_mut_ptr() as usize + stack.len();
         let sp = (top - 256) & !15;
@@ -2072,6 +2632,7 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "70:",
             // ~400 million iterations: comfortably longer (by roughly an
@@ -2095,10 +2656,11 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "72:",
             "brk  #0",
-            cb = sym syscall_callback,
+            cb = sym TEST_SYSCALL_ENTRY,
         )
     }
 
@@ -2112,19 +2674,14 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         crate::install_fault_handlers();
         crate::install_async_signal_handlers();
-        // PENDING_INTERRUPT is process-global (same single-guest-thread
-        // storage as GUEST_OWNS_CPU/LIVE_PTREGS/GUEST_FP -- see that flag's
-        // own doc comment), so a stray SIGUSR2 left over from another test
-        // that ran earlier in this same test binary (e.g. a hammer thread's
-        // last, unavoidably-racy send in
-        // `concurrent_sigusr2_delivery_does_not_corrupt_a_running_syscall_stream`,
-        // landing on some *other* thread entirely) could otherwise make this
-        // test's guest appear interrupted before it ever runs. `TEST_SERIAL`
-        // (held for this whole test) rules out a *concurrent* leak; this
-        // reset rules out a stale *prior* one.
-        PENDING_INTERRUPT.store(false, Ordering::Relaxed);
+        // No pending-interrupt reset is needed (there used to be one here):
+        // `GuestThreadState::pending_interrupt` is per-thread and created
+        // fresh by every `run_thread` call, so a stray `SIGUSR2` that landed
+        // on some other thread in an earlier test cannot leak into this
+        // guest's own state the way the old process-global flag could.
 
         let ready = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
         let delivered = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -2207,10 +2764,10 @@ pub(crate) mod tests {
 
     /// A shim whose `syscall` handler synchronously self-signals with
     /// `SIGUSR2` the moment it observes the guest's first syscall (marker
-    /// `0xAAAA` in `x1`) -- at that exact instant [`GUEST_OWNS_CPU`] genuinely
-    /// reads false (ordinary Rust host code, well past `syscall_callback`'s
+    /// `0xAAAA` in `x1`) -- at that exact instant `owns_cpu` genuinely
+    /// reads false (ordinary Rust host code, well past the syscall callback's
     /// own clear), so this deterministically exercises
-    /// `interrupt_signal_handler`'s case 1 and [`PENDING_INTERRUPT`]'s
+    /// `interrupt_signal_handler`'s case 1 and `pending_interrupt`'s
     /// re-check in [`enter_guest_asm`], rather than racing real concurrent
     /// timing the way
     /// [`delivers_a_genuine_guest_interrupt_to_the_shim_without_leaking_host_state`]
@@ -2260,7 +2817,7 @@ pub(crate) mod tests {
     }
 
     /// A guest that makes one syscall (marker `0xAAAA`), then -- only if it
-    /// ever genuinely resumes, which a correct [`PENDING_INTERRUPT`] re-check
+    /// ever genuinely resumes, which a correct `pending_interrupt` re-check
     /// must prevent -- makes a second, distinctly-marked syscall (`0xBBBB`)
     /// so the test can detect and fail on that instead of silently
     /// mismatching.
@@ -2278,6 +2835,7 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "73:",
             "movz x8, #64",
@@ -2291,14 +2849,15 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "74:",
             "brk  #0",
-            cb = sym syscall_callback,
+            cb = sym TEST_SYSCALL_ENTRY,
         )
     }
 
-    /// Piece 4 of this row's design (see [`PENDING_INTERRUPT`]'s doc
+    /// Piece 4 of this row's design (see `GuestThreadState::pending_interrupt`'s doc
     /// comment): an interrupt that cannot be redirected immediately (here,
     /// because it arrives while genuinely between guest entries) must not be
     /// silently dropped -- it has to be honored the next time
@@ -2312,13 +2871,9 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         crate::install_fault_handlers();
         crate::install_async_signal_handlers();
-        // See the identical reset in
-        // `delivers_a_genuine_guest_interrupt_to_the_shim_without_leaking_host_state`
-        // for why this is needed even though this test's own signal is
-        // synchronous and self-contained.
-        PENDING_INTERRUPT.store(false, Ordering::Relaxed);
 
         let mut stack = vec![0u8; 1 << 16];
         let top = stack.as_mut_ptr() as usize + stack.len();
@@ -2350,7 +2905,7 @@ pub(crate) mod tests {
             *markers,
             vec![0xAAAA],
             "the guest must never reach its second syscall (0xBBBB) -- \
-             PENDING_INTERRUPT must redirect to EnterShim::interrupt before \
+             pending_interrupt must redirect to EnterShim::interrupt before \
              any guest instruction after the first syscall runs"
         );
         drop(markers);
@@ -2389,10 +2944,27 @@ pub(crate) mod tests {
     /// it back) while the test still needs to read the results afterward.
     struct StressRecordingShim {
         ready: ReadySignal,
+        hammer_live: HammerLive,
         seen: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
         exit_code: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
         interrupts_seen: std::sync::Arc<std::sync::atomic::AtomicU32>,
     }
+
+    /// Set by the hammer thread once it has actually issued its first
+    /// `pthread_kill`, and waited for by [`StressRecordingShim::init`] before
+    /// it lets the guest run a single instruction.
+    ///
+    /// Without this handshake the test was genuinely racy in a way that made it
+    /// silently stop testing what it claims: the guest's 4000 round trips take
+    /// well under a millisecond, so on an unlucky schedule the hammer thread
+    /// had not been dispatched at all before the guest finished, and
+    /// `interrupts_seen` came back `0`. Measured on this hardware, at the
+    /// commit before this one, that happened on 2 of 15 idle runs and 3 of 15
+    /// runs under load -- a pre-existing flake in the final assertion, not a
+    /// property of what is being tested. The wait strengthens the test (it can
+    /// no longer pass while exercising nothing) rather than relaxing it: the
+    /// `interrupts_seen > 0` assertion below is unchanged.
+    type HammerLive = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
 
     impl EnterShim for StressRecordingShim {
         type ExecutionContext = PtRegs;
@@ -2404,6 +2976,24 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self_id);
             cvar.notify_one();
+
+            // Hold the guest here until the hammer is genuinely running. This
+            // thread's `GuestThreadState` is already published by `run_thread`
+            // at this point (publication happens before `EnterShim::init`), so
+            // a `SIGUSR2` arriving during this wait is recorded as pending and
+            // honored by the very first `enter_guest_asm` -- which is exactly
+            // the delivery path the assertion at the end of this test is about.
+            let (lock, cvar) = &*self.hammer_live;
+            let guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (_guard, timeout) = cvar
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |live| !*live)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !timeout.timed_out(),
+                "the hammer thread never reported live within 5s"
+            );
             ContinueOperation::Resume
         }
         fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
@@ -2455,6 +3045,7 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "76:",
             "add  x19, x19, #1",
@@ -2469,10 +3060,11 @@ pub(crate) mod tests {
             "str  x16, [sp, #8]",
             "adrp x16, {cb}@PAGE",
             "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
             "br   x16",
             "77:",
             "brk  #0",
-            cb = sym syscall_callback,
+            cb = sym TEST_SYSCALL_ENTRY,
             iters = const STRESS_ITERATIONS,
         )
     }
@@ -2495,23 +3087,21 @@ pub(crate) mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
         crate::install_fault_handlers();
         crate::install_async_signal_handlers();
-        // See the identical reset in
-        // `delivers_a_genuine_guest_interrupt_to_the_shim_without_leaking_host_state`.
-        // This test's own hammer thread is also the one most likely to *leave
-        // behind* a stray pending flag for a later test (its last send races
-        // the guest's own exit with no way to fully close that window -- see
-        // the cleanup after `hammer.join()` below), so it resets on the way
-        // in too, defensively.
-        PENDING_INTERRUPT.store(false, Ordering::Relaxed);
 
         let ready = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let exit_code = std::sync::Arc::new(std::sync::Mutex::new(None));
         let interrupts_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hammer_live: HammerLive = std::sync::Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        ));
         let shim = StressRecordingShim {
             ready: std::sync::Arc::clone(&ready),
+            hammer_live: std::sync::Arc::clone(&hammer_live),
             seen: std::sync::Arc::clone(&seen),
             exit_code: std::sync::Arc::clone(&exit_code),
             interrupts_seen: std::sync::Arc::clone(&interrupts_seen),
@@ -2551,13 +3141,23 @@ pub(crate) mod tests {
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hammer_stop = std::sync::Arc::clone(&stop);
+        let hammer_ready = std::sync::Arc::clone(&hammer_live);
         let hammer = std::thread::Builder::new()
             .spawn(move || {
+                // SAFETY: `guest_tid` was captured from a live thread above and
+                // is only ever signalled while that thread (or its exit race,
+                // harmless for `pthread_kill`) is still within this test's
+                // scope. The guest is parked in `EnterShim::init` until the
+                // handshake below, so this first delivery cannot be missed.
+                unsafe { libc::pthread_kill(guest_tid, libc::SIGUSR2) };
+                let (lock, cvar) = &*hammer_ready;
+                *lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                cvar.notify_one();
+
                 while !hammer_stop.load(Ordering::Relaxed) {
-                    // SAFETY: `guest_tid` was captured from a live thread
-                    // above and is only ever signalled while that thread (or
-                    // its exit race, harmless for `pthread_kill`) is still
-                    // within this test's scope.
+                    // SAFETY: as above.
                     unsafe { libc::pthread_kill(guest_tid, libc::SIGUSR2) };
                 }
             })
@@ -2569,16 +3169,14 @@ pub(crate) mod tests {
         // The hammer thread's own last `pthread_kill` call races the guest
         // thread's exit with no way to fully close that window from here (it
         // may land after the guest thread has already exited, on whatever
-        // unrelated thread the OS has since reused that `pthread_t` for) --
-        // if that lands with GUEST_OWNS_CPU false (the only case it possibly
-        // can, since TEST_SERIAL rules out a second concurrent guest), it
-        // sets PENDING_INTERRUPT with nothing left in *this* test to consume
-        // it. Reset it explicitly (this was found by a real failure of
-        // `syscall_survives_a_guest_stack_with_only_16_valid_bytes_below_sp`,
-        // running afterward with an empty trace, before this reset existed)
-        // instead of leaving that residue for `TEST_SERIAL`'s release to
-        // silently hand to whichever guest-entry test runs next.
-        PENDING_INTERRUPT.store(false, Ordering::Relaxed);
+        // unrelated thread the OS has since reused that `pthread_t` for). That
+        // used to need an explicit process-global reset here, because the
+        // stray delivery would set the shared `PENDING_INTERRUPT` and the next
+        // guest-entry test would consume it (found by a real failure of
+        // `syscall_survives_a_guest_stack_with_only_16_valid_bytes_below_sp`).
+        // With per-thread state there is nothing left to reset: the stray
+        // signal lands on a thread whose `GuestThreadState` is either gone or
+        // was never published, and `record_pending_interrupt` drops it.
 
         let seen = std::mem::take(
             &mut *seen
@@ -2609,6 +3207,335 @@ pub(crate) mod tests {
             interrupts_seen.load(Ordering::Relaxed) > 0,
             "expected at least one real interrupt delivery under continuous \
              concurrent SIGUSR2 pressure across {STRESS_ITERATIONS} round trips"
+        );
+    }
+
+    /// A guest that opens its own 64-byte stack frame *between* one syscall's
+    /// resume point and the next syscall -- exactly what a compiled function
+    /// does before calling a library routine that issues one -- and reads a
+    /// value back out of that frame each time round.
+    ///
+    /// This shape is the whole reason the per-thread state is reached through
+    /// `TPIDRRO_EL0` rather than staged below the guest `SP` at resume time:
+    /// the staged-word design passed every other test in this module and then
+    /// `SIGSEGV`ed on precisely this guest, because the staged pointer's
+    /// address is relative to `SP` *as of the resume*, and this guest's `SP`
+    /// has moved by the time its next `SVC` gate runs (see `docs/roadmap.md`).
+    ///
+    /// On entry `x0` carries a sentinel (from `ctx.regs[0]`), which the guest
+    /// keeps in the callee-saved `x19` and in `v0` for the whole run and
+    /// re-reports every iteration, so a context that got crossed with another
+    /// thread's shows up as a wrong reported value rather than only as a crash.
+    #[unsafe(naked)]
+    unsafe extern "C" fn sp_shifting_guest() {
+        core::arch::naked_asm!(
+            "mov  x19, x0",             // callee-saved sentinel
+            "dup  v0.2d, x19",          // ... and a vector-register copy of it
+            "mov  x20, #0",             // iteration counter
+            "60:",
+            // Open a real stack frame *after* the previous resume and *before*
+            // the next syscall: the guest's SP at the SVC gate is now 64 bytes
+            // below where it was when enter_guest_asm handed control back.
+            "sub  sp, sp, #64",
+            "str  x19, [sp, #24]",
+            "movz x8, #64",
+            "movz x0, #1",
+            "ldr  x1, [sp, #24]",       // sentinel, via this guest's own frame
+            "mov  x2, x20",             // iteration
+            "fmov x3, d0",              // sentinel, via the vector file
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 61f@PAGE",
+            "add  x16, x16, 61f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
+            "br   x16",
+            "61:",
+            "add  sp, sp, #64",
+            "add  x20, x20, #1",
+            "movz x4, #{iters}",
+            "cmp  x20, x4",
+            "b.lt 60b",
+            // exit(sentinel)
+            "movz x8, #93",
+            "mov  x0, x19",
+            "sub  sp, sp, #16",
+            "str  x16, [sp]",
+            "adrp x16, 62f@PAGE",
+            "add  x16, x16, 62f@PAGEOFF",
+            "str  x16, [sp, #8]",
+            "adrp x16, {cb}@PAGE",
+            "add  x16, x16, {cb}@PAGEOFF",
+            "ldr  x16, [x16]",
+            "br   x16",
+            "62:",
+            "brk  #0",
+            cb = sym TEST_SYSCALL_ENTRY,
+            iters = const SP_SHIFT_ITERATIONS,
+        )
+    }
+
+    /// Round trips [`sp_shifting_guest`] makes. Enough that a wrong-address
+    /// dereference has many chances to land on an unmapped page, few enough to
+    /// stay instant.
+    const SP_SHIFT_ITERATIONS: u16 = 256;
+
+    /// Everything one run of [`sp_shifting_guest`] reported, shared by `Arc`
+    /// because [`crate::run_thread`] takes its shim by value and never gives it
+    /// back.
+    #[derive(Default)]
+    struct SpShiftReport {
+        /// `(sentinel via the stack frame, iteration, sentinel via `v0`)`.
+        seen: std::sync::Mutex<Vec<(usize, usize, usize)>>,
+        exit_code: std::sync::Mutex<Option<usize>>,
+    }
+
+    struct SpShiftShim {
+        report: std::sync::Arc<SpShiftReport>,
+    }
+
+    impl EnterShim for SpShiftShim {
+        type ExecutionContext = PtRegs;
+        fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Resume
+        }
+        fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
+            if ctx.regs[8] == 93 {
+                *self
+                    .report
+                    .exit_code
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ctx.regs[0]);
+                return ContinueOperation::Terminate;
+            }
+            self.report
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((ctx.regs[1], ctx.regs[2], ctx.regs[3]));
+            ctx.regs[0] = 0;
+            ContinueOperation::Resume
+        }
+        fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+            // This guest touches nothing but its own stack, so a delivered
+            // exception means the switch dereferenced something it should not
+            // have; terminating makes the assertions below fail loudly.
+            ContinueOperation::Terminate
+        }
+        fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+            ContinueOperation::Terminate
+        }
+    }
+
+    /// Runs [`sp_shifting_guest`] with `sentinel` on a fresh host thread,
+    /// through the production [`crate::run_thread`] wrapper (alternate signal
+    /// stack and thread handle included), and returns what it reported.
+    fn run_sp_shifting_guest(sentinel: usize) -> std::thread::JoinHandle<SpShiftReport> {
+        std::thread::Builder::new()
+            .spawn(move || {
+                let report = std::sync::Arc::new(SpShiftReport::default());
+                let shim = SpShiftShim {
+                    report: std::sync::Arc::clone(&report),
+                };
+                let mut stack = vec![0u8; 1 << 16];
+                let top = stack.as_mut_ptr() as usize + stack.len();
+                let sp = (top - 4096) & !15;
+                let mut ctx = PtRegs {
+                    pc: sp_shifting_guest as *const () as usize,
+                    sp,
+                    ..Default::default()
+                };
+                ctx.regs[0] = sentinel;
+                // SAFETY: `ctx` describes a runnable guest context with a real
+                // stack and ample room below `sp`.
+                unsafe { crate::run_thread(shim, &mut ctx) };
+                drop(stack);
+                std::sync::Arc::into_inner(report).expect("the guest thread holds the last ref")
+            })
+            .expect("failed to spawn the guest thread")
+    }
+
+    /// Checks one [`sp_shifting_guest`] run reported exactly its own sentinel,
+    /// every iteration, in order, and exited with it.
+    fn assert_sp_shift_report(report: &SpShiftReport, sentinel: usize) {
+        let seen = std::mem::take(
+            &mut *report
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let expected: Vec<(usize, usize, usize)> = (0..usize::from(SP_SHIFT_ITERATIONS))
+            .map(|i| (sentinel, i, sentinel))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "guest {sentinel:#x} must report its own sentinel (from its own \
+             stack frame and its own v0) on every one of its own iterations, \
+             in order"
+        );
+        assert_eq!(
+            *report
+                .exit_code
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(sentinel),
+            "guest {sentinel:#x} must reach its own real exit"
+        );
+    }
+
+    /// The scenario that hardware-disproved the previous per-thread design: a
+    /// guest whose `SP` at its next syscall is *not* the `SP` it was resumed
+    /// with. Single-threaded, so this isolates the `SP`-independence of the
+    /// per-thread-state reach from the concurrency question below.
+    #[test]
+    fn a_guest_that_moves_its_sp_between_a_resume_and_its_next_syscall_still_round_trips() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
+        crate::install_fault_handlers();
+
+        let report = run_sp_shifting_guest(0xFEED_FACE)
+            .join()
+            .expect("guest thread panicked");
+        assert_sp_shift_report(&report, 0xFEED_FACE);
+    }
+
+    /// How many guest threads [`concurrent_guest_threads_each_keep_their_own_context`]
+    /// runs at once. More than the two that would merely prove "not one", and
+    /// enough to keep every performance core busy on this hardware.
+    const CONCURRENT_GUESTS: usize = 8;
+
+    /// The whole point of this row: several guest threads running *at the same
+    /// time*, each keeping its own register file, its own vector file, its own
+    /// stack and its own `PtRegs` across thousands of interleaved context
+    /// switches -- with every one of them also moving its `SP` between each
+    /// resume and its next syscall.
+    ///
+    /// Before this, a second concurrent `run_thread` panicked outright
+    /// (`GUEST_ACTIVE`), because the host save area, the live-`PtRegs` pointer,
+    /// the guest vector file and the ownership flag were process-global. A
+    /// build that regressed any of them to process-global state would fail here
+    /// by reporting another thread's sentinel, by desynchronising a trace, or
+    /// by crashing the test process outright -- the same proof-by-survival the
+    /// fault- and interrupt-routing tests rely on.
+    #[test]
+    fn concurrent_guest_threads_each_keep_their_own_context() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_test_syscall_entry();
+        crate::install_fault_handlers();
+
+        let sentinels: Vec<usize> = (0..CONCURRENT_GUESTS)
+            .map(|i| 0x0BAD_0000 + i * 0x1111 + 1)
+            .collect();
+        let threads: Vec<_> = sentinels
+            .iter()
+            .map(|&sentinel| (sentinel, run_sp_shifting_guest(sentinel)))
+            .collect();
+
+        for (sentinel, handle) in threads {
+            let report = handle.join().expect("a guest thread panicked");
+            assert_sp_shift_report(&report, sentinel);
+        }
+    }
+
+    /// The mechanism every naked function in this module depends on: the raw
+    /// `MRS TPIDRRO_EL0` + masked TSD load reaches exactly the storage
+    /// `pthread_setspecific` writes, for a key this module reserved. Asserted
+    /// rather than assumed because the whole per-thread design rests on it and
+    /// nothing else in the build would notice if Darwin changed it.
+    #[test]
+    fn direct_tsd_read_sees_pthread_setspecific() {
+        let _serial = TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = reserve_guest_state_tsd_slot();
+        assert!(
+            current_guest_state().is_null(),
+            "the test thread is not running a guest, so its slot starts clear"
+        );
+
+        let sentinel = 0xDEAD_BEEF_1234_5678_usize;
+        // SAFETY: `key` is this module's own reserved, live key; storing an
+        // opaque pointer-sized value has no precondition beyond that.
+        assert_eq!(
+            unsafe { libc::pthread_setspecific(key, sentinel as *const libc::c_void) },
+            0
+        );
+        assert_eq!(
+            current_guest_state() as usize,
+            sentinel,
+            "the raw TPIDRRO_EL0-relative read must observe pthread_setspecific"
+        );
+        // SAFETY: same key, same thread.
+        assert_eq!(
+            unsafe { libc::pthread_getspecific(key) } as usize,
+            sentinel,
+            "and pthread_getspecific must observe the same word"
+        );
+        // SAFETY: same key, same thread; leaves the slot as this test found it.
+        assert_eq!(
+            unsafe { libc::pthread_setspecific(key, core::ptr::null()) },
+            0
+        );
+        assert!(current_guest_state().is_null());
+    }
+
+    /// `MRS X16, TPIDRRO_EL0`, the first instruction of every entry stub.
+    /// Cross-checked against `litebox_syscall_rewriter::arm64`'s own
+    /// `MRS_TPIDRRO_EL0_BITS` (`0xD53B_D060`, with the destination register in
+    /// the low five bits).
+    const MRS_X16_TPIDRRO_EL0: u32 = 0xD53B_D060 | 16;
+
+    /// `LDR X16, [X16, #(slot * 8)]`: the unsigned-offset 64-bit load form,
+    /// `1111_1001_01 imm12 Rn Rt`, with `imm12` the offset scaled by 8 (so it
+    /// *is* the slot number), `Rn = Rt = 16`.
+    fn expected_stub_load(slot: usize) -> u32 {
+        0xF940_0000 | (u32::try_from(slot).unwrap() << 10) | (16 << 5) | 16
+    }
+
+    /// The entry-stub table is the entire mechanism that lets the syscall
+    /// callback reach per-thread state with the one register the rewriter's
+    /// `SVC` gate leaves free, and it is built with assembler `.rept`/`.set`
+    /// directives whose per-iteration immediate is exactly the thing that could
+    /// silently degenerate (an assembler that evaluated `litebox_tsd_slot` once
+    /// would emit 768 identical stubs, all reading slot 0 -- libpthread's own
+    /// `pthread_self` pointer -- and every existing test in this module would
+    /// still pass on the single thread that reserved slot 0's neighbour).
+    /// So read the emitted machine code back and check the immediates really
+    /// vary, at both ends of the table and at the slot this process uses.
+    #[test]
+    fn every_tsd_slot_gets_its_own_entry_stub() {
+        let base = syscall_entry_stubs as *const () as usize;
+        let key = reserve_guest_state_tsd_slot();
+        let reserved = usize::try_from(key).unwrap();
+
+        for slot in [0, 1, 255, reserved, TSD_SLOT_COUNT - 1] {
+            // SAFETY: reads two of the four instruction words of stub `slot`,
+            // which is inside this function's own `.text`.
+            let (mrs, ldr) = unsafe {
+                let stub = (base + slot * TSD_STUB_BYTES) as *const u32;
+                (stub.read(), stub.add(2).read())
+            };
+            assert_eq!(
+                mrs, MRS_X16_TPIDRRO_EL0,
+                "stub {slot} must anchor on TPIDRRO_EL0"
+            );
+            assert_eq!(
+                ldr,
+                expected_stub_load(slot),
+                "stub {slot} must load TSD slot {slot}, not some other slot"
+            );
+        }
+
+        assert_eq!(
+            syscall_entry_point(),
+            base + reserved * TSD_STUB_BYTES,
+            "the reported entry point must be this process's own reserved slot's stub"
         );
     }
 }

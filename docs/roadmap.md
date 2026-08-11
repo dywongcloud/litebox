@@ -89,140 +89,106 @@ subsystem.
   it -- none wires `MacOsUserland` into `litebox_shim_linux` today, so this whole
   path is still unexercised end to end on hardware.
 * **The platform's *own* per-thread context-switch bookkeeping** —
-  REATTEMPTED and correctly deferred rather than force-implemented. A separate
-  problem from the rewriter's guest slot above. Studying
-  `litebox_platform_linux_userland`'s x86_64
+  **RESOLVED on real hardware.** A separate problem from the rewriter's guest
+  slot above, and the thing that limited this platform to one guest thread at a
+  time. `litebox_platform_linux_userland`'s x86_64
   `run_thread_arch`/`switch_to_guest`/`syscall_callback` (the closest thing to
-  a template) surfaced why: that code doesn't only virtualize the *guest's*
-  thread pointer -- it also stashes its own bookkeeping (`host_sp`, `host_bp`,
-  `guest_context_top`, `in_guest`) in `fs:`-relative TLS slots, because by the
-  time `syscall_callback` runs, every general-purpose register holds live
-  guest state and there is nothing else durable to read "where was the host
-  stack" from. That mechanism is entirely x86_64-ELF-specific (raw
-  `@tpoff`-relative local-exec TLS addressing, resolved to a link-time-fixed
-  offset with no function call and no runtime-determined value at all) and has
-  no Mach-O equivalent to copy directly.
+  a template) does not only virtualize the *guest's* thread pointer -- it also
+  stashes its own bookkeeping (`host_sp`, `host_bp`, `guest_context_top`,
+  `in_guest`) in `fs:`-relative TLS slots, because by the time
+  `syscall_callback` runs, every general-purpose register holds live guest
+  state and there is nothing else durable to read "where was the host stack"
+  from. That mechanism is entirely x86_64-ELF-specific (raw `@tpoff`-relative
+  local-exec TLS addressing, resolved to a link-time-fixed offset with no
+  function call and no runtime-determined value at all) and has no Mach-O
+  equivalent to copy directly.
 
-  **What this pass confirmed is genuinely usable, on real Apple M3 Pro
-  hardware:** a raw `mrs tpidrro_el0` + `[base, #(key * 8)]` read/write reaches
-  the *same* per-thread storage `pthread_getspecific`/`pthread_setspecific` do,
-  for a **second**, independently `pthread_key_create`-reserved dynamic TSD
-  key (not just the one already relied on for the guest's own `TPIDR_EL0`
-  shadow) -- in both directions, across the full `usize` range, and disjointly
-  across two genuinely concurrent OS threads. Previously only the key-to-offset
-  *formula* had been checked against XNU header source; this pass wrote and
-  ran a standalone hardware probe (raw inline `asm!`, `pthread_key_create`
-  twice in the same process to reproduce the real deployment order, both
-  directions of the round trip, boundary values, cross-thread disjointness)
-  that exercises the *raw MRS-based read/write itself*, closing the gap the
-  `macos-guest-tp-runtime-offset` item above flagged as "still unexercised end
-  to end on hardware." This means a **second** reserved TSD key, read via the
-  same direct-TSD mechanism, is a sound building block for host-side per-thread
-  storage reachable from naked asm without a function call -- reusable beyond
-  this specific attempt.
+  **The building block, confirmed on real Apple M3 Pro hardware:** a raw
+  `mrs tpidrro_el0` (masked, `& ~7`, matching libSystem's own
+  `_os_tsd_get_base`) plus a `[base, #(key * 8)]` read/write reaches the *same*
+  per-thread storage `pthread_getspecific`/`pthread_setspecific` do, for a
+  **second**, independently `pthread_key_create`-reserved dynamic TSD key (not
+  just the one already relied on for the guest's own `TPIDR_EL0` shadow) -- in
+  both directions, across the full `usize` range, and disjointly across two
+  genuinely concurrent OS threads. Measured again this pass: the first dynamic
+  key a Rust binary gets is 259 and the pool is exhausted at key 767.
 
-  **Register-budget analysis for `litebox_platform_macos_userland::guest`'s
-  six naked functions**, checking whether each has two free registers to spare
-  for that lookup (one for the runtime-determined TSD byte offset, one for the
-  `TPIDRRO_EL0` value) at the point it would need to resolve a per-thread
-  pointer:
-  - `enter_guest_asm`: ample. At entry only `X0` (`ctx`) is live; the lookup
-    can run before any guest register is restored, and its result (kept in one
-    register for the rest of the function) needs no further register pressure
-    at the later `GUEST_OWNS_CPU`/`PENDING_INTERRUPT` check either, since `X1`
-    and `X16` are already established as free there.
-  - `exception_callback`/`interrupt_callback`/`abort_on_boundary_stack_fault`:
-    ample. Each is reached via a `pc` redirect (not a guest branch), so *every*
-    register is free -- no guest state to preserve at all.
-  - `sigreturn_trampoline`: ample. Its own doc comment already establishes
-    that every register but `SP` is "don't care" here (only `sp` and a forced
-    `syscallno` are captured), so any register is available as scratch.
-  - **`syscall_callback`: genuinely constrained, and this is the blocker.** At
-    entry, exactly one register (`X16`) is free -- the rewriter's `SVC` gate
-    sacrifices it as its own branch vehicle. `X17` is *not* free: unlike
-    `X16`, the gate never touches it, so it still holds the guest's real
-    value, which real Linux AArch64 preserves across a syscall (the kernel's
-    own entry path saves/restores every GPR faithfully; only this rewriter's
-    *own* gate mechanism sacrifices `X16` specifically) and which this file's
-    own fidelity philosophy (`preserves_registers_across_capture_and_resume`)
-    otherwise commits to capturing faithfully. Two free registers are needed
-    to combine a runtime-loaded TSD offset with `TPIDRRO_EL0`; one is not
-    enough.
+  **The blocker, and how it was actually solved.** Of the six naked functions
+  in `litebox_platform_macos_userland::guest`, five are reached with registers
+  to spare (three of them by a signal handler's `pc` redirect, so *every*
+  register is free) and can simply do a two-register lookup: one register for
+  the run-time-determined TSD byte offset, one for the `TPIDRRO_EL0` value. The
+  syscall callback cannot: the rewriter's `SVC` gate leaves exactly **one**
+  register free (`X16`), because `X17` still holds the guest's real value,
+  which real Linux AArch64 preserves across a syscall and which this file's own
+  fidelity philosophy (`preserves_registers_across_capture_and_resume`) commits
+  to capturing faithfully. One register is enough for
+  `mrs`/`and`/`ldr [x16, #imm]` **only if the immediate is a compile-time
+  constant**, and the key is not knowable until run time.
 
-  **A candidate workaround was designed, implemented, and hardware-tested --
-  and disproven, not merely judged risky.** The idea: since `enter_guest_asm`
-  has registers to spare, let it pre-resolve the per-thread pointer once and
-  stage it in a third word below the guest `SP` (extending the existing
-  16-byte `PC`/`X0` staging area to 24 bytes), so `syscall_callback` only ever
-  needs to *re-read* that word with its one free register, never re-derive it.
-  Implemented in full (all six naked functions converted, a new
-  `PerThreadGuestState` struct, `GUEST_ACTIVE`/`PENDING_EXCEPTION_INFO`
-  converted to ordinary per-thread storage, `lib.rs` call sites updated) and
-  run against the full existing hardware test suite. After fixing two
-  self-inflicted bugs during iteration (a wrong relative offset, and an
-  `SP`-alignment violation in a boundary test unrelated to the mechanism
-  itself, both confirmed and fixed via `lldb`), **every existing test passed**
-  -- including the exact-boundary `syscall_survives_a_guest_stack_with_only_16_valid_bytes_below_sp`
-  test (extended to 24, later 32 for 16-byte `SP` alignment). This looked like
-  success. It was not: a **targeted diagnostic guest**, added specifically to
-  probe the one assumption the whole design rests on -- that the guest's `SP`
-  at its *next* syscall equals what it was at the *most recent resume* -- push-
-  es a 64-byte local-variable-style stack frame (`sub sp, sp, #64`, exactly
-  what a real compiled function does before calling a library routine that
-  issues a syscall) between the first syscall's resume point and the second
-  syscall. It reproducibly crashed with `SIGSEGV`. Root cause, confirmed via
-  `lldb`: the staged pointer lives at a fixed offset below the guest `SP` *as
-  of the resume that staged it*; the `SVC` gate decrements `SP` from whatever
-  the guest's `SP` actually is *at the moment of the syscall*, which shifts
-  independently of that once the guest does any of its own stack management in
-  between (i.e. essentially any real, non-trivial compiled program).
-  `syscall_callback` then reads back a stale/wrong address, dereferences it,
-  and crashes -- or, on an unluckier layout, would not crash and would instead
-  write captured guest state through a wild pointer, a silent-corruption
-  failure mode strictly worse than the crash actually observed. This is an
-  architectural flaw in the *approach*, not an off-by-one in the
-  implementation: no adjustment of the staging offset or word count fixes it.
-  All code from this attempt was reverted; `litebox_platform_macos_userland`'s
-  build/clippy/tests are unaffected (verified clean on real hardware after the
-  revert).
+  A previous pass bought the second register by staging the per-thread pointer
+  in a word below the guest `SP` at resume time. That design passed every
+  existing test and was then hardware-disproven: the staged word's address is
+  relative to `SP` *as of the resume*, and any real compiled program moves `SP`
+  (opens a stack frame) before its next syscall, so the callback read back a
+  stale address. Architectural, not an off-by-one.
 
-  **What would need to be true for a future pass to succeed** -- this is the
-  precise target the next attempt needs, not a repeat of "process-global,
-  needs per-thread storage": `syscall_callback` needs a way to resolve its own
-  thread's per-thread pointer using at most one spare register, in a way that
-  does not depend on the guest's `SP` value staying constant between a resume
-  and the guest's own next syscall. None of the following were pursued this
-  pass, each for a stated reason, and any of them is a legitimate next step:
-  - Extend `litebox_syscall_rewriter`'s `SVC` gate itself to also sacrifice
-    `X17` (matching `X16`) or to relay the per-thread pointer freshly at
-    *every* gate site (computed from the guest's own, always-correct-at-that-
-    instant `SP`, not a stale resume-time snapshot) -- structurally sound,
-    since the gate runs at the exact right moment, but this is a change to the
-    AOT-rewritten guest-binary format in a *different* crate, affecting
-    already-packaged binaries; out of scope for a pass scoped to
-    `litebox_platform_macos_userland`.
-  - Deliberately sacrifice `X17` fidelity in `syscall_callback` only (accept
-    that `regs[17]` is no longer trustworthy after a syscall) -- structurally
-    simple (frees a second register with no `SP`-dependent staging needed at
-    all) but a real, if narrow, behavioral regression from today's faithful
-    round-tripping that would need to be a deliberate, disclosed design
-    decision (and a test update), not a side effect.
-  - Some other mechanism not yet found. Self-modifying the crate's own compiled
-    `.text` (to bake the TSD offset in as a patched immediate after
-    `pthread_key_create` returns, needing only one register at each site) was
-    considered and set aside as introducing a materially different, higher-risk
-    class of complexity (mutating the host's own running code section, with no
-    existing precedent anywhere in this codebase) than the rest of this
-    attempt, not evaluated further.
+  **The fix that landed instead makes the immediate a compile-time constant by
+  enumerating every possible one.** `guest::syscall_entry_stubs` is a table of
+  768 identical four-instruction stubs -- one per pthread TSD slot Darwin can
+  hand out -- emitted with assembler `.rept`/`.set` directives, stub `N` being
+  `mrs x16, tpidrro_el0` / `and x16, x16, #~7` / `ldr x16, [x16, #(N*8)]` /
+  `b <shared callback body>`. `SystemInfoProvider::get_syscall_entry_point`
+  reports the address of the *one* stub matching the key this process actually
+  reserved, so the loader writes that into the guest trampoline's callback slot
+  like any other entry point. One register, no function call, no dependence on
+  the guest's `SP`, no self-modifying code, and **no change to the
+  ahead-of-time-rewritten guest binary format** -- which is what made this
+  implementable inside `litebox_platform_macos_userland` alone, unlike the
+  "extend the `SVC` gate" and "sacrifice `X17`" candidates the previous pass
+  recorded. (Sacrificing `X17` was rejected on its merits, not merely as extra
+  work: it is a real, if narrow, ABI regression, and it turned out to be
+  unnecessary.) The stubs branch to the shared body via an `L`-prefixed local
+  label in the same assembly fragment, so the assembler resolves it with no
+  relocation and the linker cannot interpose a range-extension veneer -- which
+  would clobber `X16`, the one register carrying the whole mechanism. Verified
+  by disassembling the shipped binary: 768 stubs, `0x3000` bytes, last one
+  loading `[x16, #0x17f8]` (= slot 767), every `b` landing directly on the body.
+  Cost: 12 KiB of otherwise-inert `.text`.
 
-  `GUEST_ACTIVE` and `PENDING_EXCEPTION_INFO` (2 of the 7 statics
-  `dev_tests/src/ratchet.rs` counts here) are touched only from ordinary Rust,
-  never from naked asm, and would convert to per-thread `thread_local!`s
-  trivially in isolation -- but doing so without the other 5 would be actively
-  harmful: `GUEST_ACTIVE` specifically exists to stop two threads from
-  corrupting `HOST_SAVE`/`GUEST_FP`/`LIVE_PTREGS`/`GUEST_OWNS_CPU`, which stay
-  process-global until `syscall_callback` can reach per-thread storage too, so
-  it cannot be safely weakened alone.
+  `HOST_SAVE`, `GUEST_FP`, `LIVE_PTREGS`, `GUEST_OWNS_CPU`, `PENDING_INTERRUPT`,
+  `PENDING_EXCEPTION_INFO` and the `GUEST_ACTIVE` guard that existed only to
+  stop two threads racing them are all gone, replaced by one per-thread
+  `GuestThreadState` allocated on each guest thread's own host stack. The
+  crate's `dev_tests/src/ratchet.rs` static budget drops from 13 to 8
+  accordingly. `PENDING_INTERRUPT` becoming per-thread also fixes a real (if
+  minor) latent bug on the way past: a `SIGUSR2` that landed on a thread which
+  was not in guest code used to set a *process-global* flag that some
+  *different* guest thread would then consume at its next entry.
+
+  **Proof, on this hardware, beyond the crate's own tests** (the previous pass
+  fooled itself by stopping at those): a freestanding aarch64 Linux guest that
+  `clone(2)`s three more guest threads, has all four print an identity byte
+  re-derived every iteration from a callee-saved register, out of a buffer on
+  each thread's own stack, 500 iterations each, and -- deliberately -- opens a
+  64-byte stack frame between every resume and the next syscall, i.e. exactly
+  the shape that killed the staged-pointer design. Under the fixed build it
+  exits 0 with an exact 500/500/500/500 histogram, repeatably. Under a build of
+  clean `HEAD` the same binary panics with "a second concurrent guest thread
+  reached macOS guest entry" and hangs. Two negative controls confirm the new
+  crate tests are not vacuous: republishing a single shared `GuestThreadState`
+  for all threads makes `concurrent_guest_threads_each_keep_their_own_context`
+  die with `SIGBUS`, and reinstating the resume-time below-`SP` staging makes
+  `a_guest_that_moves_its_sp_between_a_resume_and_its_next_syscall_still_round_trips`
+  fail *while* `runs_a_guest_through_two_syscalls_and_exit` still passes --
+  precisely how the earlier attempt was misled.
+
+  **Still open, and unrelated to this row:** a guest that *uses* `TPIDR_EL0`
+  still needs `pthread_setspecific` of each guest thread's own pointer into the
+  guest-TP key (see the item above); and the intermittent
+  `macos-concurrent-guest-entry-sigsegv` remains, measured this pass at 3/100
+  runs of `busybox uname -a` on clean `HEAD` and 2/100 on the fixed build --
+  i.e. untouched, neither fixed nor worsened, by per-thread bookkeeping.
 ## Guest-entry context switch — DONE (implemented and hardware-tested)
 
 AArch64 guest entry is implemented in `litebox_platform_macos_userland::guest`
@@ -272,15 +238,16 @@ garbage back, while host code lost `d8`-`d15` to the guest.
 restore makes that test fail on hardware while the two older ones still pass.
 
 Remaining, smaller, follow-ups on top of the working switch:
-* Host bookkeeping (save area + live-`PtRegs` pointer) is process-global, so
-  **one guest thread at a time** (a second panics loudly). Reattempted and
-  correctly deferred (see "The platform's own per-thread context-switch
-  bookkeeping" above): the `TPIDRRO_EL0` direct-TSD reach the rewriter gates
-  need is confirmed sound for a second key, but `syscall_callback` cannot
-  reach it with only its one free register, and the one workaround found
-  (staging the pointer below `SP` at resume time) was hardware-disproven for
-  guests that shift `SP` before their next syscall -- see that section for the
-  precise remaining gap.
+* **Resolved in a later pass:** host bookkeeping (save area, live-`PtRegs`
+  pointer, guest vector file, ownership and pending-interrupt flags) used to be
+  process-global, so only **one guest thread at a time** could run (a second
+  panicked loudly). It is now a per-thread `GuestThreadState` on each guest
+  thread's own host stack, reached from naked assembly through a reserved
+  pthread TSD slot; the syscall callback gets there with its single free
+  register via a per-slot entry-stub table. See "The platform's own per-thread
+  context-switch bookkeeping" above for the mechanism, why the earlier
+  below-`SP` staging attempt was architecturally wrong, and the real
+  multi-guest-thread hardware proof.
 * **Resolved in a later pass:** the **syscall**, guest hardware fault
   (`SIGSEGV`/`SIGBUS`), and `SIGUSR2` interrupt event paths are all now wired
   to `EnterShim::syscall`/`exception`/`interrupt` respectively -- see "A guest
@@ -349,8 +316,15 @@ the AArch64 syscall number from that field, not from `regs[8]`, so every guest
 syscall dispatched as whatever the guest stack happened to hold -- usually 0,
 which is `io_setup`. Filling it, and `orig_x0` beside it, fixed both the
 hand-written guest and Alpine. The 91 `x18`/`w18` references counted in `busybox`
-are real, but they were not what broke it; XNU's `x18` zeroing remains a
-documented restriction that has simply not bitten yet.
+are real, but they were not what broke it.
+
+**It has since bitten, hard.** The sentence that stood here previously -- that
+XNU's `x18` zeroing "remains a documented restriction that has simply not bitten
+yet" -- is now false, and its confident tone is part of why three separate
+investigation passes looked elsewhere. XNU's `x18` zeroing is the root cause of
+*both* the intermittent concurrent-launch `SIGSEGV` and the total failure of
+Node.js to boot; see "XNU destroys a live guest `x18`" below for the measured
+evidence.
 
 A shell runs: `busybox sh -c 'echo shell works; echo $((6*7))'` prints both
 lines, and `ls`, `ls -l`, `wc` and `grep` all behave. Reaching that needed one
@@ -707,7 +681,15 @@ Known gaps a real guest hits now:
      (`mov x1, #0` two instructions earlier -- expected and correct), and
      `x3` is `dso->strings + sym->st_name`, i.e. the pointer to the symbol
      name musl is looking up, computed entirely from ELF dynamic-linking
-     metadata; and (b) **`ld-musl-aarch64.so.1`'s entire ~801 KB image contains
+     metadata
+     [**CORRECTION: that identification of `x3` is wrong, and it is the single
+     mistake that kept this bug unsolved across three passes. `dso->strings +
+     st_name` is in `x9` (`ldr x9,[x2,#0x60]` then `add x9,x9,x1`). `x3` is the
+     *other* operand: `s`, the name being searched for, which `find_sym2` parks
+     in `x18` (`mov x18, x1` at entry, `mov x3, x18` immediately before each of
+     its two call sites). Everything downstream of the mis-read -- including the
+     "transient Darwin write-visibility gap" hypothesis -- followed from it. See
+     "XNU destroys a live guest `x18`" below.**]; and (b) **`ld-musl-aarch64.so.1`'s entire ~801 KB image contains
      exactly 33 `MRS`/`MSR` instructions, and every one of them targets
      `FPCR`, `FPSR`, or `DCZID_EL0` -- none targets `TPIDR_EL0` or
      `TPIDRRO_EL0`.** The crash's whole call path (`do_relocs` →
@@ -790,6 +772,64 @@ Known gaps a real guest hits now:
 * The two flaky timer tests do not flake in CI, which runs `cargo nextest`
   (`.github/workflows/ci.yml`) -- that is process-per-test, so the cross-test
   interference only appears under `cargo test`.
+
+### XNU destroys a live guest `x18`
+
+This is the root cause of both the intermittent concurrent-launch `SIGSEGV` and
+Node.js failing to boot. Two agents investigating those two symptoms
+independently, in separate worktrees, converged on the same mechanism, and each
+finding was then re-derived from scratch by adversarial verifiers on this
+hardware.
+
+`x18` is the AArch64 *platform register*, reserved by Apple. XNU zeroes it on
+every return to EL0. LiteBox executes guest instructions natively, so a guest
+holding a live value in `x18` loses it at an arbitrary instruction boundary,
+asynchronously, with no notification and no userspace hook to intercept.
+
+Measured directly on an M3 Pro (a sentinel placed in `x18`, then observed):
+
+| Event | Sentinel survives |
+| --- | --- |
+| No trap at all | 500/500 |
+| Anonymous first-touch page fault | 0/500 |
+| Signal round trip | 0/500 |
+| Pure timer preemption of an asm-only loop touching no memory | lost |
+
+A handler writing `uc_mcontext->__ss.__x[18]` is ignored on return -- the kernel
+exposes the original value to the handler but discards a write. The
+`com.apple.security.cs.allow-jit` entitlement makes no difference. The in-tree
+test `guest::tests::xnu_zeroes_guest_x18_on_every_return_to_el0` pins this fact
+so it cannot quietly stop being true.
+
+Why it presents as "concurrency": the driver is *host preemption rate*, not other
+LiteBox processes. Sequential idle runs failed 0/60; sequential runs under CPU
+hogs failed 3/40. Concurrency merely raises the trap rate.
+
+Why Node and not busybox: window size. `x18`/`w18` operand counts are `node`
+19,010, `libstdc++.so.6` 199, `ld-musl` 82, `busybox` 91. Node's relocation
+workload guarantees a trap lands inside a live-`x18` window.
+
+LiteBox's own save/restore is *not* the leak --
+`guest::tests::liteboxs_own_syscall_gate_round_trip_preserves_guest_x18` proves
+both directions. The loss happens on kernel-serviced returns where no LiteBox
+instruction executes.
+
+**Two corrections to what an earlier draft of this section claimed**, both from
+adversarial verification rather than from the original investigation:
+
+1. "The whole guest userland would have to be rebuilt with `-ffixed-x18`" is
+   **not** established. Patching only four instructions in musl's `find_sym2`
+   (spilling `s` to the stack instead of parking it in `x18`) eliminated the
+   `SIGSEGV` in 5/5 runs and carried Node through its *entire* relocation phase.
+   The blast radius may be far smaller than a full userland rebuild.
+2. Fixing `x18` alone will not boot Node; it exposes a **second, distinct
+   blocker that is fixable inside LiteBox**. Node's bundled OpenSSL deliberately
+   executes `sm3partw1` (encoding `0xce63c004`) as a CPU-feature probe,
+   *expecting* to catch its own `SIGILL`. This host implements no
+   FEAT_SM3/FEAT_SM4, and `install_fault_handlers` covers only `SIGSEGV` and
+   `SIGBUS`, so that intentional `SIGILL` kills the runner outright instead of
+   being delivered to the guest. It runs in the `init_array` constructor loop,
+   strictly after relocation.
 
 Three things had to be fixed to get that far, each of which would have stopped
 any guest:

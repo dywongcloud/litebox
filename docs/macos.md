@@ -288,12 +288,16 @@ M3 Pro:
 Instead, `enter_guest_asm` hand-rolls the restore and uses **`X16`** as the
 branch vehicle. That is safe because the rewriter's own `SVC` gate already
 treats `X16` as scratch, and neither glibc nor musl keeps a live `X16`/`X17`
-across an `SVC`. `syscall_callback` captures the full guest register file back
-into `PtRegs`, restores the host's callee-saved state, and returns *normally*
-into the Rust run loop -- a hand-rolled `swapcontext`, no `longjmp`, no
-`ucontext`. See the module docs for the register-level contract and the
-documented limitations (one guest thread at a time via a process-global save
-area; below-`SP` staging needs a `sigaltstack`). The syscall, hardware-fault
+across an `SVC`. The syscall callback captures the full guest register file
+back into `PtRegs`, restores the host's callee-saved state, and returns
+*normally* into the Rust run loop -- a hand-rolled `swapcontext`, no `longjmp`,
+no `ucontext`. Any number of guest threads may run at once: everything the
+switch remembers lives in a per-thread `GuestThreadState` reached from naked
+assembly through a reserved pthread TSD slot, which the syscall callback gets
+at with its one free register via a table of per-slot entry stubs (see the
+module docs for the register-level contract, that mechanism, and the remaining
+documented limitation -- below-`SP` staging needs a `sigaltstack`).
+The syscall, hardware-fault
 (`SIGSEGV`/`SIGBUS`) and interrupt (`SIGUSR2`) event paths are all wired now
 -- see the interrupt-routing entry below for the last of the three.
 
@@ -357,13 +361,15 @@ Three smaller gaps worth recording:
   can tell "mid-restoring a still-authoritative `PtRegs`" from "genuinely
   executing guest code" the same way `litebox_platform_linux_userland`'s and
   `litebox_platform_windows_userland`'s own interrupt handlers do; a new
-  `PENDING_INTERRUPT` flag (checked immediately after `enter_guest_asm` sets
-  `GUEST_OWNS_CPU` true) closes a real race the boundary alone would still
+  pending-interrupt flag (checked immediately after `enter_guest_asm` marks the
+  guest as owning the CPU) closes a real race the boundary alone would still
   lose an interrupt to; a new `interrupt_callback`/`GuestExit::Interrupt`
   return path lets `run_thread`'s loop call `shim.interrupt` instead of always
   assuming a syscall; and `darwin::install_handler` now masks `SIGUSR2`
   against `SIGSEGV`/`SIGBUS` (and back) so the two handlers can no longer nest
-  atop each other and race the same process-global guest-entry state. See
+  atop each other and race the same thread's guest-entry state (both flags
+  were process-global then and are per-thread now, which does not change that
+  masking argument -- the hazard is same-thread nesting, not concurrency). See
   [`docs/roadmap.md`](./roadmap.md) for the full design and the three new
   hardware-verified tests in `guest::tests`:
   `delivers_a_genuine_guest_interrupt_to_the_shim_without_leaking_host_state`,

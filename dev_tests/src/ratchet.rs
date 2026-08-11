@@ -48,16 +48,30 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_linux_kernel/", 6),
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 24),
-            // 13, not 12: `GUEST_FP`, the guest's vector-register file held
-            // across a syscall, and `GUEST_OWNS_CPU`/`PENDING_EXCEPTION_INFO`,
-            // added when guest hardware faults were routed to `EnterShim::exception`,
-            // plus `PENDING_INTERRUPT`, added when the SIGUSR2 interrupt path
-            // was routed to `EnterShim::interrupt`. All are process-global for
-            // the same reason the rest of the guest-entry save area is: a
-            // naked callback running on the guest stack cannot reach a
-            // `thread_local!` without a call. Lifting the single-guest-thread
-            // limit retires all of them together.
-            ("litebox_platform_macos_userland/", 13),
+            // Was 13 while the guest-entry save area was process-global (a
+            // naked callback running on the guest stack could not reach a
+            // `thread_local!` without a call, so `HOST_SAVE`, `GUEST_FP`,
+            // `LIVE_PTREGS`, `GUEST_OWNS_CPU`, `PENDING_INTERRUPT`,
+            // `PENDING_EXCEPTION_INFO` and the `GUEST_ACTIVE` guard that kept
+            // them from being raced all had to be statics). Lifting the
+            // single-guest-thread limit retired all seven at once, in favour of
+            // a per-thread `GuestThreadState` reached through a reserved
+            // pthread TSD slot; the one static left in their place holds that
+            // slot's byte offset. That accounts for 8: `mach_task_self_` (a
+            // link-time `extern` symbol, not mutable state), three
+            // `thread_local!`s, `GUEST_TP_TSD_KEY`, that new offset, and two
+            // test-only statics in `guest::tests`.
+            //
+            // The ninth is `PROBE_ALLOCATOR`, which is `#[cfg(test)]`-only and
+            // never exists in a production build: it is the
+            // `#[global_allocator]` behind
+            // `delivering_a_guest_fault_allocates_nothing_inside_the_signal_handler`,
+            // which enforces that nothing reachable from the SIGSEGV/SIGBUS
+            // handler allocates. `#[global_allocator]` can only be applied to a
+            // `static`, so it cannot be expressed any other way; its own armed
+            // flag and counter are deliberately struct fields rather than
+            // further `static`s so the scaffolding costs exactly one.
+            ("litebox_platform_macos_userland/", 9),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
             ("litebox_runner_lvbs/", 5),

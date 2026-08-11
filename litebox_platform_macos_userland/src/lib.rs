@@ -1501,7 +1501,12 @@ impl litebox::platform::StdioProvider for MacOsUserland {
 
 impl litebox::platform::SystemInfoProvider for MacOsUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        guest::syscall_callback as *const () as usize
+        // Not a single fixed function address: this platform's syscall callback
+        // has to resolve the calling thread's own guest-entry state with the
+        // one register the rewriter's `SVC` gate leaves free, which it does by
+        // there being one entry stub per possible pthread TSD slot. See
+        // `guest::syscall_entry_point`.
+        guest::syscall_entry_point()
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -1812,9 +1817,14 @@ unsafe extern "C" fn interrupt_signal_handler(
         return;
     }
 
-    if !guest::GUEST_OWNS_CPU.load(Ordering::Relaxed) {
+    // Per-thread, so an interrupt aimed at one guest thread can no longer be
+    // consumed by a different one (and a `SIGUSR2` landing on a thread that
+    // runs no guest at all has nowhere to be recorded, which is correct: its
+    // other job, `EINTR`-ing a blocking host call, is already done).
+    let guest_state = guest::current_guest_state();
+    if !guest::guest_owns_cpu(guest_state) {
         // Case 1.
-        guest::PENDING_INTERRUPT.store(true, Ordering::Relaxed);
+        guest::record_pending_interrupt(guest_state);
         return;
     }
 
@@ -1823,17 +1833,17 @@ unsafe extern "C" fn interrupt_signal_handler(
 
     if guest::interrupted_pc_is_in_guest_exit_prologue(pc) {
         // Case 2.
-        guest::PENDING_INTERRUPT.store(true, Ordering::Relaxed);
+        guest::record_pending_interrupt(guest_state);
         return;
     }
 
     let recovery = if guest::interrupted_pc_is_in_guest_entry_restore(pc) {
-        // Case 3: nothing to capture, `*LIVE_PTREGS` is already correct.
+        // Case 3: nothing to capture, the live `PtRegs` is already correct.
         //
-        // SAFETY: `GUEST_OWNS_CPU` was true and `pc` falls inside
-        // `enter_guest_asm`'s own restore range, matching this function's
-        // documented precondition.
-        unsafe { guest::abandon_guest_entry_for_interrupt() }
+        // SAFETY: `guest_owns_cpu` was true (so `guest_state` is this thread's
+        // own non-null live state) and `pc` falls inside `enter_guest_asm`'s
+        // own restore range, matching this function's documented precondition.
+        unsafe { guest::abandon_guest_entry_for_interrupt(guest_state) }
     } else {
         // Case 4.
         //
@@ -1844,10 +1854,11 @@ unsafe extern "C" fn interrupt_signal_handler(
                 &(*machine_context).neon_state,
             )
         };
-        // SAFETY: `GUEST_OWNS_CPU` true and `pc` outside every switch-code
-        // range checked above means the interrupted context is genuinely the
-        // guest's own, matching this function's documented precondition.
-        unsafe { guest::prepare_interrupt_delivery(thread_state, neon_state) }
+        // SAFETY: `guest_owns_cpu` true (so `guest_state` is this thread's own
+        // non-null live state) and `pc` outside every switch-code range
+        // checked above means the interrupted context is genuinely the guest's
+        // own, matching this function's documented precondition.
+        unsafe { guest::prepare_interrupt_delivery(guest_state, thread_state, neon_state) }
     };
     // SAFETY: checked non-null above.
     unsafe { (*machine_context).thread_state.pc = recovery as u64 };
@@ -2620,7 +2631,10 @@ unsafe extern "C" fn fault_handler(
         return;
     }
 
-    if guest::GUEST_OWNS_CPU.load(Ordering::Relaxed) {
+    // Per-thread: null on any thread that is not inside `guest::run_thread`,
+    // and each guest thread's own state is disjoint from every other's.
+    let guest_state = guest::current_guest_state();
+    if guest::guest_owns_cpu(guest_state) {
         // The exception table missed and the guest genuinely owns the CPU at
         // this pc (not merely mid-switch -- see the ordering note above), so
         // this is a real guest fault: hand it to the guest via
@@ -2645,9 +2659,12 @@ unsafe extern "C" fn fault_handler(
             // "kernel-mode access faulted" case for a userland host to model.
             kernel_mode: false,
         };
-        // SAFETY: `GUEST_OWNS_CPU.load` just returned true, this function's
-        // own documented precondition.
-        let recovery = unsafe { guest::prepare_exception_delivery(thread_state, neon_state, info) };
+        // SAFETY: `guest_owns_cpu` just returned true, which also means
+        // `guest_state` is this thread's own non-null live state -- this
+        // function's own documented precondition.
+        let recovery = unsafe {
+            guest::prepare_exception_delivery(guest_state, thread_state, neon_state, info)
+        };
         // SAFETY: checked non-null just above.
         unsafe { (*machine_context).thread_state.pc = recovery as u64 };
         return;
@@ -2659,6 +2676,148 @@ unsafe extern "C" fn fault_handler(
     // this handler installed.
     darwin::reraise_fatally(signum);
 }
+
+/// Detects heap activity performed *inside* [`fault_handler`] or
+/// [`interrupt_signal_handler`], so a test can assert that this platform's
+/// fault- and interrupt-delivery paths stay async-signal-safe.
+///
+/// Everything reachable from a POSIX signal handler must be async-signal-safe,
+/// and `malloc`/`free` are the canonical counter-example: Darwin's allocator
+/// takes a non-reentrant `os_unfair_lock`, so allocating in a handler that
+/// interrupted the same thread mid-`malloc` deadlocks the process. The
+/// interesting allocations are not this crate's own explicit ones (there are
+/// none on that path) but the *hidden* ones a future edit could reintroduce --
+/// a `format!`, a `Vec`, or a logging macro whose backend allocates. A
+/// pass-through [`core::alloc::GlobalAlloc`] catches all of them uniformly,
+/// which is why this is an allocator rather than a call-site assertion.
+///
+/// "Inside a handler" is detected from the signal mask rather than from a flag
+/// the handler sets, because the handler must not be modified to be
+/// measurable: [`install_fault_handlers`] installs `SIGSEGV`/`SIGBUS` with
+/// `sa_mask = { INTERRUPT_SIGNAL }` and without `SA_NODEFER`, so the kernel
+/// runs [`fault_handler`] with both the delivered fault signal *and*
+/// [`INTERRUPT_SIGNAL`] blocked; [`install_async_signal_handlers`] installs
+/// `INTERRUPT_SIGNAL` with `sa_mask = { SIGSEGV, SIGBUS }`, so
+/// [`interrupt_signal_handler`] runs with the same combination in force.
+/// Nothing else in this crate ever blocks any of the three
+/// ([`block_guest_signals`] blocks only `SIGINT`/`SIGALRM`), so that
+/// combination is a precise, self-updating test for "the calling thread is
+/// executing one of this platform's guest-delivery signal handlers right now"
+/// -- and it keeps working unchanged if the masks are ever widened further.
+///
+/// The mask query is a real syscall, so it only runs while
+/// [`ProbeAllocator::arm`] has turned it on; outside that window every
+/// allocation in the test binary pays one relaxed atomic load.
+///
+/// The probe's own state lives in [`ProbeAllocator`]'s fields rather than in
+/// free `static`s purely to keep `dev_tests`' `ratchet_globals` count honest:
+/// `#[global_allocator]` requires exactly one `static`, and there is no reason
+/// for this test scaffolding to cost three.
+#[cfg(test)]
+mod signal_handler_alloc_probe {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Whether the calling thread is currently running
+    /// [`super::fault_handler`] or [`super::interrupt_signal_handler`], per
+    /// this module's doc comment.
+    fn inside_signal_handler() -> bool {
+        // SAFETY: `current` is fully initialized by `sigemptyset` before
+        // `pthread_sigmask` writes it, a null `set` argument makes the call a
+        // pure query, and `sigismember` only reads it.
+        unsafe {
+            let mut current: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&raw mut current);
+            if libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &raw mut current) != 0 {
+                return false;
+            }
+            libc::sigismember(&raw const current, super::INTERRUPT_SIGNAL) == 1
+                && (libc::sigismember(&raw const current, libc::SIGSEGV) == 1
+                    || libc::sigismember(&raw const current, libc::SIGBUS) == 1)
+        }
+    }
+
+    /// The pass-through allocator this module installs for the test binary.
+    pub(crate) struct ProbeAllocator {
+        /// Whether each allocation should be checked. Off outside a test that
+        /// explicitly asked for the check.
+        armed: AtomicBool,
+        /// How many allocations were made from inside a signal handler while
+        /// armed.
+        inside_handler: AtomicUsize,
+    }
+
+    impl ProbeAllocator {
+        pub(crate) const fn new() -> Self {
+            Self {
+                armed: AtomicBool::new(false),
+                inside_handler: AtomicUsize::new(0),
+            }
+        }
+
+        /// Records one allocation if it is happening inside a signal handler.
+        fn note_allocation(&self) {
+            if self.armed.load(Ordering::Relaxed) && inside_signal_handler() {
+                self.inside_handler.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Starts checking, resetting the count first so each armed window
+        /// reports only its own allocations.
+        pub(crate) fn arm(&self) {
+            self.inside_handler.store(0, Ordering::Relaxed);
+            self.armed.store(true, Ordering::Relaxed);
+        }
+
+        /// Stops checking and reports how many allocations happened inside a
+        /// signal handler since [`Self::arm`].
+        pub(crate) fn disarm(&self) -> usize {
+            self.armed.store(false, Ordering::Relaxed);
+            self.inside_handler.load(Ordering::Relaxed)
+        }
+    }
+
+    // SAFETY: every method forwards to `std::alloc::System` with the caller's
+    // own arguments unchanged, so the allocator contract is exactly
+    // `System`'s; `note_allocation` neither allocates nor touches the
+    // returned block.
+    unsafe impl core::alloc::GlobalAlloc for ProbeAllocator {
+        unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+            self.note_allocation();
+            // SAFETY: forwarded caller guarantee.
+            unsafe { core::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
+            self.note_allocation();
+            // SAFETY: forwarded caller guarantee.
+            unsafe { core::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+            self.note_allocation();
+            // SAFETY: forwarded caller guarantee.
+            unsafe { core::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: core::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            self.note_allocation();
+            // SAFETY: forwarded caller guarantee.
+            unsafe { core::alloc::GlobalAlloc::realloc(&std::alloc::System, ptr, layout, new_size) }
+        }
+    }
+}
+
+/// See [`signal_handler_alloc_probe`]; only the crate's own test binary gets
+/// this allocator, production builds keep the default one.
+#[cfg(test)]
+#[global_allocator]
+static PROBE_ALLOCATOR: signal_handler_alloc_probe::ProbeAllocator =
+    signal_handler_alloc_probe::ProbeAllocator::new();
 
 /// Page faults are serviced by the host kernel, so LiteBox never handles one
 /// itself here. Provided to satisfy the trait bound on `PageManager`.
