@@ -904,7 +904,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
-        assert!(matches!(signal, Signal::SIGKILL | Signal::SIGSEGV));
+        // This function resets the handler to `SIG_DFL` when forcing delivery,
+        // so the signal must be fatal by default; otherwise the guest would
+        // never actually see it acted on. `handle_exception_request` reaches
+        // this with any signal `arch::exception_signal` can decode a hardware
+        // exception into -- not just `SIGSEGV` (e.g. `SIGILL` for an
+        // undefined instruction, `SIGTRAP` for a breakpoint, `SIGFPE` for a
+        // floating-point exception) -- so the check has to match on
+        // disposition rather than enumerate specific signals.
+        assert!(matches!(
+            signal.default_disposition(),
+            SignalDisposition::Core | SignalDisposition::Terminate
+        ));
 
         self.signals
             .pending
