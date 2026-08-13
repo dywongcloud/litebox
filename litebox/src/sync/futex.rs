@@ -182,8 +182,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
     /// without waking them -- they stay asleep until a later [`Self::wake`] (or another
     /// [`Self::requeue`]) targets `addr2`.
     ///
-    /// Reuses the exact same [`LoanList`]-based wait-queue nodes `wait`/`wake` use (via
-    /// [`crate::utilities::loan_list::LoanedEntry::requeue_into`]) rather than a parallel
+    /// Reuses the exact same `LoanList`-based wait-queue nodes `wait`/`wake` use (via
+    /// `LoanedEntry::requeue_into`) rather than a parallel
     /// mechanism, so a requeued waiter is indistinguishable from one that called `wait(addr2,
     /// ...)` in the first place, from `wake`'s point of view.
     ///

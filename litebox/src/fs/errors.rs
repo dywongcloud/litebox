@@ -113,10 +113,10 @@ pub enum ChmodError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
-    /// Only relevant to [`FileSystem::fd_chmod`](super::FileSystem::fd_chmod).
+    /// Only relevant to [`FileSystem::fd_chmod`].
     #[error("fd has been closed already")]
     ClosedFd,
-    /// Only relevant to [`FileSystem::fd_chmod`](super::FileSystem::fd_chmod).
+    /// Only relevant to [`FileSystem::fd_chmod`].
     #[error("operation not permitted on an `O_PATH` fd")]
     PathOnlyFd,
 }
@@ -150,10 +150,10 @@ pub enum UtimeError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
-    /// Only relevant to [`FileSystem::fd_utimensat`](super::FileSystem::fd_utimensat).
+    /// Only relevant to [`FileSystem::fd_utimensat`].
     #[error("fd has been closed already")]
     ClosedFd,
-    /// Only relevant to [`FileSystem::fd_utimensat`](super::FileSystem::fd_utimensat).
+    /// Only relevant to [`FileSystem::fd_utimensat`].
     #[error("operation not permitted on an `O_PATH` fd")]
     PathOnlyFd,
 }
