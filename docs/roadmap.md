@@ -1010,6 +1010,74 @@ from a context that did not arrive via a real signal delivery in the first
 place. None of this was implemented or verified this pass -- it is a design
 sketch, not a plan vetted against the real API.
 
+**A follow-up pass ruled out three more candidate mechanisms for the further
+crash, with direct evidence for each, and fixed one real, separate bug found
+along the way.** None of the three explain the crash; it remains open.
+
+1. *Is XNU's `x18`-zeroing a general "any scratch register" phenomenon,
+   just not yet observed for `x16`/`x17`?* No -- tested directly with the
+   same proven-reliable methodology the `x18` test above uses (a raw Darwin
+   `SVC`, 256 rounds), but for `x17` instead: `x17` survives every round
+   (`guest::tests::xnu_svc_x17_probe`, now a permanent regression pin). `x18`
+   is Apple's own uniquely-reserved AArch64 platform register -- the ABI
+   basis for XNU zeroing it does not extend to an ordinary scratch register
+   like `x17`. This refutes the leading hypothesis two sections up (that the
+   further crash is the same XNU mechanism hitting a different register) at
+   the mechanism level, not just for the specific vehicle-choice angle
+   already ruled out there.
+
+2. *Does the host's own memory allocator alias the guest's address space?*
+   This was a real, confirmed, **separately worthwhile** bug, independent of
+   whether it explains the further crash (it does not -- see below), found by
+   comparing this platform's `reserved_pages` mechanism against
+   `AnEntrypoint/litebox`'s own independent discovery of the identical bug
+   class on its (Windows) backend (commits `8b1a0fb`/`ab383ff`: the host's
+   global allocator committing pages inside the guest's own claimed address
+   range, because their equivalent of `reserved_pages` was also only a
+   one-time startup snapshot with no visibility into allocations made later,
+   during guest execution). Measured directly on this Darwin host before
+   trusting the parallel: 200,000 ordinary Rust heap allocations and 50 real
+   `std::thread::spawn` stacks landed at addresses from ~4 GiB to ~39 GiB --
+   **100% inside** the then-current `GUEST_ADDR_MIN..GUEST_ADDR_MAX` range of
+   `[4 GiB, 64 TiB)`. Unsurprising in hindsight: 4 GiB is approximately where
+   an ordinary 64-bit process's own heap begins, immediately adjacent to
+   where the guest was also claiming its first pages. Fixed by raising
+   `GUEST_ADDR_MIN` to 1 TiB (roughly 25x the worst address measured, leaving
+   63 TiB of guest headroom on top of the unchanged 64 TiB ceiling -- wide
+   margin on both sides, not tuned to just barely clear what was measured).
+   Verified live: full `node:alpine` re-run against the raised floor produces
+   the byte-for-byte **same** crash (`pc=0`, `esr=0x82000006`,
+   `exception=Exception(32)`) -- so this was not the cause of the further
+   crash specifically, but it closes a real, demonstrated, previously
+   unprotected collision window regardless, at zero regression (full
+   `litebox_platform_macos_userland` suite green, a fresh `busybox`/Alpine
+   OCI repackage-and-boot still clean).
+
+3. *Is the guest thread-pointer TSD-slot mismatch (the `WARN` logged on
+   every run: "`pthread_key_create` gave a slot the AOT-rewritten `Host::MacOs`
+   gates do not use") actually live for a `TPIDR_EL0`-using guest like
+   Node's musl, contrary to `reserve_guest_tpidr_tsd_slot`'s own doc comment
+   claiming the runtime load-time-offset-indirection fix already closes it?*
+   Reviewed the wiring (`litebox_shim_linux/src/loader/elf.rs`'s
+   `FileAndParsed::new` calls `get_guest_tp_slot_offset` and
+   `parse_trampoline` for every ELF loaded, main and interpreter and shared
+   libraries alike) and it is architecturally consistent with that claim --
+   plus circumstantial support: a guest whose TLS access were genuinely
+   reading the wrong slot would plausibly fail far earlier than 250+ clean
+   syscalls into a real Node boot, not at this specific late point. Not
+   exhaustively verified (would need confirming the patched offset actually
+   lands in Node's own trampoline header at load time, not just that the
+   call chain exists) -- flagged as the one thread in this list not run to
+   ground, in case a future pass wants to finish it rather than re-derive
+   the wiring from scratch.
+
+None of the three redirect where the real fix effort should go next. The
+concrete next diagnostic remains what it was before this pass: a debug
+V8/Node build with real symbols, so a captured `PC`/corrupted-register value
+resolves to an actual function name instead of a bare address -- the
+un-symbolized guesswork this and the prior pass's investigations have been
+constrained to is close to exhausted as a technique on its own.
+
 ## The test suite's own macOS gaps
 
 Running `cargo test` on an Apple Silicon machine surfaced defects in the tests

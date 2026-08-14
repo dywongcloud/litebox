@@ -2448,6 +2448,58 @@ pub(crate) mod tests {
         );
     }
 
+    /// DIAGNOSTIC (not a permanent regression pin): the same proven-reliable
+    /// SVC-based methodology as the test above, checking `x17` instead of
+    /// `x18`. Darwin's raw `SVC` calling convention only reads `x16` (the
+    /// syscall number) -- `x17` carries no meaning to the call itself, so
+    /// unlike a `x16`-based probe this is not confounded by the ABI's own use
+    /// of the register, the same way the test above is not confounded for
+    /// `x18`.
+    #[test]
+    fn xnu_svc_x17_probe() {
+        const MAGIC: u64 = 0xFEED_1700_FEED_1700;
+        const ROUNDS: usize = 256;
+
+        let mut observed = [MAGIC; ROUNDS];
+        for slot in &mut observed {
+            let after: u64;
+            // SAFETY: same reasoning as the x18 test above; x17 here is pure
+            // scratch, immediately overwritten by the guest and read back
+            // right after the syscall returns.
+            unsafe {
+                core::arch::asm!(
+                    "mov x17, {magic}",
+                    "mov x16, #20",
+                    "svc #0x80",
+                    "mov {after}, x17",
+                    magic = in(reg) MAGIC,
+                    after = out(reg) after,
+                    out("x0") _,
+                    out("x1") _,
+                    out("x16") _,
+                    options(nostack),
+                );
+            }
+            *slot = after;
+        }
+
+        // Unlike x18 (Apple's own reserved platform register, unconditionally
+        // zeroed on every EL0 return -- see the test above), x17 has no
+        // special significance to Darwin's own ABI or SVC calling convention
+        // (only x16 carries the syscall number) and survives every round
+        // trip. This is the direct, decisive evidence that XNU's x18-zeroing
+        // does not generalize to "any register": it is specific to the one
+        // register Apple's own ABI reserves, not a property every scratch
+        // register shares. See docs/roadmap.md's "A further, distinct crash"
+        // section for why this matters -- it refutes that section's leading
+        // hypothesis that the further crash is the same XNU mechanism
+        // hitting a different register.
+        assert!(
+            observed.iter().all(|&v| v == MAGIC),
+            "expected x17 to survive every SVC (unlike x18), got {observed:?}"
+        );
+    }
+
     /// A shim that captures [`guest_fp_state`] the instant a fault is
     /// delivered -- the same accessor `lib.rs`'s `ThreadProvider::get_fp_state`
     /// exposes to the shim, so this is exactly what a real signal-frame build

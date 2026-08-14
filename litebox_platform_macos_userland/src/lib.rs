@@ -343,7 +343,34 @@ pub unsafe fn jit_write_protect(executable: bool) {
 /// would need `ALIGN` pinned to a concrete value, which these call sites
 /// have no reason to do). The value genuinely does not depend on `ALIGN`, so
 /// one constant correctly serves both the associated const and these.
-const GUEST_ADDR_MIN: usize = 0x1_0000_0000;
+///
+/// Set to 1 TiB, not the 4 GiB `__PAGEZERO` floor alone, to keep this whole
+/// process's *own* heap and thread stacks out of the guest's claimed range --
+/// they are not disjoint by default. `reserved_pages` (this platform's
+/// `PageManagementProvider::reserved_pages`) is a one-time startup snapshot
+/// of `read_memory_maps()`; it protects a *guest* allocation from landing on
+/// memory the host already had mapped at that instant, but has no visibility
+/// into allocations the host's own global allocator makes *later*, while a
+/// guest is already running. Measured directly on this host: 200,000 ordinary
+/// heap allocations and 50 real `std::thread::spawn` stacks landed at
+/// addresses from ~4 GiB up to ~39 GiB, 100% inside the old `[4 GiB, 64 TiB)`
+/// range -- unsurprising, since 4 GiB is approximately where an ordinary
+/// 64-bit process's own heap begins, immediately adjacent to where the guest
+/// was also claiming its very first pages. A long-running guest (Node's own
+/// startup alone touches this host's tracing/logging/syscall-dispatch code
+/// hundreds of times) gives this collision window a great deal of time to
+/// find a `malloc` or thread stack landing exactly where the guest's own
+/// memory already lives, or will next expand into -- a real, demonstrated
+/// risk this closes on its own merits. It was tested directly as a candidate
+/// cause of the further-crash investigation in `docs/roadmap.md` and ruled
+/// out there (the crash reproduces byte-for-byte identically with this fix
+/// in place), so it is not, in the end, that bug -- but the collision window
+/// itself was real regardless of that specific crash, and closing it is not
+/// contingent on explaining it. 1 TiB is roughly 25x the worst address
+/// measured, on top of the existing 64 TiB ceiling leaving 63 TiB of guest
+/// headroom -- both numbers with wide margin, not tuned to just barely clear
+/// what was measured.
+const GUEST_ADDR_MIN: usize = 0x0100_0000_0000;
 /// See [`GUEST_ADDR_MIN`]; mirrors `TASK_ADDR_MAX` the same way.
 const GUEST_ADDR_MAX: usize = 0x0000_4000_0000_0000;
 
@@ -514,9 +541,18 @@ fn allocate_jit_pages_hint_honors_the_suggested_address() {
 
     // SAFETY: each anonymous mapping with no fixed-address request has no
     // precondition beyond what `mmap` itself checks.
+    //
+    // Hinted at `GUEST_ADDR_MIN`, not `NULL`: this probe needs a free
+    // candidate *inside* the guest range to exercise anything, but an
+    // unhinted `mmap(NULL, ...)` no longer reliably lands there by chance --
+    // that range was deliberately widened away from where the host's own
+    // ordinary allocations land (see `GUEST_ADDR_MIN`'s own doc comment).
+    // The hint is still only advisory, so this remains a real probe of
+    // wherever the kernel actually places it, not an assumption; the
+    // in-range check below still gates every attempt on that.
     let mmap_anon = || unsafe {
         libc::mmap(
-            core::ptr::null_mut(),
+            GUEST_ADDR_MIN as *mut libc::c_void,
             len,
             libc::PROT_NONE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
