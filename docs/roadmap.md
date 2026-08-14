@@ -950,6 +950,66 @@ Reproduced fresh this pass, 8/8 runs, with the exact repro command:
 litebox_runner_linux_on_macos_userland --initial-files <node:alpine tar with
 the `-ffixed-x18` musl swapped in> -- /usr/local/bin/node --version`.
 
+**A follow-up pass tried, and disproved, the obvious next move: picking a
+"safer" vehicle register instead of `X17`.** An independent research pass over
+`https://github.com/AnEntrypoint/litebox` (a derivative under active,
+unrelated development -- x86-64/Windows only, no macOS or AArch64 code at all
+as of its HEAD `8065258`, so nothing in it addresses this bug directly)
+surfaced the exact structural parallel on that platform
+(`372f9f4`, "Preserve guest xmm0-xmm5 across the guest-to-host syscall
+trampoline") and, in the course of comparing it, an independently-confirmed
+fact about *this* codebase: `enter_guest_asm`'s `X17` sacrifice (the state as
+of commit `697e927`) means `X17`'s real guest value is silently discarded on
+*every* resume, exactly as `X16` was before that commit -- `X16`/`X17` are
+AArch64's canonical PLT/lazy-binding scratch pair (`ADRP X16, ...; LDR X17,
+[X16, ...]; BR X17`), so a dynamically-linked guest exercises both on every
+lazily-bound call.
+
+The natural next step -- restore both `X16` and `X17` correctly, moving the
+sacrifice to a register with no PLT/ABI-special role (`X9` was tried) --
+**was implemented, tested, and reverted this pass**, because it is not a
+fix, only a relocation of the same gap: with `X9` as the vehicle,
+`guest::tests::delivers_a_genuine_guest_fault_to_the_shim_without_leaking_host_state`
+and `delivers_an_undefined_instruction_to_the_shim_as_a_guest_exception`
+(both pre-existing, both pass on `697e927`, both do a real, litebox-mediated
+`write(2)` syscall with a live sentinel in `X9` immediately beforehand)
+started failing -- deterministically confirmed via `git stash` A/B on this
+same hardware, not merely suspected. `X9` turned out to be exactly as "live
+across a syscall" as `X16`/`X17` were, just in a different, narrower way
+(these two tests happen to hold a value there; real guest code plausibly does
+too). This is the general case, not a coincidence: **AArch64 has no
+instruction that atomically restores all 31 GPRs *and* the PC from EL0
+(`ERET` requires EL1+); every indirect-branch-based resume needs one GPR to
+carry the target address, and there is no register general-purpose code is
+*guaranteed* never to hold live across an arbitrary syscall.** Trying
+successive single-register vehicles is provably a dead end -- three now
+tried (`X16`, `X17`, `X9`), all three demonstrated-live in some real scenario
+-- not merely three unlucky guesses. A vehicle change also still would not
+have addressed the Node crash regardless: that was already tested directly
+(`X16` vs. `X17`, byte-identical crash) before this pass even started.
+
+**What an actual fix needs**, left for follow-up rather than attempted here
+given the blast radius (this platform's *only* guest-resume path,
+risking every currently-working guest, not only Node) and the remaining time
+budget: eliminate the sacrifice entirely rather than relocate it, by
+borrowing a real EL1-privileged atomic restore instead of a raw userspace
+indirect branch. Darwin's own `sigreturn` syscall does exactly this --
+restore an entire `mcontext_t` (all GPRs plus `PC`) atomically, from EL1, on
+behalf of EL0 -- and this platform already has the supporting pieces for
+signal *delivery* (`sigreturn_trampoline`,
+`get_sigreturn_trampoline_address`). Reusing that mechanism for *every*
+ordinary resume (not just returning from a delivered signal) would need: a
+real `ucontext_t`/signal-frame-shaped structure built from `PtRegs` on each
+resume (today's plain register restore is far cheaper, so this is a real
+performance trade, not a free win), a decision on which stack it is safe to
+stage that frame on (the guest's own -- matching how signal delivery already
+works -- or a dedicated per-thread alternate stack, avoiding any assumption
+about the guest `SP`'s validity at an arbitrary resume point), and
+verification that Darwin's `sigreturn` is actually callable in this shape
+from a context that did not arrive via a real signal delivery in the first
+place. None of this was implemented or verified this pass -- it is a design
+sketch, not a plan vetted against the real API.
+
 ## The test suite's own macOS gaps
 
 Running `cargo test` on an Apple Silicon machine surfaced defects in the tests
