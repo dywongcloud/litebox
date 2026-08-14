@@ -9,6 +9,8 @@
 ))]
 pub mod oci;
 
+mod musl_x18;
+
 use anyhow::{Context, bail};
 use clap::Parser;
 use rayon::prelude::*;
@@ -744,7 +746,39 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
         return data.to_vec();
     }
 
-    match litebox_syscall_rewriter::hook_syscalls_in_elf_for_host(data, None, rewrite_host()) {
+    let host = rewrite_host();
+
+    // musl's dynamic-linker relocation bootstrap holds a live value in `x18`
+    // across a boundary XNU zeroes it at, so a guest built for ordinary Linux
+    // (where `x18` is an allocatable register) crashes early under a macOS
+    // host -- see `musl_x18`'s module doc comment and `docs/roadmap.md`'s
+    // "XNU destroys a live guest x18" section. Substituting a cached,
+    // `-ffixed-x18`-rebuilt replacement before rewriting closes that gap for
+    // any macOS-targeted package containing a standard Alpine musl; a cache
+    // miss changes nothing (packaging still proceeds with the stock bytes,
+    // exactly as it did before this substitution existed) but prints a clear,
+    // actionable warning once.
+    let data = if matches!(host, litebox_syscall_rewriter::Host::MacOs)
+        && musl_x18::is_musl_libc_filename(path)
+    {
+        if let Some(patched) = musl_x18::lookup_patched_musl(data) {
+            if verbose {
+                eprintln!(
+                    "  {} (substituting cached -ffixed-x18 musl before rewriting)",
+                    path.display()
+                );
+            }
+            patched
+        } else {
+            musl_x18::warn_missing_patch(path, data);
+            data.to_vec()
+        }
+    } else {
+        data.to_vec()
+    };
+    let data = data.as_slice();
+
+    match litebox_syscall_rewriter::hook_syscalls_in_elf_for_host(data, None, host) {
         Ok(rewritten) => {
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());

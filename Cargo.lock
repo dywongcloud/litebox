@@ -1658,6 +1658,7 @@ dependencies = [
  "oci-client",
  "oci-spec",
  "rayon",
+ "sha2",
  "tar",
  "tempfile",
  "tokio",

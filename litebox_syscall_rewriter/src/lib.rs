@@ -108,14 +108,29 @@ pub const TRAMPOLINE_GUEST_TP_SLOT_OFFSET: usize = arm64::HEADER_GUEST_TP_OFFSET
 
 /// Rewrite a supported binary for LiteBox.
 ///
-/// ELF64 inputs are passed through [`hook_syscalls_in_elf`]. PE64 inputs have
-/// executable-section GS segment overrides rewritten to FS and `syscall`
-/// instructions redirected through a LiteBox trampoline footer.
+/// ELF64 inputs are passed through [`hook_syscalls_in_elf`] (the
+/// [`Host::Linux`] anchor). PE64 inputs have executable-section GS segment
+/// overrides rewritten to FS and `syscall` instructions redirected through a
+/// LiteBox trampoline footer.
+///
+/// Use [`rewrite_binary_for_host`] to target an AArch64 ELF input at a
+/// non-Linux host.
 pub fn rewrite_binary(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    rewrite_binary_for_host(input_binary, trampoline, Host::Linux)
+}
+
+/// As [`rewrite_binary`], but selects the AArch64 host anchor explicitly
+/// instead of defaulting to [`Host::Linux`] -- see [`hook_syscalls_in_elf_for_host`].
+/// Ignored for PE64 input, which has no per-host anchor concept.
+pub fn rewrite_binary_for_host(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    host: Host,
+) -> Result<Vec<u8>> {
     if is_pe_binary(input_binary) {
         rewrite_pe_for_litebox(input_binary, trampoline)
     } else {
-        hook_syscalls_in_elf(input_binary, trampoline)
+        hook_syscalls_in_elf_for_host(input_binary, trampoline, host)
     }
 }
 

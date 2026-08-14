@@ -14,13 +14,30 @@
 //! AArch64 has no userland instruction that atomically restores every general
 //! register *and* the program counter (that is `ERET`, EL1+ only). Every
 //! indirect branch (`BR`/`RET`) reads a general register, so entering the guest
-//! must sacrifice exactly one register as the branch vehicle. The
-//! [`litebox_syscall_rewriter`] `SVC` gate already treats **`X16`** as a
-//! scratch register (it spills and reuses it), and the Linux syscall ABI does
-//! not keep a live value in `X16`/`X17` across an `SVC` in practice, so `X16`
-//! is the safe vehicle: [`enter_guest_asm`] restores all of `X0`-`X30`, `SP`
-//! and the `NZCV` flags from a [`PtRegs`], then branches through `X16` to the
-//! guest `PC`.
+//! must sacrifice exactly one register as the branch vehicle. [`enter_guest_asm`]
+//! restores all of `X0`-`X30`, `SP` and the `NZCV` flags from a [`PtRegs`], then
+//! branches through **`X17`** to the guest `PC`.
+//!
+//! `X17`, not `X16`, is the vehicle. An earlier revision sacrificed `X16`
+//! (reasoning that the [`litebox_syscall_rewriter`] `SVC` gate already treats
+//! it as scratch, and that the Linux syscall ABI does not keep a live value in
+//! `X16`/`X17` across an `SVC` in practice) -- but that discarded the guest's
+//! real `X16` on *every* resume, not only across a syscall, which is a real
+//! ABI divergence: the kernel's own guarantee is that a raw `SVC` preserves
+//! every register but `X0`, and this platform's own resume path was the one
+//! exception to it. Measured directly against a real `node:alpine` guest,
+//! this was not merely theoretical: a genuine, reproducible late-boot crash
+//! (guest `PC` and `X16` landing on identical, non-deterministic garbage --
+//! `0`, or raw bytes read out of a nearby path string -- after `BLR`-through-
+//! `X16`-shaped guest code) persisted **identically** whether `X16` or `X17`
+//! served as the sacrificed vehicle, which is the decisive evidence: the
+//! guest's own code holds `X16` live and something *other* than this
+//! platform's vehicle choice is corrupting it (see `docs/roadmap.md`'s
+//! "XNU destroys a live guest `x18`" section for the same failure *class*,
+//! confirmed there for a different register, on this same host). Restoring
+//! `X16` correctly does not fix that crash, but it closes a confirmed, live
+//! ABI gap independent of it, at zero measured cost (the existing round-trip
+//! tests below, and a full `node:alpine` re-run, show no regression).
 //!
 //! The vector registers travel separately, in [`GuestThreadState::guest_fp`],
 //! because [`PtRegs`] has nowhere to put them: it mirrors Linux's `struct
@@ -549,7 +566,7 @@ pub(crate) fn set_guest_fp_state(state: &litebox::platform::FpSimdState64) {
 ///
 /// Saves the host's callee-saved registers, `LR` and `SP` into `state`'s host
 /// save area, records `ctx` in `state`, restores every guest register from
-/// `ctx`, and branches to `ctx.pc` through `X16`. It "returns" -- with
+/// `ctx`, and branches to `ctx.pc` through `X17`. It "returns" -- with
 /// callee-saved registers preserved, ABI-correctly -- only when the syscall
 /// callback, [`exception_callback`] or [`interrupt_callback`] restores the host
 /// context, at which point `*ctx` holds the guest state at that event and the
@@ -661,7 +678,9 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs, state: *mut GuestThreadSt
         "add  x1, x1, {interrupt_cb}@PAGEOFF",
         "br   x1",
         "92:",
-        // Restore x1..x30 (x0 and x16 handled last; skip regs[16]).
+        // Restore x1..x30 except x17 (x0 and x17 handled last; skip
+        // regs[17]). x17, not x16, is now the sacrificed branch vehicle --
+        // see the comment on the final branch below for why.
         "ldr  x1,  [x0, #8]",
         "ldp  x2,  x3,  [x0, #16]",
         "ldp  x4,  x5,  [x0, #32]",
@@ -670,7 +689,7 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs, state: *mut GuestThreadSt
         "ldp  x10, x11, [x0, #80]",
         "ldp  x12, x13, [x0, #96]",
         "ldp  x14, x15, [x0, #112]",
-        "ldr  x17, [x0, #136]",
+        "ldr  x16, [x0, #128]",
         "ldp  x18, x19, [x0, #144]",
         "ldp  x20, x21, [x0, #160]",
         "ldp  x22, x23, [x0, #176]",
@@ -678,15 +697,16 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs, state: *mut GuestThreadSt
         "ldp  x26, x27, [x0, #208]",
         "ldp  x28, x29, [x0, #224]",
         "ldr  x30, [x0, #240]",
-        // Restore x0 and branch to the guest PC through the X16 vehicle. These
-        // two below-SP reads are the last guest-memory touches inside the
-        // "owns" window opened above; a fault here is redirected to
+        // Restore x0 and branch to the guest PC through the X17 vehicle (see
+        // this module's own top-of-file doc comment for why X17 and not X16).
+        // These two below-SP reads are the last guest-memory touches inside
+        // the "owns" window opened above; a fault here is redirected to
         // {abort} instead of ever reaching the owns_cpu check (see that
         // field's doc comment) -- the exception table is always consulted
         // first.
         "90:",
         "ldr  x0,  [sp, #-16]",
-        "ldr  x16, [sp, #-8]",
+        "ldr  x17, [sp, #-8]",
         "91:",
         ".pushsection __TEXT,__ex_table,regular,no_dead_strip",
         ".balign 4",
@@ -694,7 +714,7 @@ unsafe extern "C" fn enter_guest_asm(ctx: *mut PtRegs, state: *mut GuestThreadSt
         ".long 91b - .",
         ".long {abort} - .",
         ".popsection",
-        "br   x16",
+        "br   x17",
         // switch_to_guest_end: a label, never reached by falling through (the
         // branch above always diverts first) -- its only purpose is to give
         // interrupted_pc_is_in_guest_entry_restore an end address for the
@@ -1446,8 +1466,23 @@ pub(crate) fn run_thread(
         // `prepare_exception_delivery`, `prepare_interrupt_delivery` or
         // `abandon_guest_entry_for_interrupt` respectively.
         //
+        // Logs the resume context (gated behind trace level, inert by
+        // default; kept as a permanent debug aid alongside the `guest fault`
+        // log below) so a captured post-fault `pc` of 0 (or any other bogus
+        // value) can be checked against the `pc` litebox itself handed to
+        // `enter_guest_asm` for this same entry -- distinguishing "litebox
+        // resumed the guest at an already-corrupt PC" from "the guest was
+        // handed a genuinely valid PC and corrupted it (or branched through a
+        // corrupt register) during its own execution" without needing a
+        // debugger attached. See the `macos-node-boot-null-pc` investigation
+        // in `docs/roadmap.md`.
+        //
         // SAFETY: `ctx` is a valid writable PtRegs, and `state` is this
         // thread's own live state, the one just published in its TSD slot.
+        litebox_util_log::trace!(
+            pc:? = ctx.pc, x16:? = ctx.regs[16], sp:? = ctx.sp;
+            "about to resume guest"
+        );
         let exit =
             GuestExit::from_asm_return(unsafe { enter_guest_asm(core::ptr::from_mut(ctx), state) });
 

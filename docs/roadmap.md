@@ -873,6 +873,83 @@ any guest:
   `litebox_packager` sidesteps this by writing `Header::new_ustar()` itself; a
   hand-built archive needs a writer that emits no extended headers.
 
+### A further, distinct crash past both the `x18` and `SIGILL` fixes
+
+With a `-ffixed-x18`-rebuilt `ld-musl-aarch64.so.1`/`libc.musl-aarch64.so.1`
+swapped into a packaged `node:alpine` image (getting the guest through
+relocation) and `SIGILL` delivery to the guest working (getting past
+OpenSSL's `sm3partw1`/`sm3partw2`/`sm3tt1a`/`sm3tt1b`/`sm3ss1` CPU-feature
+probes -- five distinct probe faults observed per run, each a clean
+deliver-and-resume round trip), `node --version` still does not boot: it
+reaches roughly 250 further syscalls of real bootstrap (an early
+`getpid`/`capget`/`getuid`/`geteuid`/`getgid`/`getegid` privilege check,
+dozens of `rt_sigaction` calls installing/restoring each CPU-probe's own
+`SIGILL` handler, `openat`/`mmap`/`mprotect` for the one dynamically-loaded
+library) and then dies with a genuine hardware instruction-abort
+(`ESR=0x82000006`, translation fault at the faulted address) whose captured
+`PC` is not a valid guest address at all -- observed as exactly `0`, or as
+raw ASCII bytes off a nearby path string (`/run\0\0\0\0`, `/usr/loc`),
+varying non-deterministically run to run.
+
+**Ruled out, with a live diagnostic, not merely argued.** A trace log added
+immediately before `enter_guest_asm` (logging `ctx.pc`/`ctx.regs[16]`/`ctx.sp`
+for every resume, kept as a permanent `trace`-gated aid) shows the `pc`
+litebox hands to the guest for the fatal resume is always valid -- a real,
+previously-executed guest address, matching the same resume point several
+earlier (successful) iterations of the same privilege-check loop used. So
+this is not `enter_guest_asm` resuming the guest at an already-corrupt `PC`
+(one candidate an earlier pass of this investigation could not rule out
+without this instrumentation), and it is not a host-side fault
+misattributed as a guest one either (`owns_cpu` was continuously true across
+the ~250 syscalls between the last valid resume and the fault, and the
+guest visibly kept making real forward progress in between).
+
+**A further experiment, also run live, ruled out this platform's own
+context-switch mechanism as the direct cause.** The captured `PC` at the
+fatal fault is always bit-identical to the captured `X16` -- across three
+independent runs with three different garbage values (`0`, a `/run`-prefixed
+value, a `/usr/loc`-prefixed value), never differing. That is exactly the
+signature [`enter_guest_asm`]'s own resume vehicle would produce if litebox
+itself branched through a corrupt `X16` (see this file's `guest.rs` doc
+comment on why `X17`, not `X16`, is now that vehicle) -- so this was tested
+directly: switching the vehicle register from `X16` to `X17` (restoring the
+guest's real `X16` correctly on every resume, a genuine, confirmed,
+independently-worthwhile ABI fix in its own right, verified against the
+existing register round-trip tests with zero regressions) left the crash
+*byte-for-byte identical*, still landing on `X16` specifically, in five
+further live re-runs. Litebox no longer supplies `X16`'s value at the point
+of the crash under either vehicle choice, so the guest's own code is
+holding `X16` live across the intervening syscalls and something else is
+corrupting it.
+
+**Leading hypothesis, not yet confirmed: this is the same failure class as
+"XNU destroys a live guest `x18`" above, hitting a second register.** `X16`
+is exactly the AArch64 ELF ABI's canonical PLT/lazy-binding scratch register
+(confirmed against this guest's own disassembled `ld-musl-aarch64.so.1`:
+its PLT stubs load the GOT slot address into `X16`, then branch through
+`X17`) -- a plausible, if unconfirmed, mechanism for real compiled code
+(Node's own ~90 MB binary and V8's JIT output, neither built with
+`-ffixed-x18`/an equivalent `X16` restriction, unlike the patched musl) to
+hold `X16` live across a syscall the same way `find_sym2` held `X18` live
+across one. The non-determinism (sometimes `0`, sometimes readable path-string
+bytes) is also consistent with a read of a stale/uninitialized value rather
+than a fixed corruption pattern, matching how XNU's `x18`-zeroing was
+measured to be probabilistic under preemption, not a deterministic
+per-syscall event. Not proven: no capture yet pins down *which* instruction
+or memory location supplies `X16`'s bad value, and it has not been checked
+whether XNU's documented `x18`-zeroing behavior extends to `x16` under the
+same conditions, or whether this is instead a distinct, litebox-specific
+memory-initialization bug (e.g. a not-reliably-zeroed anonymous mapping).
+Confirming the exact mechanism needs either a kernel-level trace across the
+fault (this pass did not have one available) or a targeted sentinel-register
+experiment analogous to `guest::tests::xnu_zeroes_guest_x18_on_every_return_to_el0`,
+extended to `x16`.
+
+Reproduced fresh this pass, 8/8 runs, with the exact repro command:
+`LITEBOX_LOG=litebox_shim_linux=trace,litebox_platform_macos_userland=trace
+litebox_runner_linux_on_macos_userland --initial-files <node:alpine tar with
+the `-ffixed-x18` musl swapped in> -- /usr/local/bin/node --version`.
+
 ## The test suite's own macOS gaps
 
 Running `cargo test` on an Apple Silicon machine surfaced defects in the tests

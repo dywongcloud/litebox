@@ -10,6 +10,7 @@ litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewri
 rayon = "1.10"
 tar = "0.4"
 object = { version = "0.36.7", default-features = false, features = ["elf", "read_core"] }
+sha2 = "0.10"
 
 # OCI image support. The image architecture now follows the host, so the
 # remaining constraint is `native-tls`: on non-Apple hosts it pulls in
