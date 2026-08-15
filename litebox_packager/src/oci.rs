@@ -813,9 +813,17 @@ fn extract_tar<R: Read>(
                 .link_name()?
                 .context("symlink entry has no link name")?
                 .into_owned();
-            // A later layer may override this symlink, so remove any stale
-            // entry with the same rel_path.
-            symlinks.retain(|s| s.rel_path != path);
+            // A later layer overriding this path with a symlink supersedes any
+            // earlier symlink at the same path, under it, or above it -- the
+            // same pruning the file/directory branch below does. Pruning only
+            // the exact path would leave a stale descendant symlink (e.g. a
+            // lower layer's `a/b` when `a` is now itself a symlink) to be
+            // resurrected during scan_rootfs.
+            symlinks.retain(|s| {
+                s.rel_path != path
+                    && !s.rel_path.starts_with(&path)
+                    && !path.starts_with(&s.rel_path)
+            });
             // If a previous layer extracted a file or directory at this path,
             // remove it so the symlink takes precedence.
             if target.is_dir() {
@@ -1600,6 +1608,54 @@ mod tests {
         // to contradict) -- callers still get the image.
         assert!(verify_config_architecture(br#"{"os":"linux"}"#, "arm64", "test").is_ok());
         assert!(verify_config_architecture(b"not json", "arm64", "test").is_ok());
+    }
+
+    fn tar_with_symlink(link_path: &str, target: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder.append_link(&mut header, link_path, target).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn symlink_override_prunes_stale_descendant_symlinks() {
+        // Layer 1 records a symlink `a/b`; layer 2 replaces `a` itself with a
+        // symlink. The stale descendant `a/b` must be pruned, not left for
+        // scan_rootfs to resurrect (sweep round 2). The override branch had
+        // pruned only the exact path, unlike the file/directory branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let mut symlinks = Vec::new();
+        let mut permissions = HashMap::new();
+
+        extract_tar(
+            &tar_with_symlink("a/b", "target")[..],
+            &rootfs,
+            &mut symlinks,
+            &mut permissions,
+        )
+        .unwrap();
+        assert!(symlinks.iter().any(|s| s.rel_path == Path::new("a/b")));
+
+        extract_tar(
+            &tar_with_symlink("a", "elsewhere")[..],
+            &rootfs,
+            &mut symlinks,
+            &mut permissions,
+        )
+        .unwrap();
+        assert!(
+            symlinks.iter().any(|s| s.rel_path == Path::new("a")),
+            "the new symlink at `a` should be recorded"
+        );
+        assert!(
+            !symlinks.iter().any(|s| s.rel_path == Path::new("a/b")),
+            "the stale descendant symlink `a/b` should be pruned by the override"
+        );
     }
 
     #[test]
