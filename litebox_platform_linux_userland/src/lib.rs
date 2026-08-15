@@ -109,7 +109,7 @@ pub struct LinuxUserland {
     /// [`Self::new`]. See [`litebox::platform::StdinPump`].
     stdin_pump: litebox::platform::StdinPump,
     /// Doorbell the stdin-pump background thread notifies after every push/EOF, so
-    /// [`StdioProvider::read_from_stdin`]'s blocking path can sleep instead of busy-polling.
+    /// [`litebox::platform::StdioProvider::read_from_stdin`]'s blocking path can sleep instead of busy-polling.
     stdin_doorbell: (std::sync::Mutex<()>, std::sync::Condvar),
     /// Serializes real host writes to stdout, so concurrent guest threads' `write()` calls to the
     /// same stream don't interleave mid-write.
@@ -1798,7 +1798,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
 /// Spawns the single background host thread that blockingly reads the real stdin and feeds
 /// [`LinuxUserland::stdin_pump`], notifying [`LinuxUserland::stdin_doorbell`] after every push or
-/// EOF so [`StdioProvider::read_from_stdin`]'s blocking path wakes promptly instead of polling.
+/// EOF so [`litebox::platform::StdioProvider::read_from_stdin`]'s blocking path wakes promptly instead of polling.
 ///
 /// Spawned unconditionally in [`LinuxUserland::new`] -- see the identical rationale on
 /// `litebox_platform_macos_userland`'s copy of this function.
@@ -1844,7 +1844,7 @@ fn spawn_stdin_pump_thread(platform: &'static LinuxUserland) {
 }
 
 impl LinuxUserland {
-    /// Wakes any thread parked in [`StdioProvider::read_from_stdin`]'s blocking wait.
+    /// Wakes any thread parked in [`litebox::platform::StdioProvider::read_from_stdin`]'s blocking wait.
     fn notify_stdin_doorbell(&self) {
         let (lock, cvar) = &self.stdin_doorbell;
         drop(lock.lock().unwrap());
