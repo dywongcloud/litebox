@@ -119,12 +119,22 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
     /// Returns the offsets of the strings in the stack.
     /// Returns `None` if the stack has insufficient space.
     fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<usize>> {
-        let mut envp = Vec::with_capacity(vals.len());
-        for val in vals {
+        // Push in reverse so that -- with the stack growing down -- `vals[0]`
+        // lands at the LOWEST address and the whole block is contiguous in
+        // increasing address order. That is the exact layout the Linux kernel
+        // produces, and the one libuv's `uv_setup_args` relies on: it walks
+        // `argv[0]..argv[n]` then `environ[0]..` requiring each string to abut
+        // the previous at a higher address, and sizes the process-title buffer
+        // from that contiguous span. Pushing forward reversed each block, so the
+        // walk broke immediately and libuv computed a garbage `process_title.len`
+        // -- and the first `process.title = ...` (which `npm` does at startup)
+        // then `memset`s that bogus length and SIGSEGVs.
+        let mut ptrs = alloc::vec![0usize; vals.len()];
+        for (i, val) in vals.iter().enumerate().rev() {
             self.push_cstring(val)?;
-            envp.push(self.pos);
+            ptrs[i] = self.pos;
         }
-        Some(envp)
+        Some(ptrs)
     }
 
     /// Push a vector of stack pointers to the stack.
