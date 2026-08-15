@@ -1072,3 +1072,46 @@ a real, multi-day project on its own:
 * **CI checks that `CallerCredential::Unauthenticated` can't reach the broker
   in non-test builds**, and that malformed/truncated broker messages fail
   closed -- currently enforced by code review, not by an automated check.
+
+## Every box's guest network identity is hardcoded, blocking direct box-to-box addressing
+
+Found while proving out a multi-box composition (several `boxer` instances,
+each running one single-process workload, wired together over TCP -- the
+shape multi-process desktop-class workloads like an X11 display server plus
+clients need, since LiteBox has no `fork`). `litebox/src/net/mod.rs:36,40`
+hardcodes `INTERFACE_IP_ADDR = 10.0.0.2` and `GATEWAY_IP_ADDR = 10.0.0.1` as
+compile-time constants (each already marked `// TODO: Make this
+configurable` in the source), and `boxer/src/publish.rs:27`'s `GUEST_IP`
+mirrors the same hardcoded `10.0.0.2` as the forward target for published
+ports. Every box's guest network stack believes this is its address and its
+only gateway, regardless of which `--net <device>` the box is attached to or
+what host-side IP `tun-setup.sh -i` assigned that device.
+
+Confirmed live: `boxer` also flatly refuses two processes attaching to the
+same TUN device concurrently (`tun device 'tun99' is already in use`,
+matching the fork-less, one-guest-thread-of-one-process model
+`litebox_shim_linux/src/lib.rs:1430` documents), so composing two boxes at
+all requires two separate TUN devices. `tun-setup.sh -t tun98 -i 10.0.1.1`
+correctly assigns a second device its own distinct host-side address. But a
+box attached via `--net tun98` never learns that its own gateway is
+`10.0.1.1` -- its guest routing table only ever contains the hardcoded
+`10.0.0.0/24`, so a guest `connect()` aimed at `10.0.1.1` (a different
+subnet, from the guest's point of view) has no route and hangs indefinitely
+rather than failing fast. This was verified by elimination: a plain host
+process binding and self-connecting to `10.0.0.1` (the first, default
+device) round-trips correctly; the same pattern against a correctly-assigned
+second device's `10.0.1.1` does not, and the guest-side hang was traced to
+the missing route rather than to any transport-layer failure.
+
+Practical consequence: a box can only ever reach *its own* device's fixed
+`10.0.0.1` -- it cannot be pointed at a different box's host address to
+reach it directly. The composition shape that *does* work today (proven live
+this pass) is host-mediated: each box's guest talks only to a process bound
+on its own `10.0.0.1`, and that host-side process is free to relay onward
+however it likes (including to a different box's published port on the
+host's loopback, which the host itself can always reach regardless of which
+TUN device is involved). True peer-addressed box-to-box networking -- box A's
+guest directly reaching box B's guest by a distinguishing address -- needs
+`GATEWAY_IP_ADDR`/`INTERFACE_IP_ADDR` parameterized per `--net` device (the
+TODO already on record) or per-box network namespaces, either a real
+`litebox`/`boxer` core change, not something expressible from the CLI today.
