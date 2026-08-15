@@ -228,28 +228,33 @@ fn logical_lines(text: &str, escape: char) -> anyhow::Result<Vec<LogicalLine>> {
             }
         }
 
-        // Collect heredoc bodies named on this line.
+        // Collect heredoc bodies named on this line. Only RUN/COPY/ADD carry
+        // heredocs (matching BuildKit); scanning every instruction turned a
+        // `<<` in shell arithmetic or an ENV/LABEL value into a phantom
+        // heredoc that broke or silently truncated the build.
         let mut heredocs = Vec::new();
-        for (name, strip_tabs) in heredoc_markers(&logical) {
-            let mut body = String::new();
-            let mut terminated = false;
-            for (_, body_line) in lines.by_ref() {
-                let candidate = if strip_tabs {
-                    body_line.trim_start_matches('\t')
-                } else {
-                    body_line
-                };
-                if candidate == name {
-                    terminated = true;
-                    break;
+        if instruction_takes_heredoc(&logical) {
+            for (name, strip_tabs) in heredoc_markers(&logical) {
+                let mut body = String::new();
+                let mut terminated = false;
+                for (_, body_line) in lines.by_ref() {
+                    let candidate = if strip_tabs {
+                        body_line.trim_start_matches('\t')
+                    } else {
+                        body_line
+                    };
+                    if candidate == name {
+                        terminated = true;
+                        break;
+                    }
+                    body.push_str(candidate);
+                    body.push('\n');
                 }
-                body.push_str(candidate);
-                body.push('\n');
+                if !terminated {
+                    bail!("line {number}: heredoc <<{name} is never terminated");
+                }
+                heredocs.push(Heredoc { name, body });
             }
-            if !terminated {
-                bail!("line {number}: heredoc <<{name} is never terminated");
-            }
-            heredocs.push(Heredoc { name, body });
         }
 
         result.push(LogicalLine {
@@ -272,6 +277,20 @@ fn heredoc_markers(line: &str) -> Vec<(String, bool)> {
             // "<<" inside a shell redirection like "cat << EOF" counts; the
             // docker grammar requires the name to follow immediately, with an
             // optional '-' for tab stripping.
+            //
+            // The `<<` must also begin a shell word (optionally behind an fd
+            // number like `2<<EOF`), matching BuildKit's per-word
+            // `^(\d*)<<...` rule. Without this, `1<<8` inside `$((...))` or a
+            // quoted `'1<<20'` would be misread as a heredoc named `8`/`20`.
+            let mut word_start = i;
+            while word_start > 0 && bytes[word_start - 1].is_ascii_digit() {
+                word_start -= 1;
+            }
+            let at_word_start = word_start == 0 || bytes[word_start - 1].is_ascii_whitespace();
+            if !at_word_start {
+                i += 1;
+                continue;
+            }
             let mut j = i + 2;
             let strip_tabs = bytes.get(j) == Some(&b'-');
             if strip_tabs {
@@ -305,6 +324,29 @@ fn heredoc_markers(line: &str) -> Vec<(String, bool)> {
         i += 1;
     }
     markers
+}
+
+/// Whether an instruction can carry a heredoc body: RUN, COPY, or ADD, matching
+/// BuildKit -- optionally behind an `ONBUILD` prefix. Every other instruction
+/// treats `<<` in its text as literal.
+fn instruction_takes_heredoc(logical: &str) -> bool {
+    fn takes(kw: &str) -> bool {
+        kw.eq_ignore_ascii_case("RUN")
+            || kw.eq_ignore_ascii_case("COPY")
+            || kw.eq_ignore_ascii_case("ADD")
+    }
+    let Some((kw, rest)) = split_keyword(logical) else {
+        return false;
+    };
+    if takes(kw) {
+        return true;
+    }
+    if kw.eq_ignore_ascii_case("ONBUILD")
+        && let Some((inner, _)) = split_keyword(rest)
+    {
+        return takes(inner);
+    }
+    false
 }
 
 fn split_keyword(line: &str) -> Option<(&str, &str)> {

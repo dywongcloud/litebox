@@ -890,6 +890,31 @@ fn extract_local_tar(path: &Path, dest: &Path) -> anyhow::Result<()> {
     .with_context(|| format!("extracting {} into {}", path.display(), dest.display()))
 }
 
+/// The RUN shell-form command line with its heredoc marker tokens
+/// (`<<NAME`, `<<-NAME`, `<<"NAME"`, ...) removed, trimmed. Empty means the
+/// RUN had no command of its own -- a `RUN <<EOF` whose body is the script --
+/// versus `RUN python3 <<EOF`, which runs `python3` with the body as input.
+fn command_without_heredoc_markers(line: &str, heredocs: &[Heredoc]) -> String {
+    let mut remaining = line.to_string();
+    for heredoc in heredocs {
+        let name = &heredoc.name;
+        for marker in [
+            format!("<<{name}"),
+            format!("<<-{name}"),
+            format!("<<\"{name}\""),
+            format!("<<-\"{name}\""),
+            format!("<<'{name}'"),
+            format!("<<-'{name}'"),
+        ] {
+            if let Some(pos) = remaining.find(&marker) {
+                remaining.replace_range(pos..pos + marker.len(), "");
+                break;
+            }
+        }
+    }
+    remaining.trim().to_string()
+}
+
 /// Execute RUN inside a chroot of the stage rootfs.
 fn run_in_chroot(
     state: &mut StageState,
@@ -912,12 +937,45 @@ fn run_in_chroot(
     // rootfs; plain shell form goes through the stage shell.
     let script_path = state.rootfs.join("tmp/.boxer-run-script");
     let mut cleanup_script = false;
-    let argv: Vec<String> = if let Some(heredoc) = heredocs.first() {
+    let argv: Vec<String> = if let Some(first) = heredocs.first() {
         std::fs::create_dir_all(state.rootfs.join("tmp"))?;
-        std::fs::write(&script_path, heredoc.body.as_bytes())?;
+
+        // `RUN <<EOF` with an empty command line runs the body itself as a
+        // script; `RUN cmd <<EOF` runs `cmd` with the body as its heredoc
+        // input (Docker's `RUN python3 <<EOF` feeds the body to python3, not
+        // /bin/sh). Distinguish by whether anything survives removing the
+        // heredoc markers from the shell-form command line.
+        let command_line = match command {
+            Command::Shell(text) => Some(text.clone()),
+            Command::Exec(_) => None,
+        };
+        let leading = command_line
+            .as_deref()
+            .map(|line| command_without_heredoc_markers(line, heredocs))
+            .unwrap_or_default();
+
+        let has_command = !leading.is_empty();
+        let script_content = if has_command {
+            // Reconstruct the shell heredoc so a real shell runs the named
+            // command with the body(ies) as its input, in order.
+            let mut script = command_line.clone().unwrap_or_default();
+            script.push('\n');
+            for heredoc in heredocs {
+                script.push_str(&heredoc.body);
+                script.push_str(&heredoc.name);
+                script.push('\n');
+            }
+            script
+        } else {
+            // No command: the first body is the script.
+            first.body.clone()
+        };
+        std::fs::write(&script_path, script_content.as_bytes())?;
         set_mode(&script_path, 0o755)?;
         cleanup_script = true;
-        if heredoc.body.starts_with("#!") {
+
+        if !has_command && first.body.starts_with("#!") {
+            // A shebang body executes directly; the interpreter is its own.
             vec![String::from("/tmp/.boxer-run-script")]
         } else {
             // The script is a file, not a command string: interpreter + path,
