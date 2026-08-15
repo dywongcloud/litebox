@@ -114,6 +114,30 @@ fn host_image_arch() -> oci_spec::image::Arch {
     }
 }
 
+/// Refuse an image whose config architecture contradicts the requested one.
+///
+/// `wanted_arch` is the OCI arch name (`"amd64"`/`"arm64"`); `source` names the
+/// image for the error. A config that is unparseable or omits `architecture` is
+/// accepted -- there is nothing to contradict, matching how the archive path
+/// treats a config without the field.
+///
+/// Both image sources funnel through this one check: the registry pull (where
+/// oci-client's platform_resolver only guards multi-arch manifest lists, not a
+/// single-manifest image) and the archive loader.
+pub fn verify_config_architecture(
+    config_json: &[u8],
+    wanted_arch: &str,
+    source: &str,
+) -> anyhow::Result<()> {
+    if let Ok(config) = serde_json::from_slice::<serde_json::Value>(config_json)
+        && let Some(arch) = config.get("architecture").and_then(|a| a.as_str())
+        && arch != wanted_arch
+    {
+        anyhow::bail!("{source} is a {arch} image but platform linux/{wanted_arch} was requested");
+    }
+    Ok(())
+}
+
 /// As [`pull_and_extract`], but selecting an explicit target architecture
 /// (`None` selects the host architecture). When the registry's manifest list
 /// has no Linux entry for the requested architecture, the error names the
@@ -223,7 +247,21 @@ pub fn pull_and_extract_for_platform(
         })
         .collect();
 
-    extract_image_layers(&layers, image_data.config.data.to_vec(), verbose)
+    let config_json = image_data.config.data.to_vec();
+
+    // oci-client's platform_resolver only runs for multi-arch manifest LISTS.
+    // A single-manifest image (a classic `docker push`) is returned as-is with
+    // no architecture check, so a request for one platform could silently pull
+    // and mislabel an image built for another. The image's config records its
+    // real architecture; refuse a mismatch here, mirroring the archive path, so
+    // `--platform` is honored rather than producing a foreign-arch box.
+    verify_config_architecture(
+        &config_json,
+        &wanted_arch.to_string(),
+        &format!("registry image {reference}"),
+    )?;
+
+    extract_image_layers(&layers, config_json, verbose)
 }
 
 /// Resolve the credentials to authenticate a pull with.
@@ -1387,6 +1425,29 @@ mod tests {
             rootfs.exists(),
             "the rootfs itself must survive a malformed whiteout"
         );
+    }
+
+    #[test]
+    fn config_arch_mismatch_is_refused() {
+        // A single-manifest image whose config architecture differs from the
+        // requested platform must be refused, not silently mislabeled (F14).
+        let amd64_config = br#"{"architecture":"amd64","os":"linux"}"#;
+        let err = verify_config_architecture(amd64_config, "arm64", "registry image test:latest")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("amd64"), "error names the actual arch: {err}");
+        assert!(
+            err.contains("arm64"),
+            "error names the requested arch: {err}"
+        );
+
+        // A matching architecture passes.
+        assert!(verify_config_architecture(amd64_config, "amd64", "test").is_ok());
+
+        // A config missing `architecture`, or unparseable, is accepted (nothing
+        // to contradict) -- callers still get the image.
+        assert!(verify_config_architecture(br#"{"os":"linux"}"#, "arm64", "test").is_ok());
+        assert!(verify_config_architecture(b"not json", "arm64", "test").is_ok());
     }
 
     #[test]

@@ -97,17 +97,13 @@ pub fn from_archive(
         .with_context(|| format!("no usable image in {}", path.display()))?;
 
     // The archive's config records the image's actual architecture; refuse a
-    // silent platform mismatch instead of building a mislabeled box.
-    if let Ok(config) = serde_json::from_slice::<serde_json::Value>(&config_json)
-        && let Some(arch) = config.get("architecture").and_then(|a| a.as_str())
-        && arch != platform.oci_arch_name()
-    {
-        bail!(
-            "archive {} contains a {arch} image but --platform requested {}",
-            path.display(),
-            platform
-        );
-    }
+    // silent platform mismatch instead of building a mislabeled box. Shares the
+    // one arch guard with the registry path.
+    litebox_packager::oci::verify_config_architecture(
+        &config_json,
+        platform.oci_arch_name(),
+        &format!("archive {}", path.display()),
+    )?;
 
     extract_image_layers(&layers, config_json, verbose)
 }
