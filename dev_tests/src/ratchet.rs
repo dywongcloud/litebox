@@ -62,14 +62,20 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_windows_userland/", 8),
             ("litebox_runner_lvbs/", 5),
             ("litebox_runner_snp/", 2),
-            // 5, not 4: includes the test-only `ADDRESS_SPACE` and
+            // 7, not 4: includes the test-only `ADDRESS_SPACE` and
             // `ASYNC_SIGNAL` mutexes that serialize tests (see
             // `address_space_guard`), the `EPOLL_NEST_LOCK` global lock
-            // guarding nested-epoll registration, and `AUTOBIND_COUNTER`,
+            // guarding nested-epoll registration, `AUTOBIND_COUNTER`,
             // the monotonic counter Unix-socket autobind draws candidate
             // abstract addresses from (retried against the shared address
-            // table on collision -- see `UnixSocketAddr::bind_and_reserve`).
-            ("litebox_shim_linux/", 5),
+            // table on collision -- see `UnixSocketAddr::bind_and_reserve`),
+            // and the two test-only TUN-pump-lifecycle globals
+            // `PUMP_GENERATION`/`PUMP_HANDLE`: consecutive TUN tests share one
+            // process and one host pump thread, so its generation and join
+            // handle must be process-global to hand the pump off between
+            // sequential tests (same test-serialization category as
+            // `ADDRESS_SPACE`).
+            ("litebox_shim_linux/", 7),
             // 5, not 4: `static INIT_FUNC` arrived with the OP-TEE syscall
             // support in 071841e and the table was never updated, so this count
             // has been stale since well before the macOS work.
