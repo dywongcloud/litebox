@@ -570,14 +570,62 @@ fn extract_layer(
     // read back from `docker save` archives carry generic tar media types
     // regardless of their actual on-disk compression.
     if media_type.contains("gzip") || is_gzip_data(data) {
-        let decoder = flate2::read::GzDecoder::new(data);
+        // MultiGzDecoder, not GzDecoder: a layer may be several concatenated
+        // gzip members (the format allows it and some tooling emits it), and
+        // the single-member decoder would stop after the first, truncating the
+        // tar and dropping every file in later members.
+        let decoder = flate2::read::MultiGzDecoder::new(data);
         extract_tar(decoder, rootfs, symlinks, permissions)
     } else if media_type.contains("zstd") || is_zstd_data(data) {
-        let decoder = ruzstd::decoding::StreamingDecoder::new(data)
-            .context("failed to initialize zstd decoder for layer")?;
+        // Likewise a zstd layer may be several concatenated frames; decode all
+        // of them rather than stopping at the first.
+        let decoder = MultiFrameZstdDecoder::new(data)?;
         extract_tar(decoder, rootfs, symlinks, permissions)
     } else {
         extract_tar(data, rootfs, symlinks, permissions)
+    }
+}
+
+/// A `Read` adapter that decodes concatenated zstd frames as one continuous
+/// stream. ruzstd's `StreamingDecoder` stops at the end of a single frame; a
+/// tar layer may legally be several frames back to back, so when one frame ends
+/// this restarts the decoder on the remaining input. A non-frame tail (trailing
+/// padding, say) simply ends the stream.
+struct MultiFrameZstdDecoder<'a> {
+    decoder: Option<ruzstd::decoding::StreamingDecoder<&'a [u8], ruzstd::decoding::FrameDecoder>>,
+}
+
+impl<'a> MultiFrameZstdDecoder<'a> {
+    fn new(data: &'a [u8]) -> anyhow::Result<Self> {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(data)
+            .context("failed to initialize zstd decoder for layer")?;
+        Ok(Self {
+            decoder: Some(decoder),
+        })
+    }
+}
+
+impl std::io::Read for MultiFrameZstdDecoder<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let Some(decoder) = self.decoder.as_mut() else {
+                return Ok(0);
+            };
+            let read = decoder.read(buf)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            // The current frame is drained. Recover the bytes after it and, if
+            // another frame follows, decode that; otherwise the stream is done.
+            let rest = self.decoder.take().expect("decoder present").into_inner();
+            if rest.is_empty() {
+                return Ok(0);
+            }
+            match ruzstd::decoding::StreamingDecoder::new(rest) {
+                Ok(next) => self.decoder = Some(next),
+                Err(_) => return Ok(0),
+            }
+        }
     }
 }
 
@@ -1395,6 +1443,110 @@ mod tests {
             .append_data(&mut header, name, std::io::empty())
             .unwrap();
         builder.into_inner().unwrap()
+    }
+
+    /// One tar byte stream carrying two regular files.
+    fn two_file_tar() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            for (name, data) in [("a.txt", &b"aaaa"[..]), ("b.txt", &b"bbbb"[..])] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(0o644);
+                builder.append_data(&mut header, name, data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn multi_member_gzip_layer_recovers_all_files() {
+        use std::io::{Read as _, Write as _};
+        // Split one tar stream across two gzip members. A single-member decoder
+        // stops after the first, truncating the tar (sweep round 2).
+        let tar_bytes = two_file_tar();
+        let mid = tar_bytes.len() / 2;
+        let mut multi = Vec::new();
+        for chunk in [&tar_bytes[..mid], &tar_bytes[mid..]] {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(chunk).unwrap();
+            multi.extend(enc.finish().unwrap());
+        }
+
+        // Control: the single-member decoder truncates below the full tar size.
+        let mut single = Vec::new();
+        flate2::read::GzDecoder::new(&multi[..])
+            .read_to_end(&mut single)
+            .ok();
+        assert!(
+            single.len() < tar_bytes.len(),
+            "expected the single-member decoder to truncate the stream"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let mut symlinks = Vec::new();
+        let mut permissions = HashMap::new();
+        extract_layer(
+            &multi,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            &rootfs,
+            &mut symlinks,
+            &mut permissions,
+        )
+        .unwrap();
+        assert!(rootfs.join("a.txt").exists(), "first gzip member lost");
+        assert!(
+            rootfs.join("b.txt").exists(),
+            "second gzip member lost (multi-member truncation)"
+        );
+    }
+
+    #[test]
+    fn multi_frame_zstd_layer_recovers_all_files() {
+        use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+        use std::io::Read as _;
+        // Split one tar stream across two zstd frames.
+        let tar_bytes = two_file_tar();
+        let mid = tar_bytes.len() / 2;
+        let mut multi = Vec::new();
+        for chunk in [&tar_bytes[..mid], &tar_bytes[mid..]] {
+            multi.extend(compress_to_vec(chunk, CompressionLevel::Uncompressed));
+        }
+
+        // Control: a single-frame decoder stops after the first frame.
+        let mut single = Vec::new();
+        ruzstd::decoding::StreamingDecoder::new(&multi[..])
+            .unwrap()
+            .read_to_end(&mut single)
+            .unwrap();
+        assert!(
+            single.len() < tar_bytes.len(),
+            "expected the single-frame decoder to truncate the stream"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let mut symlinks = Vec::new();
+        let mut permissions = HashMap::new();
+        extract_layer(
+            &multi,
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            &rootfs,
+            &mut symlinks,
+            &mut permissions,
+        )
+        .unwrap();
+        assert!(rootfs.join("a.txt").exists(), "first zstd frame lost");
+        assert!(
+            rootfs.join("b.txt").exists(),
+            "second zstd frame lost (multi-frame truncation)"
+        );
     }
 
     #[test]
