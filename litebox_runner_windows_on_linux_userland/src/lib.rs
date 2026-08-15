@@ -67,7 +67,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let tar_data = std::fs::read(tar_file)
         .with_context(|| format!("Could not read tar file at {}", tar_file.display()))?;
 
-    let platform = LinuxUserland::new(None);
+    let platform = LinuxUserland::new(None)
+        .map_err(|e| anyhow::anyhow!("failed to initialize the platform: {e}"))?;
     let shim_builder = litebox_shim_windows::WindowsShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 

@@ -37,8 +37,15 @@ pub struct ElfParsedFile {
 pub struct MappingInfo {
     /// The base address where the ELF file is mapped.
     pub base_addr: usize,
-    /// The program break (end of all mapped segments).
+    /// The program break (end of all mapped segments). May sit above
+    /// [`Self::mapped_end`] when a trampoline reserve was added: that reserve
+    /// is address space accounted for but not actually mapped.
     pub brk: usize,
+    /// The end of the actually-mapped pages, i.e. `brk` before any
+    /// never-mapped trampoline reserve was added. Unmapping `[base_addr,
+    /// mapped_end)` releases exactly the mapped pages and touches no free
+    /// region -- which some platforms' deallocators require.
+    pub mapped_end: usize,
     /// The entry point, where execution begins.
     pub entry_point: usize,
     /// The mapped address of the program headers.
@@ -509,6 +516,7 @@ impl ElfParsedFile {
         let mut info = MappingInfo {
             base_addr,
             brk,
+            mapped_end: brk,
             entry_point: base_addr.wrapping_add(self.header.e_entry.trunc()),
             phdrs_addr,
             num_phdrs: self.header.e_phnum.into(),
@@ -516,10 +524,13 @@ impl ElfParsedFile {
 
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, &mut info)?;
+            // The trampoline mapped real pages; the mapped end moves with brk.
+            info.mapped_end = info.brk;
         } else if let Some(size) = reserve_trampoline {
             // Reserve space for a runtime trampoline so brk starts past it.
             // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
             // will allocate the actual trampoline in this region via MAP_FIXED.
+            // `mapped_end` stays at the real end: the reserve is never mapped.
             info.brk = page_align_up(info.brk) + page_align_up(size);
         }
 
@@ -607,6 +618,7 @@ impl ElfParsedFile {
         let mut info = MappingInfo {
             base_addr,
             brk: 0,
+            mapped_end: 0,
             entry_point: 0,
             phdrs_addr: 0,
             num_phdrs: 0,

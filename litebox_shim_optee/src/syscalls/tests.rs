@@ -14,7 +14,7 @@ static INIT_FUNC: spin::Once = spin::Once::new();
 pub(crate) fn init_platform() -> crate::Task {
     INIT_FUNC.call_once(|| {
         #[cfg(target_os = "linux")]
-        let platform = Platform::new(None);
+        let platform = Platform::new(None).expect("test platform initialization");
 
         #[cfg(not(target_os = "linux"))]
         let platform = Platform::new();

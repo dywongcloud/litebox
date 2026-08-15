@@ -73,7 +73,7 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
     static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
     PLATFORM.get_or_init(|| {
         #[cfg(target_os = "linux")]
-        let platform = TestPlatform::new(None);
+        let platform = TestPlatform::new(None).expect("test platform initialization");
 
         #[cfg(target_os = "windows")]
         let platform = TestPlatform::new();
