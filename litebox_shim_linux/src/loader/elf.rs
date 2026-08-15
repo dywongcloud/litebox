@@ -321,6 +321,16 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
             litebox::platform::RawConstPointer::as_usize(&sp),
             super::DEFAULT_STACK_SIZE,
         );
+        // Where each image landed, and where the stack landed: exactly the
+        // placements a cross-process teardown investigation needs, and
+        // invisible in the syscall trace (these are shim-internal mappings).
+        litebox_util_log::debug!(
+            main_base:? = info.base_addr,
+            interp_base:? = interp.as_ref().map(|i| i.base_addr),
+            stack:? = litebox::platform::RawConstPointer::as_usize(&sp),
+            stack_size:? = super::DEFAULT_STACK_SIZE;
+            "loaded program image"
+        );
         let mut stack = UserStack::<Platform>::new(
             UserPtrMut::from_platform_ptr::<Platform>(sp),
             super::DEFAULT_STACK_SIZE,

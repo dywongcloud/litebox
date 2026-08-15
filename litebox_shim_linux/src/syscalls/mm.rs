@@ -643,6 +643,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         debug_assert_eq!(stashed, 0, "the page manager's break is only live in here");
         let result = litebox_common_linux::mm::sys_brk(&self.global.pm, addr);
         let new_brk = self.global.pm.swap_brk(0);
+        // The full swap protocol per call: `stashed` non-zero here means some
+        // other path left its break live in the manager (a protocol breach
+        // this per-process model depends on never happening), and
+        // old->new shows exactly what range a grow/shrink walked -- the
+        // evidence needed when a break operation touches memory it should
+        // not (a cross-process brk was one observed way a forked child
+        // destroyed its suspended parent's heap).
+        litebox_util_log::trace!(
+            pid:? = self.pid, requested:? = addr.as_usize(), old_brk:? = old_brk,
+            stashed:? = stashed, new_brk:? = new_brk;
+            "brk"
+        );
         process.brk.store(new_brk, Ordering::Relaxed);
         // The break's backing pages are this process's mappings like any other.
         let (old_page, new_page) = (align_up(old_brk, PAGE_SIZE), align_up(new_brk, PAGE_SIZE));
@@ -2032,5 +2044,105 @@ mod tests {
 
         task.sys_munmap(addr, 2 * PAGE_SIZE).unwrap();
         task.sys_close(fd).unwrap();
+    }
+
+    /// Regression test: `PageManager::release_memory` must release exactly the
+    /// address ranges the caller names, never the whole tracked mapping those
+    /// ranges happen to fall inside.
+    ///
+    /// The VMA tree coalesces adjacent ranges with identical properties into
+    /// one entry, so two separate `mmap`s that abut are reported as a single
+    /// mapping. That is not an exotic shape here: `Vmem::get_unmmaped_area`
+    /// hands out the address immediately below an existing range, so a guest's
+    /// next anonymous `mmap` routinely lands flush against the previous one --
+    /// and every guest process in this shim shares one page manager, so the
+    /// previous one can belong to a *different* process. `execve`'s teardown
+    /// (`sys_execve`, the `leave_address_space_if_alone` branch) scopes itself
+    /// to the calling process's `owned_ranges` for exactly that reason; before
+    /// this, it still released the whole coalesced entry each owned range
+    /// touched. Observed live as `node -e 'execSync("/bin/sh -c ...")'`: the
+    /// forked child's post-exec `mmap`s abutted 208 KiB of its suspended
+    /// parent's musl heap, the child's second `execve` unmapped all of it, and
+    /// the parent `SIGSEGV`ed on the first libc global it read after taking its
+    /// address space back.
+    #[test]
+    fn release_memory_releases_only_the_named_ranges_of_a_coalesced_mapping() {
+        use litebox::mm::linux::VmFlags;
+
+        let _guard = crate::syscalls::tests::address_space_guard();
+        let task = init_platform(None);
+        let prot = || ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let flags = || MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE;
+
+        // Two *separate* mappings that end up adjacent: take two pages, give
+        // the second back, then claim it again at that exact address. The
+        // second `mmap` is a mapping of its own, but carries the same
+        // properties as the first, so the tree merges them.
+        let mine = task
+            .sys_mmap(0, 2 * PAGE_SIZE, prot(), flags(), -1, 0)
+            .unwrap();
+        let neighbour_addr = mine.as_usize() + PAGE_SIZE;
+        task.sys_munmap(UserPtrMut::from_usize(neighbour_addr), PAGE_SIZE)
+            .unwrap();
+        let neighbour = task
+            .sys_mmap(
+                neighbour_addr,
+                PAGE_SIZE,
+                prot(),
+                flags() | MapFlags::MAP_FIXED,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(neighbour.as_usize(), neighbour_addr);
+
+        let entry = |addr: usize| {
+            task.global
+                .pm
+                .mappings()
+                .into_iter()
+                .find(|(r, _)| r.contains(&addr))
+        };
+        let (merged, _) = entry(mine.as_usize()).expect("the first mapping should be tracked");
+        assert!(
+            merged.contains(&neighbour_addr),
+            "precondition: the two adjacent mappings should be tracked as one entry \
+             ({merged:?} should cover {neighbour_addr:#x}). If they no longer coalesce, the \
+             cross-owner teardown this test pins cannot happen -- revisit the test, not the fix."
+        );
+
+        // Release only the first page, exactly as `execve` names the calling
+        // process's own ranges out of a mapping it may share with a sibling.
+        let mine_range = mine.as_usize()..mine.as_usize() + PAGE_SIZE;
+        // SAFETY: nothing holds references into the first page; the test does
+        // not touch it again.
+        unsafe {
+            task.global
+                .pm
+                .release_memory(|r: core::ops::Range<usize>, _: VmFlags| {
+                    let start = r.start.max(mine_range.start);
+                    let end = r.end.min(mine_range.end);
+                    (start < end).then_some(start..end)
+                })
+        }
+        .unwrap();
+
+        assert!(
+            entry(mine.as_usize()).is_none(),
+            "the named range should have been released"
+        );
+        let (survivor, flags) = entry(neighbour_addr)
+            .expect("the neighbour's page must survive a release that did not name it");
+        assert_eq!(survivor, neighbour_addr..neighbour_addr + PAGE_SIZE);
+        assert!(flags.contains(VmFlags::VM_READ | VmFlags::VM_WRITE));
+        // Still really mapped, not merely still tracked: this is the failure
+        // that killed the parent process, since `remove_mapping` unmaps at the
+        // host before it forgets the range.
+        neighbour
+            .write_slice_at_offset::<Platform>(0, &[0xab; 8])
+            .expect("the surviving page must still be writable");
+        assert_eq!(neighbour.read_at_offset::<Platform>(0).unwrap(), 0xab);
+
+        task.sys_munmap(neighbour, PAGE_SIZE).unwrap();
     }
 }

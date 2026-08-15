@@ -1673,11 +1673,55 @@ pub enum EpollOp {
     EpollCtlMod = 3,
 }
 
+/// The kernel's `struct epoll_event`.
+///
+/// x86-64 Linux declares it `__attribute__((packed))` (12 bytes, `data` at
+/// offset 4); every other architecture -- aarch64 included -- uses natural
+/// alignment (16 bytes, 4 padding bytes after `events`, `data` at offset 8).
+/// Handing a packed layout to an aarch64 guest made it misparse every event
+/// array `epoll_wait` returned: single events happened to read a `data` of
+/// ~0 and misdispatched harmlessly, but a multi-event wakeup straddled the
+/// 12-vs-16-byte stride into garbage fds -- observed live as libuv's
+/// `uv__io_poll` aborting on `Assertion failed: fd >= 0` the first time a
+/// spawned child's stdio produced three simultaneous events.
+///
+/// Construct via [`EpollEvent::new`]; the aarch64 variant carries the padding
+/// as an explicit field so `IntoBytes` stays derivable (zerocopy rejects
+/// implicit padding).
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 #[repr(C, packed)]
 pub struct EpollEvent {
     pub events: u32,
     pub data: u64,
+}
+
+/// See the x86-64 variant's doc comment for why the layout is per-arch.
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct EpollEvent {
+    pub events: u32,
+    _pad: u32,
+    pub data: u64,
+}
+
+impl EpollEvent {
+    #[must_use]
+    pub fn new(events: u32, data: u64) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self { events, data }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self {
+                events,
+                _pad: 0,
+                data,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]

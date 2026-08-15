@@ -97,6 +97,29 @@ impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
 }
 
 /// Thread state that can be accessed from a remote thread.
+/// Closed bit of [`Process::fork_gate`]'s word; the low 31 bits count parked
+/// threads.
+const FORK_GATE_CLOSED: u32 = 1 << 31;
+
+/// Reopens a [`Process::fork_gate`] closed by
+/// [`Task::park_sibling_threads_for_fork`] when dropped, releasing every
+/// parked sibling. Held across the whole of `do_fork`'s remaining body --
+/// including the parent's suspension for the child's address-space turn -- so
+/// the gate reopens on success, on any error return, and on panic alike.
+struct ForkGateGuard<'a, Platform: ShimPlatform> {
+    process: &'a Process<Platform>,
+}
+
+impl<Platform: ShimPlatform> Drop for ForkGateGuard<'_, Platform> {
+    fn drop(&mut self) {
+        self.process
+            .fork_gate
+            .underlying_atomic()
+            .fetch_and(!FORK_GATE_CLOSED, Ordering::AcqRel);
+        self.process.fork_gate.wake_all();
+    }
+}
+
 struct ThreadRemote<Platform: ShimPlatform> {
     /// Always set under the process `inner` lock, but can be read without
     /// locking.
@@ -125,6 +148,25 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
     /// mutex lock.
     nr_threads: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// Stop-the-world gate for `fork` from a multithreaded process.
+    ///
+    /// The delayed-address-space-handoff fork model (see [`SharedAddressSpace`])
+    /// requires that no sibling thread touches guest memory during the child's
+    /// turn: the parent's private memory is snapshotted at `fork` and restored
+    /// when the turn comes back, so a sibling that kept running would have its
+    /// writes silently rolled back. Rather than refusing `fork` outright for
+    /// multithreaded guests (which breaks every libuv/Node `spawn`, whose
+    /// child does nothing but the classic dup2/close/execve dance), the
+    /// forking thread closes this gate: every sibling parks here -- woken out
+    /// of any interruptible wait by [`ThreadRemote::interrupt`] and caught at
+    /// the [`CheckForInterrupt::check_for_interrupt`]/
+    /// [`Task::prepare_to_run_guest`] choke points before it can touch guest
+    /// memory again -- until the parent's turn resumes and the gate reopens.
+    ///
+    /// Word layout: bit 31 = closed; low 31 bits = number of currently-parked
+    /// threads. Mirrors how `nr_threads` uses its `RawMutex` word purely as a
+    /// blockable atomic.
+    fork_gate: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits,
@@ -599,8 +641,11 @@ impl<Platform: ShimPlatform> Process<Platform> {
     fn new(pid: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
+        let fork_gate = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        fork_gate.underlying_atomic().store(0, Ordering::Relaxed);
         Self {
             nr_threads,
+            fork_gate,
             inner: Mutex::new(ProcessInner {
                 exit_status: ExitStatus::Exit(0),
                 group_exit: false,
@@ -621,6 +666,38 @@ impl<Platform: ShimPlatform> Process<Platform> {
     /// Returns the current number of threads in this process.
     pub fn nr_threads(&self) -> u32 {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
+    }
+
+    /// Parks the calling thread while this process's fork gate is closed.
+    ///
+    /// The fast path -- gate open, the only case any thread sees outside a
+    /// concurrent multithreaded `fork` -- is a single atomic load. A parked
+    /// thread blocks on the raw gate word (never an interruptible wait: this
+    /// is called from [`CheckForInterrupt::check_for_interrupt`], whose
+    /// contract forbids interruptible waiting) and resumes when
+    /// [`ForkGateGuard`] reopens the gate. An exiting thread never parks --
+    /// it proceeds to detach, and `detach_thread` wakes the gate so the
+    /// forker re-evaluates how many siblings it is still waiting for.
+    fn park_while_fork_gate_closed(&self, is_exiting: bool) {
+        let word = self.fork_gate.underlying_atomic();
+        if word.load(Ordering::Acquire) & FORK_GATE_CLOSED == 0 {
+            return;
+        }
+        if is_exiting {
+            return;
+        }
+        word.fetch_add(1, Ordering::AcqRel);
+        // The forker blocks on this same word until enough siblings are
+        // parked; every increment must wake it to re-count.
+        self.fork_gate.wake_all();
+        loop {
+            let cur = word.load(Ordering::Acquire);
+            if cur & FORK_GATE_CLOSED == 0 {
+                break;
+            }
+            let _ = self.fork_gate.block(cur);
+        }
+        word.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
@@ -687,6 +764,12 @@ impl<Platform: ShimPlatform> Process<Platform> {
         if notify {
             self.nr_threads.wake_all();
         }
+        // A forker blocked in `park_sibling_threads_for_fork` counts parked
+        // siblings against `nr_threads`; an exiting sibling shrinks the
+        // latter without ever parking, so the forker must recount.
+        if self.fork_gate.underlying_atomic().load(Ordering::Acquire) & FORK_GATE_CLOSED != 0 {
+            self.fork_gate.wake_all();
+        }
         is_last_thread
     }
 }
@@ -716,6 +799,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             thread.is_exiting.store(true, Ordering::Relaxed);
             thread.interrupt();
         }
+    }
+
+    /// Closes the process's fork gate and waits until every sibling thread is
+    /// parked at it, so the caller can take the address-space turn (see
+    /// [`SharedAddressSpace`]) with the same guarantees a single-threaded
+    /// process has: nothing else will touch guest memory until the returned
+    /// guard reopens the gate.
+    ///
+    /// Modeled on [`Self::kill_other_threads`]'s stop-the-world shape:
+    /// interrupt every sibling ([`ThreadRemote::interrupt`] wakes a thread
+    /// blocked in any interruptible shim wait, and yanks one executing guest
+    /// code back into the shim via the platform interrupt), then block on the
+    /// gate word until the parked count accounts for every sibling. A sibling
+    /// mid-syscall parks at the next
+    /// [`CheckForInterrupt::check_for_interrupt`] or
+    /// [`Task::prepare_to_run_guest`] point -- in particular, one mid-copy
+    /// into guest memory finishes that copy *before* parking, so the snapshot
+    /// taken after this returns cannot lose an in-flight write. Siblings that
+    /// exit instead of parking are handled by `detach_thread` waking the gate
+    /// so the count converges either way.
+    /// [`Process::park_while_fork_gate_closed`] for this task; see
+    /// `Process::fork_gate`. Called from the two guest-memory choke points in
+    /// `crate::wait`.
+    pub(crate) fn park_while_fork_gate_closed(&self) {
+        self.process()
+            .park_while_fork_gate_closed(self.is_exiting());
+    }
+
+    fn park_sibling_threads_for_fork(&self) -> ForkGateGuard<'_, Platform> {
+        let process = self.process();
+        let word = process.fork_gate.underlying_atomic();
+        // If another thread is mid-fork, park like any other sibling until
+        // its gate reopens, then take our own turn.
+        loop {
+            let prev = word.fetch_or(FORK_GATE_CLOSED, Ordering::AcqRel);
+            if prev & FORK_GATE_CLOSED == 0 {
+                break;
+            }
+            process.park_while_fork_gate_closed(self.is_exiting());
+        }
+        let guard = ForkGateGuard { process };
+        {
+            let inner = process.inner.lock();
+            for (&tid, thread) in &inner.threads {
+                if tid != self.tid {
+                    thread.interrupt();
+                }
+            }
+        }
+        loop {
+            let cur = word.load(Ordering::Acquire);
+            let parked = cur & !FORK_GATE_CLOSED;
+            let others = process.nr_threads().saturating_sub(1);
+            if parked >= others {
+                break;
+            }
+            let _ = process.fork_gate.block(cur);
+        }
+        guard
     }
 
     /// Kills all other threads in the process, waiting for them to exit.
@@ -1354,13 +1496,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
         // The child runs on this process's memory and takes a turn at it (see
-        // `SharedAddressSpace`), which only works if this thread is the only one running on that
-        // memory. A sibling thread has no turn to lose and would keep writing to pages the child
-        // is about to have rolled back under it. Refuse loudly instead of corrupting both.
-        if self.process().nr_threads() > 1 {
-            log_unsupported!("fork from a multithreaded process");
-            return Err(Errno::ENOSYS);
-        }
+        // `SharedAddressSpace`), which only works while nothing else is running on that memory.
+        // A sibling thread has no turn to lose and would keep writing to pages the child is
+        // about to have rolled back under it -- so for a multithreaded caller (libuv's
+        // fork/dup2/execve spawn path is the motivating case: Node's threadpool exists by the
+        // time the first `child_process` call forks), park every sibling at the process's fork
+        // gate for the duration of the child's turn. The guard reopens the gate when this
+        // thread's turn resumes, on error, and on panic alike.
+        let _fork_gate_guard = if self.process().nr_threads() > 1 {
+            Some(self.park_sibling_threads_for_fork())
+        } else {
+            None
+        };
 
         // The child runs on this thread's guest stack, below this thread's current `sp`, and gets
         // the address-space token, so the parent must not touch guest memory again until it takes
@@ -1658,8 +1805,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // Only reachable if another member of the address space unmapped or
                 // write-protected memory belonging to this process, which no correct program
                 // does; this process is left with whatever that member made of it.
+                let pm_view = self
+                    .global
+                    .pm
+                    .mappings()
+                    .into_iter()
+                    .find(|(range, _)| range.contains(&start))
+                    .map(|(range, flags)| (range.start, range.end, flags));
                 litebox_util_log::error!(
-                    pid:? = self.pid, start:? = start;
+                    pid:? = self.pid, start:? = start, len:? = bytes.len(), pm_view:? = pm_view;
                     "failed to restore a mapping when taking the address space back"
                 );
             }
@@ -2913,8 +3067,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.signals.reset_for_exec();
 
         if self.leave_address_space_if_alone() {
-            // Don't release reserved mappings.
-            let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
+            // Release only the mappings this process owns, not everything the
+            // (process-blind) page manager tracks. "Alone in the shared
+            // address space" -- or never having shared at all -- does not
+            // mean alone in the page manager: a forked child that already
+            // completed one exec has left the shared space, yet its suspended
+            // parent's entire live memory is still in the manager, and a
+            // release-everything here destroys it. Observed live as Node's
+            // `execSync("/bin/sh -c ...")`: fork, exec /bin/sh (first exec
+            // keeps the parent's memory via the branch below), sh execs the
+            // command (second exec took this branch and unmapped the
+            // suspended parent wholesale -- every one of its subsequent
+            // address-space restores failed and it died on the first libc
+            // global it touched). `owned_ranges` exists precisely to name
+            // which mappings are this process's, and the fork/exec paths
+            // maintain it for every mapping source (mmap, mremap, brk, the
+            // loader's stack); reserved mappings carry empty `VmFlags` and
+            // are skipped as before.
+            //
+            // What is released is the *intersection* with `owned_ranges`, never a whole tracked
+            // mapping that merely overlaps it. The page manager coalesces adjacent ranges with
+            // identical properties into a single entry (see `PageManager::mappings`), and
+            // adjacency between this process's memory and a suspended sibling's is not a
+            // coincidence here: `Vmem::get_unmmaped_area` hands out the address immediately below
+            // an existing range, so a forked child's very first anonymous `mmap` lands flush
+            // against whatever its parent had there. Observed live, exactly so: the
+            // `execSync("/bin/sh -c ...")` child `mmap`ed 16 KiB that abutted 48 KiB of its
+            // parent's musl heap, and (via `mprotect`) another 16 KiB that abutted 160 KiB more
+            // of it -- four of the parent's ranges the manager had silently merged into two of
+            // this process's -- and a whole-entry release then unmapped all 208 KiB of the
+            // parent's, which died on the first libc global it touched after taking its address
+            // space back.
+            let owned = self.process().owned_ranges.lock();
+            let release = |r: Range<usize>, vm: VmFlags| {
+                if vm.is_empty() {
+                    Vec::new()
+                } else {
+                    owned.intersect(&r).collect::<Vec<_>>()
+                }
+            };
             unsafe { self.global.pm.release_memory(release) }
                 .expect("failed to release memory mappings");
         } else {
@@ -4368,10 +4559,7 @@ mod tests {
         let epfd = writer_task
             .sys_epoll_create(EpollCreateFlags::empty())
             .expect("epoll_create failed");
-        let event = EpollEvent {
-            events: litebox::event::Events::OUT.bits(),
-            data: 0,
-        };
+        let event = EpollEvent::new(litebox::event::Events::OUT.bits(), 0);
         writer_task
             .sys_epoll_ctl(
                 i32::try_from(epfd).unwrap(),

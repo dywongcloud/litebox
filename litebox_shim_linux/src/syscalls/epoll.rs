@@ -482,10 +482,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
         if events.is_empty() {
             Some((None, false))
         } else {
-            let event = Some(EpollEvent {
-                events: events.bits(),
-                data: inner.data,
-            });
+            let event = Some(EpollEvent::new(events.bits(), inner.data));
 
             // keep the entry in the ready list if it is not edge-triggered or one-shot
             let is_still_ready = event.is_some()
@@ -795,10 +792,7 @@ mod test {
                     &epoll_fd,
                     10,
                     &reader,
-                    EpollEvent {
-                        events: Events::IN.bits(),
-                        data: 0,
-                    },
+                    EpollEvent::new(Events::IN.bits(), 0),
                 )
             })
             .unwrap();
@@ -853,10 +847,7 @@ mod test {
                     &inner_fd,
                     20,
                     &reader,
-                    EpollEvent {
-                        events: Events::IN.bits(),
-                        data: 0,
-                    },
+                    EpollEvent::new(Events::IN.bits(), 0),
                 )
             })
             .unwrap();
@@ -876,10 +867,7 @@ mod test {
                     &outer_fd,
                     10,
                     &nested,
-                    EpollEvent {
-                        events: Events::IN.bits(),
-                        data: 42,
-                    },
+                    EpollEvent::new(Events::IN.bits(), 42),
                 )
             })
             .unwrap();
@@ -921,10 +909,7 @@ mod test {
                     &a_fd,
                     20,
                     &super::EpollDescriptor::Epoll(Arc::clone(&b_fd)),
-                    EpollEvent {
-                        events: Events::IN.bits(),
-                        data: 0,
-                    },
+                    EpollEvent::new(Events::IN.bits(), 0),
                 )
             })
             .unwrap();
@@ -944,10 +929,7 @@ mod test {
                 &b_fd,
                 10,
                 &super::EpollDescriptor::Epoll(Arc::clone(&a_fd)),
-                EpollEvent {
-                    events: Events::IN.bits(),
-                    data: 0,
-                },
+                EpollEvent::new(Events::IN.bits(), 0),
             )
         });
         assert_eq!(result, Err(Errno::ELOOP));
@@ -987,10 +969,7 @@ mod test {
                         &a,
                         1000 + iteration,
                         &super::EpollDescriptor::Epoll(Arc::clone(&b)),
-                        EpollEvent {
-                            events: Events::IN.bits(),
-                            data: 0,
-                        },
+                        EpollEvent::new(Events::IN.bits(), 0),
                     )
                 });
                 let _ = tx_a.send(result);
@@ -1009,10 +988,7 @@ mod test {
                         &b,
                         2000 + iteration,
                         &super::EpollDescriptor::Epoll(Arc::clone(&a)),
-                        EpollEvent {
-                            events: Events::IN.bits(),
-                            data: 0,
-                        },
+                        EpollEvent::new(Events::IN.bits(), 0),
                     )
                 });
                 let _ = tx_b.send(result);

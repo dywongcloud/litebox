@@ -378,24 +378,39 @@ where
         Ok(brk)
     }
 
-    /// Release memory mappings that satisfy the given condition and reset the program break.
+    /// Release memory mappings and reset the program break.
+    ///
+    /// `releasable` is called once per tracked mapping and returns the *sub-ranges* of it to
+    /// release, not merely whether to release the whole of it. That distinction is load-bearing,
+    /// because a tracked mapping is not the same thing as a mapping the caller made: the VMA tree
+    /// coalesces adjacent ranges carrying identical properties into a single entry
+    /// (see [`Self::mappings`]), so one entry can span several unrelated `mmap`s -- and, when one
+    /// manager backs more than one owner (litebox's Linux shim runs every guest process against
+    /// one manager, at disjoint addresses in one host address space), several unrelated *owners*.
+    /// A caller that only wants its own memory gone therefore has to be able to name the addresses
+    /// it means; a whole-entry predicate cannot, and releasing the whole entry would unmap a
+    /// neighbour's live memory. Ranges are clamped to the entry they came from, and empty ones are
+    /// skipped, so an owner set that does not intersect an entry simply releases nothing of it.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the released memory regions are no longer used.
-    pub unsafe fn release_memory(
+    pub unsafe fn release_memory<R>(
         &self,
-        releasable: fn(Range<usize>, VmFlags) -> bool,
-    ) -> Result<(), VmemUnmapError> {
+        releasable: impl Fn(Range<usize>, VmFlags) -> R,
+    ) -> Result<(), VmemUnmapError>
+    where
+        R: IntoIterator<Item = Range<usize>>,
+    {
         for (r, vma) in self.mappings() {
-            if !releasable(r.clone(), vma) {
-                continue;
+            for part in releasable(r.clone(), vma) {
+                let Some(range) = PageRange::new(part.start.max(r.start), part.end.min(r.end))
+                else {
+                    continue;
+                };
+                let mut vmem = self.vmem.write();
+                unsafe { vmem.remove_mapping(range) }?;
             }
-            let mut vmem = self.vmem.write();
-            let Some(range) = PageRange::new(r.start, r.end) else {
-                unreachable!()
-            };
-            unsafe { vmem.remove_mapping(range) }?;
         }
 
         // reset brk
@@ -645,6 +660,13 @@ where
     }
 
     /// Returns all mappings in a vector.
+    ///
+    /// One returned range is *not* one `mmap`: the underlying VMA tree coalesces adjacent ranges
+    /// whose properties are identical, so two separately created mappings that happen to abut --
+    /// which is the common case here, since `Vmem::get_unmmaped_area`'s placement search returns
+    /// the address immediately below an existing range -- are reported as a single entry. Any
+    /// caller that acts on a whole returned range therefore acts on memory it may not have
+    /// created; see [`Self::release_memory`], which takes sub-ranges for exactly this reason.
     pub fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
         self.vmem
             .read()

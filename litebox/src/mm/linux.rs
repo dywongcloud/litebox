@@ -388,6 +388,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         range: PageRange<ALIGN>,
     ) -> Result<(), VmemUnmapError> {
+        // Trace-gated twin of `insert_mapping`'s replace log: in a
+        // process-blind manager shared by several guest processes, every
+        // removal is a potential cross-process teardown, and knowing exactly
+        // which ranges were removed (correlated with the shim's own
+        // pid/tid-stamped syscall trace) is what pins down who removed them.
+        litebox_util_log::trace!(
+            start:? = range.start, end:? = range.end;
+            "removing mapping"
+        );
         unsafe {
             self.platform
                 .deallocate_pages(range.into())
@@ -486,6 +495,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             }
             FixedAddressBehavior::Replace => {
                 if self.vmas.overlaps(&(start..end)) {
+                    // A fixed mapping quietly destroying live mappings is the
+                    // correct MAP_FIXED semantic *within one process*, but in
+                    // this process-blind manager it is also how one guest
+                    // process can destroy another's memory -- worth a
+                    // permanent record whenever it fires.
+                    litebox_util_log::debug!(
+                        start:? = start, end:? = end;
+                        "fixed-address mapping replaces existing mapping(s)"
+                    );
                     if self.vmas.gaps(&(start..end)).next().is_some() {
                         // The range is partially overlapping with existing
                         // mappings. If we call into the platform with

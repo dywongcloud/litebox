@@ -36,6 +36,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// exit instead.
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
+        // A sibling `fork` in flight must not see this thread touch guest
+        // memory (see `Process::fork_gate`); park here, before re-entering
+        // guest code, until the forker's turn completes. No-op single load
+        // when no fork is in flight.
+        self.park_while_fork_gate_closed();
         self.wait_state.0.prepare_to_run_guest(|| {
             self.global.platform.take_pending_signals(|signal| {
                 self.queue_signals(signal);
@@ -55,6 +60,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::event::wait::CheckForInterrupt
     for Task<Platform, FS>
 {
     fn check_for_interrupt(&self) -> bool {
+        // See `Process::fork_gate`: a woken waiter passes through here before
+        // re-blocking, which is what lets a forking sibling park a thread that
+        // was asleep in a futex/epoll/read wait. Parking blocks on a raw
+        // (non-interruptible) word, satisfying this hook's no-interruptible-
+        // wait contract.
+        self.park_while_fork_gate_closed();
         self.global.platform.take_pending_signals(|sig| {
             self.queue_signals(sig);
         });
