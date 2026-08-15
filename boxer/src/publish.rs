@@ -15,7 +15,10 @@
 //! task, each direction is a copy that propagates its own half-close, and a
 //! guest that refuses a connection fails that connection only.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4};
+// Only the linux+x86_64 forwarding paths name the enum directly.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::net::SocketAddr;
 
 use anyhow::{Context, bail};
 
