@@ -473,7 +473,21 @@ where
                     Err(linux::VmemMoveError::RemapError(err)) => Err(err),
                 }
             }
-            Err(linux::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
+            Err(linux::VmemResizeError::NotExist(_)) => {
+                // The old range's start is not inside a tracked VMA. For a grow,
+                // degrade to `OutOfMemory` (ENOMEM) instead of the fatal
+                // `AlreadyUnallocated` (EFAULT): this is exactly the errno Linux
+                // returns when an mmap-region grow cannot be satisfied in place,
+                // and it lets a guest heap allocator (musl grows a chunk via
+                // `mremap` without `MREMAP_MAYMOVE`) fall back to allocate-and-copy
+                // rather than treat it as a corrupt pointer and crash. A non-grow
+                // on an untracked range is a genuine bad address and stays EFAULT.
+                if new_size > old_size {
+                    Err(RemapError::OutOfMemory)
+                } else {
+                    Err(RemapError::AlreadyUnallocated)
+                }
+            }
             Err(linux::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
             Err(linux::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
         }
