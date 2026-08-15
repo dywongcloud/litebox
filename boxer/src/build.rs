@@ -95,6 +95,7 @@ pub fn evaluate(dockerfile: &Dockerfile, options: &BuildOptions) -> anyhow::Resu
                 &context_dir,
                 &ignore,
                 &build_args,
+                &dockerfile.pre_from_args,
                 &stages,
                 &mut external_images,
                 options,
@@ -296,6 +297,7 @@ fn apply_instruction(
     context_dir: &Path,
     ignore: &DockerIgnore,
     build_args: &HashMap<String, String>,
+    global_args: &[ArgDecl],
     stages: &[StageState],
     external_images: &mut HashMap<String, ExtractedImage>,
     options: &BuildOptions,
@@ -314,7 +316,18 @@ fn apply_instruction(
         }
         Instruction::Arg(decls) => {
             for ArgDecl { name, default } in decls {
-                let default = default.as_ref().map(|d| expand(state, d));
+                // A bare in-stage `ARG NAME` (no default) inherits the value of
+                // a matching pre-FROM global `ARG NAME=default`, as docker does:
+                // globals go out of scope at the first FROM, and re-declaring the
+                // name without a value pulls the global default back into the
+                // stage. Only an explicit in-stage default overrides that.
+                let default = match default {
+                    Some(d) => Some(expand(state, d)),
+                    None => global_args
+                        .iter()
+                        .find(|a| &a.name == name)
+                        .and_then(|a| a.default.clone()),
+                };
                 state.config.args.insert(name.clone(), default);
             }
         }
@@ -1252,13 +1265,93 @@ impl DockerIgnore {
     }
 
     fn pattern_matches(pattern: &[String], components: &[String]) -> bool {
-        // A pattern matches the path itself or any parent directory of it.
-        if pattern.len() > components.len() {
-            return false;
+        // A pattern matches when it matches a prefix of the path: the path
+        // itself or any ancestor directory (so ignoring a directory ignores
+        // everything beneath it). `**` matches zero or more whole path
+        // components -- `**/node_modules` matches `node_modules` at the root and
+        // at every depth -- so the match cannot be a fixed 1:1 zip; it needs the
+        // backtracking `**` gives.
+        match pattern.split_first() {
+            // The whole pattern was consumed against a prefix of the path.
+            None => true,
+            Some((first, rest)) if first == "**" => {
+                // Try `**` matching no components, then one more each time.
+                Self::pattern_matches(rest, components)
+                    || matches!(components.split_first(),
+                        Some((_, crest)) if Self::pattern_matches(pattern, crest))
+            }
+            Some((first, rest)) => matches!(components.split_first(),
+                Some((c, crest)) if component_match(first, c)
+                    && Self::pattern_matches(rest, crest)),
         }
-        pattern
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ignore_from(lines: &[&str]) -> DockerIgnore {
+        let patterns = lines
             .iter()
-            .zip(components)
-            .all(|(p, c)| p == "**" || component_match(p, c))
+            .map(|line| {
+                let (negated, pattern) = match line.strip_prefix('!') {
+                    Some(rest) => (true, rest),
+                    None => (false, *line),
+                };
+                let components = pattern
+                    .trim_matches('/')
+                    .split('/')
+                    .map(str::to_string)
+                    .collect();
+                (negated, components)
+            })
+            .collect();
+        DockerIgnore { patterns }
+    }
+
+    #[test]
+    fn dockerignore_double_star_matches_any_depth() {
+        // `**/node_modules` must match at the root and at every depth, and
+        // ignoring the directory ignores everything nested under it. The old
+        // 1:1 zip matched `**` against exactly one component, so root-level and
+        // deeply-nested hits were both missed (sweep F13).
+        let ignore = ignore_from(&["**/node_modules"]);
+        assert!(ignore.excluded(Path::new("node_modules")));
+        assert!(ignore.excluded(Path::new("node_modules/left-pad/index.js")));
+        assert!(ignore.excluded(Path::new("a/node_modules")));
+        assert!(ignore.excluded(Path::new("a/b/c/node_modules/pkg.json")));
+        assert!(!ignore.excluded(Path::new("src/app.js")));
+    }
+
+    #[test]
+    fn dockerignore_double_star_suffix_glob() {
+        // `**/*.pem` must reach `.pem` files at any depth, not just one level.
+        let ignore = ignore_from(&["**/*.pem"]);
+        assert!(ignore.excluded(Path::new("key.pem")));
+        assert!(ignore.excluded(Path::new("certs/key.pem")));
+        assert!(ignore.excluded(Path::new("a/b/key.pem")));
+        assert!(!ignore.excluded(Path::new("key.txt")));
+    }
+
+    #[test]
+    fn dockerignore_plain_patterns_unchanged() {
+        // Non-`**` patterns keep their anchored, prefix-matching behavior.
+        let ignore = ignore_from(&["node_modules", "*.log"]);
+        assert!(ignore.excluded(Path::new("node_modules")));
+        assert!(ignore.excluded(Path::new("node_modules/pkg/index.js")));
+        assert!(ignore.excluded(Path::new("build.log")));
+        // Anchored at the root: `*.log` does not reach a nested file.
+        assert!(!ignore.excluded(Path::new("logs/build.log")));
+        assert!(!ignore.excluded(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn dockerignore_negation_reincludes() {
+        // Last match wins: re-include a path a broader rule excluded.
+        let ignore = ignore_from(&["**/*.log", "!keep.log"]);
+        assert!(ignore.excluded(Path::new("debug.log")));
+        assert!(ignore.excluded(Path::new("nested/debug.log")));
+        assert!(!ignore.excluded(Path::new("keep.log")));
     }
 }

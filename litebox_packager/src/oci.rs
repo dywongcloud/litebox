@@ -397,11 +397,16 @@ pub fn extract_image_layers(
 /// The script:
 /// 1. Exports all `ENV` variables from the image config
 /// 2. `cd`s to `WORKDIR` (defaults to `/`)
-/// 3. If the caller passes arguments (`"$@"`), executes them directly
-/// 4. Otherwise falls back to the image's ENTRYPOINT/CMD as the default command
+/// 3. If the caller passes arguments, runs them with the image ENTRYPOINT still
+///    prepended (`exec ENTRYPOINT "$@"`) -- caller args replace CMD but keep the
+///    ENTRYPOINT, matching docker's run semantics. With no ENTRYPOINT they run
+///    directly (`exec "$@"`).
+/// 4. Otherwise falls back to the image's ENTRYPOINT + CMD as the default command
 ///
-/// This allows the runner to either pass a command explicitly:
-///   `/litebox/config_and_run.sh python3 -c 'print("hi")'`
+/// This allows the runner to either pass a command explicitly, appended to the
+/// ENTRYPOINT prefix:
+///   `/litebox/config_and_run.sh app.py`  (an ENTRYPOINT `["python3"]` image runs
+///   `python3 app.py`)
 /// or rely on the image default:
 ///   `/litebox/config_and_run.sh`
 ///
@@ -447,26 +452,39 @@ pub fn generate_config_and_run_script(config: &ImageConfig) -> String {
             .join(" ")
     };
 
-    // Build the default command from ENTRYPOINT and/or CMD.
-    let default_cmd = if has_entrypoint && has_cmd {
-        let ep = config.entrypoint.as_deref().unwrap_or_default();
-        let cmd = config.cmd.as_deref().unwrap_or_default();
-        format!("{} {}", quote(ep), quote(cmd))
-    } else if has_entrypoint {
+    // ENTRYPOINT is the fixed prefix; CMD is the default set of arguments.
+    let ep = if has_entrypoint {
         quote(config.entrypoint.as_deref().unwrap_or_default())
-    } else if has_cmd {
-        quote(config.cmd.as_deref().unwrap_or_default())
     } else {
         String::new()
     };
 
+    // The default command run when the caller passes no arguments: ENTRYPOINT
+    // followed by CMD (either may be absent).
+    let default_cmd = match (has_entrypoint, has_cmd) {
+        (true, true) => format!("{ep} {}", quote(config.cmd.as_deref().unwrap_or_default())),
+        (true, false) => ep.clone(),
+        (false, true) => quote(config.cmd.as_deref().unwrap_or_default()),
+        (false, false) => String::new(),
+    };
+
+    // Docker semantics: arguments passed to the container replace CMD but keep
+    // the ENTRYPOINT prefix. Only `--entrypoint` (which boxer does not expose)
+    // would drop it. So caller args run as `ENTRYPOINT "$@"`, not `"$@"` alone.
+    let caller_cmd = if has_entrypoint {
+        format!("{ep} \"$@\"")
+    } else {
+        String::from("\"$@\"")
+    };
+
     if default_cmd.is_empty() {
-        // No default command — just exec whatever the caller passes.
+        // No ENTRYPOINT and no CMD -- there is nothing to prepend, so just exec
+        // whatever the caller passes (and error at runtime if they pass nothing).
         let _ = writeln!(script, "exec \"$@\"");
     } else {
         let _ = write!(
             script,
-            "if [ $# -gt 0 ]; then\n  exec \"$@\"\nelse\n  exec {default_cmd}\nfi\n",
+            "if [ $# -gt 0 ]; then\n  exec {caller_cmd}\nelse\n  exec {default_cmd}\nfi\n",
         );
     }
 
@@ -1252,5 +1270,64 @@ mod tests {
         // Regular file (not a symlink) returns host path directly
         let r = resolve_symlink_in_rootfs(Path::new("hello.txt"), rootfs, &empty_map, 32);
         assert_eq!(r, Some(rootfs.join("hello.txt")));
+    }
+
+    fn config_with(entrypoint: Option<&[&str]>, cmd: Option<&[&str]>) -> ImageConfig {
+        ImageConfig {
+            entrypoint: entrypoint.map(|v| v.iter().copied().map(String::from).collect()),
+            cmd: cmd.map(|v| v.iter().copied().map(String::from).collect()),
+            ..ImageConfig::default()
+        }
+    }
+
+    #[test]
+    fn config_script_keeps_entrypoint_when_caller_overrides_cmd() {
+        // Docker semantics: caller arguments replace CMD but keep the ENTRYPOINT
+        // prefix. The old script did `exec "$@"`, dropping ENTRYPOINT entirely
+        // (sweep F16). The caller branch must prepend the entrypoint.
+        let script =
+            generate_config_and_run_script(&config_with(Some(&["python3"]), Some(&["app.py"])));
+        assert!(
+            script.contains("exec 'python3' \"$@\""),
+            "caller args must keep the entrypoint prefix:\n{script}"
+        );
+        assert!(
+            script.contains("exec 'python3' 'app.py'"),
+            "default command must be entrypoint + cmd:\n{script}"
+        );
+    }
+
+    #[test]
+    fn config_script_entrypoint_only_prepends_to_caller_args() {
+        let script = generate_config_and_run_script(&config_with(Some(&["/tini", "--"]), None));
+        assert!(
+            script.contains("exec '/tini' '--' \"$@\""),
+            "entrypoint-only image must still prepend the entrypoint:\n{script}"
+        );
+    }
+
+    #[test]
+    fn config_script_cmd_only_replaces_fully() {
+        // With no ENTRYPOINT, caller args replace CMD outright -- `exec "$@"`.
+        let script = generate_config_and_run_script(&config_with(None, Some(&["nginx"])));
+        assert!(
+            script.contains("exec \"$@\""),
+            "cmd-only image replaces the whole command:\n{script}"
+        );
+        assert!(
+            script.contains("exec 'nginx'"),
+            "cmd-only default runs the cmd:\n{script}"
+        );
+        assert!(
+            !script.contains("exec 'nginx' \"$@\""),
+            "cmd must not be prepended to caller args:\n{script}"
+        );
+    }
+
+    #[test]
+    fn config_script_no_entrypoint_no_cmd_execs_caller() {
+        let script = generate_config_and_run_script(&config_with(None, None));
+        assert!(script.contains("exec \"$@\""), "{script}");
+        assert!(!script.contains("if [ $# -gt 0 ]"), "{script}");
     }
 }
