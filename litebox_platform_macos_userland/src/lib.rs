@@ -91,7 +91,7 @@ pub struct MacOsUserland {
     /// [`Self::new`]. See [`litebox::platform::StdinPump`].
     stdin_pump: litebox::platform::StdinPump,
     /// Doorbell the stdin-pump background thread notifies after every push/EOF, so
-    /// [`StdioProvider::read_from_stdin`]'s blocking path can sleep instead of busy-polling.
+    /// [`litebox::platform::StdioProvider::read_from_stdin`]'s blocking path can sleep instead of busy-polling.
     stdin_doorbell: (std::sync::Mutex<()>, Condvar),
     /// Serializes real host writes to stdout, so concurrent guest threads' `write()` calls to the
     /// same stream don't interleave mid-write.
@@ -319,7 +319,7 @@ const GUEST_ADDR_MAX: usize = 0x0000_4000_0000_0000;
 ///
 /// For a [`FixedAddressBehavior::Hint`] request, `suggested_range.start` is
 /// offered to `mmap` as an advisory address -- mirroring what
-/// [`MacOsUserland::allocate_pages`]'s non-JIT `Hint` branch does -- so Darwin
+/// [`litebox::platform::PageManagementProvider::allocate_pages`]'s non-JIT `Hint` branch does -- so Darwin
 /// gets a real chance to place the mapping there directly instead of this
 /// function relying solely on the correction below. `Replace`/`NoReplace`
 /// instead always request a kernel-chosen address here: both finish with an
@@ -1309,7 +1309,7 @@ impl litebox::platform::RawPointerProvider for MacOsUserland {
 
 /// Spawns the single background host thread that blockingly reads the real stdin and feeds
 /// [`MacOsUserland::stdin_pump`], notifying [`MacOsUserland::stdin_doorbell`] after every push or
-/// EOF so [`StdioProvider::read_from_stdin`]'s blocking path wakes promptly instead of polling.
+/// EOF so [`litebox::platform::StdioProvider::read_from_stdin`]'s blocking path wakes promptly instead of polling.
 ///
 /// Spawned unconditionally in [`MacOsUserland::new`] -- real host stdin (whether an interactive
 /// terminal, a pipe, or a redirected file) always needs pumping so both blocking reads and
@@ -1359,7 +1359,7 @@ fn spawn_stdin_pump_thread(platform: &'static MacOsUserland) {
 }
 
 impl MacOsUserland {
-    /// Wakes any thread parked in [`StdioProvider::read_from_stdin`]'s blocking wait.
+    /// Wakes any thread parked in [`litebox::platform::StdioProvider::read_from_stdin`]'s blocking wait.
     fn notify_stdin_doorbell(&self) {
         let (lock, cvar) = &self.stdin_doorbell;
         drop(lock.lock().unwrap());
@@ -1591,7 +1591,7 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
 /// The interrupt signal has two independent jobs. Every delivery, regardless
 /// of what follows, already accomplishes the older one just by arriving: EINTR
 /// -ing a blocking host call (`SA_RESTART` is deliberately absent below), the
-/// mechanism [`TimerProvider::create_timer`]'s doc comment describes. The
+/// mechanism [`litebox::platform::TimerProvider::create_timer`]'s doc comment describes. The
 /// newer one is routing to [`litebox::shim::EnterShim::interrupt`] when the
 /// signalled thread is genuinely executing guest code, mirroring
 /// `litebox_platform_linux_userland`'s `interrupt_signal_handler` (a TLS
