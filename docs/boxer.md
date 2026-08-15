@@ -182,8 +182,11 @@ persist back out of the sandbox -- a builder needs real writes. Consequences:
   single buffers at 2 GiB; `boxer build` warns when crossing that line.
   `boxer` enforces a 3.5 GiB ceiling, held safely below the ~4 GiB that u32
   section sizes impose so the section header and metadata always fit.
-- Private registries (authentication) are not supported yet, matching
-  `litebox-packager --oci-image`.
+- Private registries are supported: credentials come from `REGISTRY_TOKEN`
+  (a bearer token), a `REGISTRY_USERNAME`/`REGISTRY_PASSWORD` pair, or the
+  `auth` entry docker/podman's `config.json` holds for the registry
+  (honoring `DOCKER_CONFIG`). Public pulls stay anonymous. Credentials are
+  used only for the request and never logged or stored in the box.
 - `USER` is recorded in the config but not enforced by the runner.
 - Upstream boxer's `compile` subcommand (marcotte-based C-to-wasm) is not
   reproduced here; its repository does not include the marcotte sources.

@@ -172,8 +172,9 @@ pub fn pull_and_extract_for_platform(
         };
         let client = Client::new(config);
 
-        // Authenticate (anonymous for public images)
-        let auth = RegistryAuth::Anonymous;
+        // Anonymous for public images; private registries take credentials
+        // from the environment or the docker/podman credential store.
+        let auth = registry_auth_for(&reference);
 
         if verbose {
             eprintln!("  Fetching manifest...");
@@ -223,6 +224,69 @@ pub fn pull_and_extract_for_platform(
         .collect();
 
     extract_image_layers(&layers, image_data.config.data.to_vec(), verbose)
+}
+
+/// Resolve the credentials to authenticate a pull with.
+///
+/// Precedence, highest first: an explicit `REGISTRY_TOKEN` bearer token; a
+/// `REGISTRY_USERNAME`/`REGISTRY_PASSWORD` pair; then the entry the docker or
+/// podman credential store (`config.json`) holds for this registry. Anonymous
+/// when none is present, so public pulls are unaffected. Credentials are used
+/// only for the request and never logged or stored in the box.
+fn registry_auth_for(reference: &Reference) -> RegistryAuth {
+    if let Ok(token) = std::env::var("REGISTRY_TOKEN")
+        && !token.is_empty()
+    {
+        return RegistryAuth::Bearer(token);
+    }
+    if let (Ok(username), Ok(password)) = (
+        std::env::var("REGISTRY_USERNAME"),
+        std::env::var("REGISTRY_PASSWORD"),
+    ) && !username.is_empty()
+    {
+        return RegistryAuth::Basic(username, password);
+    }
+    if let Some((username, password)) = docker_config_credentials(reference.registry()) {
+        return RegistryAuth::Basic(username, password);
+    }
+    RegistryAuth::Anonymous
+}
+
+/// Read `username:password` for `registry` from docker/podman `config.json`.
+///
+/// Honors `DOCKER_CONFIG`, then `~/.docker/config.json`. The `auth` field is
+/// base64-encoded `username:password`, matching what `docker login` writes.
+fn docker_config_credentials(registry: &str) -> Option<(String, String)> {
+    use base64::Engine as _;
+
+    let config_path = if let Ok(dir) = std::env::var("DOCKER_CONFIG") {
+        PathBuf::from(dir).join("config.json")
+    } else {
+        PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".docker")
+            .join("config.json")
+    };
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let auths = parsed.get("auths")?.as_object()?;
+
+    // docker keys the store by host, sometimes with a scheme or a trailing
+    // slash; match the bare registry host against the key's host part.
+    let entry = auths.iter().find_map(|(key, value)| {
+        let host = key
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/');
+        (host == registry).then_some(value)
+    })?;
+
+    let encoded = entry.get("auth")?.as_str()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let pair = String::from_utf8(decoded).ok()?;
+    let (username, password) = pair.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
 }
 
 /// Extract already-fetched image layers into a temp-directory rootfs and parse

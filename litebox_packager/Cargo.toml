@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.97"
+# Decode the base64 `auth` field of docker/podman's config.json for private
+# registry credentials.
+base64 = "0.22"
 clap = { version = "4.5.33", features = ["derive"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 rayon = "1.10"
