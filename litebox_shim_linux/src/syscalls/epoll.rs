@@ -244,8 +244,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         match op {
             EpollOp::EpollCtlAdd => self.add_interest(global, self_fd, fd, file, event.unwrap()),
             EpollOp::EpollCtlMod => {
-                log_unsupported!("epoll_ctl mod");
-                Err(Errno::EINVAL)
+                self.mod_interest(global, fd, file, event.ok_or(Errno::EINVAL)?)
             }
             EpollOp::EpollCtlDel => {
                 let mut interests = self.interests.lock();
@@ -344,7 +343,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         })
     }
 
-    #[expect(dead_code, reason = "currently unused, but might want to use soon")]
     fn mod_interest(
         &self,
         global: &GlobalState<Platform, FS>,
@@ -820,6 +818,71 @@ mod test {
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
+    }
+
+    #[test]
+    fn test_epoll_ctl_mod_updates_registered_fd_instead_of_failing() {
+        // Regression: `EPOLL_CTL_MOD` used to return `EINVAL` unconditionally.
+        // libuv's `uv__io_poll` registers a watcher with `ADD`, and on the
+        // `EEXIST` that a re-add returns it issues `MOD` to swap the event
+        // mask; the stray `EINVAL` there made libuv `abort()` (guest SIGABRT),
+        // which stalled every Node `http` loopback connection. `MOD` on a
+        // registered fd must succeed; `MOD` on an unregistered fd is `ENOENT`,
+        // never `EINVAL`.
+        use litebox_common_linux::EpollOp;
+        let (task, epoll_fd) = setup_epoll();
+        let (_producer, consumer) = task
+            .global
+            .pipes
+            .create_pipe(2, litebox::pipes::Flags::empty(), None)
+            .unwrap();
+        let consumer = Arc::new(consumer);
+        let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
+        let handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&epoll_fd)
+            .unwrap();
+
+        // MOD before the fd is registered: not present, so ENOENT (not EINVAL).
+        let before_add = handle.with_entry(|epoll| {
+            epoll.epoll_ctl(
+                &task.global,
+                &epoll_fd,
+                EpollOp::EpollCtlMod,
+                10,
+                &reader,
+                Some(EpollEvent::new(Events::OUT.bits(), 0)),
+            )
+        });
+        assert_eq!(before_add, Err(Errno::ENOENT));
+
+        // ADD, then MOD to a fresh mask: the MOD must succeed.
+        handle
+            .with_entry(|epoll| {
+                epoll.epoll_ctl(
+                    &task.global,
+                    &epoll_fd,
+                    EpollOp::EpollCtlAdd,
+                    10,
+                    &reader,
+                    Some(EpollEvent::new(Events::IN.bits(), 0)),
+                )
+            })
+            .unwrap();
+        handle
+            .with_entry(|epoll| {
+                epoll.epoll_ctl(
+                    &task.global,
+                    &epoll_fd,
+                    EpollOp::EpollCtlMod,
+                    10,
+                    &reader,
+                    Some(EpollEvent::new(Events::OUT.bits(), 5)),
+                )
+            })
+            .expect("MOD on a registered fd must succeed, not return EINVAL");
     }
 
     #[test]
