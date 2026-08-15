@@ -197,7 +197,7 @@ impl SocketAddress {
     clippy::struct_excessive_bools,
     reason = "each field mirrors one boolean socket option Linux defines"
 )]
-pub(super) struct SocketOptions {
+pub(crate) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,
     pub(super) broadcast: bool,
@@ -285,7 +285,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         proxy
     }
 
-    fn with_socket_options<R>(
+    pub(crate) fn with_socket_options<R>(
         &self,
         fd: &SocketFd<Platform>,
         f: impl FnOnce(&SocketOptions) -> R,
@@ -2153,6 +2153,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             |fd| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
                 if how.is_shutdown_read() {
+                    // Linux returns ENOTCONN for a shutdown of any kind on an
+                    // unconnected socket. Probe the connection before recording
+                    // the read shutdown, so a listening socket reports ENOTCONN
+                    // and SHUT_RDWR leaves no partial effect when it then errors.
+                    self.global
+                        .net
+                        .lock()
+                        .get_remote_addr(fd)
+                        .map_err(|_| Errno::ENOTCONN)?;
                     self.global
                         .with_socket_options_mut(fd, |opt| opt.receive_shutdown = true);
                 }

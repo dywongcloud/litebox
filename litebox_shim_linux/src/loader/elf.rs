@@ -570,12 +570,23 @@ mod tests {
         // with whatever it picks. That is easy to miss on a host whose guest
         // range sits well clear of the host's own image; on arm64 macOS both
         // live above the 4 GiB `__PAGEZERO` floor, so the collision is routine.
+        // `brk` includes the reserved-but-never-mapped trampoline region for a
+        // synthetic interp, so `brk - base` overshoots the real mapping. That
+        // is harmless for the low-address main image, but the interp sits
+        // top-down flush against the address-space ceiling, where the overshoot
+        // runs past it and munmap returns EINVAL. Clamp each length to the top
+        // of the address space: the reserve was never mapped, so dropping it
+        // from the range releases exactly the mapped pages.
+        let addr_top = addr_max;
         let exec_start = usize::try_from(EXEC_LOAD_ADDR).expect("load address fits usize");
-        task.sys_munmap(UserPtrMut::from_usize(exec_start), main.brk - exec_start)
-            .expect("main image should unmap");
+        task.sys_munmap(
+            UserPtrMut::from_usize(exec_start),
+            (main.brk - exec_start).min(addr_top - exec_start),
+        )
+        .expect("main image should unmap");
         task.sys_munmap(
             UserPtrMut::from_usize(interp.base_addr),
-            interp.brk - interp.base_addr,
+            (interp.brk - interp.base_addr).min(addr_top - interp.base_addr),
         )
         .expect("interpreter image should unmap");
     }

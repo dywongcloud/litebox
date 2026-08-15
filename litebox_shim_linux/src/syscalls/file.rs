@@ -632,6 +632,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;
+                    if self
+                        .global
+                        .with_socket_options(fd, |opt| opt.receive_shutdown)
+                    {
+                        // `shutdown(fd, SHUT_RD)` makes every later read report
+                        // end-of-file, matching recv on the same socket.
+                        return Ok(0);
+                    }
                     self.global.receive(
                         &self.wait_cx(),
                         fd,

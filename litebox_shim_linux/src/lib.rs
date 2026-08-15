@@ -667,6 +667,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         count: usize,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
+        // A zero-length write must still validate the fd: writing 0 bytes to a
+        // non-writable fd (the read end of a pipe) owes EBADF, as on the host.
+        // The loop below would skip its body and return Ok(0) without ever
+        // reaching sys_write, so run one empty write to force that check.
+        if count == 0 {
+            return self.sys_write(fd, &[], offset).map(|_| 0);
+        }
         let mut written_total = 0;
         while written_total < count {
             let to_write = (count - written_total).min(MAX_KERNEL_BUF_SIZE);
