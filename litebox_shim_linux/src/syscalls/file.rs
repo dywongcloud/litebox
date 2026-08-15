@@ -1866,9 +1866,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         follow_symlink: bool,
     ) -> Result<T, Errno> {
         let normalized_path = pathname.normalized()?;
+        // `stat` follows a trailing symlink; use the same leaf-following resolver
+        // as `open`, which handles chained links, relative targets (resolved
+        // against each link's own directory, not the cwd), and ELOOP -- unlike the
+        // old single-hop `do_readlink` that mis-resolved a relative target.
         let path = if follow_symlink {
-            self.do_readlink(normalized_path.as_str())
-                .unwrap_or(normalized_path)
+            self.resolve_leaf_symlink(normalized_path.as_str())?
         } else {
             normalized_path
         };
