@@ -348,61 +348,113 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Linux caps a single path resolution at `MAXSYMLINKS` (40) followed links.
     const MAX_SYMLINK_HOPS: usize = 40;
 
-    /// Follow a trailing-component symlink chain on an already-resolved absolute
-    /// `path`, per `path_resolution(7)`. Only the final component is followed --
-    /// following a symlink used as an intermediate directory component is not yet
-    /// supported (such a component surfaces as `ENOTDIR` from the backend walk).
+    /// Resolve every symbolic link on an already-cwd-resolved absolute `path`,
+    /// per `path_resolution(7)`: walk it component by component and, whenever a
+    /// component is a symlink, splice in its target (an absolute target restarts
+    /// from `/`, a relative one is interpreted from the directory that contains
+    /// the link) and keep going -- so a symlink used as an *intermediate*
+    /// directory component is followed, not only the final one.
     ///
-    /// The path is returned unchanged when the final component is not a symlink,
-    /// or does not exist (so `O_CREAT` can still create it and a missing target
-    /// yields `ENOENT` from the real operation, not here). `ELOOP` once the chain
-    /// exceeds [`Self::MAX_SYMLINK_HOPS`].
-    fn resolve_leaf_symlink(&self, path: &str) -> Result<String, Errno> {
+    /// A component that does not exist stops resolution and is returned verbatim
+    /// with whatever is still pending, so `O_CREAT` can still create a missing
+    /// final component and a genuinely missing path yields `ENOENT` from the real
+    /// operation rather than here. `ELOOP` once more than
+    /// [`Self::MAX_SYMLINK_HOPS`] links are followed.
+    ///
+    /// NOTE: callers pass a lexically `.normalized()` path, so a `..` that real
+    /// `path_resolution(7)` would apply *after* an intermediate symlink is
+    /// resolved has already been collapsed lexically -- following an intermediate
+    /// link works, but `..`-immediately-after-a-symlink is not yet exact.
+    fn resolve_path_symlinks(&self, path: &str) -> Result<String, Errno> {
+        use alloc::collections::VecDeque;
+        use alloc::vec::Vec;
         use litebox::fs::FileType;
         use litebox::fs::errors::{FileStatusError, PathError};
-        let mut current = String::from(path);
-        for _ in 0..Self::MAX_SYMLINK_HOPS {
-            let file_type = match self.files.borrow().fs.file_status(current.as_str()) {
+
+        let into_components = |s: &str| -> VecDeque<String> {
+            s.split('/')
+                .filter(|component| !component.is_empty() && *component != ".")
+                .map(String::from)
+                .collect()
+        };
+        let mut pending = into_components(path);
+        let mut resolved: Vec<String> = Vec::new();
+        let mut hops = 0usize;
+
+        while let Some(name) = pending.pop_front() {
+            if name == ".." {
+                // Applied to the already-resolved prefix -- i.e. after any symlink
+                // in it was followed -- which is the correct base component.
+                resolved.pop();
+                continue;
+            }
+            let mut candidate = String::new();
+            for component in &resolved {
+                candidate.push('/');
+                candidate.push_str(component);
+            }
+            candidate.push('/');
+            candidate.push_str(&name);
+
+            let file_type = match self.files.borrow().fs.file_status(candidate.as_str()) {
                 Ok(status) => status.file_type,
-                // A missing final component (or missing ancestor) is handed back
-                // unchanged; the real operation decides ENOENT vs O_CREAT.
                 Err(FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-                )) => return Ok(current),
+                )) => {
+                    // This component does not exist: keep it and the rest verbatim
+                    // and let the real operation decide (ENOENT vs O_CREAT).
+                    resolved.push(name);
+                    resolved.extend(pending);
+                    return Ok(Self::join_absolute(&resolved));
+                }
                 Err(e) => return Err(Errno::from(e)),
             };
-            if file_type != FileType::SymLink {
-                return Ok(current);
+
+            if file_type == FileType::SymLink {
+                hops += 1;
+                if hops > Self::MAX_SYMLINK_HOPS {
+                    return Err(Errno::ELOOP);
+                }
+                let target = self
+                    .files
+                    .borrow()
+                    .fs
+                    .readlink(candidate.as_str())
+                    .map_err(Errno::from)?;
+                if target.is_empty() {
+                    return Err(Errno::ENOENT);
+                }
+                // An absolute target restarts resolution from the root; a relative
+                // one continues from `resolved` (the link's directory, since the
+                // link's own name was not pushed).
+                if target.starts_with('/') {
+                    resolved.clear();
+                }
+                for component in target
+                    .split('/')
+                    .filter(|component| !component.is_empty() && *component != ".")
+                    .rev()
+                {
+                    pending.push_front(String::from(component));
+                }
+            } else {
+                resolved.push(name);
             }
-            let target = self
-                .files
-                .borrow()
-                .fs
-                .readlink(current.as_str())
-                .map_err(Errno::from)?;
-            current = Self::join_symlink_target(&current, &target)?;
         }
-        Err(Errno::ELOOP)
+        Ok(Self::join_absolute(&resolved))
     }
 
-    /// Resolve a symlink's `target` against the link at `link_path`: an absolute
-    /// target from the root, a relative one from the directory containing the
-    /// link (recomputed each hop). An empty target resolves to nothing (`ENOENT`).
-    fn join_symlink_target(link_path: &str, target: &str) -> Result<String, Errno> {
-        use litebox::path::Arg as _;
-        if target.is_empty() {
-            return Err(Errno::ENOENT);
+    /// Join resolved path components into an absolute path (`/` when empty).
+    fn join_absolute(components: &[String]) -> String {
+        if components.is_empty() {
+            return String::from("/");
         }
-        let joined = if target.starts_with('/') {
-            String::from(target)
-        } else {
-            let dir = link_path.rsplit_once('/').map_or("", |(dir, _)| dir);
-            let mut joined = String::from(dir);
-            joined.push('/');
-            joined.push_str(target);
-            joined
-        };
-        joined.normalized().map_err(|_| Errno::ENOENT)
+        let mut path = String::new();
+        for component in components {
+            path.push('/');
+            path.push_str(component);
+        }
+        path
     }
 
     /// Apply `open(2)` default symlink-following to an already-resolved absolute
@@ -413,7 +465,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if flags.contains(OFlags::NOFOLLOW) || flags.contains(OFlags::CREAT | OFlags::EXCL) {
             return Ok(path);
         }
-        let resolved = self.resolve_leaf_symlink(path.to_str().map_err(|_| Errno::EINVAL)?)?;
+        let resolved = self.resolve_path_symlinks(path.to_str().map_err(|_| Errno::EINVAL)?)?;
         CString::new(resolved).map_err(|_| Errno::EINVAL)
     }
 
@@ -1609,7 +1661,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `access(2)`/`faccessat(2)` dereference a trailing symlink, so a dangling
         // link correctly reports as absent (ENOENT) and a link's target's
         // permissions -- not the always-`rwxrwxrwx` link node -- are checked.
-        let resolved = self.resolve_leaf_symlink(pathname.as_rust_str().map_err(|_| Errno::EINVAL)?)?;
+        let resolved = self.resolve_path_symlinks(pathname.as_rust_str().map_err(|_| Errno::EINVAL)?)?;
         let status = self.files.borrow().fs.file_status(resolved.as_str())?;
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -1871,7 +1923,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // against each link's own directory, not the cwd), and ELOOP -- unlike the
         // old single-hop `do_readlink` that mis-resolved a relative target.
         let path = if follow_symlink {
-            self.resolve_leaf_symlink(normalized_path.as_str())?
+            self.resolve_path_symlinks(normalized_path.as_str())?
         } else {
             normalized_path
         };
@@ -2274,7 +2326,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
         // `chdir(2)` dereferences a trailing symlink, so `cd` into a symlinked
         // directory works (and lands the cwd on the link's target).
-        let abs_path = self.resolve_leaf_symlink(&abs_path)?;
+        let abs_path = self.resolve_path_symlinks(&abs_path)?;
 
         // Verify the path exists and is a directory.
         match self.files.borrow().fs.file_status(abs_path.as_str()) {
