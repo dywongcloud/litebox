@@ -78,6 +78,8 @@ struct ProcInner<Platform: RawSyncPrimitivesProvider + 'static> {
     pid_dir_inode: NodeInfo,
     meminfo_inode: NodeInfo,
     mounts_inode: NodeInfo,
+    stat_system_inode: NodeInfo,
+    cpuinfo_inode: NodeInfo,
     stat_inode: NodeInfo,
     status_inode: NodeInfo,
     cmdline_inode: NodeInfo,
@@ -102,6 +104,8 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Proc<Platform> {
                 pid_dir_inode: allocator.next(),
                 meminfo_inode: allocator.next(),
                 mounts_inode: allocator.next(),
+                stat_system_inode: allocator.next(),
+                cpuinfo_inode: allocator.next(),
                 stat_inode: allocator.next(),
                 status_inode: allocator.next(),
                 cmdline_inode: allocator.next(),
@@ -155,6 +159,8 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Proc<Platform> {
         match file {
             ProcFile::Meminfo => render_meminfo(),
             ProcFile::Mounts => render_mounts(),
+            ProcFile::StatSystem => render_stat_system(),
+            ProcFile::Cpuinfo => render_cpuinfo(),
             ProcFile::PidStat => render_stat(&self.inner.task.read()),
             ProcFile::PidStatus => render_status(&self.inner.task.read()),
             ProcFile::PidCmdline => self.inner.task.read().cmdline.clone(),
@@ -196,6 +202,59 @@ fn render_mounts() -> Vec<u8> {
          proc /proc proc rw 0 0\n",
     )
     .into_bytes()
+}
+
+/// Number of logical CPUs the synthetic `/proc` reports. Kept in step with
+/// `sched_getaffinity`'s `NR_CPUS` in `litebox_shim_linux` so `os.cpus()` (which
+/// counts `/proc/stat` `cpuN` lines) agrees with `os.availableParallelism()`
+/// (which counts the affinity mask).
+const SYNTHETIC_NUM_CPUS: usize = 2;
+
+/// System-wide `/proc/stat` content. libuv's `uv_cpu_info` -- what Node's
+/// `os.cpus()` calls -- enumerates CPUs by counting the `cpuN` lines here and
+/// reads their jiffy counters; without this file `os.cpus()` returns an empty
+/// array. The counters are zero (this process model has no per-CPU scheduler
+/// accounting), and the aggregate `cpu` line plus the trailing bookkeeping
+/// fields are included for any other real reader.
+fn render_stat_system() -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
+    for cpu in 0..SYNTHETIC_NUM_CPUS {
+        let _ = writeln!(out, "cpu{cpu} 0 0 0 0 0 0 0 0 0 0");
+    }
+    out.push_str(
+        "intr 0\n\
+         ctxt 0\n\
+         btime 0\n\
+         processes 1\n\
+         procs_running 1\n\
+         procs_blocked 0\n",
+    );
+    out.into_bytes()
+}
+
+/// `/proc/cpuinfo` content, AArch64 flavour (one stanza per CPU). Node reads this
+/// after `/proc/stat` for each CPU's model/speed. The AArch64 layout carries no
+/// `model name`/`cpu MHz` line (unlike x86), so `os.cpus()[i].model` reports the
+/// generic implementer identity and `.speed` is 0 -- exactly as on real AArch64
+/// Linux.
+fn render_cpuinfo() -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut out = String::new();
+    for cpu in 0..SYNTHETIC_NUM_CPUS {
+        let _ = write!(
+            out,
+            "processor\t: {cpu}\n\
+             BogoMIPS\t: 48.00\n\
+             Features\t: fp asimd\n\
+             CPU implementer\t: 0x61\n\
+             CPU architecture: 8\n\
+             CPU variant\t: 0x0\n\
+             CPU part\t: 0x000\n\
+             CPU revision\t: 0\n\n",
+        );
+    }
+    out.into_bytes()
 }
 
 /// `/proc/<pid>/stat` content: the standard 52 space-separated fields (see `proc_pid_stat(5)`).
@@ -255,14 +314,22 @@ pub enum ProcDir {
 pub enum ProcFile {
     Meminfo,
     Mounts,
+    /// System-wide `/proc/stat`.
+    StatSystem,
+    /// `/proc/cpuinfo`.
+    Cpuinfo,
     PidStat,
     PidStatus,
     PidCmdline,
 }
 
 impl ProcFile {
-    const ROOT_FILES: &'static [(&'static str, ProcFile)] =
-        &[("meminfo", ProcFile::Meminfo), ("mounts", ProcFile::Mounts)];
+    const ROOT_FILES: &'static [(&'static str, ProcFile)] = &[
+        ("meminfo", ProcFile::Meminfo),
+        ("mounts", ProcFile::Mounts),
+        ("stat", ProcFile::StatSystem),
+        ("cpuinfo", ProcFile::Cpuinfo),
+    ];
     const PID_DIR_FILES: &'static [(&'static str, ProcFile)] = &[
         ("stat", ProcFile::PidStat),
         ("status", ProcFile::PidStatus),
@@ -457,6 +524,8 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
         let (node_info, owner) = match file {
             ProcFile::Meminfo => (self.inner.meminfo_inode.clone(), UserInfo::ROOT),
             ProcFile::Mounts => (self.inner.mounts_inode.clone(), UserInfo::ROOT),
+            ProcFile::StatSystem => (self.inner.stat_system_inode.clone(), UserInfo::ROOT),
+            ProcFile::Cpuinfo => (self.inner.cpuinfo_inode.clone(), UserInfo::ROOT),
             ProcFile::PidStat => (self.inner.stat_inode.clone(), self.task_owner()),
             ProcFile::PidStatus => (self.inner.status_inode.clone(), self.task_owner()),
             ProcFile::PidCmdline => (self.inner.cmdline_inode.clone(), self.task_owner()),
