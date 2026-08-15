@@ -170,29 +170,51 @@ struct LogicalLine {
 fn parse_escape_directive(text: &str) -> char {
     for raw_line in text.lines() {
         let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
+        // The directive block is only the unbroken run of parser-directive
+        // comments at the very top. Docker ends it at the first blank line,
+        // plain comment, instruction, or unrecognized `# key=value` directive
+        // -- and treats anything after (including a later `# escape=`) as
+        // ordinary content. Scanning past those honored directives docker would
+        // ignore.
         let Some(directive) = line.strip_prefix('#') else {
-            // First non-comment line ends the directive block.
+            // Blank line or an instruction ends the block.
             return '\\';
         };
-        let directive = directive.trim();
-        if let Some((key, value)) = directive.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("escape") {
-                let value = value.trim();
-                if value == "`" {
-                    return '`';
-                }
-                return '\\';
-            }
-            // Other directives (syntax=...) are ignored; keep scanning.
-            continue;
+        let Some((key, value)) = directive.trim().split_once('=') else {
+            // A plain comment ends the block.
+            return '\\';
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "escape" => return if value.trim() == "`" { '`' } else { '\\' },
+            // `syntax` is a recognized directive that does not set escape; keep
+            // scanning the block for an `escape` directive.
+            "syntax" => {}
+            // Any other `# key=value` is not a recognized directive, so the
+            // block ends here.
+            _ => return '\\',
         }
-        // A plain comment ends the directive block.
-        return '\\';
     }
     '\\'
+}
+
+/// Whether `line` ends with an unpaired escape character, meaning it continues
+/// onto the next line.
+///
+/// An odd number of trailing escapes leaves the last one escaping the newline
+/// (a real continuation); an even number is all escaped pairs (a literal `\\`),
+/// which does not continue. A previous form used `!line.ends_with([escape,
+/// escape])` to reject the doubled case, but `ends_with` with a `[char; 2]`
+/// array is a *character set* match -- it matches a single trailing char equal
+/// to either element -- so the guard reduced to `A && !A` and no line ever
+/// continued.
+fn ends_with_continuation(line: &str, escape: char) -> bool {
+    line.trim_end()
+        .chars()
+        .rev()
+        .take_while(|&c| c == escape)
+        .count()
+        % 2
+        == 1
 }
 
 /// Join continuation lines, strip comments, and collect heredoc bodies.
@@ -210,9 +232,7 @@ fn logical_lines(text: &str, escape: char) -> anyhow::Result<Vec<LogicalLine>> {
         let mut logical = String::from(raw_line);
         // Join continuations: a trailing escape char (not doubled) pulls in
         // the next line; interleaved comment lines are dropped.
-        while logical.trim_end().ends_with(escape)
-            && !logical.trim_end().ends_with([escape, escape])
-        {
+        while ends_with_continuation(&logical, escape) {
             let without = logical.trim_end();
             logical = without[..without.len() - escape.len_utf8()].to_string();
             loop {
@@ -397,11 +417,11 @@ fn parse_instruction(
 ) -> anyhow::Result<Instruction> {
     match keyword {
         "RUN" => Ok(Instruction::Run {
-            command: parse_command(rest)?,
+            command: parse_command(rest),
             heredocs: line.heredocs.clone(),
         }),
-        "CMD" => Ok(Instruction::Cmd(parse_command(rest)?)),
-        "ENTRYPOINT" => Ok(Instruction::Entrypoint(parse_command(rest)?)),
+        "CMD" => Ok(Instruction::Cmd(parse_command(rest))),
+        "ENTRYPOINT" => Ok(Instruction::Entrypoint(parse_command(rest))),
         "COPY" | "ADD" => {
             let (flags, mut paths) = parse_copy_args(rest)?;
             // Heredoc markers (`<<EOF`) are captured separately as
@@ -465,13 +485,19 @@ fn strip_escape_doubling(instruction: Instruction, _escape: char) -> Instruction
     instruction
 }
 
-fn parse_command(rest: &str) -> anyhow::Result<Command> {
+fn parse_command(rest: &str) -> Command {
     let trimmed = rest.trim_start();
-    if trimmed.starts_with('[') {
-        Ok(Command::Exec(parse_exec_array(trimmed)?))
-    } else {
-        Ok(Command::Shell(rest.trim().to_string()))
+    // A leading `[` marks the exec (JSON array) form -- but only when the line
+    // actually parses as a JSON array. Docker falls back to shell form when it
+    // does not, so a shell line that merely starts with the `[` test builtin
+    // (`RUN [ -f /etc/x ] && ...`) runs as a command instead of failing to
+    // parse.
+    if trimmed.starts_with('[')
+        && let Ok(argv) = parse_exec_array(trimmed)
+    {
+        return Command::Exec(argv);
     }
+    Command::Shell(rest.trim().to_string())
 }
 
 /// Parse the JSON-style exec form array: `["a", "b"]`.
@@ -550,30 +576,56 @@ fn split_words(text: &str) -> anyhow::Result<Vec<String>> {
 fn parse_copy_args(rest: &str) -> anyhow::Result<(CopyFlags, Vec<String>)> {
     let mut flags = CopyFlags::default();
     let mut paths = Vec::new();
-    if rest.trim_start().starts_with('[') {
-        // Exec-form COPY: ["src", "dest"] with no flags mixed in.
-        return Ok((flags, parse_exec_array(rest)?));
+
+    // Skip past any leading `--flag` tokens to find where the arguments proper
+    // begin. An exec-form array can be preceded by flags
+    // (`COPY --chown=u:g ["a b", "/d"]`); detecting `[` only on the raw `rest`
+    // would miss that and split the JSON into corrupted paths.
+    let mut after_flags = rest.trim_start();
+    while after_flags.starts_with("--") {
+        after_flags = match after_flags.split_once(char::is_whitespace) {
+            Some((_, tail)) => tail.trim_start(),
+            None => "",
+        };
     }
+    if after_flags.starts_with('[') {
+        // Apply the flags that precede the array, then take the array verbatim.
+        let flag_prefix = &rest[..rest.len() - after_flags.len()];
+        for word in split_words(flag_prefix)? {
+            apply_copy_flag(&mut flags, &word)?;
+        }
+        return Ok((flags, parse_exec_array(after_flags)?));
+    }
+
     for word in split_words(rest)? {
-        if let Some(value) = word.strip_prefix("--from=") {
-            flags.from = Some(value.to_string());
-        } else if let Some(value) = word.strip_prefix("--chmod=") {
-            flags.chmod = Some(value.to_string());
-        } else if let Some(value) = word.strip_prefix("--chown=") {
-            flags.chown = Some(value.to_string());
-        } else if let Some(value) = word.strip_prefix("--checksum=") {
-            flags.checksum = Some(value.to_string());
-        } else if let Some(value) = word.strip_prefix("--exclude=") {
-            flags.excludes.push(value.to_string());
-        } else if word == "--link" {
-            flags.link = true;
-        } else if word.starts_with("--") {
-            bail!("unknown COPY/ADD flag: {word}");
+        if word.starts_with("--") {
+            apply_copy_flag(&mut flags, &word)?;
         } else {
             paths.push(word);
         }
     }
     Ok((flags, paths))
+}
+
+/// Apply one `--flag[=value]` token to a COPY/ADD flag set, erroring on an
+/// unknown flag.
+fn apply_copy_flag(flags: &mut CopyFlags, word: &str) -> anyhow::Result<()> {
+    if let Some(value) = word.strip_prefix("--from=") {
+        flags.from = Some(value.to_string());
+    } else if let Some(value) = word.strip_prefix("--chmod=") {
+        flags.chmod = Some(value.to_string());
+    } else if let Some(value) = word.strip_prefix("--chown=") {
+        flags.chown = Some(value.to_string());
+    } else if let Some(value) = word.strip_prefix("--checksum=") {
+        flags.checksum = Some(value.to_string());
+    } else if let Some(value) = word.strip_prefix("--exclude=") {
+        flags.excludes.push(value.to_string());
+    } else if word == "--link" {
+        flags.link = true;
+    } else {
+        bail!("unknown COPY/ADD flag: {word}");
+    }
+    Ok(())
 }
 
 /// Parse `k=v k2=v2 ...`; when `allow_legacy` is set, a bare `KEY VALUE...`
@@ -584,8 +636,17 @@ fn parse_key_values(rest: &str, allow_legacy: bool) -> anyhow::Result<Vec<(Strin
         bail!("expected at least one key=value pair");
     }
     if allow_legacy && !words[0].contains('=') {
+        // Legacy `ENV KEY VALUE`: docker splits only on the first whitespace
+        // run and keeps the value verbatim, so internal spacing is preserved.
+        // Rejoining the split words with single spaces would collapse runs of
+        // whitespace in the value (e.g. `-Xmx512m    -Xms256m`).
         let key = words[0].clone();
-        let value = words[1..].join(" ");
+        let value = rest
+            .trim_start()
+            .strip_prefix(&key)
+            .unwrap_or("")
+            .trim_start()
+            .to_string();
         return Ok(vec![(key, value)]);
     }
     words
@@ -644,12 +705,21 @@ pub fn substitute(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            if let Some(&'$') = chars.peek() {
-                chars.next();
-                result.push('$');
-                continue;
+            match chars.peek() {
+                // `\$` escapes the dollar: a literal `$`, no expansion.
+                Some('$') => {
+                    chars.next();
+                    result.push('$');
+                }
+                // `\\` is a completed escape pair -> one literal backslash, and
+                // crucially the pair is consumed so a following `$VAR` expands
+                // normally (rather than the second backslash escaping the `$`).
+                Some('\\') => {
+                    chars.next();
+                    result.push('\\');
+                }
+                _ => result.push(c),
             }
-            result.push(c);
             continue;
         }
         if c != '$' {
@@ -707,4 +777,151 @@ fn expand_braced(inner: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String
         };
     }
     lookup(inner).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instrs(df: &Dockerfile) -> Vec<&Instruction> {
+        df.stages[0].instructions.iter().map(|(_, i)| i).collect()
+    }
+
+    #[test]
+    fn line_continuation_joins_lines() {
+        // The old `!ends_with([escape, escape])` guard was a char-set match, so
+        // the loop condition reduced to `A && !A` and no line ever continued.
+        let df = parse("FROM scratch\nENV FOO=bar \\\n    BAZ=qux\n").unwrap();
+        let envs: Vec<(String, String)> = instrs(&df)
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Env(p) => Some(p.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            envs.iter().any(|(k, v)| k == "FOO" && v == "bar"),
+            "{envs:?}"
+        );
+        assert!(
+            envs.iter().any(|(k, v)| k == "BAZ" && v == "qux"),
+            "{envs:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_counts_trailing_escapes() {
+        assert!(ends_with_continuation("RUN echo x\\", '\\')); // single -> continues
+        assert!(!ends_with_continuation("RUN echo x\\\\", '\\')); // doubled -> no
+        assert!(ends_with_continuation("RUN echo x\\\\\\", '\\')); // triple -> continues
+        assert!(!ends_with_continuation("RUN echo x", '\\'));
+    }
+
+    #[test]
+    fn leading_bracket_non_json_falls_back_to_shell() {
+        // `CMD [ -f x ]` is the shell `test` builtin, not a JSON array; docker
+        // runs it as a shell command rather than failing to parse.
+        let df = parse("FROM scratch\nCMD [ -f /etc/passwd ]\n").unwrap();
+        let cmd = instrs(&df)
+            .into_iter()
+            .find_map(|i| match i {
+                Instruction::Cmd(c) => Some(c.clone()),
+                _ => None,
+            })
+            .unwrap();
+        match cmd {
+            Command::Shell(s) => assert_eq!(s, "[ -f /etc/passwd ]"),
+            Command::Exec(v) => panic!("expected shell form, got exec {v:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_json_exec_form_still_parses() {
+        let df = parse("FROM scratch\nCMD [\"/bin/app\", \"--flag\"]\n").unwrap();
+        let cmd = instrs(&df)
+            .into_iter()
+            .find_map(|i| match i {
+                Instruction::Cmd(c) => Some(c.clone()),
+                _ => None,
+            })
+            .unwrap();
+        match cmd {
+            Command::Exec(v) => assert_eq!(v, vec!["/bin/app", "--flag"]),
+            Command::Shell(s) => panic!("expected exec form, got shell {s:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_env_preserves_internal_whitespace() {
+        let df = parse("FROM scratch\nENV OPTS -Xmx512m    -Xms256m\n").unwrap();
+        let env = instrs(&df)
+            .into_iter()
+            .find_map(|i| match i {
+                Instruction::Env(p) => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            env,
+            vec![(String::from("OPTS"), String::from("-Xmx512m    -Xms256m"))]
+        );
+    }
+
+    #[test]
+    fn copy_exec_form_with_leading_flags() {
+        // Flags may precede the exec-form array; the array must still be read as
+        // JSON, not split on whitespace into corrupted paths.
+        let df =
+            parse("FROM scratch\nCOPY --chown=1000:1000 [\"a b.txt\", \"/dest.txt\"]\n").unwrap();
+        let (flags, sources, dest) = instrs(&df)
+            .into_iter()
+            .find_map(|i| match i {
+                Instruction::Copy {
+                    flags,
+                    sources,
+                    dest,
+                    ..
+                } => Some((flags.clone(), sources.clone(), dest.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(flags.chown.as_deref(), Some("1000:1000"));
+        assert_eq!(sources, vec![String::from("a b.txt")]);
+        assert_eq!(dest, "/dest.txt");
+    }
+
+    #[test]
+    fn substitute_double_backslash_then_var_expands() {
+        let lookup = |name: &str| (name == "VAR").then(|| String::from("hello"));
+        // `\\$VAR` -> literal backslash + expanded VAR.
+        assert_eq!(substitute("\\\\$VAR", &lookup), "\\hello");
+        // `\$VAR` -> escaped dollar, no expansion.
+        assert_eq!(substitute("\\$VAR", &lookup), "$VAR");
+        // plain `$VAR` -> expanded.
+        assert_eq!(substitute("$VAR", &lookup), "hello");
+    }
+
+    #[test]
+    fn escape_directive_block_ends_at_blank_or_unknown() {
+        // Recognized escape directive at the very top is honored.
+        assert_eq!(parse_escape_directive("# escape=`\nFROM scratch\n"), '`');
+        // A `syntax` directive does not end the block; a later escape is honored.
+        assert_eq!(
+            parse_escape_directive("# syntax=docker/dockerfile:1\n# escape=`\nFROM x\n"),
+            '`'
+        );
+        // A blank line ends the block -> the later escape is a plain comment.
+        assert_eq!(parse_escape_directive("\n# escape=`\nFROM x\n"), '\\');
+        // An unrecognized directive ends the block.
+        assert_eq!(
+            parse_escape_directive("# foo=bar\n# escape=`\nFROM x\n"),
+            '\\'
+        );
+        // A plain comment ends the block.
+        assert_eq!(
+            parse_escape_directive("# hello\n# escape=`\nFROM x\n"),
+            '\\'
+        );
+    }
 }
