@@ -194,12 +194,25 @@ fn publish_tcp(
     Ok(())
 }
 
-/// The most distinct UDP clients a single published port tracks at once.
-/// UDP has no connection to end, so each client holds a guest-side socket
-/// until the process exits; bounding the table keeps a flood of spoofed
-/// source addresses from exhausting sockets.
+/// A hard ceiling on concurrently tracked UDP clients, so a flood of distinct
+/// (possibly spoofed) source addresses cannot exhaust sockets between reaps.
+/// Idle entries are reclaimed continuously (see [`UDP_CLIENT_IDLE_TIMEOUT`]),
+/// so this bounds live clients, not the number ever seen.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const MAX_UDP_CLIENTS: usize = 1024;
+
+/// How long a UDP client entry may sit idle -- no datagram in either direction
+/// -- before its guest-side socket and reply task are reclaimed. UDP has no
+/// connection to close, so entries are reaped on inactivity; without this a
+/// long-running relay would leak a socket, task, and buffer per distinct source
+/// address forever (a well-behaved DNS resolver alone cycles through thousands
+/// of ephemeral source ports).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const UDP_CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the relay sweeps its client table for idle entries.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const UDP_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Bind a host UDP socket and relay datagrams to the guest, one guest-side
 /// socket per client source address so replies route back to the right client.
@@ -210,9 +223,19 @@ fn publish_udp(
     verbose: bool,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     use tokio::net::UdpSocket;
+
+    /// One tracked client flow. `last_seen` is shared with the reply task so
+    /// traffic in either direction keeps the flow alive; the reaper aborts
+    /// `reply_task` when the flow goes idle.
+    struct Client {
+        guest: Arc<UdpSocket>,
+        last_seen: Arc<Mutex<Instant>>,
+        reply_task: tokio::task::JoinHandle<()>,
+    }
 
     let host_addr = mapping.host_addr;
     let guest_addr = SocketAddr::V4(SocketAddrV4::new(GUEST_IP, mapping.guest_port));
@@ -225,62 +248,98 @@ fn publish_udp(
     eprintln!("Publishing {host_addr}/udp -> {guest_addr}/udp");
 
     runtime.spawn(async move {
-        // Only this task mutates the table, so no lock is needed.
-        let mut clients: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
+        // Only this task mutates the table, so no lock on the map is needed;
+        // each entry's `last_seen` is the one value the reply tasks also touch.
+        let mut clients: HashMap<SocketAddr, Client> = HashMap::new();
         let mut buf = vec![0u8; 65_536];
+        let mut reaper = tokio::time::interval(UDP_REAP_INTERVAL);
+        reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let (len, client) = match socket.recv_from(&mut buf).await {
-                Ok(received) => received,
-                Err(e) => {
-                    eprintln!("warning: recv failed on {host_addr}: {e}");
-                    continue;
-                }
-            };
-
-            let guest = if let Some(guest) = clients.get(&client) {
-                Arc::clone(guest)
-            } else {
-                if clients.len() >= MAX_UDP_CLIENTS {
-                    eprintln!(
-                        "warning: {host_addr}/udp is tracking {MAX_UDP_CLIENTS} clients; \
-                         dropping datagram from {client}"
-                    );
-                    continue;
-                }
-                // A fresh guest-side socket bound to an ephemeral port, connected
-                // so its replies come only from the guest workload.
-                let guest_socket =
-                    match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await {
-                        Ok(guest_socket) => guest_socket,
+            tokio::select! {
+                received = socket.recv_from(&mut buf) => {
+                    let (len, client) = match received {
+                        Ok(received) => received,
                         Err(e) => {
-                            eprintln!("warning: {client} -> {guest_addr} setup failed: {e}");
+                            eprintln!("warning: recv failed on {host_addr}: {e}");
                             continue;
                         }
                     };
-                if let Err(e) = guest_socket.connect(guest_addr).await {
-                    eprintln!("warning: {client} -> {guest_addr} connect failed: {e}");
-                    continue;
-                }
-                let guest_socket = Arc::new(guest_socket);
-                if verbose {
-                    eprintln!("  {client} -> {guest_addr}");
-                }
 
-                // Relay the guest's replies back to this client.
-                let back_socket = Arc::clone(&socket);
-                let reply_from = Arc::clone(&guest_socket);
-                tokio::spawn(async move {
-                    let mut reply = vec![0u8; 65_536];
-                    while let Ok(reply_len) = reply_from.recv(&mut reply).await {
-                        let _ = back_socket.send_to(&reply[..reply_len], client).await;
+                    // Reuse a live entry, bumping its activity clock.
+                    if let Some(existing) = clients.get(&client) {
+                        *existing.last_seen.lock().unwrap() = Instant::now();
+                        let _ = existing.guest.send(&buf[..len]).await;
+                        continue;
                     }
-                });
 
-                clients.insert(client, Arc::clone(&guest_socket));
-                guest_socket
-            };
+                    if clients.len() >= MAX_UDP_CLIENTS {
+                        eprintln!(
+                            "warning: {host_addr}/udp is tracking {MAX_UDP_CLIENTS} clients; \
+                             dropping datagram from {client}"
+                        );
+                        continue;
+                    }
 
-            let _ = guest.send(&buf[..len]).await;
+                    // A fresh guest-side socket bound to an ephemeral port,
+                    // connected so its replies come only from the guest workload.
+                    let guest_socket =
+                        match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await {
+                            Ok(guest_socket) => guest_socket,
+                            Err(e) => {
+                                eprintln!("warning: {client} -> {guest_addr} setup failed: {e}");
+                                continue;
+                            }
+                        };
+                    if let Err(e) = guest_socket.connect(guest_addr).await {
+                        eprintln!("warning: {client} -> {guest_addr} connect failed: {e}");
+                        continue;
+                    }
+                    let guest_socket = Arc::new(guest_socket);
+                    if verbose {
+                        eprintln!("  {client} -> {guest_addr}");
+                    }
+
+                    let last_seen = Arc::new(Mutex::new(Instant::now()));
+
+                    // Relay the guest's replies back to this client.
+                    let back_socket = Arc::clone(&socket);
+                    let reply_from = Arc::clone(&guest_socket);
+                    let reply_seen = Arc::clone(&last_seen);
+                    let reply_task = tokio::spawn(async move {
+                        let mut reply = vec![0u8; 65_536];
+                        // A connected UDP socket reports a queued ICMP error
+                        // (e.g. port-unreachable before the workload binds its
+                        // port) as a one-shot recv error. Loop past it and keep
+                        // serving rather than abandoning the client for the life
+                        // of the process -- the earlier `while let Ok` form broke
+                        // out permanently here. A genuinely idle flow is reclaimed
+                        // by the reaper instead.
+                        loop {
+                            if let Ok(reply_len) = reply_from.recv(&mut reply).await {
+                                *reply_seen.lock().unwrap() = Instant::now();
+                                let _ = back_socket.send_to(&reply[..reply_len], client).await;
+                            }
+                        }
+                    });
+
+                    clients.insert(
+                        client,
+                        Client { guest: Arc::clone(&guest_socket), last_seen, reply_task },
+                    );
+                    let _ = guest_socket.send(&buf[..len]).await;
+                }
+                _ = reaper.tick() => {
+                    let now = Instant::now();
+                    clients.retain(|_, entry| {
+                        let idle = now.duration_since(*entry.last_seen.lock().unwrap());
+                        let keep = idle < UDP_CLIENT_IDLE_TIMEOUT;
+                        if !keep {
+                            entry.reply_task.abort();
+                        }
+                        keep
+                    });
+                }
+            }
         }
     });
     Ok(())
