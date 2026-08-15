@@ -12,7 +12,7 @@ use crate::utilities::anymap::AnyCloneSendSync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RmdirError, TruncateError, UnlinkError, UtimeError, WalkError, WriteError,
+    ReadlinkError, RmdirError, TruncateError, UnlinkError, UtimeError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, Mode, OFlags, Timestamp, UserInfo};
 
@@ -131,6 +131,14 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
 
     /// Status of an open directory handle.
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError>;
+
+    /// Read the target of an open symbolic-link handle (opened with `O_PATH`,
+    /// since a symlink is not followed on open). The default rejects any handle
+    /// as not-a-symlink, which is correct for a backend that stores no symlinks.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn read_link(&self, h: &FileHandle) -> Result<alloc::string::String, ReadlinkError> {
+        Err(ReadlinkError::NotASymlink)
+    }
 
     /// Create a new file at `parent` with the given `name` and `mode`.
     fn create_file_at(

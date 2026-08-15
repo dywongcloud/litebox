@@ -15,7 +15,8 @@ use super::backend::{
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, UtimeError, WalkError, WriteError,
+    ReadError, ReadlinkError, RmdirError, TruncateError, UnlinkError, UtimeError, WalkError,
+    WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
@@ -674,6 +675,11 @@ impl Backend for Composer {
     fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index].backend.file_status(&h.handle)
+    }
+
+    fn read_link(&self, h: &FileHandle) -> Result<alloc::string::String, ReadlinkError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.read_link(&h.handle)
     }
 
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {

@@ -13,8 +13,8 @@ use crate::{LiteBox, fd::TypedFd, sync};
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, UtimeError,
-    WalkError, WriteError,
+    ReadDirError, ReadError, ReadlinkError, RmdirError, SeekError, TruncateError, UnlinkError,
+    UtimeError, WalkError, WriteError,
 };
 use super::{
     FileType, Mode, OFlags, Timestamp,
@@ -829,6 +829,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             OwnedHandle::File(file) => self.backend.file_status(file),
             OwnedHandle::Dir(dir) => self.backend.dir_status(dir),
         }
+    }
+
+    fn readlink(&self, path: impl Arg) -> Result<alloc::string::String, ReadlinkError> {
+        // Open the link itself (`O_PATH` never follows a symlink), then read its
+        // target from the backend. `open` does not follow symlinks here -- the
+        // shim's leaf-following runs above this layer -- so a symlink resolves to
+        // its own handle.
+        let fd = self
+            .open(path, OFlags::PATH, Mode::empty())
+            .map_err(|error| match error {
+                OpenError::PathError(error) => error.into(),
+                _ => ReadlinkError::Io,
+            })?;
+        let result = {
+            let entry = self
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(ReadlinkError::Io)?;
+            let entry = entry.get_entry();
+            match &entry.entry.handle {
+                OwnedHandle::File(file) => self.backend.read_link(file),
+                OwnedHandle::Dir(_) => Err(ReadlinkError::NotASymlink),
+            }
+        };
+        self.close(&fd).unwrap();
+        result
     }
 
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {

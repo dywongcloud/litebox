@@ -70,10 +70,13 @@ impl super::backend::private::Sealed for TarRo {}
 pub struct TarRoDirHandle {
     idx: usize,
 }
-/// File handle
+/// File handle. `is_symlink` selects which index vector `idx` refers to: the
+/// `files` vector for a regular file, the `symlinks` vector for a symbolic link
+/// (only ever opened with `O_PATH`, never followed at this layer).
 #[derive(Clone)]
 pub struct TarRoFileHandle {
     idx: usize,
+    is_symlink: bool,
 }
 impl super::backend::BackendHandles for TarRo {
     type WalkingDirHandle<'a> = TarRoDirHandle;
@@ -148,32 +151,42 @@ impl super::backend::Backend for TarRo {
         flags: OFlags,
     ) -> Result<super::backend::Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
-        let child = self.tar_index.dirs[dir.idx]
+        let child = *self.tar_index.dirs[dir.idx]
             .children
             .get(name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-        let IndexedChild::File(file_idx) = *child else {
-            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-        };
-        if flags.contains(OFlags::DIRECTORY) {
-            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-        }
-        if !(flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL))
+        let write_requested = !(flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL))
             && (flags.contains(OFlags::CREAT)
                 || flags.contains(OFlags::TRUNC)
                 || flags.contains(OFlags::WRONLY)
-                || flags.contains(OFlags::RDWR))
-        {
+                || flags.contains(OFlags::RDWR));
+        if write_requested {
             return Err(OpenError::ReadOnlyFileSystem);
         }
-        let file = &self.tar_index.files[file_idx];
+        let (idx, is_symlink, mode, owner) = match child {
+            IndexedChild::Dir(_) => {
+                return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+            }
+            IndexedChild::File(file_idx) => {
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
+                let file = &self.tar_index.files[file_idx];
+                (file_idx, false, file.mode, file.owner)
+            }
+            // A symlink is only reached here via `O_PATH` (the resolver never
+            // follows a link; the shim resolves following above this layer).
+            // Return a handle to the link itself -- `read_link`/`file_status`
+            // read it. A symlink's mode is a fixed `lrwxrwxrwx`.
+            IndexedChild::SymLink(sym_idx) => {
+                let sym = &self.tar_index.symlinks[sym_idx];
+                (sym_idx, true, Mode::RWXU | Mode::RWXG | Mode::RWXO, sym.owner)
+            }
+        };
         Ok(super::backend::Permissioned {
-            item: FileHandle::from_typed::<Self>(TarRoFileHandle { idx: file_idx }),
+            item: FileHandle::from_typed::<Self>(TarRoFileHandle { idx, is_symlink }),
             permissions: super::backend::PermissionCheck::ByResolver(
-                super::backend::PermissionInfo {
-                    mode: file.mode,
-                    owner: file.owner,
-                },
+                super::backend::PermissionInfo { mode, owner },
             ),
         })
     }
@@ -193,6 +206,10 @@ impl super::backend::Backend for TarRo {
                         FileType::Directory,
                         self.tar_index.dirs[idx].node_info.clone(),
                     ),
+                    IndexedChild::SymLink(idx) => (
+                        FileType::SymLink,
+                        self.tar_index.symlinks[idx].node_info.clone(),
+                    ),
                 };
                 DirEntry {
                     name: name.clone(),
@@ -204,7 +221,15 @@ impl super::backend::Backend for TarRo {
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
-        let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
+        let h = h.get_typed::<Self>();
+        // A symlink handle is opened only with `O_PATH` and normally never read;
+        // if a reader does reach it, its "contents" are the target string, matching
+        // how a symlink reads at the byte level.
+        let file: &[u8] = if h.is_symlink {
+            self.tar_index.symlinks[h.idx].target.as_bytes()
+        } else {
+            self.tar_index.file_data(h.idx)
+        };
         let start = offset.min(file.len());
         let end = offset.checked_add(buf.len()).unwrap().min(file.len());
         debug_assert!(start <= end);
@@ -229,7 +254,23 @@ impl super::backend::Backend for TarRo {
         &self,
         h: &FileHandle,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let file = &self.tar_index.files[h.get_typed::<Self>().idx];
+        let h = h.get_typed::<Self>();
+        if h.is_symlink {
+            let sym = &self.tar_index.symlinks[h.idx];
+            return Ok(super::FileStatus {
+                // `lstat` semantics: report the link, sized by its target string.
+                file_type: FileType::SymLink,
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                size: sym.target.len(),
+                owner: sym.owner,
+                node_info: sym.node_info.clone(),
+                blksize: BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
+            });
+        }
+        let file = &self.tar_index.files[h.idx];
         Ok(super::FileStatus {
             file_type: FileType::RegularFile,
             mode: file.mode,
@@ -241,6 +282,18 @@ impl super::backend::Backend for TarRo {
             mtime: Timestamp::default(),
             ctime: Timestamp::default(),
         })
+    }
+
+    fn read_link(
+        &self,
+        h: &FileHandle,
+    ) -> Result<alloc::string::String, super::errors::ReadlinkError> {
+        let h = h.get_typed::<Self>();
+        if h.is_symlink {
+            Ok(self.tar_index.symlinks[h.idx].target.clone())
+        } else {
+            Err(super::errors::ReadlinkError::NotASymlink)
+        }
     }
 
     fn dir_status(
@@ -278,7 +331,10 @@ impl super::backend::Backend for TarRo {
         let dir = dir.into_typed::<Self>();
         match self.tar_index.dirs[dir.idx].children.get(name) {
             Some(IndexedChild::Dir(_)) => Err(UnlinkError::IsADirectory),
-            Some(IndexedChild::File(_)) => Err(UnlinkError::ReadOnlyFileSystem),
+            // A file or a symlink exists but the tar is read-only.
+            Some(IndexedChild::File(_) | IndexedChild::SymLink(_)) => {
+                Err(UnlinkError::ReadOnlyFileSystem)
+            }
             None => Err(PathError::NoSuchFileOrDirectory.into()),
         }
     }
@@ -287,7 +343,8 @@ impl super::backend::Backend for TarRo {
         let dir = dir.into_typed::<Self>();
         match self.tar_index.dirs[dir.idx].children.get(name) {
             Some(IndexedChild::Dir(_)) => Err(RmdirError::ReadOnlyFileSystem),
-            Some(IndexedChild::File(_)) => Err(RmdirError::NotADirectory),
+            // Neither a file nor a symlink is a directory.
+            Some(IndexedChild::File(_) | IndexedChild::SymLink(_)) => Err(RmdirError::NotADirectory),
             None => Err(PathError::NoSuchFileOrDirectory.into()),
         }
     }
@@ -378,12 +435,22 @@ struct IndexedDir {
 enum IndexedChild {
     File(usize),
     Dir(usize),
+    SymLink(usize),
+}
+
+/// A symbolic link parsed from a tar entry (typeflag `'2'`). `target` is the raw
+/// linkname; it is neither resolved nor required to exist.
+struct IndexedSymlink {
+    target: String,
+    owner: UserInfo,
+    node_info: NodeInfo,
 }
 
 struct TarIndex {
     tar_data: alloc::borrow::Cow<'static, [u8]>,
     files: Vec<IndexedFile>,
     dirs: Vec<IndexedDir>,
+    symlinks: Vec<IndexedSymlink>,
 }
 
 impl TarIndex {
@@ -392,7 +459,12 @@ impl TarIndex {
         let base_ptr = tar_data.as_ptr() as usize;
 
         let mut files = Vec::new();
-        let mut files_by_path: HashMap<String, usize> = HashMap::new();
+        let mut symlinks = Vec::new();
+        // Each archive entry's normalized path plus the leaf child it becomes and
+        // the owner used when synthesizing its ancestor directories. Kept in a Vec
+        // (not a HashMap) so the directory tree is built in a deterministic order.
+        let mut leaves: Vec<(String, IndexedChild, UserInfo)> = Vec::new();
+        let mut seen_paths: HashMap<String, ()> = HashMap::new();
         for entry in archive.entries() {
             let filename = entry.filename();
             let Ok(path) = filename.as_str() else {
@@ -400,6 +472,7 @@ impl TarIndex {
             };
             let path = normalize_tar_filename(path);
             assert!(!path.is_empty());
+            let owner = owner_from_posix_header(entry.posix_header());
 
             let data = entry.data();
             let start = (data.as_ptr() as usize).checked_sub(base_ptr).unwrap();
@@ -408,17 +481,49 @@ impl TarIndex {
             let indexed_file = IndexedFile {
                 data_range: start..end,
                 mode: mode_of_modeflags(entry.posix_header().mode.to_flags().unwrap()),
-                owner: owner_from_posix_header(entry.posix_header()),
+                owner,
                 node_info: inode_allocator.next(),
             };
 
             let file_idx = files.len();
             files.push(indexed_file);
-            let old = files_by_path.insert(path.into(), file_idx);
+            let old = seen_paths.insert(path.into(), ());
             assert!(
                 old.is_none(),
                 "tar files with rewritten file contents are unsupported"
             );
+            leaves.push((path.into(), IndexedChild::File(file_idx), owner));
+        }
+
+        // `archive.entries()` yields only regular files -- it silently skips
+        // symlinks and every other type. Walk the raw header stream separately to
+        // pick up symlink entries (typeflag '2'), whose target is the linkname and
+        // whose data section is empty.
+        for (_block, hdr) in tar_no_std::ArchiveHeaderIterator::new(tar_data.as_ref()) {
+            if hdr.is_zero_block()
+                || !matches!(
+                    hdr.typeflag.try_to_type_flag(),
+                    Ok(tar_no_std::TypeFlag::SYMTYPE)
+                )
+            {
+                continue;
+            }
+            let Ok(name) = hdr.name.as_str() else {
+                continue;
+            };
+            let path = normalize_tar_filename(name);
+            assert!(!path.is_empty());
+            let target = String::from(hdr.linkname.as_str().unwrap_or(""));
+            let owner = owner_from_posix_header(hdr);
+            let sym_idx = symlinks.len();
+            symlinks.push(IndexedSymlink {
+                target,
+                owner,
+                node_info: inode_allocator.next(),
+            });
+            let old = seen_paths.insert(path.into(), ());
+            assert!(old.is_none(), "duplicate tar entry path");
+            leaves.push((path.into(), IndexedChild::SymLink(sym_idx), owner));
         }
 
         let mut dirs = alloc::vec![IndexedDir {
@@ -427,8 +532,7 @@ impl TarIndex {
             children: HashMap::new(),
         }];
         let mut dirs_by_path: HashMap<String, usize> = [(String::new(), 0)].into_iter().collect();
-        for (path, &file_idx) in &files_by_path {
-            let file = &files[file_idx];
+        for (path, leaf_child, owner) in &leaves {
             let components: Vec<&str> = path
                 .split('/')
                 .filter(|component| !component.is_empty())
@@ -438,12 +542,12 @@ impl TarIndex {
             let mut parent_dir_idx = 0;
             for (component_idx, component) in components.iter().enumerate() {
                 let is_last_component = component_idx + 1 == components.len();
-                dirs[parent_dir_idx].owner.get_or_insert(file.owner);
+                dirs[parent_dir_idx].owner.get_or_insert(*owner);
 
                 if is_last_component {
                     dirs[parent_dir_idx]
                         .children
-                        .insert((*component).into(), IndexedChild::File(file_idx));
+                        .insert((*component).into(), *leaf_child);
                     break;
                 }
 
@@ -455,7 +559,7 @@ impl TarIndex {
                 }
                 let child_dir_idx = *dirs_by_path.entry(parent.clone()).or_insert_with(|| {
                     dirs.push(IndexedDir {
-                        owner: Some(file.owner),
+                        owner: Some(*owner),
                         node_info: inode_allocator.next(),
                         children: HashMap::new(),
                     });
@@ -464,7 +568,7 @@ impl TarIndex {
                 dirs[parent_dir_idx]
                     .children
                     .insert((*component).into(), IndexedChild::Dir(child_dir_idx));
-                dirs[child_dir_idx].owner.get_or_insert(file.owner);
+                dirs[child_dir_idx].owner.get_or_insert(*owner);
                 parent_dir_idx = child_dir_idx;
             }
         }
@@ -473,6 +577,7 @@ impl TarIndex {
             tar_data,
             files,
             dirs,
+            symlinks,
         }
     }
 
