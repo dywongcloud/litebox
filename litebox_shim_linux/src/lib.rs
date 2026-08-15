@@ -203,6 +203,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 return ContinueOperation::Terminate;
             }
         }
+        // Best-effort symbolization of a genuine guest fault: name the guest
+        // ELF image (and image-relative offset) containing the fault PC and
+        // the return address, in the `path+0xoffset` form `llvm-symbolizer`
+        // resolves directly against the guest's own binaries. Debug level so
+        // it is inert unless logging is enabled -- guests also take faults on
+        // purpose (e.g. OpenSSL's SIGILL CPU-feature probes).
+        {
+            let symbolize = |addr: usize| match self.task.find_guest_image(addr) {
+                Some((path, offset)) => alloc::format!("{path}+{offset:#x}"),
+                None => alloc::format!("{addr:#x} (no image)"),
+            };
+            #[cfg(target_arch = "aarch64")]
+            litebox_util_log::debug!(
+                pc:% = symbolize(ctx.pc), x30:% = symbolize(ctx.regs[30]),
+                exception:? = info.exception;
+                "guest fault location"
+            );
+            #[cfg(target_arch = "x86_64")]
+            litebox_util_log::debug!(
+                rip:% = symbolize(ctx.rip), exception:? = info.exception;
+                "guest fault location"
+            );
+        }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 
@@ -298,6 +321,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            guest_images: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
             // Overwritten with the initial task's pid in `load_program`; `0` is not a valid pid
             // so it's an obviously-uninitialized placeholder if ever observed.
             pgid: 0.into(),
@@ -1450,6 +1474,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Guest ELF images recorded at map time, for fault symbolization. Grows
+    /// monotonically (never pruned on unmap) and survives the mapping fd's
+    /// close, unlike [`Self::elf_patch_cache`]. See `Task::find_guest_image`.
+    guest_images: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::mm::GuestImage>>,
     /// Handle to the `/proc` backend mounted by [`LinuxShimBuilder::default_fs`], if any --
     /// `None` when the shim was built with a filesystem that doesn't mount one.
     /// `Task::set_task_comm` publishes the guest task's identity here as it becomes known.

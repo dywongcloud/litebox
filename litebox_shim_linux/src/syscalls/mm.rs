@@ -12,7 +12,9 @@ use litebox::{
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
     },
 };
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{
+    MRemapFlags, MapFlags, ProtFlags, errno::Errno, loader::TRAMPOLINE_GUEST_TP_SLOT_OFFSET,
+};
 
 use crate::ShimFS;
 use crate::ShimPlatform;
@@ -24,6 +26,15 @@ use object::endian::LittleEndian;
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
+
+/// This module publishes the guest thread-pointer offset into the same
+/// trampoline word the rewriter's gates read. Mirrors the identical assertion
+/// in `crate::loader::elf`, which holds the loader path to the same constant:
+/// drift here would make the mmap path write the offset into the middle of an
+/// instruction instead of into the slot the gates read.
+const _: () = assert!(
+    TRAMPOLINE_GUEST_TP_SLOT_OFFSET == litebox_syscall_rewriter::TRAMPOLINE_GUEST_TP_SLOT_OFFSET
+);
 
 const ENDIAN: LittleEndian = LittleEndian;
 
@@ -139,6 +150,12 @@ fn clear_icache_range(_start: usize, _len: usize) {}
 pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pre_patched: bool,
+    /// `e_machine` from the ELF header. The runtime rewriter
+    /// (`patch_code_segment` / `trap_all_syscalls_in_code`) decodes x86-64
+    /// instructions only; recording the machine lets the patching path refuse
+    /// to run that decoder over any other architecture's code instead of
+    /// silently reinterpreting (and corrupting) it.
+    machine: u16,
     /// For pre-patched binaries: file offset and size of the trampoline data.
     trampoline_file_offset: u64,
     trampoline_file_size: usize,
@@ -166,6 +183,24 @@ pub(crate) struct ElfPatchState {
 
 /// Per-process collection of ELF patching state, keyed by fd number.
 pub(crate) type ElfPatchCache = BTreeMap<i32, ElfPatchState>;
+
+/// A guest ELF image recorded at first-map time, for fault symbolization.
+///
+/// Deliberately not part of [`ElfPatchState`]: that cache is keyed by a
+/// reusable raw fd and dropped when the fd closes, while a dynamic linker
+/// closes each library's fd as soon as its segments are mapped -- long before
+/// any fault that needs symbolizing. Entries here live for the process.
+pub(crate) struct GuestImage {
+    /// Lowest mapped guest address covered by the image's PT_LOAD segments.
+    lo: usize,
+    /// One past the highest mapped guest address covered by the image.
+    hi: usize,
+    /// The load bias: guest address minus ELF vaddr. `addr - base` is the
+    /// image-relative address `llvm-symbolizer` resolves against the file.
+    base: usize,
+    /// The absolute guest path the image was opened with.
+    path: alloc::string::String,
+}
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -726,6 +761,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let e_type = ehdr.e_type.get(ENDIAN);
+        let e_machine = ehdr.e_machine.get(ENDIAN);
         let e_phoff: usize = ehdr.e_phoff.get(ENDIAN).trunc();
         let e_phentsize = ehdr.e_phentsize.get(ENDIAN) as usize;
         let e_phnum = ehdr.e_phnum.get(ENDIAN) as usize;
@@ -751,6 +787,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
         // by matching the segment whose p_offset corresponds to file_offset.
         let mut max_load_end: u64 = 0;
+        let mut min_load_start: u64 = u64::MAX;
         let mut base_addr: Option<usize> = None;
         for i in 0..e_phnum {
             let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
@@ -773,6 +810,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if end > max_load_end {
                 max_load_end = end;
             }
+            if p_vaddr < min_load_start {
+                min_load_start = p_vaddr;
+            }
             // Match segment by page-aligned file offset to derive base address.
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
@@ -783,6 +823,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         if max_load_end == 0 {
             return; // No PT_LOAD segments
+        }
+
+        // Record the image span for fault symbolization. This must happen at
+        // map time: the dynamic linker closes the fd (dropping the patch-state
+        // entry below) as soon as the library is mapped, long before any fault
+        // that needs a `path+offset`. Best-effort -- an fd without a recorded
+        // path (memfd, inherited fd) simply is not symbolizable later.
+        let image_base = if e_type == ET_DYN { base_addr } else { Some(0) };
+        if let Some(base) = image_base
+            && let Some(path) = self.fd_abs_path(fd)
+        {
+            let lo = base + align_down(min_load_start.trunc(), PAGE_SIZE);
+            let hi = base + align_up(max_load_end.trunc(), PAGE_SIZE);
+            self.global.guest_images.lock().push(GuestImage {
+                lo,
+                hi,
+                base,
+                path: alloc::string::String::from_utf8_lossy(path.as_bytes()).into_owned(),
+            });
         }
 
         // Check if file is pre-patched by reading the last 32 bytes for magic
@@ -821,6 +880,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut cache = self.global.elf_patch_cache.lock();
         cache.entry(fd).or_insert(ElfPatchState {
             pre_patched,
+            machine: e_machine,
             trampoline_file_offset: tramp_file_offset,
             trampoline_file_size: tramp_file_size.trunc(),
             trampoline_addr: trampoline_vaddr,
@@ -1011,6 +1071,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tramp_data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
                 }
 
+                // Publish the guest thread-pointer offset the runtime actually
+                // reserved, mirroring `ElfParsedFile::load_trampoline` in
+                // `litebox_common_linux::loader`. The loader path only covers
+                // the main executable and its interpreter; libraries mapped by
+                // the in-guest dynamic linker arrive here instead, and leaving
+                // the packager-seeded default in place would make this
+                // module's gates read the guest TP from a different slot than
+                // every loader-published module writes it to. Skipped when the
+                // platform bakes the offset into the gates as an immediate.
+                if let Some(offset) = self.global.platform.get_guest_tp_slot_offset() {
+                    let end = TRAMPOLINE_GUEST_TP_SLOT_OFFSET + size_of::<usize>();
+                    if tramp_data.len() < end {
+                        // The gates in this image read this word; a trampoline
+                        // too short to hold it means every rewritten syscall
+                        // would compute a garbage thread pointer. Fail the
+                        // mapping rather than continuing silently.
+                        let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
+                        return false;
+                    }
+                    tramp_data[TRAMPOLINE_GUEST_TP_SLOT_OFFSET..end]
+                        .copy_from_slice(&offset.to_ne_bytes());
+                }
+
                 // Write to the mapped region.
                 if self.write_code_bytes(tramp_ptr, &tramp_data).is_none() {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
@@ -1037,6 +1120,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         // ── Runtime patching path (unpatched binaries) ───────────────
+
+        // The runtime rewriter is an x86-64 instruction decoder. Running it
+        // (or the trap fallback, which shares that decoder) over another
+        // architecture's code would reinterpret arbitrary instruction words as
+        // x86 and corrupt the segment, so refuse and leave the code untouched.
+        // On such hosts every shipped image is expected to be pre-patched
+        // (carrying the `LITEBOX0` trailer) and never reaches this arm.
+        if state.machine != object::elf::EM_X86_64 {
+            litebox_util_log::warn!(
+                machine:? = state.machine, addr:? = mapped_addr.as_usize(), len:? = len;
+                "unpatched non-x86-64 image: runtime syscall patching skipped"
+            );
+            return true;
+        }
 
         // Allocate the trampoline region if not yet done.
         let addr_usize = mapped_addr.as_usize();
@@ -1266,6 +1363,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         restore_trampoline_rx(self, state);
         true
+    }
+
+    /// Find the guest ELF image containing `addr`, returning its guest path
+    /// and the image-relative offset (`addr - load bias`) -- the pair
+    /// `llvm-symbolizer` needs to resolve the address against the guest's own
+    /// (debug-info-carrying) ELF. Latest mapping wins so an address reused
+    /// after an image is replaced resolves to the live image.
+    pub(crate) fn find_guest_image(&self, addr: usize) -> Option<(alloc::string::String, usize)> {
+        let images = self.global.guest_images.lock();
+        images
+            .iter()
+            .rev()
+            .find(|img| (img.lo..img.hi).contains(&addr))
+            .map(|img| (img.path.clone(), addr - img.base))
     }
 
     /// Finalize the ELF patching state for `fd`.
@@ -1808,5 +1919,118 @@ mod tests {
         let ptr = UserPtrMut::<u8>::from_usize(0xdeadbeef);
         let result = ptr.read_at_offset::<Platform>(0);
         assert!(result.is_none());
+    }
+
+    /// Regression test: mapping a pre-patched ET_DYN's executable segment must
+    /// rewrite BOTH runtime-variable trampoline header words -- the syscall
+    /// entry point (word 0) and, on a platform whose gates read the guest
+    /// thread-pointer offset from the trampoline, that offset (word 1).
+    ///
+    /// The loader path (`ElfParsedFile::load_trampoline`) always published
+    /// both, but the mmap path used by an in-guest dynamic linker mapping a
+    /// pre-patched library only published word 0, leaving the packager-seeded
+    /// default in word 1. On macOS that made every gate in an ld.so-mapped
+    /// library read the guest TP from the wrong TSD slot, sending node's
+    /// cross-module `std::call_once` through host-heap garbage to a PC=0
+    /// instruction abort.
+    #[test]
+    fn test_prepatched_mmap_publishes_trampoline_header() {
+        use litebox::platform::SystemInfoProvider as _;
+
+        // Values the packager might have seeded; the runtime must replace them.
+        const SEED_ENTRY: u64 = 0x1111_1111_1111_1111;
+        const SEED_TP_OFFSET: u64 = 0x2222_2222_2222_2222;
+        const TRAMP_SIZE: usize = 32;
+
+        let _guard = crate::syscalls::tests::address_space_guard();
+        let task = init_platform(None);
+
+        // Synthetic pre-patched ET_DYN:
+        // [ELF header + one PT_LOAD phdr | pad to PAGE_SIZE]
+        // [trampoline code (TRAMP_SIZE bytes)] [32-byte LITEBOX0 trailer]
+        let mut file = alloc::vec![0u8; PAGE_SIZE + TRAMP_SIZE + 32];
+        file[0..4].copy_from_slice(b"\x7fELF");
+        file[4] = 2; // ELFCLASS64
+        file[5] = 1; // ELFDATA2LSB
+        file[6] = 1; // EV_CURRENT
+        file[16..18].copy_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+        #[cfg(target_arch = "x86_64")]
+        let e_machine: u16 = 62; // EM_X86_64
+        #[cfg(target_arch = "aarch64")]
+        let e_machine: u16 = 183; // EM_AARCH64
+        file[18..20].copy_from_slice(&e_machine.to_le_bytes());
+        file[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        file[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        file[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        file[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        file[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        // PT_LOAD at p_offset 0, p_vaddr 0, R+X, one page.
+        let ph = 64;
+        file[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type
+        file[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // p_flags R|X
+        file[ph + 32..ph + 40].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_filesz
+        file[ph + 40..ph + 48].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_memsz
+        file[ph + 48..ph + 56].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_align
+        // Trampoline code, seeded like the packager leaves it.
+        file[PAGE_SIZE..PAGE_SIZE + 8].copy_from_slice(&SEED_ENTRY.to_le_bytes());
+        file[PAGE_SIZE + 8..PAGE_SIZE + 16].copy_from_slice(&SEED_TP_OFFSET.to_le_bytes());
+        // Trailer: magic, trampoline file offset, vaddr (just past PT_LOAD), size.
+        let t = PAGE_SIZE + TRAMP_SIZE;
+        file[t..t + 8].copy_from_slice(b"LITEBOX0");
+        file[t + 8..t + 16].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
+        file[t + 16..t + 24].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
+        file[t + 24..t + 32].copy_from_slice(&(TRAMP_SIZE as u64).to_le_bytes());
+
+        let fd = task
+            .sys_open(
+                "prepatched_test.so",
+                OFlags::RDWR | OFlags::CREAT,
+                Mode::RWXU,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        assert_eq!(task.sys_write(fd, &file, None).unwrap(), file.len());
+
+        // Map two pages so the trampoline's MAP_FIXED landing zone (page 1,
+        // per the trailer's vaddr) is this test's own mapping, not whatever
+        // else the harness put there.
+        let addr = task
+            .sys_mmap(
+                0,
+                2 * PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap();
+
+        let tramp = UserPtrMut::<u8>::from_usize(addr.as_usize() + PAGE_SIZE);
+        let header = tramp.to_owned_slice::<Platform>(16).unwrap();
+        let platform = task.global.platform;
+
+        let entry = platform.get_syscall_entry_point();
+        assert_ne!(entry, 0, "test platform must expose a syscall entry point");
+        assert_eq!(
+            header[..8],
+            entry.to_le_bytes(),
+            "mmap path must publish the runtime syscall entry into trampoline word 0"
+        );
+
+        match platform.get_guest_tp_slot_offset() {
+            Some(offset) => assert_eq!(
+                header[8..16],
+                offset.to_ne_bytes(),
+                "mmap path must publish the runtime guest TP slot offset into trampoline word 1"
+            ),
+            None => assert_eq!(
+                header[8..16],
+                SEED_TP_OFFSET.to_le_bytes(),
+                "platforms that bake the TP offset into gates must leave the seeded word alone"
+            ),
+        }
+
+        task.sys_munmap(addr, 2 * PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
     }
 }

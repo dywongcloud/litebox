@@ -306,6 +306,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
+    /// The absolute path `fd` was opened with, if one was recorded (see
+    /// [`FdPath`]). Best-effort by design: sockets, pipes, and fds inherited
+    /// without a path resolve to `None`. Used by the ELF mapping code to name
+    /// guest images for fault symbolization.
+    pub(crate) fn fd_abs_path(&self, fd: i32) -> Option<CString> {
+        let fd = u32::try_from(fd).ok()?;
+        self.resolve_dirfd_path(fd).ok()
+    }
+
     /// Resolve a path relative to a dirfd.
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
