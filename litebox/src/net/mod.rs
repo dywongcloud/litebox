@@ -39,6 +39,10 @@ const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 // TODO: Make this configurable
 const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
+/// The loopback address. Packets destined anywhere in `127.0.0.0/8` are looped
+/// back into the interface's own receive path (see [`phy`]).
+const LOOPBACK_IP_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+
 /// Maximum size of rx/tx buffers for sockets
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 
@@ -101,6 +105,21 @@ where
             match ip_addrs.push(smoltcp::wire::IpCidr::new(
                 smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
                 24,
+            )) {
+                Ok(()) => {}
+                Err(_) => unreachable!(),
+            }
+            // Own `127.0.0.0/8` so the interface both accepts inbound packets
+            // to `127.0.0.1` as local and, under `Medium::Ip` (no ARP), sends
+            // to it directly without the default gateway. The `phy::Device`
+            // loops any packet destined here straight back into its own
+            // receive queue (see `phy.rs`), which is what makes an in-process
+            // guest server reachable from the same guest -- a Node http server
+            // on `127.0.0.1` fetched by the same process, and the many test
+            // frameworks and IPC paths that assume a working loopback.
+            match ip_addrs.push(smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(LOOPBACK_IP_ADDR),
+                8,
             )) {
                 Ok(()) => {}
                 Err(_) => unreachable!(),
@@ -1076,6 +1095,33 @@ where
 
         match socket_handle.protocol() {
             Protocol::Tcp => {
+                // A *listening* socket's address is not on the original
+                // `socket()` handle -- `listen`/`refill_to_backlog` create
+                // separate accept sockets, and the original never gets a
+                // `local_endpoint`, so reading it here returns `0.0.0.0:0` and
+                // a guest's `getsockname` (Node's `server.address().port`)
+                // sees port 0. The bound listen endpoint recorded at `bind`
+                // time is the authoritative answer for a server socket; use
+                // it, and fall back to the plain bound `local_port` for a
+                // socket that was bound but not yet listened.
+                let tcp = socket_handle.tcp();
+                if let Some(server) = tcp.server_socket.as_ref() {
+                    let ep = &server.ip_listen_endpoint;
+                    let addr = match ep.addr {
+                        Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
+                        None => Ipv4Addr::UNSPECIFIED,
+                    };
+                    return Ok(SocketAddr::V4(SocketAddrV4::new(addr, ep.port)));
+                }
+                if let Some(local_port) = tcp.local_port.as_ref() {
+                    let port = local_port.port();
+                    if port != 0 {
+                        return Ok(SocketAddr::V4(SocketAddrV4::new(
+                            Ipv4Addr::UNSPECIFIED,
+                            port,
+                        )));
+                    }
+                }
                 let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
                 match socket.local_endpoint() {
                     Some(endpoint) => match endpoint.addr {

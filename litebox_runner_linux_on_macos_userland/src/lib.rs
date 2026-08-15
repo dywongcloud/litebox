@@ -167,6 +167,41 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp,
     )?;
 
+    // Drive the network stack. The shim keeps its smoltcp interface in
+    // `Manual` mode -- nothing polls it unless a runner does -- and the Linux
+    // runner spawns this exact loop, but only when a `--tun` device is
+    // present. macOS has no tun by default, yet still needs the poll to run:
+    // in-process loopback (a guest binding a server on `127.0.0.1` and
+    // reaching it from the same process -- a Node `http` server, and the many
+    // test frameworks and IPC paths that assume a working loopback) is entirely
+    // driven by this poll. Without it every TCP handshake stalls, because the
+    // SYN a `connect` queues is never egressed. A short bounded sleep between
+    // polls keeps loopback latency low without a hot spin; there is no tun to
+    // block on here.
+    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let net_worker = {
+        let shim = shim.clone();
+        let shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            const IDLE_SLEEP: core::time::Duration = core::time::Duration::from_micros(200);
+            const MAX_SLEEP: core::time::Duration = core::time::Duration::from_millis(1);
+            while !shutdown.load(core::sync::atomic::Ordering::Relaxed) {
+                let timeout = loop {
+                    match shim.perform_network_interaction() {
+                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
+                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
+                            break timeout;
+                        }
+                    }
+                };
+                std::thread::sleep(timeout.unwrap_or(IDLE_SLEEP).min(MAX_SLEEP));
+            }
+            // Final flush so a socket with data still queued at guest exit gets
+            // one last chance to drain.
+            while shim.perform_network_interaction().call_again_immediately() {}
+        })
+    };
+
     // SAFETY: `load_program` produced the entry context, so its `pc` and `sp`
     // describe a loaded, runnable guest image.
     unsafe {
@@ -175,5 +210,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             &mut litebox_common_linux::PtRegs::default(),
         );
     }
-    std::process::exit(program.process.wait())
+    let exit_code = program.process.wait();
+    shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
+    let _ = net_worker.join();
+    std::process::exit(exit_code)
 }
