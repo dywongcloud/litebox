@@ -58,10 +58,12 @@ is absent. An interface that already exists is reused rather than replaced.
 `boxer run -P` (or `-p`) attaches the workload to that device -- the guest
 answers on `10.0.0.2` -- and publishes each mapping on the host, so clients
 connect to `127.0.0.1:<port>` without knowing the guest address. `-p` takes
-docker's shapes: `PORT`, `HOST:GUEST`, `IP:HOST:GUEST`. Only TCP is
-published; a `/udp` mapping is refused rather than quietly forwarded over
-TCP. `--net <device>` selects a different TUN device, and is implied by
-publishing.
+docker's shapes: `PORT`, `HOST:GUEST`, `IP:HOST:GUEST`, each optionally
+suffixed `/tcp` or `/udp` (TCP by default). Both protocols are published:
+TCP forwards each connection with independent half-close, and UDP relays
+datagrams with one guest-side socket per client source address so replies
+route back to the right client. `--net <device>` selects a different TUN
+device, and is implied by publishing.
 
 Forwarding is async (tokio): every connection is its own task, each direction
 is copied independently so a half-close propagates, and a workload that

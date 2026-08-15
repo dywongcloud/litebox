@@ -101,12 +101,12 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
             .iter()
             .filter_map(|port| crate::publish::PortMapping::from_exposed(port))
             .collect();
-        // Every EXPOSEd port being non-TCP would otherwise leave -P a silent
-        // no-op: no listener, no device, a workload the user thinks is served.
+        // Guard against a silent no-op: if nothing mappable came out of the
+        // EXPOSEd set, -P would set up no listener and no device while the user
+        // believes something is served.
         if from_exposed.is_empty() {
             eprintln!(
-                "warning: --publish-all matched no ports: this box EXPOSEs only \
-                 non-TCP ports ({}), and only TCP is published",
+                "warning: --publish-all matched no publishable ports from ({})",
                 meta.exposed_ports.join(", ")
             );
         }
