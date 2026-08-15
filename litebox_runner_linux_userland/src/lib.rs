@@ -216,7 +216,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
-    let platform = Platform::new(cli_args.tun_device_name.as_deref());
+    let platform = Platform::new(cli_args.tun_device_name.as_deref())
+        .map_err(|e| anyhow::anyhow!("failed to initialize the platform: {e}"))?;
 
     for file in cow_eligible_regions {
         platform.register_cow_region(file.data, file.abs_path);

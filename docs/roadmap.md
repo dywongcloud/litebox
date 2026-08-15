@@ -857,19 +857,50 @@ Both need a real diagnosis rather than a test adjustment: an unmap of an
 unowned range is exactly the class of bug the platform assertions exist to
 catch.
 
-## Consecutive TUN socket tests hang in the same process
+## Consecutive TUN socket tests hang in the same process (fixed)
 
-`syscalls::net::tests::test_tun_*` pass one at a time, but running two of
-them back to back in one test binary hangs the second: with
-`--test-threads=1`, `test_tun_blocking_recvfrom_tcp_socket` passes and
-`..._with_truncation` never returns. The pair behaves identically at the
-commit before this branch, so it is pre-existing rather than a regression,
-and each test passes when selected with `--exact`.
+`syscalls::net::tests::test_tun_*` passed one at a time but hung the second
+of any back-to-back pair in one test binary: with `--test-threads=1`,
+`test_tun_blocking_recvfrom_tcp_socket` passed and `..._with_truncation`
+never returned.
 
-The tests share one host TUN device and each builds a fresh platform on it,
-so the likely cause is the previous test's interface or its `nc` peer not
-being fully torn down before the next one attaches. Whatever the cause, it
-makes the socket suite unable to run as a suite, which is how CI runs it.
+The cause was a leaked pump thread. Every `init_platform(Some(tun))` spawned
+a detached, immortal loop reading the one shared host TUN fd (the platform is
+a process-wide `OnceLock`), with no stop signal and no join. When the next
+test started, the previous test's pump was still reading that fd; a TUN read
+is destructive, so the leaked reader swallowed the new test's inbound SYN and
+its `accept()` blocked forever. `--exact`/nextest masked it because each test
+then ran in its own process with no prior reader.
+
+Fixed: the pump is now generation-gated. Each `init_platform` bumps a counter,
+joins the previous pump, and starts its own; the pump checks the generation
+every iteration and exits when a newer one supersedes it, so exactly one
+thread ever reads the shared fd. The full `test_tun_*` set now passes under
+`--test-threads=1` in one process (the only remaining failures on a bare host
+are the 9P tests, which need `diod` installed).
+
+## A guest's read after its own SHUT_WR sees ECONNRESET, not EOF
+
+A guest that half-closes with `shutdown(fd, SHUT_WR)` and then keeps reading
+until end-of-stream gets `ECONNRESET` (errno 104) on the terminal read where
+Linux would deliver a clean `EOF` (0), once the peer sends its own FIN. Any
+data still in flight before that point is delivered correctly; only the final
+end-of-stream indication has the wrong shape.
+
+The cause is that the LiteBox TCP stack is built on smoltcp, which has no
+half-close: `shutdown_send` maps `SHUT_WR` onto smoltcp's `close()`, a
+full-duplex teardown that sends FIN and moves the socket to a closing state,
+so the peer's subsequent clean FIN arrives at a socket smoltcp already
+considers closed and is reported as a reset rather than an orderly shutdown.
+
+This is not fixable at the shim layer without smoltcp support for a true
+half-open state: translating every post-`SHUT_WR` reset into EOF would hide
+genuine resets, trading one wrong answer for another. The correct fix is
+either a smoltcp half-close (an upstream change) or a LiteBox TCP state that
+tracks the local write-shutdown and distinguishes a peer's orderly FIN from a
+real RST. Reproduced with a guest that does `SHUT_WR`, reads the peer's
+in-flight bytes (delivered fine), then reads again after the peer's clean FIN
+(`errno 104`).
 
 ## The test suite's own macOS gaps
 

@@ -23,7 +23,7 @@ impl TestLauncher {
         initial_files: &[&str],
         tun_device_name: Option<&str>,
     ) -> Self {
-        let platform = Platform::new(tun_device_name);
+        let platform = Platform::new(tun_device_name).expect("platform initialization");
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
         let litebox = shim_builder.litebox();
 

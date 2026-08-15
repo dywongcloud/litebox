@@ -136,6 +136,11 @@ struct CowRegionInfo {
 const IF_NAMESIZE: usize = 16;
 /// Use TUN device
 const IFF_TUN: i32 = 0x0001;
+/// `IFF_TUN | IFF_NO_PI` in the `i16` shape the `ifr_flags` field wants. Kept
+/// in sync with the flags by the assertion below (a widening compare, so no
+/// truncation and no runtime check).
+const TUN_IFR_FLAGS: i16 = 0x1001;
+const _: () = assert!(TUN_IFR_FLAGS as i32 == IFF_TUN | IFF_NO_PI);
 /// Do not provide packet information
 const IFF_NO_PI: i32 = 0x1000;
 /// libc `ifreq` structure, used for TUN/TAP devices.
@@ -184,14 +189,29 @@ impl LinuxUserland {
     /// Takes an optional tun device name (such as `"tun0"` or `"tun99"`) to connect networking (if
     /// not specified, networking is disabled).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the tun device could not be successfully opened.
-    pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+    /// Returns an error string if the tun device could not be opened or
+    /// attached -- for example when the device name is already in use by
+    /// another process (`EBUSY`), so callers can report it rather than abort.
+    pub fn new(tun_device_name: Option<&str>) -> Result<&'static Self, alloc::string::String> {
         register_exception_handlers();
 
-        let tun_socket_fd = tun_device_name
-            .map(|tun_device_name| {
+        let tun_socket_fd = match tun_device_name {
+            None => None,
+            Some(tun_device_name) => {
+                if tun_device_name.len() >= 16 {
+                    // Strictly-less-than 16 so it fits the fixed ifr_name field.
+                    return Err(alloc::format!(
+                        "tun device name '{tun_device_name}' is longer than 15 bytes"
+                    ));
+                }
+                if !tun_device_name.is_ascii() {
+                    return Err(alloc::format!(
+                        "tun device name '{tun_device_name}' must be ASCII"
+                    ));
+                }
+
                 let tun_path = b"/dev/net/tun\0";
                 let tun_fd = unsafe {
                     syscalls::syscall3(
@@ -204,44 +224,52 @@ impl LinuxUserland {
                         litebox::fs::Mode::empty().bits() as usize,
                     )
                 }
-                .expect("failed to open tun device");
+                .map_err(|e| alloc::format!("failed to open /dev/net/tun: {e:?}"))?;
 
-                let tunsetiff = |fd: usize, ifreq: *const Ifreq| {
-                    let cmd =
-                        litebox_common_linux::iow!(b'T', 202, size_of::<::core::ffi::c_int>());
-                    unsafe {
-                        syscalls::syscall3(syscalls::Sysno::ioctl, fd, cmd as usize, ifreq as usize)
-                    }
-                    .expect("failed to set TUN interface flags");
-                };
+                let mut name = [0i8; 16];
+                for (i, b) in tun_device_name.bytes().enumerate() {
+                    // ASCII was checked above, so every byte is 0..=127 and the
+                    // cast to the signed `ifr_name` element is exact.
+                    name[i] = b.cast_signed();
+                }
                 let ifreq = Ifreq {
-                    ifr_name: {
-                        let mut name = [0i8; 16];
-                        assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
-                        for (i, b) in tun_device_name.char_indices() {
-                            let b = b as u32;
-                            assert!(b < 128);
-                            name[i] = i8::try_from(b).unwrap();
-                        }
-                        name
-                    },
+                    ifr_name: name,
                     ifr_ifru: Ifru {
-                        // IFF_NO_PI: no tun header
-                        // IFF_TUN: create tun (i.e., IP)
-                        ifru_flags: i16::try_from(IFF_TUN | IFF_NO_PI).unwrap(),
+                        // IFF_TUN (create an IP tun) | IFF_NO_PI (no tun header).
+                        // 0x1001 fits i16, so the cast is exact and cannot panic.
+                        ifru_flags: TUN_IFR_FLAGS,
                     },
                 };
-                tunsetiff(tun_fd, &raw const ifreq);
+                let cmd = litebox_common_linux::iow!(b'T', 202, size_of::<::core::ffi::c_int>());
+                unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::ioctl,
+                        tun_fd,
+                        cmd as usize,
+                        &raw const ifreq as usize,
+                    )
+                }
+                .map_err(|e| match e {
+                    syscalls::Errno::EBUSY => alloc::format!(
+                        "tun device '{tun_device_name}' is already in use by another process; \
+                         run one workload per device or pass a different --net device"
+                    ),
+                    other => {
+                        alloc::format!("failed to attach tun device '{tun_device_name}': {other:?}")
+                    }
+                })?;
 
                 // By taking ownership, we are letting the drop handler automatically run `libc::close`
                 // when necessary.
-                unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().trunc()) }
-            })
-            .into();
+                Some(unsafe {
+                    std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().trunc())
+                })
+            }
+        };
 
         let reserved_pages = Self::read_maps();
         let platform = Self {
-            tun_socket_fd,
+            tun_socket_fd: tun_socket_fd.into(),
             reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
@@ -259,7 +287,7 @@ impl LinuxUserland {
         };
         let platform: &'static Self = Box::leak(Box::new(platform));
         spawn_stdin_pump_thread(platform);
-        platform
+        Ok(platform)
     }
 
     /// Initializes support for KDFs by using boot-specific uniqueness.
@@ -2710,7 +2738,7 @@ mod tests {
 
     #[test]
     fn test_reserved_pages() {
-        let platform = LinuxUserland::new(None);
+        let platform = LinuxUserland::new(None).expect("platform initialization");
         let reserved_pages: Vec<_> =
             <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
 
@@ -2734,7 +2762,7 @@ mod tests {
             unsafe { OwnedFd::from_raw_fd(fd) }
         }
 
-        let _platform: &LinuxUserland = LinuxUserland::new(None);
+        let _platform: &LinuxUserland = LinuxUserland::new(None).expect("platform initialization");
         let allowed = test_memfd(c"seccomp-allowed-positional-io");
         let denied = test_memfd(c"seccomp-denied-positional-io");
         let (allowed_shutdown, _allowed_peer) = UnixStream::pair().unwrap();

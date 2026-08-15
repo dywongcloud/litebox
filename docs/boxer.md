@@ -180,7 +180,8 @@ persist back out of the sandbox -- a builder needs real writes. Consequences:
   is a LiteBox filesystem roadmap item, not a box format limit.
 - Boxes above 2 GiB stay valid wasm and run fine natively, but JS engines cap
   single buffers at 2 GiB; `boxer build` warns when crossing that line.
-  The hard format ceiling is 3.5 GiB (u32 section sizes).
+  `boxer` enforces a 3.5 GiB ceiling, held safely below the ~4 GiB that u32
+  section sizes impose so the section header and metadata always fit.
 - Private registries (authentication) are not supported yet, matching
   `litebox-packager --oci-image`.
 - `USER` is recorded in the config but not enforced by the runner.

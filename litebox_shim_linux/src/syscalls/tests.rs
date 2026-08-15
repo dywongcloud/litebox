@@ -33,7 +33,7 @@ pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatf
         // Only the Linux userland platform takes a tun device name.
         #[cfg(target_os = "linux")]
         {
-            TestPlatform::new(tun_device_name)
+            TestPlatform::new(tun_device_name).expect("test platform initialization")
         }
         #[cfg(target_os = "macos")]
         {
@@ -110,20 +110,46 @@ pub(crate) fn init_platform(
     let task = shim_builder.build().0.new_test_task(fs);
 
     if tun_device_name.is_some() {
+        // The tests share one static platform and therefore one host tun fd.
+        // A pump thread reading that fd is destructive, so a previous test's
+        // leaked pump would swallow this test's inbound packets and its
+        // accept() would block forever. Gate each pump on a generation and
+        // join the previous one before starting ours, so exactly one thread
+        // ever reads the shared fd.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PUMP_GENERATION: AtomicU64 = AtomicU64::new(0);
+        static PUMP_HANDLE: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+
+        let my_generation = PUMP_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(previous) = PUMP_HANDLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = previous.join();
+        }
+
         let global = task.global.clone();
-        // Start a background thread to perform network interaction
-        // Naive implementation for testing purpose only
-        std::thread::spawn(move || {
-            loop {
-                while global
+        let handle = std::thread::spawn(move || {
+            // Check the generation every iteration, not just when idle: the
+            // interaction can keep signalling more work, and if the loop never
+            // returned to this check the pump would outlive its generation and
+            // the next test's join() would block forever.
+            while PUMP_GENERATION.load(Ordering::SeqCst) == my_generation {
+                if !global
                     .net
                     .lock()
                     .perform_platform_interaction()
                     .call_again_immediately()
-                {}
-                core::hint::spin_loop();
+                {
+                    core::hint::spin_loop();
+                }
             }
         });
+        *PUMP_HANDLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
     }
     task
 }
