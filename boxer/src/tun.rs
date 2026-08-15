@@ -29,6 +29,7 @@ const PREFIX_LEN: u32 = 24;
 // ones are Linux's stable `SIOCSIF*` constants.
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
+const SIOCGIFADDR: libc::c_ulong = 0x8915;
 const SIOCSIFADDR: libc::c_ulong = 0x8916;
 const SIOCSIFNETMASK: libc::c_ulong = 0x891c;
 const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
@@ -81,11 +82,57 @@ pub fn ensure_device(device: &str) -> anyhow::Result<bool> {
                  boxer will not reconfigure it. Pass a different --net name."
             );
         }
+        // Even a TUN might belong to another process (a VPN's `tun0`, say).
+        // Reconfiguring its address would sever that program's connectivity --
+        // and the runner's own "already in use" check only fires later, after
+        // the clobber. A TUN boxer made and left idle carries either no address
+        // or [`HOST_IP`]; anything else is in use, so refuse it here.
+        if let Some(addr) = current_ipv4(device)?
+            && addr != HOST_IP
+        {
+            bail!(
+                "network device '{device}' already carries address {addr}, so it is \
+                 in use by another process; boxer will not reconfigure it. Pass a \
+                 different --net name."
+            );
+        }
     } else {
         create_device(device)?;
     }
     configure_device(device)?;
     Ok(!existed)
+}
+
+/// The device's current IPv4 address, or `None` if it has none. Distinguishes
+/// an idle boxer-made TUN (no address, or already [`HOST_IP`]) from one another
+/// process is actively using, which boxer must not clobber.
+fn current_ipv4(device: &str) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+    // SAFETY: creating a socket with constant arguments; the result is checked.
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if socket < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open a socket to inspect the network device");
+    }
+    // SAFETY: `socket` is the descriptor just returned and is owned by the guard.
+    let socket = unsafe { OwnedFd::from_raw_fd_checked(socket) };
+
+    let mut req = IfReq::new(device)?;
+    // SAFETY: `req` is a correctly-shaped `ifreq` living for the call and
+    // `socket` is an open AF_INET socket.
+    if unsafe { libc::ioctl(socket.as_raw_fd(), SIOCGIFADDR, &raw mut req) } < 0 {
+        let err = std::io::Error::last_os_error();
+        // No IPv4 address assigned yet -- nothing to protect.
+        if err.raw_os_error() == Some(libc::EADDRNOTAVAIL) {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("failed to read the address of '{device}'"));
+    }
+    // The union holds a `sockaddr_in`: family, port, then the 4-byte address
+    // in the same octet order `set_address` writes.
+    let octets: [u8; 4] = req.union[4..8]
+        .try_into()
+        .expect("union is 24 bytes, slice 4..8 is 4");
+    Ok(Some(std::net::Ipv4Addr::from(octets)))
 }
 
 /// Is there already an interface with this name?
