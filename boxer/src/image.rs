@@ -177,7 +177,7 @@ fn select_image(
         return select_from_oci_index(blobs, index, platform, 0);
     }
     if let Some(manifest) = blobs.get("manifest.json") {
-        return select_from_docker_manifest(blobs, manifest);
+        return select_from_docker_manifest(blobs, manifest, platform);
     }
     bail!("neither index.json (OCI layout) nor manifest.json (docker save) found");
 }
@@ -304,15 +304,27 @@ fn select_from_oci_index(
 fn select_from_docker_manifest(
     blobs: &HashMap<String, Vec<u8>>,
     manifest: &[u8],
+    platform: TargetPlatform,
 ) -> anyhow::Result<(Vec<LayerData>, Vec<u8>)> {
     let manifest: serde_json::Value =
         serde_json::from_slice(manifest).context("manifest.json is not valid JSON")?;
     let images = manifest
         .as_array()
         .context("manifest.json is not an array")?;
-    let image = images
-        .first()
-        .context("manifest.json lists no images (empty archive)")?;
+    if images.is_empty() {
+        bail!("manifest.json lists no images (empty archive)");
+    }
+
+    // A single-image `docker save` is used as-is (its architecture is validated
+    // by the caller). A multi-image archive (`docker save a b`) may hold several
+    // architectures, so pick the one whose config matches the requested
+    // platform rather than blindly taking the first -- which could be the wrong
+    // architecture and get rejected downstream.
+    let image = if images.len() == 1 {
+        &images[0]
+    } else {
+        select_docker_image_for_platform(blobs, images, platform)?
+    };
 
     let config_path = image
         .get("Config")
@@ -344,4 +356,42 @@ fn select_from_docker_manifest(
         });
     }
     Ok((layers, config_json))
+}
+
+/// Pick, from a multi-image `docker save` archive, the entry whose config
+/// architecture matches `platform`. Errors naming the architectures present
+/// when none matches.
+fn select_docker_image_for_platform<'a>(
+    blobs: &HashMap<String, Vec<u8>>,
+    images: &'a [serde_json::Value],
+    platform: TargetPlatform,
+) -> anyhow::Result<&'a serde_json::Value> {
+    let mut available = Vec::new();
+    for image in images {
+        let Some(config_path) = image.get("Config").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        let Some(config_bytes) = blobs.get(config_path) else {
+            continue;
+        };
+        let Ok(config) = serde_json::from_slice::<serde_json::Value>(config_bytes) else {
+            continue;
+        };
+        let arch = config.get("architecture").and_then(|a| a.as_str());
+        if let Some(arch) = arch {
+            available.push(arch.to_string());
+            if arch == platform.oci_arch_name() {
+                return Ok(image);
+            }
+        }
+    }
+    bail!(
+        "no {} image in archive; available architectures: {}",
+        platform,
+        if available.is_empty() {
+            String::from("(none declared)")
+        } else {
+            available.join(", ")
+        }
+    );
 }

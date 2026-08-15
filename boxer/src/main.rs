@@ -170,7 +170,17 @@ fn build_command(args: &BuildArgs) -> anyhow::Result<()> {
             };
             list.push(platform);
         }
-        list.dedup();
+        // Drop duplicate platforms regardless of position -- `Vec::dedup` only
+        // removes *consecutive* repeats, so `--platform a,b,a` would otherwise
+        // build `a` twice (and write the same output file twice).
+        let mut seen: Vec<TargetPlatform> = Vec::new();
+        list.retain(|p| {
+            let fresh = !seen.contains(p);
+            if fresh {
+                seen.push(*p);
+            }
+            fresh
+        });
         list
     };
 
