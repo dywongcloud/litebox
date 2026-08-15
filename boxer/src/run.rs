@@ -64,6 +64,12 @@ pub struct NetOptions {
 /// the default in `litebox_platform_linux_userland/scripts/tun-setup.sh`.
 const DEFAULT_TUN_DEVICE: &str = "tun99";
 
+/// Whether two port mappings would try to bind the same host socket -- same
+/// host address and transport. TCP and UDP on one port are distinct listeners.
+fn clashes(a: &crate::publish::PortMapping, b: &crate::publish::PortMapping) -> bool {
+    a.host_addr == b.host_addr && a.protocol == b.protocol
+}
+
 /// Run a box: `extra_args` override the image CMD (docker semantics).
 pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::Result<()> {
     let parsed = parse_box_file(box_path)?;
@@ -89,28 +95,53 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
         .iter()
         .map(|spec| crate::publish::PortMapping::parse(spec))
         .collect::<anyhow::Result<_>>()?;
+
+    // Two explicit -p on the same host address and protocol would otherwise
+    // fail later with a bare EADDRINUSE that reads like an external conflict.
+    for (i, first) in mappings.iter().enumerate() {
+        if let Some(dup) = mappings[i + 1..].iter().find(|other| clashes(first, other)) {
+            bail!(
+                "host port {}/{} is published more than once",
+                dup.host_addr,
+                dup.protocol.as_str()
+            );
+        }
+    }
+
     if net.publish_all {
         if meta.exposed_ports.is_empty() {
-            bail!(
-                "--publish-all was given but this box EXPOSEs no ports; \
-                 publish one explicitly with -p HOST:GUEST"
-            );
+            // -P has nothing to add. That is a fatal mistake only when no
+            // explicit -p was given either; otherwise the -p mappings stand.
+            if mappings.is_empty() {
+                bail!(
+                    "--publish-all was given but this box EXPOSEs no ports; \
+                     publish one explicitly with -p HOST:GUEST"
+                );
+            }
+        } else {
+            let from_exposed: Vec<crate::publish::PortMapping> = meta
+                .exposed_ports
+                .iter()
+                .filter_map(|port| crate::publish::PortMapping::from_exposed(port))
+                .collect();
+            // Guard against a silent no-op: if nothing mappable came out of the
+            // EXPOSEd set, -P would set up no listener and no device while the
+            // user believes something is served.
+            if from_exposed.is_empty() {
+                eprintln!(
+                    "warning: --publish-all matched no publishable ports from ({})",
+                    meta.exposed_ports.join(", ")
+                );
+            }
+            // An explicit -p wins over the same host port derived from EXPOSE,
+            // so `-p 8080:80 -P` on a box that EXPOSEs 8080 keeps the 8080->80
+            // mapping instead of colliding with a derived 8080->8080.
+            for mapping in from_exposed {
+                if !mappings.iter().any(|existing| clashes(existing, &mapping)) {
+                    mappings.push(mapping);
+                }
+            }
         }
-        let from_exposed: Vec<crate::publish::PortMapping> = meta
-            .exposed_ports
-            .iter()
-            .filter_map(|port| crate::publish::PortMapping::from_exposed(port))
-            .collect();
-        // Guard against a silent no-op: if nothing mappable came out of the
-        // EXPOSEd set, -P would set up no listener and no device while the user
-        // believes something is served.
-        if from_exposed.is_empty() {
-            eprintln!(
-                "warning: --publish-all matched no publishable ports from ({})",
-                meta.exposed_ports.join(", ")
-            );
-        }
-        mappings.extend(from_exposed);
     }
 
     let entry_names = tar_entry_names(&parsed.rootfs_tar)?;
@@ -128,6 +159,15 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
     if let Some(program_bytes) = tar_entry_bytes(&parsed.rootfs_tar, &program_tar_path)?
         && program_bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d])
     {
+        // The wasm runtime has no TUN device, so any publishing or --net flag
+        // would be silently dropped -- the user would think a port was served.
+        if !mappings.is_empty() || net.tun_device.is_some() {
+            bail!(
+                "port publishing and --net are not supported for a wasm workload \
+                 (the wasm runtime has no network device); run a native box to \
+                 publish ports"
+            );
+        }
         return run_wasm_workload(&program_bytes, &argv, &meta.env);
     }
 

@@ -33,6 +33,16 @@ pub enum Protocol {
     Udp,
 }
 
+impl Protocol {
+    /// The lowercase name used in `-p` specs and messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
 /// One `-p` mapping: a host bind address plus the guest port to forward to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortMapping {
