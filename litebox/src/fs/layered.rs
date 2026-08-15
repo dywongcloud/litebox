@@ -16,8 +16,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, UtimeError,
-    WriteError,
+    ReadDirError, ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, UtimeError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, Timestamp};
 
@@ -146,7 +146,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                // The lower layer holds no symlinks (they are only created in the
+                // writable upper layer), so `SymLink` here is as unreachable as a
+                // regular-file ancestor.
+                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::SymLink)
                 | Err(
                     FileStatusError::PathError(PathError::MissingComponent)
                     | FileStatusError::ClosedFd,
@@ -200,6 +203,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                // The lower layer holds no symlinks and is opened for reading
+                // (no O_NOFOLLOW), so ELOOP cannot arise here.
+                | OpenError::TooManySymbolicLinks
                 | OpenError::TruncateError(_) => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
@@ -544,6 +550,9 @@ impl<
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                // O_NOFOLLOW hit a symlink at the upper (writable) layer: terminal,
+                // the lower layer cannot satisfy it.
+                | OpenError::TooManySymbolicLinks
                 | OpenError::TruncateError(
                     TruncateError::IsDirectory
                     | TruncateError::NotForWriting
@@ -1171,8 +1180,9 @@ impl<
                         FileStatusError::PathError(p) => UnlinkError::PathError(p),
                         FileStatusError::ClosedFd => unreachable!(),
                     })? {
-                        FileType::RegularFile => {
-                            // fallthrough
+                        FileType::RegularFile | FileType::SymLink => {
+                            // fallthrough to place the tombstone (unlink removes the
+                            // link itself, never its target)
                         }
                         FileType::Directory => {
                             return Err(UnlinkError::IsADirectory);
@@ -1231,6 +1241,46 @@ impl<
         self.upper.mkdir(path, mode)
     }
 
+    fn symlink(&self, target: &str, linkpath: impl crate::path::Arg) -> Result<(), SymlinkError> {
+        // A symlink is always created in the writable upper layer (the link node
+        // is new state), mirroring `mkdir`: if the parent directory lives only in
+        // the lower layer, migrate the ancestors up first, then create.
+        let path = self.absolute_path(linkpath)?;
+        match self.upper.symlink(target, path.as_str()) {
+            Ok(()) => {
+                if self.ensure_lower_contains(&path).is_ok() {
+                    return Err(SymlinkError::AlreadyExists);
+                }
+                Ok(())
+            }
+            Err(SymlinkError::PathError(PathError::MissingComponent)) => {
+                self.mkdir_migrating_ancestor_dirs(&path)
+                    .map_err(|e| match e {
+                        MkdirError::NoWritePerms => SymlinkError::NoWritePerms,
+                        MkdirError::ReadOnlyFileSystem => SymlinkError::ReadOnlyFileSystem,
+                        MkdirError::Io => SymlinkError::Io,
+                        MkdirError::AlreadyExists => SymlinkError::AlreadyExists,
+                        MkdirError::PathError(pe) => SymlinkError::PathError(pe),
+                    })?;
+                self.upper.symlink(target, path.as_str())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn readlink(&self, path: impl crate::path::Arg) -> Result<String, ReadlinkError> {
+        // The upper layer shadows the lower: if the path resolves in the upper
+        // layer at all (as a symlink or as a non-symlink), that is the answer; only
+        // a path absent from the upper layer falls through to the lower.
+        let path = self.absolute_path(path)?;
+        match self.upper.readlink(path.as_str()) {
+            Err(ReadlinkError::PathError(
+                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+            )) => self.lower.readlink(path.as_str()),
+            other => other,
+        }
+    }
+
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
 
@@ -1246,7 +1296,10 @@ impl<
         ) {
             Ok(fd) => fd,
             Err(e) => match e {
-                OpenError::PathError(PathError::ComponentNotADirectory) => {
+                // rmdir does not follow symlinks; a symlink at this path is simply
+                // not a directory.
+                OpenError::PathError(PathError::ComponentNotADirectory)
+                | OpenError::TooManySymbolicLinks => {
                     return Err(RmdirError::NotADirectory);
                 }
                 OpenError::PathError(pe) => return Err(pe.into()),

@@ -14,8 +14,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, UtimeError,
-    WriteError,
+    ReadDirError, ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, UtimeError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, Timestamp, UserInfo};
 
@@ -284,6 +284,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 .litebox
                 .descriptor_table_mut()
                 .insert(Descriptor::Dir { dir: dir.clone() }),
+            Entry::SymLink(_) => {
+                // The shim resolves symlink following before it ever calls
+                // `open`, so a symlink reaching here means O_NOFOLLOW was set on
+                // the final component -- which `open(2)` answers with ELOOP.
+                return Err(OpenError::TooManySymbolicLinks);
+            }
         };
         if flags.contains(OFlags::TRUNC) {
             match self.truncate(&fd, 0, true) {
@@ -494,6 +500,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 perms.mode = mode;
                 Ok(())
             }
+            // Reached only via `AT_SYMLINK_NOFOLLOW` (a following caller resolves
+            // the link first); a symlink's own mode is inert on Linux but the
+            // ownership check still applies.
+            Entry::SymLink(link) => {
+                let perms = &mut link.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChmodError::NotTheOwner);
+                }
+                perms.mode = mode;
+                Ok(())
+            }
         }
     }
 
@@ -559,6 +576,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 }
                 Ok(())
             }
+            // `lchown` on the link itself (following callers resolve first).
+            Entry::SymLink(link) => {
+                let perms = &mut link.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChownError::NotTheOwner);
+                }
+                if let Some(new_user) = user {
+                    perms.userinfo.user = new_user;
+                }
+                if let Some(new_group) = group {
+                    perms.userinfo.group = new_group;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -600,6 +631,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 }
                 if let Some(changed) = mtime.or(atime) {
                     dir.ctime = changed;
+                }
+            }
+            Entry::SymLink(link) => {
+                let mut link = link.write();
+                if let Some(atime) = atime {
+                    link.atime = atime;
+                }
+                if let Some(mtime) = mtime {
+                    link.mtime = mtime;
+                }
+                if let Some(changed) = mtime.or(atime) {
+                    link.ctime = changed;
                 }
             }
         }
@@ -670,11 +713,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let removed = parent
             .children
             .remove(path.components().unwrap().last().unwrap());
-        // Just a sanity check
-        assert!(matches!(removed, Some(FileType::RegularFile)));
+        // Just a sanity check. `unlink` removes a regular file or a symlink (the
+        // link itself, never its target); directories were rejected above.
+        assert!(matches!(
+            removed,
+            Some(FileType::RegularFile | FileType::SymLink)
+        ));
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
-        assert!(matches!(removed, Entry::File(File { .. })));
+        assert!(matches!(removed, Entry::File(_) | Entry::SymLink(_)));
         Ok(())
     }
 
@@ -714,6 +761,57 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         );
         assert!(old.is_none());
         Ok(())
+    }
+
+    fn symlink(&self, target: &str, linkpath: impl crate::path::Arg) -> Result<(), SymlinkError> {
+        let path = self.absolute_path(linkpath)?;
+        let mut root = self.root.write();
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let Some((_parent_path, parent)) = parent else {
+            // A link at `/` -- the root already exists.
+            return Err(SymlinkError::AlreadyExists);
+        };
+        let None = entry else {
+            return Err(SymlinkError::AlreadyExists);
+        };
+        let mut parent = parent.write();
+        if !self.current_user.can_write(&parent.perms) {
+            return Err(SymlinkError::NoWritePerms);
+        }
+        let old = parent.children.insert(
+            path.components().unwrap().last().unwrap().into(),
+            FileType::SymLink,
+        );
+        assert!(old.is_none());
+        let old = root.entries.insert(
+            path,
+            Entry::SymLink(Arc::new(sync::RwLock::new(SymLinkX {
+                target: target.into(),
+                // A symlink's own mode is a fixed `lrwxrwxrwx` on Linux; access
+                // checks apply to the resolved target, never to the link node.
+                perms: Permissions {
+                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                    userinfo: self.current_user,
+                },
+                unique_id: self.fresh_id(),
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
+            }))),
+        );
+        assert!(old.is_none());
+        Ok(())
+    }
+
+    fn readlink(&self, path: impl crate::path::Arg) -> Result<String, ReadlinkError> {
+        let path = self.absolute_path(path)?;
+        let root = self.root.read();
+        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        match entry {
+            Some(Entry::SymLink(link)) => Ok(link.read().target.clone()),
+            Some(_) => Err(ReadlinkError::NotASymlink),
+            None => Err(PathError::NoSuchFileOrDirectory)?,
+        }
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
@@ -776,6 +874,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 let ino = match entry {
                     Entry::File(file) => file.read().unique_id,
                     Entry::Dir(dir) => dir.read().unique_id,
+                    Entry::SymLink(link) => link.read().unique_id,
                 };
                 NodeInfo {
                     dev: DEVICE_ID,
@@ -852,6 +951,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     dir.atime,
                     dir.mtime,
                     dir.ctime,
+                )
+            }
+            Entry::SymLink(link) => {
+                let link = link.read();
+                (
+                    // `file_status` is `lstat` semantics: report the link itself.
+                    // Its size is the byte length of the target string.
+                    super::FileType::SymLink,
+                    link.perms.clone(),
+                    link.target.len(),
+                    link.unique_id,
+                    link.atime,
+                    link.mtime,
+                    link.ctime,
                 )
             }
         };
@@ -993,7 +1106,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                 .get_key_value(&collected)
                 .ok_or(PathError::MissingComponent)?
             {
-                (_, Entry::File(_)) => return Err(PathError::ComponentNotADirectory),
+                // A regular file or a symlink used as an intermediate directory
+                // component is not traversable. Following an intermediate symlink
+                // is deferred (a leaf symlink is followed above this layer, in the
+                // shim); a non-final symlink surfaces as ENOTDIR, matching how a
+                // regular file in that position does.
+                (_, Entry::File(_) | Entry::SymLink(_)) => {
+                    return Err(PathError::ComponentNotADirectory);
+                }
                 (parent_path, Entry::Dir(dir)) => {
                     if !current_user.can_execute(&dir.read().perms) {
                         return Err(PathError::NoSearchPerms {
@@ -1016,6 +1136,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
 enum Entry<Platform: sync::RawSyncPrimitivesProvider> {
     File(File<Platform>),
     Dir(Dir<Platform>),
+    SymLink(SymLink<Platform>),
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> Entry<Platform> {
@@ -1023,6 +1144,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Entry<Platform> {
         match self {
             Self::File(file) => file.read().perms.clone(),
             Self::Dir(dir) => dir.read().perms.clone(),
+            Self::SymLink(link) => link.read().perms.clone(),
         }
     }
 }
@@ -1032,11 +1154,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Entry<Platform> {
         match self {
             Self::File(file) => Self::File(file.clone()),
             Self::Dir(dir) => Self::Dir(dir.clone()),
+            Self::SymLink(link) => Self::SymLink(link.clone()),
         }
     }
 }
 
 type Dir<Platform> = Arc<sync::RwLock<Platform, DirX>>;
+
+type SymLink<Platform> = Arc<sync::RwLock<Platform, SymLinkX>>;
+
+/// A symbolic link node. `target` is the uninterpreted link contents; resolution
+/// happens above this layer (see the shim's path-following).
+pub(crate) struct SymLinkX {
+    target: String,
+    perms: Permissions,
+    unique_id: usize,
+    atime: Timestamp,
+    mtime: Timestamp,
+    ctime: Timestamp,
+}
 
 pub(crate) struct DirX {
     perms: Permissions,

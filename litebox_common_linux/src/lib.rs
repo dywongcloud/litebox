@@ -260,6 +260,7 @@ impl From<litebox::fs::FileType> for InodeType {
             litebox::fs::FileType::RegularFile => InodeType::File,
             litebox::fs::FileType::Directory => InodeType::Dir,
             litebox::fs::FileType::CharacterDevice => InodeType::CharDevice,
+            litebox::fs::FileType::SymLink => InodeType::SymLink,
             _ => unimplemented!(),
         }
     }
@@ -291,6 +292,7 @@ impl From<litebox::fs::FileType> for DirentType {
             litebox::fs::FileType::RegularFile => DirentType::Regular,
             litebox::fs::FileType::Directory => DirentType::Directory,
             litebox::fs::FileType::CharacterDevice => DirentType::CharDevice,
+            litebox::fs::FileType::SymLink => DirentType::SymLink,
             _ => unimplemented!(),
         }
     }

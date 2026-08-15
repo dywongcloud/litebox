@@ -131,6 +131,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::OpenError::TooManySymbolicLinks => Errno::ELOOP,
             litebox::fs::errors::OpenError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
@@ -227,6 +228,31 @@ impl From<litebox::fs::errors::MkdirError> for Errno {
             litebox::fs::errors::MkdirError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::MkdirError::NoWritePerms => Errno::EACCES,
             litebox::fs::errors::MkdirError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::SymlinkError> for Errno {
+    fn from(value: litebox::fs::errors::SymlinkError) -> Self {
+        match value {
+            litebox::fs::errors::SymlinkError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::SymlinkError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::SymlinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::SymlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::SymlinkError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::ReadlinkError> for Errno {
+    fn from(value: litebox::fs::errors::ReadlinkError) -> Self {
+        match value {
+            litebox::fs::errors::ReadlinkError::PathError(path_error) => path_error.into(),
+            // readlink(2) on a non-symlink is EINVAL.
+            litebox::fs::errors::ReadlinkError::NotASymlink => Errno::EINVAL,
+            litebox::fs::errors::ReadlinkError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }

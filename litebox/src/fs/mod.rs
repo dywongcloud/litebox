@@ -30,7 +30,8 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, UtimeError, WriteError,
+    ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
+    UtimeError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -164,6 +165,28 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Remove a directory
     fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
 
+    /// Create a symbolic link at `linkpath` whose contents are the (uninterpreted)
+    /// `target` string.
+    ///
+    /// The `target` is stored verbatim and is not resolved or validated here; a
+    /// dangling link (target that does not exist) is allowed, matching `symlink(2)`.
+    /// The default body rejects creation, which is the correct answer for a
+    /// read-only backend.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn symlink(&self, target: &str, linkpath: impl path::Arg) -> Result<(), SymlinkError> {
+        Err(SymlinkError::ReadOnlyFileSystem)
+    }
+
+    /// Read the target of the symbolic link at `path`, without following it.
+    ///
+    /// Returns [`ReadlinkError::NotASymlink`] if `path` is not a symlink. The
+    /// default body reports that, which is the correct answer for a backend that
+    /// stores no symlinks.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn readlink(&self, path: impl path::Arg) -> Result<alloc::string::String, ReadlinkError> {
+        Err(ReadlinkError::NotASymlink)
+    }
+
     /// Read directory entries from a directory file descriptor.
     ///
     /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
@@ -236,6 +259,10 @@ pub enum FileType {
     RegularFile,
     Directory,
     CharacterDevice,
+    /// Symbolic link. The link's target path is read via [`FileSystem::readlink`];
+    /// [`FileSystem::file_status`] reports this type without following the link
+    /// (i.e. `lstat` semantics).
+    SymLink,
 }
 
 bitflags! {

@@ -26,6 +26,8 @@ pub enum OpenError {
     ReadOnlyFileSystem,
     #[error("file already exists")]
     AlreadyExists,
+    #[error("the final path component is a symbolic link and O_NOFOLLOW was set")]
+    TooManySymbolicLinks,
     #[error("error when truncating: {0}")]
     TruncateError(#[from] TruncateError),
     #[error("I/O error")]
@@ -184,6 +186,34 @@ pub enum MkdirError {
     AlreadyExists,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::symlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("the link would reside on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::readlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadlinkError {
+    #[error("the named file is not a symbolic link")]
+    NotASymlink,
     #[error("I/O error")]
     Io,
     #[error(transparent)]

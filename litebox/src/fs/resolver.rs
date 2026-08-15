@@ -810,6 +810,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::TooManySymbolicLinks
                 | OpenError::TruncateError(_) => FileStatusError::Io,
             })?;
         let status = self.fd_file_status(&fd);
