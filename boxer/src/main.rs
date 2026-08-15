@@ -113,7 +113,8 @@ struct BuildArgs {
     /// AArch64 syscall-rewrite anchor: the OS that will run arm64 boxes.
     #[arg(long = "rewrite-host", value_parser = ["linux", "macos"], default_value = "linux")]
     rewrite_host: String,
-    /// Skip rewriting specific files (absolute paths inside the rootfs scan).
+    /// Skip rewriting specific files, named by their image path inside the
+    /// rootfs (e.g. /usr/bin/busybox).
     #[arg(long = "no-rewrite", value_name = "PATH")]
     no_rewrite: Vec<PathBuf>,
     /// Verbose progress output.
@@ -349,9 +350,11 @@ fn emit_box(
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
+    // `--no-rewrite` names an image path (the files live in an ephemeral temp
+    // dir); match on the rootfs-relative tar-path, not a host path.
     let no_rewrite = no_rewrite
         .iter()
-        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .map(|p| litebox_packager::image_tar_path(p))
         .collect();
     let tar_entries = litebox_packager::package_extracted_image(
         extracted,

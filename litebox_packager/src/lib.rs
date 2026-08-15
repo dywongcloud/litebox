@@ -63,7 +63,8 @@ pub struct CliArgs {
     )]
     pub include: Vec<String>,
 
-    /// Skip rewriting specific files (by their absolute path on the host).
+    /// Skip rewriting specific files: a host path in host mode, or an image
+    /// path inside the rootfs (e.g. /usr/bin/busybox) when packaging an image.
     #[arg(long = "no-rewrite", value_name = "PATH")]
     pub no_rewrite: Vec<PathBuf>,
 
@@ -281,6 +282,20 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Normalize a user-supplied `--no-rewrite` path to the rootfs-relative tar-path
+/// form used inside a packaged image: drop any leading `/` (and `./` and empty
+/// components), so `/usr/bin/busybox` and `usr/bin/busybox` both match the
+/// scanned entry's `tar_path`. This is the image-mode counterpart to
+/// canonicalizing a host path, which never matches an extracted temp-dir file.
+pub fn image_tar_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Run the packager in OCI mode: pull image, extract rootfs, rewrite ELFs, build tar.
 #[cfg(any(
     target_arch = "x86_64",
@@ -291,20 +306,10 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     eprintln!("Pulling OCI image: {image_ref}");
     let extracted = oci::pull_and_extract(image_ref, args.verbose)?;
 
-    let no_rewrite: BTreeSet<PathBuf> = args
-        .no_rewrite
-        .iter()
-        .map(|p| {
-            std::fs::canonicalize(p).unwrap_or_else(|e| {
-                eprintln!(
-                    "warning: could not resolve --no-rewrite path '{}': {e}; \
-                     it may not match any discovered file",
-                    p.display()
-                );
-                p.clone()
-            })
-        })
-        .collect();
+    // Image files are extracted to an ephemeral temp dir, so `--no-rewrite`
+    // names a rootfs-relative image path (e.g. `/usr/bin/busybox`); normalize
+    // it to the tar-path form the packager matches on.
+    let no_rewrite: BTreeSet<String> = args.no_rewrite.iter().map(|p| image_tar_path(p)).collect();
 
     let tar_entries = package_extracted_image(
         &extracted,
@@ -332,8 +337,11 @@ pub struct PackageOptions {
     pub elf_machine: u16,
     /// AArch64 host anchor to rewrite against; ignored for x86-64 guests.
     pub rewrite_host: litebox_syscall_rewriter::Host,
-    /// Absolute host paths excluded from rewriting.
-    pub no_rewrite: BTreeSet<PathBuf>,
+    /// Image paths excluded from rewriting, as rootfs-relative tar paths (no
+    /// leading `/`, e.g. `usr/bin/busybox`). The extracted files live in an
+    /// ephemeral temp directory, so matching must be against the image path,
+    /// not a host path.
+    pub no_rewrite: BTreeSet<String>,
     pub verbose: bool,
 }
 
@@ -375,7 +383,7 @@ pub fn package_extracted_image(
             let data = std::fs::read(&entry.read_path)
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
-            let rewritten = if entry.is_executable && !options.no_rewrite.contains(&entry.read_path)
+            let rewritten = if entry.is_executable && !options.no_rewrite.contains(&entry.tar_path)
             {
                 rewrite_elf_for(
                     &data,
