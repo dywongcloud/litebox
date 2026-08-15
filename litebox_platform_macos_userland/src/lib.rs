@@ -67,7 +67,7 @@
 // there is deliberately no x86-64 variant.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::io::IsTerminal as _;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -317,6 +317,89 @@ fn needs_jit(permissions: MemoryRegionPermissions) -> bool {
     permissions.contains(MemoryRegionPermissions::EXEC)
 }
 
+/// Registry of live `MAP_JIT` region bounds, read from [`fault_handler`] to
+/// implement fault-driven W^X toggling for a guest that writes its own code
+/// (a JIT engine like V8).
+///
+/// Darwin makes a `MAP_JIT` mapping writable *or* executable per thread, never
+/// both -- switched by [`jit_write_protect`]. LiteBox brackets its *own* writes
+/// into guest code, but a guest JIT writes machine code into its code range
+/// with plain stores and then jumps to it, never calling
+/// `pthread_jit_write_protect_np`, because on a real Linux host that memory is
+/// simply RWX. Under this host the guest's store faults (page is
+/// execute-only for the thread) and its jump-to-freshly-written-code faults
+/// (page is writable-only). [`fault_handler`] resolves both transparently:
+/// a write fault at a JIT address toggles the thread to writable, an
+/// instruction abort at a JIT address toggles it back to executable, and the
+/// faulting instruction re-runs. No guest signal is delivered.
+///
+/// The registry is a small fixed array of `(start, end)` atomic pairs so it
+/// can be scanned from inside the signal handler without a lock or allocation
+/// (both async-signal-unsafe). V8 uses a single large code range plus a
+/// handful of small ranges, so the capacity is generous; an overflow is
+/// logged once and simply means faults in the overflow region are delivered
+/// to the guest as before (correct, just un-toggled).
+const JIT_REGISTRY_CAP: usize = 64;
+static JIT_REGIONS: [(AtomicUsize, AtomicUsize); JIT_REGISTRY_CAP] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; JIT_REGISTRY_CAP];
+static JIT_REGISTRY_OVERFLOWED: AtomicBool = AtomicBool::new(false);
+
+/// Records `[start, start+len)` as a `MAP_JIT` region for the fault handler.
+fn register_jit_region(start: usize, len: usize) {
+    let end = start + len;
+    for (s, e) in &JIT_REGIONS {
+        // Claim a free slot (start == 0) atomically. `Relaxed` is enough: the
+        // only reader is this process's own signal handler, always on a thread
+        // that is strictly later than the `mmap`/`mprotect` that produced the
+        // region, so the store is already visible by the time any fault in it
+        // can occur.
+        if s.compare_exchange(0, start, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            e.store(end, Ordering::Release);
+            return;
+        }
+    }
+    if !JIT_REGISTRY_OVERFLOWED.swap(true, Ordering::Relaxed) {
+        litebox_util_log::warn!(
+            cap:? = JIT_REGISTRY_CAP;
+            "MAP_JIT region registry full; further JIT regions will not get \
+             fault-driven write-protect toggling (guest self-modifying code in \
+             them will fault to the guest instead of resuming transparently)"
+        );
+    }
+}
+
+/// Whether `addr` falls in any registered `MAP_JIT` region. Async-signal-safe:
+/// plain atomic loads, no lock or allocation.
+fn addr_in_jit_region(addr: usize) -> bool {
+    for (s, e) in &JIT_REGIONS {
+        let start = s.load(Ordering::Acquire);
+        if start != 0 && addr >= start && addr < e.load(Ordering::Acquire) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drops any registered `MAP_JIT` region that overlaps `[start, start+len)`,
+/// so an address the guest has unmapped and the kernel may later hand back for
+/// something else cannot keep matching in [`fault_handler`]. Called from
+/// `deallocate_pages`.
+fn unregister_jit_region(start: usize, len: usize) {
+    let end = start + len;
+    for (s, e) in &JIT_REGIONS {
+        let rs = s.load(Ordering::Acquire);
+        if rs != 0 && rs < end && start < e.load(Ordering::Acquire) {
+            // Free the slot. `start`-first: a concurrent reader either sees the
+            // old (still-valid, about-to-be-freed) bounds or a zeroed start it
+            // skips -- never a torn half-updated pair it would treat as live.
+            s.store(0, Ordering::Release);
+            e.store(0, Ordering::Release);
+        }
+    }
+}
+
 /// Enable or disable write access to this thread's `MAP_JIT` mappings.
 ///
 /// Darwin makes `MAP_JIT` memory writable *or* executable per thread, never
@@ -478,13 +561,11 @@ fn allocate_jit_pages(
         )
     };
 
-    // `remap_to_fixed` aliases rather than moves: `kernel_chosen` is still a
-    // live mapping of the same pages after a successful remap, and a
-    // pointless one after a failed one either way. Drop it now so it never
-    // leaks.
-    // SAFETY: `kernel_chosen` is still a valid mapping owned by this
-    // function; the remap above only added a second reference to the same
-    // pages, it did not invalidate this one.
+    // `remap_to_fixed` COW-duplicates rather than aliases: `kernel_chosen` is
+    // still a live, now-redundant mapping of its own after a successful remap,
+    // and a pointless one after a failed one either way. Drop it now so it
+    // never leaks; the destination is an independent copy and is unaffected.
+    // SAFETY: `kernel_chosen` is still a valid mapping owned by this function.
     unsafe { libc::munmap(kernel_chosen, suggested_range.len()) };
 
     match remap_result {
@@ -665,10 +746,22 @@ fn allocate_jit_pages_hint_honors_the_suggested_address() {
 ///
 /// See `update_permissions` for why this exists: `MAP_JIT`-ness is decided at
 /// mapping creation, so an ordinary mapping that later needs `EXEC` has to be
-/// replaced, not re-protected. The replacement preserves contents (copied
-/// under a temporary read-only view of the old mapping) and address (via
-/// `remap_to_fixed`), which together make it look like the `mprotect` simply
-/// succeeded.
+/// replaced, not re-protected. The replacement preserves contents (only the
+/// pages that are actually resident) and address (via `remap_to_fixed`),
+/// which together make it look like the `mprotect` simply succeeded.
+///
+/// Two properties make this cheap even for V8's 256 MiB code-range promotion,
+/// which is a single `mprotect(->EXEC)` over a `PROT_NONE`/`MAP_NORESERVE`
+/// reservation:
+///
+/// * **Only resident pages are copied.** An empty reservation has none, so
+///   the copy is skipped entirely -- no 256 MiB `memcpy`, no forced commit.
+///   A real RW-then-RX code page (the common per-method JIT transition, and
+///   the loader's own segment flip) copies exactly its committed bytes.
+/// * **The remap is copy-on-write** (`remap_to_fixed` uses `copy=TRUE`; see
+///   its doc for why `copy=FALSE` is impossible for a `MAP_JIT` source), so
+///   even the fresh JIT reservation and its placement at `range.start` stay
+///   lazy until the guest touches a page.
 ///
 /// On failure the range may be left readable-only rather than with its
 /// original permissions -- the original protection is not known here, and
@@ -683,9 +776,10 @@ unsafe fn migrate_range_to_jit(
     range: &core::ops::Range<usize>,
     new_permissions: MemoryRegionPermissions,
 ) -> Result<(), PermissionUpdateError> {
-    // The old contents have to be readable to copy out. The caller asked for
-    // this range's permissions to change anyway, so a temporary read-only
-    // view is within its guarantee.
+    // Any resident contents have to be readable to copy out. The caller asked
+    // for this range's permissions to change anyway, so a temporary read-only
+    // view is within its guarantee. (Also makes the `mincore` residency read
+    // below well-defined for a range that was `PROT_NONE`.)
     // SAFETY: forwarded caller guarantee, per this function's safety doc.
     let rc = unsafe {
         libc::mprotect(
@@ -698,6 +792,9 @@ unsafe fn migrate_range_to_jit(
         return Err(PermissionUpdateError::Unallocated);
     }
 
+    // A fresh JIT reservation of the same size. RWX-tagged; the per-thread
+    // write-protect (`jit_write_protect`) decides which of write/execute is
+    // live. Untouched pages cost nothing until written.
     // SAFETY: an anonymous mapping at a kernel-chosen address has nothing to
     // validate beyond what `mmap` itself checks.
     let jit = unsafe {
@@ -714,49 +811,88 @@ unsafe fn migrate_range_to_jit(
         return Err(PermissionUpdateError::Unallocated);
     }
 
+    // Copy only the pages that are actually resident in the source. For an
+    // empty reservation this loop finds nothing and does no work at all;
+    // for a written code page it transfers exactly the live bytes.
+    // SAFETY: `sysconf(_SC_PAGESIZE)` takes no arguments and cannot fault.
+    let page = {
+        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        // `_SC_PAGESIZE` is always a positive power of two on this platform;
+        // fall back to Apple Silicon's 16 KiB if the query ever fails.
+        if p > 0 { p as usize } else { 16384 }
+    };
+    let n_pages = range.len().div_ceil(page);
+    let mut resident = alloc::vec![0u8; n_pages];
+    // SAFETY: `range` is readable (mprotect above) and `resident` is sized to
+    // one byte per page of it.
+    let mincore_rc = unsafe {
+        libc::mincore(
+            range.start as *mut libc::c_void,
+            range.len(),
+            resident.as_mut_ptr().cast::<libc::c_char>(),
+        )
+    };
+    // A `mincore` failure is not fatal -- fall back to treating every page as
+    // resident (copy all), which is merely slower, never wrong.
+    let copy_all = mincore_rc != 0;
     // SAFETY: no code is executed out of a JIT mapping between the toggles;
-    // the copy below runs ordinary host code.
+    // the copies below run ordinary host code.
     unsafe { jit_write_protect(false) };
-    // SAFETY: `jit` was just mapped with exactly this length, `range` is
-    // readable per the mprotect above, and the two cannot overlap (`jit` is
-    // fresh kernel-chosen pages).
-    unsafe {
-        core::ptr::copy_nonoverlapping(range.start as *const u8, jit.cast::<u8>(), range.len());
+    for (i, &r) in resident.iter().enumerate() {
+        if copy_all || (r & 1) != 0 {
+            let off = i * page;
+            // SAFETY: `off + page <= range.len()`, both mappings span
+            // `range.len()`, `range` is readable, `jit` is writable under the
+            // toggle, and they do not overlap (`jit` is fresh pages).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (range.start + off) as *const u8,
+                    jit.cast::<u8>().add(off),
+                    page,
+                );
+            }
+        }
     }
-    // SAFETY: write access was only needed for the copy above.
+    // SAFETY: write access was only needed for the copies above.
     unsafe { jit_write_protect(true) };
 
     // SAFETY: `jit` is a live mapping of exactly this length that only this
     // function references.
     let remapped = unsafe { remap_to_fixed(jit as usize, range.len(), range.start) };
-    // A successful remap leaves `jit` as a second, now-redundant alias of the
-    // same pages; a failed one leaves it as the only copy. Either way it must
-    // not leak.
+    // The remap COW-duplicated `jit` onto `range.start`; `jit` itself is now a
+    // redundant copy (and the only copy after a failed remap). Drop it either
+    // way so it never leaks; the destination is independent.
     // SAFETY: still a live mapping owned by this function.
     unsafe { libc::munmap(jit, range.len()) };
     if remapped.is_err() {
         return Err(PermissionUpdateError::Unallocated);
     }
 
-    // SAFETY: forwarded caller guarantee, per this function's safety doc.
-    let rc = unsafe {
-        libc::mprotect(
-            range.start as *mut libc::c_void,
-            range.len(),
-            prot_flags(new_permissions),
-        )
-    };
-    if rc != 0 {
-        return Err(PermissionUpdateError::Unallocated);
-    }
+    // No final `mprotect`. `remap_to_fixed`'s copy-on-write remap already
+    // established the destination at `cur_protection = RWX` (measured), which
+    // for a `MAP_JIT` mapping means "executable now, writable when this
+    // thread's write-protect is toggled off" -- exactly the executable range
+    // the guest asked for. Any `mprotect` on a remapped `MAP_JIT` region is
+    // refused with `EPERM` (measured, for R|X and R|W|X alike), so calling one
+    // here would fail a migration that has otherwise fully succeeded. The
+    // guest's own code writes into this range are served by the per-thread
+    // write-protect toggle: bracketed around every write LiteBox itself makes
+    // into guest code, and, for a guest that writes its own code (a JIT like
+    // V8), by the fault-driven toggle in `fault_handler`.
+    let _ = new_permissions;
 
     // The bytes now executable at `range` were written through a different
-    // virtual address (the `jit` alias), so the instruction cache has no
+    // virtual address (the `jit` mapping), so the instruction cache has no
     // reason to be coherent for them. Invalidate here rather than relying on
     // a caller: not every path that lands in `update_permissions` goes
     // through a shim-level choke point that flushes.
     // SAFETY: the range was just made executable and is mapped.
     unsafe { darwin::sys_icache_invalidate(range.start as *mut libc::c_void, range.len()) };
+
+    // This range is now `MAP_JIT`-backed. Register it so a guest that writes
+    // its own code into it (V8) gets fault-driven write-protect toggling; see
+    // `register_jit_region`.
+    register_jit_region(range.start, range.len());
     Ok(())
 }
 
@@ -807,11 +943,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         let ptr = if needs_jit(initial_permissions) {
             // See `allocate_jit_pages`: `MAP_FIXED` and `MAP_JIT` cannot be
             // combined in one `mmap` call on real Darwin.
-            allocate_jit_pages(
+            let p = allocate_jit_pages(
                 &suggested_range,
                 initial_permissions,
                 fixed_address_behavior,
-            )?
+            )?;
+            // Born `MAP_JIT`; register for fault-driven write-protect toggling
+            // (a guest that mmaps executable memory directly and then writes
+            // its own code into it, e.g. a JIT that skips the mprotect dance).
+            register_jit_region(p as usize, suggested_range.len());
+            p
         } else {
             // `MAP_FIXED_NOREPLACE` has no Darwin equivalent, so claim the
             // range through the Mach VM API first: this fails with
@@ -959,6 +1100,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // SAFETY: the caller guarantees the range is no longer in use.
         let rc = unsafe { libc::munmap(range.start as *mut libc::c_void, range.len()) };
         if rc == 0 {
+            // Drop any JIT-region registration for this address so a later,
+            // unrelated mapping at the same address is not mistaken for JIT by
+            // the fault handler.
+            unregister_jit_region(range.start, range.len());
             Ok(())
         } else {
             Err(DeallocationError::AlreadyUnallocated)
@@ -1696,6 +1841,70 @@ fn sysctl_bool_is_false_for_a_nonexistent_sysctl() {
     assert!(!sysctl_bool(
         "hw.optional.litebox_does_not_define_this_sysctl"
     ));
+}
+
+/// `decode_mrs_ctr_el0` accepts `mrs Xt, CTR_EL0` for every destination
+/// register and rejects everything else -- notably the neighbouring
+/// `mrs Xt, DCZID_EL0` and the OpenSSL feature-probe instruction that must
+/// still reach the guest as a real `SIGILL`. This is the exact decode the
+/// fault handler runs to tell a cache-line-size read (emulate) from an
+/// undefined instruction (deliver).
+#[cfg(test)]
+#[test]
+fn decode_mrs_ctr_el0_matches_only_the_real_instruction() {
+    // `mrs x3, CTR_EL0` and `mrs x0, CTR_EL0` (the two forms libgcc/JITs emit).
+    assert_eq!(decode_mrs_ctr_el0(0xd53b_0023), Some(3));
+    assert_eq!(decode_mrs_ctr_el0(0xd53b_0020), Some(0));
+    // Highest register.
+    assert_eq!(decode_mrs_ctr_el0(0xd53b_003f), Some(31));
+    // `mrs x0, DCZID_EL0` (op2=7) -- a different system register, not ours.
+    assert_eq!(decode_mrs_ctr_el0(0xd53b_00e0), None);
+    // `sm3partw1 v4.4s, v0.4s, v3.4s` -- OpenSSL's probe; must fall through.
+    assert_eq!(decode_mrs_ctr_el0(0xce63_c004), None);
+    // A plain `nop`.
+    assert_eq!(decode_mrs_ctr_el0(0xd503_201f), None);
+}
+
+/// The synthesized `CTR_EL0` is well-formed for `__clear_cache`: bit 31 is
+/// RES1, and the I/D minimum-line fields decode to a stride no larger than the
+/// host's real cache line (so cache maintenance can only over-flush, never
+/// skip a line). Verified against the value the platform actually derives on
+/// this host.
+#[cfg(test)]
+#[test]
+fn synthetic_ctr_el0_is_well_formed_and_never_understates_the_line() {
+    init_synthetic_ctr_el0();
+    let ctr = SYNTHETIC_CTR_EL0.load(Ordering::Relaxed);
+    assert_ne!(ctr, 0, "must be initialized");
+    assert_eq!(ctr >> 31 & 1, 1, "bit 31 is RES1");
+    let imin_words = 1u64 << (ctr & 0xf);
+    let dmin_words = 1u64 << (ctr >> 16 & 0xf);
+    let real_line = darwin::sysctl_u64(c"hw.cachelinesize").unwrap_or(64);
+    // Encoded stride (in bytes) must not exceed the real coherency granule.
+    assert!(imin_words * 4 <= real_line, "icache stride over-wide");
+    assert!(dmin_words * 4 <= real_line, "dcache stride over-wide");
+}
+
+/// The JIT-region registry round-trips: an address inside a registered region
+/// matches, one outside does not, and unregistering (as `deallocate_pages`
+/// does) makes the region stop matching -- the property that keeps a stale
+/// entry from mistaking a later, unrelated mapping for JIT in the fault
+/// handler.
+#[cfg(test)]
+#[test]
+fn jit_region_registry_round_trips() {
+    // A high address unlikely to collide with a real live JIT region during
+    // the test run.
+    let base = 0x5000_0000_0000usize;
+    let len = 0x10_0000usize;
+    assert!(!addr_in_jit_region(base + 0x1000));
+    register_jit_region(base, len);
+    assert!(addr_in_jit_region(base));
+    assert!(addr_in_jit_region(base + len - 1));
+    assert!(!addr_in_jit_region(base + len));
+    assert!(!addr_in_jit_region(base - 1));
+    unregister_jit_region(base, len);
+    assert!(!addr_in_jit_region(base + 0x1000));
 }
 
 /// Every real Apple Silicon Mac (the only hardware this platform targets) implements
@@ -2715,6 +2924,7 @@ fn guest_tp_tsd_key_is_disjoint_across_threads() {
 /// `litebox_shim_linux::syscalls::signal::aarch64::exception_signal` already
 /// maps to `Signal::SIGILL`, mirroring the kernel's own `do_el0_undef`.
 pub(crate) fn install_fault_handlers() {
+    init_synthetic_ctr_el0();
     for signum in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL] {
         darwin::install_handler(
             signum,
@@ -2722,6 +2932,47 @@ pub(crate) fn install_fault_handlers() {
             true,
             &[INTERRUPT_SIGNAL],
         );
+    }
+}
+
+/// A synthetic `CTR_EL0` (cache type register) value, computed once at
+/// start-up and served to a guest that reads `CTR_EL0` from EL0.
+///
+/// Apple Silicon leaves `SCTLR_EL1.UCT` clear, so a guest `mrs Xt, CTR_EL0`
+/// -- the standard way code computes the cache-line stride for its own
+/// instruction-cache maintenance (`__clear_cache`, which every AArch64 JIT and
+/// libgcc's own cache-sync routine call after writing code) -- traps to
+/// `SIGILL` instead of returning a value. The host itself cannot read the real
+/// register either (same EL, same restriction), so the value is synthesized
+/// from the cache-line size the kernel *does* expose via `sysctl`, and
+/// [`fault_handler`] emulates the read. See `fault_handler`'s own comment.
+static SYNTHETIC_CTR_EL0: AtomicU64 = AtomicU64::new(0);
+
+fn init_synthetic_ctr_el0() {
+    // `hw.cachelinesize` is the coherency granule in bytes. `CTR_EL0` encodes
+    // I/D minimum line sizes as log2 of the number of 4-byte *words*.
+    let line_bytes = darwin::sysctl_u64(c"hw.cachelinesize")
+        .unwrap_or(64)
+        .max(16);
+    let words = (line_bytes / 4).max(1);
+    let log2_words = (u64::BITS - 1 - words.leading_zeros()) as u64;
+    // Only `IminLine` [3:0] and `DminLine` [19:16] matter to `__clear_cache`'s
+    // stride; deriving both from the coherency granule can only *over*-flush
+    // (a stride no larger than the true line), which is always safe. Bit 31 is
+    // RES1. `L1Ip` [15:14] = 0b11 (PIPT), the Apple Silicon value, so a reader
+    // that inspects it draws no wrong conclusion about aliasing.
+    let ctr = (1u64 << 31) | (log2_words << 16) | (0b11u64 << 14) | log2_words;
+    SYNTHETIC_CTR_EL0.store(ctr, Ordering::Relaxed);
+}
+
+/// Decodes `insn` as `mrs Xt, CTR_EL0` and returns the destination register
+/// index `t`, or `None`. The fixed bits are `mrs Xt, S3_3_C0_C0_1`; only the
+/// low five (`Rt`) vary.
+fn decode_mrs_ctr_el0(insn: u32) -> Option<u32> {
+    if insn & 0xffff_ffe0 == 0xd53b_0020 {
+        Some(insn & 0x1f)
+    } else {
+        None
     }
 }
 
@@ -2747,6 +2998,109 @@ unsafe extern "C" fn fault_handler(
 
     // SAFETY: checked non-null just above.
     let pc = unsafe { (*machine_context).thread_state.pc };
+
+    // Fault-driven W^X toggle for a guest that writes its own machine code
+    // into a `MAP_JIT` region (a JIT engine: V8). Darwin makes such a region
+    // writable *or* executable per thread, never both, and stock V8 (which
+    // dropped `--write-protect-code-memory` in v11.1, and whose Linux/aarch64
+    // build compiles out every write-protect API) just stores code and jumps
+    // to it as if the pages were plain RWX. Under this host the store faults
+    // with a *write permission fault* (the page is execute-only for this
+    // thread) and the jump-to-fresh-code faults with an *instruction
+    // permission fault* (the page is writable-only). Resolve both by toggling
+    // this thread's write-protect the matching way and letting the faulting
+    // instruction re-run; no guest signal is delivered.
+    //
+    // Gated on the exact permission-fault status codes so an unrelated fault
+    // that merely lands in a JIT address range (a wild pointer, an illegal
+    // instruction, a BTI failure) is not swallowed -- it falls through to the
+    // normal guest-fault path below. The toggle direction is fully determined
+    // by the fault type, which is self-consistent (a write fault can only
+    // occur when not writable; an instruction permission fault only when not
+    // executable), so this cannot loop for legitimate JIT access; the
+    // registry is cleared on `deallocate_pages`, so a stale entry cannot
+    // either.
+    //
+    // SAFETY: checked non-null just above.
+    let guest_state = guest::current_guest_state();
+    if guest::guest_owns_cpu(guest_state) {
+        // SAFETY: non-null machine context, checked above.
+        let esr = u64::from(unsafe { (*machine_context).exception_state.esr });
+        // SAFETY: non-null machine context, checked above.
+        let far = unsafe { (*machine_context).exception_state.far };
+        let ec = (esr >> 26) & 0x3f;
+        let fsc = esr & 0x3f;
+        let is_permission_fault = (0x0c..=0x0f).contains(&fsc);
+        // Data abort (EC 0x24/0x25) with the write bit set: guest is writing
+        // code into a JIT page that is currently executable.
+        let is_write = matches!(ec, 0x24 | 0x25) && (esr >> 6) & 1 == 1;
+        // Instruction abort (EC 0x20/0x21): guest is executing a JIT page that
+        // is currently writable.
+        let is_exec = matches!(ec, 0x20 | 0x21);
+        if is_permission_fault && is_write && addr_in_jit_region(far.trunc()) {
+            // SAFETY: makes JIT mappings writable for this thread; the
+            // faulting store re-runs and succeeds. No JIT code executes before
+            // the paired exec fault toggles it back.
+            unsafe { jit_write_protect(false) };
+            return;
+        }
+        if is_permission_fault && is_exec && addr_in_jit_region(pc.trunc()) {
+            // SAFETY: makes JIT mappings executable for this thread; the
+            // faulting branch/fetch re-runs and succeeds.
+            unsafe { jit_write_protect(true) };
+            return;
+        }
+
+        // Emulate a trapped `mrs Xt, CTR_EL0`. Apple Silicon leaves
+        // `SCTLR_EL1.UCT` clear, so reading the cache type register from EL0
+        // traps -- but it is exactly what `__clear_cache` reads to size its
+        // instruction-cache maintenance loop, so every AArch64 JIT (V8) and
+        // libgcc's own cache-sync path hits it right after writing code, and a
+        // real guest cannot proceed without an answer. Supply the synthesized
+        // value (see `SYNTHETIC_CTR_EL0`) and step over the instruction.
+        //
+        // Only for the exception classes where a validly-fetched instruction
+        // trapped: `0x00` (unknown -- how Darwin surfaces an EL0 system-register
+        // trap as `SIGILL`, and also a plain undefined instruction) and `0x18`
+        // (a trapped `MSR`/`MRS`). Crucially *not* an instruction or data
+        // abort (`0x20`-`0x25`): those can carry a `pc` that is itself
+        // unmapped -- a guest that branches to a null or wild pointer -- and
+        // reading the instruction word there would fault the handler
+        // recursively. Decoding the instruction (rather than trusting the
+        // signal) still keeps this precise: OpenSSL's `sm3partw1` feature
+        // probe is also `ec == 0x00` but decodes to `None` and falls through
+        // to real guest `SIGILL` delivery.
+        let pc_addr: usize = pc.trunc();
+        let insn = if matches!(ec, 0x00 | 0x18) && pc_addr != 0 {
+            // SAFETY: `ec` says a validly-fetched instruction trapped, so `pc`
+            // addresses live, executable guest memory; reading its 4 bytes is
+            // valid.
+            unsafe { core::ptr::read(pc_addr as *const u32) }
+        } else {
+            0 // decodes to `None`
+        };
+        if let Some(rt) = decode_mrs_ctr_el0(insn) {
+            let ctr = SYNTHETIC_CTR_EL0.load(Ordering::Relaxed);
+            // `x0`-`x28` live in the `x` array; `x29`/`x30` are the separate
+            // `fp`/`lr` fields; `x31` in this position is the zero register
+            // (the write is discarded).
+            // SAFETY: non-null machine context, checked above; index bounds
+            // enforced by the match.
+            unsafe {
+                let ts = &mut (*machine_context).thread_state;
+                match rt {
+                    0..=28 => ts.x[rt as usize] = ctr,
+                    29 => ts.fp = ctr,
+                    30 => ts.lr = ctr,
+                    _ => {} // x31 == xzr: discard.
+                }
+                // Step past the emulated instruction.
+                ts.pc = pc + 4;
+            }
+            return;
+        }
+    }
+
     if let Some(recovery) = litebox::mm::exception_table::search_exception_tables(pc.trunc()) {
         // A LiteBox access to guest memory faulted -- either one of this
         // crate's own recoverable accesses to guest memory, or one of

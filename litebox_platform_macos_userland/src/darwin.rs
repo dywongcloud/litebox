@@ -192,17 +192,26 @@ pub(crate) fn release_reservation(range: &core::ops::Range<usize>) {
 /// Relocates the mapping at `src_addr` (of `len` bytes) to `dest`, unmapping
 /// whatever was previously at `dest`.
 ///
-/// This exists for exactly one caller: placing a `MAP_JIT` mapping at a
-/// specific address. Darwin's `mmap` refuses to combine `MAP_FIXED` with
-/// `MAP_JIT` in one call -- real-world precedent (OpenJDK's fix for
-/// JDK-8234930, and V8's `OS::RemapPages` in
+/// This places a `MAP_JIT` mapping at a specific address. Darwin's `mmap`
+/// refuses to combine `MAP_FIXED` with `MAP_JIT` in one call -- real-world
+/// precedent (OpenJDK's fix for JDK-8234930, and V8's `OS::RemapPages` in
 /// `src/base/platform/platform-darwin.cc`, both of which use exactly this
 /// create-then-remap sequence on macOS/Apple Silicon) creates the JIT mapping
 /// at a kernel-chosen address first, then uses `mach_vm_remap` to move it. The
 /// destination mapping keeps the source's JIT-capable property: it lives on
 /// the underlying `vm_map_entry` (an internal `used_for_jit` bit), which
-/// `mach_vm_remap`'s entry-copy path explicitly preserves rather than
-/// re-deriving from the flags passed here.
+/// `mach_vm_remap`'s entry-copy path preserves.
+///
+/// `copy = TRUE` (not the aliasing `FALSE`): measured on real hardware,
+/// `mach_vm_remap(copy=FALSE)` returns `KERN_PROTECTION_FAILURE` for *every*
+/// `MAP_JIT` source -- live-confirmed here as the exact reason a `MAP_JIT`
+/// mapping could never be placed at a fixed address, which is what blocked
+/// V8's code-range promotion. `copy=TRUE` is a copy-on-write entry duplication
+/// (lazy: no physical copy of untouched pages), yields a genuinely executable
+/// JIT destination (verified by writing `movz w0,#42; ret` into a source and
+/// executing it from the remapped destination), and lets the caller drop its
+/// now-redundant source mapping afterward -- the destination is an independent
+/// COW copy, not an alias, so the source `munmap` does not disturb it.
 ///
 /// # Safety
 ///
@@ -229,7 +238,7 @@ pub(crate) unsafe fn remap_to_fixed(
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
             mach_task_self(),
             src_addr as u64,
-            0, // copy = FALSE: alias the same object, don't duplicate it.
+            1, // copy = TRUE: COW-duplicate; required for MAP_JIT sources.
             &raw mut cur_protection,
             &raw mut max_protection,
             VM_INHERIT_NONE,
@@ -395,6 +404,31 @@ pub(crate) fn clock_gettime_nanos(clock: libc::clockid_t) -> u64 {
 }
 
 /// Read a string-valued `sysctl` by name.
+/// Reads an integer `sysctl` (e.g. `hw.cachelinesize`) as a `u64`, widening
+/// whatever width the kernel returns (`u32`/`u64`). Returns `None` if the
+/// name does not exist or is wider than 8 bytes.
+pub(crate) fn sysctl_u64(name: &core::ffi::CStr) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    let mut len: usize = buf.len();
+    // SAFETY: `buf`/`len` are valid, uniquely-owned out-parameters sized for
+    // the widest integer sysctl this reads.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 || len > 8 {
+        return None;
+    }
+    let mut v = [0u8; 8];
+    v[..len].copy_from_slice(&buf[..len]);
+    Some(u64::from_le_bytes(v))
+}
+
 pub(crate) fn sysctl_string(
     name: &core::ffi::CStr,
 ) -> Result<alloc::string::String, std::io::Error> {
