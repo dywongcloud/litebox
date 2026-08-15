@@ -289,10 +289,19 @@ impl<'a> Cursor<'a> {
             }
             let byte = self.u8()?;
             let bits = u32::from(byte & 0x7f);
-            result |= bits
-                .checked_shl(shift)
-                .filter(|_| shift < 32 || bits == 0)
-                .with_context(|| format!("LEB128 overflow at offset {}", self.pos))?;
+            // This 7-bit group sits at `shift`; it must fit in u32. At shift `s`
+            // only the low `32 - s` bits are representable, so reject a group
+            // whose value exceeds `u32::MAX >> s`. The previous
+            // `checked_shl(shift).filter(shift < 32 || ...)` guard was dead:
+            // `shift` never reaches 32 here (the loop bails at 35), so
+            // `checked_shl` never failed and the 5th byte's high bits were
+            // silently shifted out -- a value >= 2^32 (e.g. bytes
+            // 80 80 80 80 10) decoded to a truncated result a spec-compliant
+            // wasm decoder would instead reject.
+            if bits > (u32::MAX >> shift) {
+                bail!("LEB128 value overflows u32 at offset {}", self.pos);
+            }
+            result |= bits << shift;
             if byte & 0x80 == 0 {
                 // A terminating zero byte after the first is padding: the value
                 // could have ended sooner. wasm requires minimal encoding, so
@@ -411,4 +420,40 @@ pub fn sha256_hex(data: &[u8]) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leb(bytes: &[u8]) -> anyhow::Result<u32> {
+        Cursor { bytes, pos: 0 }.leb128_u32()
+    }
+
+    #[test]
+    fn leb128_decodes_canonical_values() {
+        assert_eq!(leb(&[0x00]).unwrap(), 0);
+        assert_eq!(leb(&[0x05]).unwrap(), 5);
+        assert_eq!(leb(&[0x7f]).unwrap(), 127);
+        assert_eq!(leb(&[0xe5, 0x8e, 0x26]).unwrap(), 624485);
+        // The largest 5-byte u32: 0xFFFFFFFF.
+        assert_eq!(leb(&[0xff, 0xff, 0xff, 0xff, 0x0f]).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn leb128_rejects_u32_overflow() {
+        // 5th byte carries bits above bit 31. The old dead-code guard shifted
+        // them out silently (2^32 -> 0); a spec-compliant decoder rejects them.
+        assert!(leb(&[0x80, 0x80, 0x80, 0x80, 0x10]).is_err()); // == 2^32
+        assert!(leb(&[0x80, 0x80, 0x80, 0x80, 0x7f]).is_err());
+        assert!(leb(&[0xff, 0xff, 0xff, 0xff, 0x1f]).is_err());
+    }
+
+    #[test]
+    fn leb128_rejects_overlong_and_nonminimal() {
+        // Six continuation bytes exceed u32's five-byte maximum.
+        assert!(leb(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]).is_err());
+        // A trailing zero group is padding: two spellings of one value.
+        assert!(leb(&[0x80, 0x00]).is_err());
+    }
 }
