@@ -218,7 +218,7 @@ const MAX_UDP_CLIENTS: usize = 1024;
 /// address forever (a well-behaved DNS resolver alone cycles through thousands
 /// of ephemeral source ports).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const UDP_CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const UDP_CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// How often the relay sweeps its client table for idle entries.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
