@@ -748,7 +748,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        let return_value = match self.do_syscall(ctx) {
+        let result = self.do_syscall(ctx);
+        // The request-side twin of this line lives in `do_syscall` (the
+        // `req=` trace). Logging the result too is what turns the trace into
+        // a usable differential record: a guest that aborts after a burst of
+        // syscalls (libuv's `uv_loop_init` cleanup was the motivating case)
+        // is undiagnosable from requests alone, because the failing call and
+        // the cleanup that follows it look identical without return values.
+        litebox_util_log::trace!(pid:? = self.pid, tid:? = self.tid, ret:? = result; "sysret");
+        let return_value = match result {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };

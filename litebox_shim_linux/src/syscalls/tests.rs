@@ -158,14 +158,16 @@ fn test_fcntl() {
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
 
-    // Eventfd requires broker control in this shim configuration.
-    assert_eq!(
-        task.sys_eventfd2(
+    // Eventfd works without a broker via the local fallback backend (it used
+    // to fail with EIO here, which aborted Node at uv_loop_init).
+    let event_fd = task
+        .sys_eventfd2(
             0,
             EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
-        ),
-        Err(Errno::EIO)
-    );
+        )
+        .expect("brokerless eventfd must fall back to the local backend");
+    task.sys_close(i32::try_from(event_fd).unwrap())
+        .expect("closing the eventfd");
 
     // Regular (non-stdio) files carry no `StdioStatusFlags` metadata; SETFL on one must be a
     // real-Linux-matching no-op rather than panicking.

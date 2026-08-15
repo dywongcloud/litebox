@@ -910,11 +910,26 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             return None;
         }
         if let Some(suggested_address) = suggested_address {
-            if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
-                return None;
+            if fixed_addr {
+                if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
+                    return None;
+                }
+                return Some(suggested_address.0);
             }
-            if fixed_addr
-                || !self
+            // A plain (non-MAP_FIXED) hint is advisory: Linux ignores an
+            // unusable hint and picks its own address rather than failing
+            // the mmap, and real programs rely on exactly that -- V8's
+            // GetRandomMmapAddr hands the kernel addresses randomized over a
+            // wider range than any particular process can necessarily map
+            // (observed live: a node:alpine guest's V8 heap-chunk hint below
+            // this platform's `TASK_ADDR_MIN` was answered with `EPERM`
+            // here, which V8 treats as fatal OOM during snapshot
+            // deserialization). Honor the hint only when it is genuinely
+            // usable; otherwise fall through to the search below, exactly as
+            // if no hint had been given.
+            if suggested_address.0 >= Platform::TASK_ADDR_MIN
+                && (Platform::TASK_ADDR_MAX - size) >= suggested_address.0
+                && !self
                     .vmas
                     .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
             {
