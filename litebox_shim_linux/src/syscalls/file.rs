@@ -1686,7 +1686,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // A real symbolic link in the filesystem: return its target verbatim.
         // `readlink(2)` is EINVAL on a non-symlink and ENOENT on a missing path,
         // which is exactly how `FileSystem::readlink` maps.
-        Ok(self.files.borrow().fs.readlink(fullpath).map_err(Errno::from)?)
+        self.files.borrow().fs.readlink(fullpath).map_err(Errno::from)
     }
 
     /// Handle syscall `readlink`
