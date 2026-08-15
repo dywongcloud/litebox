@@ -44,6 +44,21 @@ pub fn evaluate(dockerfile: &Dockerfile, options: &BuildOptions) -> anyhow::Resu
     let ignore = DockerIgnore::load(&context_dir);
     let build_args: HashMap<String, String> = options.build_args.iter().cloned().collect();
 
+    // Stage names must be unique: a duplicate would make `COPY --from=<name>`
+    // ambiguous, silently resolving to the first. Reject it as buildkit does.
+    // Names are case-insensitive, matching docker.
+    let mut seen_stage_names: HashMap<String, usize> = HashMap::new();
+    for stage in &dockerfile.stages {
+        if let Some(name) = &stage.name
+            && let Some(prev) = seen_stage_names.insert(name.to_ascii_lowercase(), stage.line)
+        {
+            bail!(
+                "line {}: duplicate stage name '{name}' (already defined at line {prev})",
+                stage.line
+            );
+        }
+    }
+
     let mut stages: Vec<StageState> = Vec::new();
     // Extracted external images pulled for `COPY --from=<image>`.
     let mut external_images: HashMap<String, ExtractedImage> = HashMap::new();
@@ -338,12 +353,13 @@ fn apply_instruction(
         Instruction::Expose(ports) => {
             for port in ports {
                 for normalized in expand_exposed_port(&expand(state, port))? {
-                    if !state.config.exposed.contains(&normalized) {
-                        state.config.exposed.push(normalized);
-                    }
+                    state.config.exposed.push(normalized);
                 }
             }
+            // Dedupe once, not with a linear scan per port: EXPOSE of a large
+            // range (a valid single line) is otherwise quadratic.
             state.config.exposed.sort();
+            state.config.exposed.dedup();
         }
         Instruction::Volume(volumes) => {
             for volume in volumes {
@@ -597,8 +613,18 @@ fn apply_copy(
             }
 
             if canonical.is_dir() {
-                // Directory sources copy their contents into dest.
-                copy_dir_contents(&canonical, &dest_host, chmod)?;
+                // Directory sources copy their contents into dest. A context
+                // copy filters each file through .dockerignore; the tree's
+                // context-relative path is the ignore base.
+                let dir_ignore = if enforce_ignore {
+                    let base = canonical
+                        .strip_prefix(&canonical_root)
+                        .unwrap_or(Path::new(""));
+                    Some((ignore, base))
+                } else {
+                    None
+                };
+                copy_dir_contents(&canonical, &dest_host, chmod, dir_ignore)?;
             } else {
                 let is_archive = is_add && looks_like_tar(&canonical)?;
                 if is_archive {
@@ -749,7 +775,17 @@ fn component_match(pattern: &str, name: &str) -> bool {
     matcher(&p, &n)
 }
 
-fn copy_dir_contents(src: &Path, dest: &Path, chmod: Option<u32>) -> anyhow::Result<()> {
+/// Copy a directory tree into `dest`. When `ignore` is `Some((rules, base))`,
+/// each file is filtered by `.dockerignore` using its path relative to the
+/// build context -- `base` is the tree's own context-relative path, so a
+/// `COPY .` and a `COPY subdir` both match ignore patterns the same way docker
+/// does. `base` is empty for a whole-context copy.
+fn copy_dir_contents(
+    src: &Path,
+    dest: &Path,
+    chmod: Option<u32>,
+    ignore: Option<(&DockerIgnore, &Path)>,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(dest)?;
     for entry in walkdir::WalkDir::new(src).follow_links(false) {
         let entry = entry.context("walking source directory")?;
@@ -758,6 +794,11 @@ fn copy_dir_contents(src: &Path, dest: &Path, chmod: Option<u32>) -> anyhow::Res
             .strip_prefix(src)
             .expect("walkdir yields children of src");
         if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some((rules, base)) = ignore
+            && rules.excluded(&base.join(rel))
+        {
             continue;
         }
         let target = dest.join(rel);
@@ -792,7 +833,7 @@ fn copy_dir_contents(src: &Path, dest: &Path, chmod: Option<u32>) -> anyhow::Res
 /// Copy a whole tree preserving modes and symlinks (stage snapshots).
 fn copy_tree(src: &Path, dest: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dest)?;
-    copy_dir_contents(src, dest, None)?;
+    copy_dir_contents(src, dest, None, None)?;
     // Preserve modes from the source tree.
     for entry in walkdir::WalkDir::new(src).follow_links(false) {
         let entry = entry?;

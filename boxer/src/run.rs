@@ -96,11 +96,21 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
                  publish one explicitly with -p HOST:GUEST"
             );
         }
-        mappings.extend(
-            meta.exposed_ports
-                .iter()
-                .filter_map(|port| crate::publish::PortMapping::from_exposed(port)),
-        );
+        let from_exposed: Vec<crate::publish::PortMapping> = meta
+            .exposed_ports
+            .iter()
+            .filter_map(|port| crate::publish::PortMapping::from_exposed(port))
+            .collect();
+        // Every EXPOSEd port being non-TCP would otherwise leave -P a silent
+        // no-op: no listener, no device, a workload the user thinks is served.
+        if from_exposed.is_empty() {
+            eprintln!(
+                "warning: --publish-all matched no ports: this box EXPOSEs only \
+                 non-TCP ports ({}), and only TCP is published",
+                meta.exposed_ports.join(", ")
+            );
+        }
+        mappings.extend(from_exposed);
     }
 
     let entry_names = tar_entry_names(&parsed.rootfs_tar)?;

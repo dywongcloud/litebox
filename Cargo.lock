@@ -272,6 +272,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tar-no-std",
  "tempfile",
  "tokio",
  "walkdir",

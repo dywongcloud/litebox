@@ -362,6 +362,11 @@ fn parse_instruction(
         "ENTRYPOINT" => Ok(Instruction::Entrypoint(parse_command(rest)?)),
         "COPY" | "ADD" => {
             let (flags, mut paths) = parse_copy_args(rest)?;
+            // Heredoc markers (`<<EOF`) are captured separately as
+            // `line.heredocs`; drop them from the path list so a lone-heredoc
+            // COPY does not carry a phantom source, which would make its single
+            // destination look like a directory and write to `dest/EOF`.
+            paths.retain(|p| !p.starts_with("<<"));
             if paths.len() < 2 && line.heredocs.is_empty() {
                 bail!("{keyword} requires at least one source and a destination");
             }

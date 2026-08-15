@@ -178,7 +178,7 @@ fn select_image(
     platform: TargetPlatform,
 ) -> anyhow::Result<(Vec<LayerData>, Vec<u8>)> {
     if let Some(index) = blobs.get("index.json") {
-        return select_from_oci_index(blobs, index, platform);
+        return select_from_oci_index(blobs, index, platform, 0);
     }
     if let Some(manifest) = blobs.get("manifest.json") {
         return select_from_docker_manifest(blobs, manifest);
@@ -199,11 +199,23 @@ fn blob_by_digest<'a>(
         .with_context(|| format!("blob {path} missing from archive"))
 }
 
+/// A manifest list may nest another manifest list; a crafted or forged archive
+/// can point one back at itself. Cap the chain so a cycle is a named error
+/// rather than a stack overflow.
+const MAX_INDEX_DEPTH: u32 = 8;
+
 fn select_from_oci_index(
     blobs: &HashMap<String, Vec<u8>>,
     index: &[u8],
     platform: TargetPlatform,
+    depth: u32,
 ) -> anyhow::Result<(Vec<LayerData>, Vec<u8>)> {
+    if depth > MAX_INDEX_DEPTH {
+        bail!(
+            "archive index nests more than {MAX_INDEX_DEPTH} levels deep; \
+             refusing a manifest-list cycle or an unreasonably deep chain"
+        );
+    }
     let index: serde_json::Value =
         serde_json::from_slice(index).context("index.json is not valid JSON")?;
     let manifests = index
@@ -260,7 +272,7 @@ fn select_from_oci_index(
 
     // A nested index (manifest list) resolves one level down.
     if manifest.get("manifests").is_some() {
-        return select_from_oci_index(blobs, manifest_bytes, platform);
+        return select_from_oci_index(blobs, manifest_bytes, platform, depth + 1);
     }
 
     let config_digest = manifest

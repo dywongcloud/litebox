@@ -12,6 +12,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
+# The same reader litebox's runner uses for the rootfs, so `parse` rejects
+# exactly the tar buffers the runner would reject -- a box that cannot load is
+# refused up front instead of aborting mid-run.
+tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
 
 # Image acquisition (registry pulls, layer decompression) is available on the
 # same hosts as litebox_packager's OCI support; see that crate's Cargo.toml for

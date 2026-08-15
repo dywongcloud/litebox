@@ -30,7 +30,11 @@ pub const ROOTFS_SECTION: &str = "box.rootfs.v1";
 pub const MAX_ROOTFS_BYTES: u64 = 3_758_096_384; // 3.5 GiB
 
 /// The metadata document embedded in every box.
+///
+/// `deny_unknown_fields`: a tampered box carrying extra keys is rejected rather
+/// than silently ignored, so what `inspect` reports is the whole document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoxMeta {
     /// Always `"litebox-box"`.
     pub format: String,
@@ -290,6 +294,12 @@ impl<'a> Cursor<'a> {
                 .filter(|_| shift < 32 || bits == 0)
                 .with_context(|| format!("LEB128 overflow at offset {}", self.pos))?;
             if byte & 0x80 == 0 {
+                // A terminating zero byte after the first is padding: the value
+                // could have ended sooner. wasm requires minimal encoding, so
+                // reject it rather than accept two spellings of one length.
+                if shift > 0 && byte == 0 {
+                    bail!("non-minimal LEB128 encoding at offset {}", self.pos);
+                }
                 return Ok(result);
             }
         }
@@ -318,7 +328,9 @@ impl<'a> Cursor<'a> {
 }
 
 /// Find a custom section by name. Returns `Ok(None)` when the module is valid
-/// wasm but has no such section.
+/// wasm but has no such section, and an error when the section appears more
+/// than once: a duplicate box section would let an unverified second payload
+/// ride along, since only the first is checked against the metadata.
 fn find_custom_section<'a>(bytes: &'a [u8], wanted: &str) -> anyhow::Result<Option<&'a [u8]>> {
     if bytes.len() < 8 || bytes[..4] != [0x00, 0x61, 0x73, 0x6d] {
         bail!("not a WebAssembly module (bad magic)");
@@ -327,6 +339,7 @@ fn find_custom_section<'a>(bytes: &'a [u8], wanted: &str) -> anyhow::Result<Opti
         bail!("unsupported WebAssembly version");
     }
     let mut cursor = Cursor { bytes, pos: 8 };
+    let mut found: Option<&'a [u8]> = None;
     while !cursor.done() {
         let id = cursor.u8()?;
         let size = cursor.leb128_u32()? as usize;
@@ -339,11 +352,14 @@ fn find_custom_section<'a>(bytes: &'a [u8], wanted: &str) -> anyhow::Result<Opti
             let name_len = inner.leb128_u32()? as usize;
             let name = inner.slice(name_len)?;
             if name == wanted.as_bytes() {
-                return Ok(Some(&body[inner.pos..]));
+                if found.is_some() {
+                    bail!("box has more than one {wanted} section; corrupt or tampered box");
+                }
+                found = Some(&body[inner.pos..]);
             }
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Parse a `.box.wasm` file into its metadata and rootfs tar.
@@ -372,6 +388,12 @@ pub fn parse(bytes: &[u8]) -> anyhow::Result<ParsedBox> {
     let digest = sha256_hex(rootfs);
     if digest != meta.tar_sha256 {
         bail!("box.rootfs.v1 digest mismatch: corrupt or tampered box");
+    }
+    // Integrity only proves the bytes are the ones the builder wrote; it does
+    // not prove they are a loadable tar. Reject a rootfs the runner could not
+    // read, using that runner's own reader, rather than aborting inside it.
+    if tar_no_std::TarArchiveRef::new(rootfs).is_err() {
+        bail!("box.rootfs.v1 is not a readable tar archive; corrupt box");
     }
     Ok(ParsedBox {
         meta,

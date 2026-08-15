@@ -69,7 +69,19 @@ impl IfReq {
 /// it was already there, so callers can say which happened.
 pub fn ensure_device(device: &str) -> anyhow::Result<bool> {
     let existed = device_exists(device);
-    if !existed {
+    if existed {
+        // A name that already exists might be a real NIC or bridge. Configuring
+        // it would replace its address with boxer's and bring it up -- severing
+        // host connectivity on a typo like `--net eth0`. Only reuse an existing
+        // interface when it is a TUN; refuse anything else rather than clobber
+        // a device boxer did not create.
+        if !is_tun_device(device) {
+            bail!(
+                "network device '{device}' already exists and is not a TUN device; \
+                 boxer will not reconfigure it. Pass a different --net name."
+            );
+        }
+    } else {
         create_device(device)?;
     }
     configure_device(device)?;
@@ -79,6 +91,16 @@ pub fn ensure_device(device: &str) -> anyhow::Result<bool> {
 /// Is there already an interface with this name?
 fn device_exists(device: &str) -> bool {
     std::path::Path::new("/sys/class/net").join(device).exists()
+}
+
+/// Is this interface a TUN/TAP device? The kernel exposes `tun_flags` in sysfs
+/// only for tun/tap interfaces, so its presence tells a TUN from an ordinary
+/// NIC, veth, or bridge without opening a socket.
+fn is_tun_device(device: &str) -> bool {
+    std::path::Path::new("/sys/class/net")
+        .join(device)
+        .join("tun_flags")
+        .exists()
 }
 
 /// Create a persistent TUN interface via `/dev/net/tun`.
