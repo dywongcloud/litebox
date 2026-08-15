@@ -1203,6 +1203,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .map_or(Err(Errno::EFAULT), |path| {
                     syscall!(sys_unlinkat(dirfd, path, flags))
                 }),
+            SyscallRequest::Symlinkat {
+                target,
+                newdirfd,
+                linkpath,
+            } => match (
+                target.to_cstring::<Platform>(),
+                linkpath.to_cstring::<Platform>(),
+            ) {
+                (Some(target), Some(linkpath)) => {
+                    syscall!(sys_symlinkat(target, newdirfd, linkpath))
+                }
+                _ => Err(Errno::EFAULT),
+            },
             SyscallRequest::Fchmodat {
                 dirfd,
                 pathname,

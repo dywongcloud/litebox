@@ -2702,6 +2702,14 @@ pub enum SyscallRequest {
         pathname: UserPtr<c_char>,
         flags: AtFlags,
     },
+    /// Reached through both `symlink` (with `newdirfd` forced to `AT_FDCWD`) and
+    /// `symlinkat`. `target` is the link's verbatim contents, `linkpath` is where
+    /// the link is created (resolved against `newdirfd`).
+    Symlinkat {
+        target: UserPtr<c_char>,
+        newdirfd: i32,
+        linkpath: UserPtr<c_char>,
+    },
     /// Reached through `chmod`, `fchmodat`, and `fchmodat2`.
     ///
     /// `flags` is empty for `chmod`/`fchmodat`, since the raw `fchmodat(2)` syscall (unlike
@@ -3366,6 +3374,16 @@ impl SyscallRequest {
                 mode_and_type: ctx.sys_req_arg(1),
                 dev: ctx.sys_req_arg(2),
             },
+            Sysno::symlinkat => sys_req!(Symlinkat { target:*, newdirfd, linkpath:* }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::symlink => {
+                // symlink is symlinkat with newdirfd AT_FDCWD
+                SyscallRequest::Symlinkat {
+                    target: ctx.sys_req_ptr(0),
+                    newdirfd: AT_FDCWD,
+                    linkpath: ctx.sys_req_ptr(1),
+                }
+            }
             Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::unlink => {

@@ -345,6 +345,78 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(Errno::from)
     }
 
+    /// Linux caps a single path resolution at `MAXSYMLINKS` (40) followed links.
+    const MAX_SYMLINK_HOPS: usize = 40;
+
+    /// Follow a trailing-component symlink chain on an already-resolved absolute
+    /// `path`, per `path_resolution(7)`. Only the final component is followed --
+    /// following a symlink used as an intermediate directory component is not yet
+    /// supported (such a component surfaces as `ENOTDIR` from the backend walk).
+    ///
+    /// The path is returned unchanged when the final component is not a symlink,
+    /// or does not exist (so `O_CREAT` can still create it and a missing target
+    /// yields `ENOENT` from the real operation, not here). `ELOOP` once the chain
+    /// exceeds [`Self::MAX_SYMLINK_HOPS`].
+    fn resolve_leaf_symlink(&self, path: &str) -> Result<String, Errno> {
+        use litebox::fs::FileType;
+        use litebox::fs::errors::{FileStatusError, PathError};
+        let mut current = String::from(path);
+        for _ in 0..Self::MAX_SYMLINK_HOPS {
+            let file_type = match self.files.borrow().fs.file_status(current.as_str()) {
+                Ok(status) => status.file_type,
+                // A missing final component (or missing ancestor) is handed back
+                // unchanged; the real operation decides ENOENT vs O_CREAT.
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => return Ok(current),
+                Err(e) => return Err(Errno::from(e)),
+            };
+            if file_type != FileType::SymLink {
+                return Ok(current);
+            }
+            let target = self
+                .files
+                .borrow()
+                .fs
+                .readlink(current.as_str())
+                .map_err(Errno::from)?;
+            current = Self::join_symlink_target(&current, &target)?;
+        }
+        Err(Errno::ELOOP)
+    }
+
+    /// Resolve a symlink's `target` against the link at `link_path`: an absolute
+    /// target from the root, a relative one from the directory containing the
+    /// link (recomputed each hop). An empty target resolves to nothing (`ENOENT`).
+    fn join_symlink_target(link_path: &str, target: &str) -> Result<String, Errno> {
+        use litebox::path::Arg as _;
+        if target.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let joined = if target.starts_with('/') {
+            String::from(target)
+        } else {
+            let dir = link_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+            let mut joined = String::from(dir);
+            joined.push('/');
+            joined.push_str(target);
+            joined
+        };
+        joined.normalized().map_err(|_| Errno::ENOENT)
+    }
+
+    /// Apply `open(2)` default symlink-following to an already-resolved absolute
+    /// path. Two flag combinations keep the final link opaque and pass the path
+    /// straight to the backend: `O_NOFOLLOW` (the backend answers `ELOOP`) and
+    /// `O_CREAT|O_EXCL` (an existing link is `EEXIST`, never followed).
+    fn follow_open_path(&self, path: CString, flags: OFlags) -> Result<CString, Errno> {
+        if flags.contains(OFlags::NOFOLLOW) || flags.contains(OFlags::CREAT | OFlags::EXCL) {
+            return Ok(path);
+        }
+        let resolved = self.resolve_leaf_symlink(path.to_str().map_err(|_| Errno::EINVAL)?)?;
+        CString::new(resolved).map_err(|_| Errno::EINVAL)
+    }
+
     fn do_openat(
         &self,
         dirfd: i32,
@@ -353,6 +425,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: Mode,
     ) -> Result<TypedFd<FS>, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
+        let path = self.follow_open_path(path, flags)?;
         self.do_open(path, flags, mode)
     }
 
@@ -418,6 +491,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: Mode,
     ) -> Result<u32, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
+        let path = self.follow_open_path(path, flags)?;
         let file = self.do_open(path.clone(), flags, mode)?;
         self.insert_raw_file_fd(file, flags, Some(path))
     }
@@ -1092,6 +1166,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_mkdir(pathname, Mode::from_bits_retain(mode))
     }
 
+    /// Handle syscall `symlinkat` (and `symlink`, which the dispatcher forwards
+    /// here with `newdirfd` = `AT_FDCWD`).
+    ///
+    /// `target` is the link's contents and is stored verbatim -- it is neither
+    /// resolved nor required to exist (a dangling link is valid). Only `linkpath`
+    /// is resolved, against `newdirfd`.
+    pub(crate) fn sys_symlinkat(
+        &self,
+        target: impl path::Arg,
+        newdirfd: i32,
+        linkpath: impl path::Arg,
+    ) -> Result<(), Errno> {
+        let target = target.as_rust_str().map_err(|_| Errno::EINVAL)?;
+        // `symlink(2)`: an empty target is ENOENT.
+        if target.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let linkpath = self.resolve_path_at(newdirfd, linkpath)?;
+        self.files
+            .borrow()
+            .fs
+            .symlink(target, linkpath)
+            .map_err(Errno::from)
+    }
+
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
         self.do_close_and_replace::<FS>(raw_fd, None)
     }
@@ -1573,12 +1672,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 0 => return Ok("/dev/stdin".to_string()),
                 1 => return Ok("/dev/stdout".to_string()),
                 2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
+                // Other `/proc/self/fd/N` are not modeled as symlinks yet; fall
+                // through to the real filesystem, which answers ENOENT/EINVAL
+                // rather than panicking (full /proc/self/fd is a separate task).
+                _ => {}
             }
         }
 
-        // TODO: we do not support symbolic links other than stdio yet.
-        Err(Errno::ENOENT)
+        // A real symbolic link in the filesystem: return its target verbatim.
+        // `readlink(2)` is EINVAL on a non-symlink and ENOENT on a missing path,
+        // which is exactly how `FileSystem::readlink` maps.
+        Ok(self.files.borrow().fs.readlink(fullpath).map_err(Errno::from)?)
     }
 
     /// Handle syscall `readlink`
