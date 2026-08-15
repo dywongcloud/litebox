@@ -1606,7 +1606,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: AccessFlags,
         caller: AccessUserInfo,
     ) -> Result<(), Errno> {
-        let status = self.files.borrow().fs.file_status(pathname)?;
+        // `access(2)`/`faccessat(2)` dereference a trailing symlink, so a dangling
+        // link correctly reports as absent (ENOENT) and a link's target's
+        // permissions -- not the always-`rwxrwxrwx` link node -- are checked.
+        let resolved = self.resolve_leaf_symlink(pathname.as_rust_str().map_err(|_| Errno::EINVAL)?)?;
+        let status = self.files.borrow().fs.file_status(resolved.as_str())?;
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
     }
@@ -2265,6 +2269,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
         let resolved = self.resolve_path(pathname)?;
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
+        // `chdir(2)` dereferences a trailing symlink, so `cd` into a symlinked
+        // directory works (and lands the cwd on the link's target).
+        let abs_path = self.resolve_leaf_symlink(&abs_path)?;
 
         // Verify the path exists and is a directory.
         match self.files.borrow().fs.file_status(abs_path.as_str()) {
