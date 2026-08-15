@@ -638,8 +638,22 @@ fn extract_tar<R: Read>(
                 continue;
             }
             if let Some(target_name) = file_name.strip_prefix(".wh.") {
-                // Regular whiteout: delete the specific file/directory
-                if let Some(parent) = path.parent() {
+                // Regular whiteout: delete the specific file/directory.
+                //
+                // The name after `.wh.` must be a plain child filename. A
+                // crafted marker like `.wh..` (target `.`) or `.wh...` (target
+                // `..`) would otherwise join, unnormalized, to the directory
+                // itself or an ancestor -- and `rootfs.join("..")` escapes the
+                // rootfs entirely, so remove_dir_all/remove_file could delete
+                // data outside the extracted image. Refuse anything that is not
+                // a single normal path component (no `.`, `..`, `/`, or empty).
+                let plain_child = !target_name.is_empty()
+                    && target_name != "."
+                    && target_name != ".."
+                    && !target_name.contains('/');
+                if let Some(parent) = path.parent()
+                    && plain_child
+                {
                     let whiteout_rel = parent.join(target_name);
                     let target = rootfs.join(&whiteout_rel);
                     if target.is_dir() {
@@ -1329,5 +1343,74 @@ mod tests {
         let script = generate_config_and_run_script(&config_with(None, None));
         assert!(script.contains("exec \"$@\""), "{script}");
         assert!(!script.contains("if [ $# -gt 0 ]"), "{script}");
+    }
+
+    /// Build an in-memory tar containing a single empty regular-file entry with
+    /// the exact name given (used to plant crafted whiteout markers).
+    fn tar_with_regular_entry(name: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, name, std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn whiteout_cannot_delete_outside_rootfs() {
+        // A crafted whiteout `.wh...` strips to the target `..`. The old code
+        // joined it unnormalized as rootfs/.. and remove_dir_all'd it, escaping
+        // the rootfs to delete sibling data (sweep F9). Extraction must refuse
+        // a whiteout whose target is not a plain child name.
+        let tmp = tempfile::tempdir().unwrap();
+        // A sibling of the rootfs, OUTSIDE it, that must survive extraction.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"host data").unwrap();
+
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let tar_bytes = tar_with_regular_entry(".wh...");
+        let mut symlinks = Vec::new();
+        let mut permissions = HashMap::new();
+        extract_tar(&tar_bytes[..], &rootfs, &mut symlinks, &mut permissions).unwrap();
+
+        assert!(
+            outside.join("secret.txt").exists(),
+            "whiteout escaped the rootfs and deleted data in a sibling directory"
+        );
+        assert!(
+            rootfs.exists(),
+            "the rootfs itself must survive a malformed whiteout"
+        );
+    }
+
+    #[test]
+    fn whiteout_removes_named_child_only() {
+        // A legitimate whiteout `.wh.gone.txt` deletes exactly its target and
+        // leaves siblings untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::write(rootfs.join("gone.txt"), b"x").unwrap();
+        std::fs::write(rootfs.join("stays.txt"), b"y").unwrap();
+
+        let tar_bytes = tar_with_regular_entry(".wh.gone.txt");
+        let mut symlinks = Vec::new();
+        let mut permissions = HashMap::new();
+        extract_tar(&tar_bytes[..], &rootfs, &mut symlinks, &mut permissions).unwrap();
+
+        assert!(
+            !rootfs.join("gone.txt").exists(),
+            "a legitimate whiteout must delete its named target"
+        );
+        assert!(
+            rootfs.join("stays.txt").exists(),
+            "a whiteout must not touch siblings"
+        );
     }
 }
