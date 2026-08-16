@@ -2856,6 +2856,10 @@ pub enum SyscallRequest {
     Sysinfo {
         buf: UserPtrMut<Sysinfo>,
     },
+    Getrusage {
+        who: i32,
+        usage: UserPtrMut<Rusage>,
+    },
     CapGet {
         header: UserPtrMut<CapHeader>,
         data: Option<UserPtrMut<CapData>>,
@@ -3476,6 +3480,7 @@ impl SyscallRequest {
                 }
             }
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
+            Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {

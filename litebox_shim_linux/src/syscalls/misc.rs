@@ -102,6 +102,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ..Default::default()
         }
     }
+
+    /// Handle syscall `getrusage`.
+    ///
+    /// LiteBox keeps no per-process CPU or fault accounting to report, so every
+    /// counter is zero except `ru_maxrss`, which mirrors the synthetic
+    /// resident-set size `/proc/<pid>/status` reports (in kilobytes, as
+    /// `getrusage(2)` specifies on Linux), so the two sources cannot be observed
+    /// drifting apart. `who` (`RUSAGE_SELF`/`_CHILDREN`/`_THREAD`) makes no
+    /// difference here: there is one accounting target to report. This is enough
+    /// for `process.cpuUsage()`/`process.resourceUsage()` to return (zeroed)
+    /// values instead of throwing `ENOSYS`.
+    pub(crate) fn sys_getrusage(&self, _who: i32) -> litebox_common_linux::Rusage {
+        litebox_common_linux::Rusage {
+            // `/proc/<pid>/status` reports `VmRSS: 1024 kB`; keep the two in step.
+            ru_maxrss: 1024,
+            ..Default::default()
+        }
+    }
 }
 
 const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;

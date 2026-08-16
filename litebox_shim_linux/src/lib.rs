@@ -307,7 +307,19 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
 
     /// Build the shim.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
-        let mut net = Network::new(&self.litebox);
+        self.build_with_net_config(None, None)
+    }
+
+    /// Same as [`Self::build`], but lets the caller override this instance's
+    /// interface/gateway addresses (`None` = use `Network::new`'s default of
+    /// `10.0.0.2`/`10.0.0.1`). Needed to run more than one shim on the same
+    /// host at once, each independently reachable.
+    pub fn build_with_net_config<FS: ShimFS>(
+        self,
+        interface_ip: Option<core::net::Ipv4Addr>,
+        gateway_ip: Option<core::net::Ipv4Addr>,
+    ) -> LinuxShim<Platform, FS> {
+        let mut net = Network::new_with_addrs(&self.litebox, interface_ip, gateway_ip);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -1409,6 +1421,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset::<Platform>(0, sysinfo)
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
+            SyscallRequest::Getrusage { who, usage } => {
+                let rusage = self.sys_getrusage(who);
+                usage
+                    .write_at_offset::<Platform>(0, rusage)
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }
