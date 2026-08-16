@@ -693,6 +693,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(Errno::from)
     }
 
+    /// Handle syscall `fchownat` (and `chown`/`lchown`, which the dispatcher
+    /// forwards here with `dirfd` forced to `AT_FDCWD` and `flags` set to
+    /// `AT_SYMLINK_NOFOLLOW` for `lchown`).
+    ///
+    /// `owner`/`group` are the raw `uid_t`/`gid_t`; `(uid_t)-1` (`u32::MAX`) means
+    /// "leave this id unchanged", which `u16::try_from` already turns into `None`
+    /// since it does not fit LiteBox's `u16` id model.
+    pub(crate) fn sys_fchownat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        owner: u32,
+        group: u32,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        // TODO: `AT_SYMLINK_NOFOLLOW` is accepted for Linux compatibility, but LiteBox file status
+        // lookups do not currently follow symlinks in any backend, so this has no distinct effect
+        // (mirrors the same TODO on `sys_fchmodat`/`sys_faccessat`).
+        if flags.intersects(AtFlags::AT_SYMLINK_NOFOLLOW.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        // LiteBox models uid/gid as `u16`; a real id fits, and the `u32::MAX`
+        // "unchanged" sentinel does not, so `try_from` maps it to `None`.
+        let owner = u16::try_from(owner).ok();
+        let group = u16::try_from(group).ok();
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        self.files
+            .borrow()
+            .fs
+            .chown(path, owner, group)
+            .map_err(Errno::from)
+    }
+
     /// Handle syscall `fchmod`
     pub fn sys_fchmod(&self, fd: i32, mode: u32) -> Result<(), Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {

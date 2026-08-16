@@ -1253,6 +1253,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .map_or(Err(Errno::EFAULT), |path| {
                     syscall!(sys_fchmodat(dirfd, path, mode, flags))
                 }),
+            SyscallRequest::Fchownat {
+                dirfd,
+                pathname,
+                owner,
+                group,
+                flags,
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_fchownat(dirfd, path, owner, group, flags))
+                }),
             SyscallRequest::Fchmod { fd, mode } => syscall!(sys_fchmod(fd, mode)),
             SyscallRequest::Utimensat {
                 dirfd,

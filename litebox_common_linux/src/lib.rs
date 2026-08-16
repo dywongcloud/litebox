@@ -2735,6 +2735,17 @@ pub enum SyscallRequest {
         fd: i32,
         mode: u32,
     },
+    /// Reached through `chown` (dirfd `AT_FDCWD`, flags empty), `lchown` (dirfd
+    /// `AT_FDCWD`, flags `AT_SYMLINK_NOFOLLOW`), and `fchownat`. `owner`/`group`
+    /// carry the raw `uid_t`/`gid_t`; a value of `(uid_t)-1` (`u32::MAX`) means
+    /// "leave unchanged", which the shim maps to `None`.
+    Fchownat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        owner: u32,
+        group: u32,
+        flags: AtFlags,
+    },
     /// Reached through `utimensat`. Also covers `futimens`, which has no syscall of its own:
     /// glibc implements it as `utimensat(fd, NULL, times, 0)`, signaled here by `pathname` being
     /// `None`.
@@ -3065,6 +3076,24 @@ impl SyscallRequest {
                 mode,
                 flags: { AtFlags::empty() },
             }),
+            Sysno::fchownat => sys_req!(Fchownat { dirfd, pathname:*, owner, group, flags }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chown => SyscallRequest::Fchownat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+                flags: AtFlags::empty(),
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::lchown => SyscallRequest::Fchownat {
+                // `lchown` acts on the link itself, i.e. `fchownat(.., AT_SYMLINK_NOFOLLOW)`.
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+                flags: AtFlags::AT_SYMLINK_NOFOLLOW,
+            },
             Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
             Sysno::mmap => sys_req!(Mmap {
