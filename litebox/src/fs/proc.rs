@@ -81,6 +81,7 @@ struct ProcInner<Platform: RawSyncPrimitivesProvider + 'static> {
     stat_system_inode: NodeInfo,
     cpuinfo_inode: NodeInfo,
     stat_inode: NodeInfo,
+    statm_inode: NodeInfo,
     status_inode: NodeInfo,
     cmdline_inode: NodeInfo,
     task: RwLock<Platform, ProcTaskInfo>,
@@ -107,6 +108,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Proc<Platform> {
                 stat_system_inode: allocator.next(),
                 cpuinfo_inode: allocator.next(),
                 stat_inode: allocator.next(),
+                statm_inode: allocator.next(),
                 status_inode: allocator.next(),
                 cmdline_inode: allocator.next(),
                 task: RwLock::new(ProcTaskInfo::default()),
@@ -162,6 +164,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Proc<Platform> {
             ProcFile::StatSystem => render_stat_system(),
             ProcFile::Cpuinfo => render_cpuinfo(),
             ProcFile::PidStat => render_stat(&self.inner.task.read()),
+            ProcFile::PidStatm => render_statm(),
             ProcFile::PidStatus => render_status(&self.inner.task.read()),
             ProcFile::PidCmdline => self.inner.task.read().cmdline.clone(),
         }
@@ -276,6 +279,15 @@ fn render_stat(task: &ProcTaskInfo) -> Vec<u8> {
     .into_bytes()
 }
 
+/// `/proc/<pid>/statm` content: `size resident shared text lib data dt`, all in
+/// pages (see `proc_pid_statm(5)`). `resident` (field 2) mirrors the RSS pages
+/// `/proc/<pid>/stat` reports in its 24th field (256), which is what libuv's
+/// `uv_resident_set_memory` actually reads for `process.memoryUsage().rss`, so a
+/// reader consulting either file sees the same resident-set size.
+fn render_statm() -> Vec<u8> {
+    String::from("512 256 64 64 0 256 0\n").into_bytes()
+}
+
 /// `/proc/<pid>/status` content: the handful of `Name:`/`State:`/`Pid:`/`PPid:`/`Uid:`/`Gid:`
 /// lines real tools most commonly parse (`sscanf`-style single-token-per-field, so extra
 /// whitespace is harmless).
@@ -319,6 +331,8 @@ pub enum ProcFile {
     /// `/proc/cpuinfo`.
     Cpuinfo,
     PidStat,
+    /// `/proc/<pid>/statm`.
+    PidStatm,
     PidStatus,
     PidCmdline,
 }
@@ -332,6 +346,7 @@ impl ProcFile {
     ];
     const PID_DIR_FILES: &'static [(&'static str, ProcFile)] = &[
         ("stat", ProcFile::PidStat),
+        ("statm", ProcFile::PidStatm),
         ("status", ProcFile::PidStatus),
         ("cmdline", ProcFile::PidCmdline),
     ];
@@ -384,9 +399,16 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
             let component = components[index];
             match current {
                 ProcDir::Root => {
-                    if component
-                        .parse::<i32>()
-                        .is_ok_and(|pid| pid == self.task_pid())
+                    // `/proc/self` is the calling task's own directory. LiteBox
+                    // hosts a single guest task, so it resolves to the same
+                    // `PidDir` as the numeric pid -- as a directory alias rather
+                    // than the symlink real Linux uses, which is enough for the
+                    // common `/proc/self/<file>` open (e.g. libuv reading
+                    // `/proc/self/statm` for `process.memoryUsage()`).
+                    if component == "self"
+                        || component
+                            .parse::<i32>()
+                            .is_ok_and(|pid| pid == self.task_pid())
                     {
                         walked.push(WalkedComponent {
                             permissions: PermissionCheck::ByResolver(PermissionInfo {
@@ -527,6 +549,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
             ProcFile::StatSystem => (self.inner.stat_system_inode.clone(), UserInfo::ROOT),
             ProcFile::Cpuinfo => (self.inner.cpuinfo_inode.clone(), UserInfo::ROOT),
             ProcFile::PidStat => (self.inner.stat_inode.clone(), self.task_owner()),
+            ProcFile::PidStatm => (self.inner.statm_inode.clone(), self.task_owner()),
             ProcFile::PidStatus => (self.inner.status_inode.clone(), self.task_owner()),
             ProcFile::PidCmdline => (self.inner.cmdline_inode.clone(), self.task_owner()),
         };
