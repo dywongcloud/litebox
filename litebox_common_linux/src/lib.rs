@@ -2710,6 +2710,17 @@ pub enum SyscallRequest {
         newdirfd: i32,
         linkpath: UserPtr<c_char>,
     },
+    /// Reached through `rename` (both dirfds forced to `AT_FDCWD`, `flags` 0),
+    /// `renameat` (both dirfds real, `flags` 0), and `renameat2` (all fields as
+    /// passed). `flags` carries the raw `RENAME_*` bits (`NOREPLACE`/`EXCHANGE`/
+    /// `WHITEOUT`); the shim interprets them.
+    Renameat2 {
+        olddirfd: i32,
+        oldpath: UserPtr<c_char>,
+        newdirfd: i32,
+        newpath: UserPtr<c_char>,
+        flags: u32,
+    },
     /// Reached through `chmod`, `fchmodat`, and `fchmodat2`.
     ///
     /// `flags` is empty for `chmod`/`fchmodat`, since the raw `fchmodat(2)` syscall (unlike
@@ -3388,6 +3399,26 @@ impl SyscallRequest {
                     linkpath: ctx.sys_req_ptr(1),
                 }
             }
+            Sysno::renameat2 => {
+                sys_req!(Renameat2 { olddirfd, oldpath:*, newdirfd, newpath:*, flags })
+            }
+            Sysno::renameat => SyscallRequest::Renameat2 {
+                // `renameat` has no flags argument; it is `renameat2` with flags 0.
+                olddirfd: ctx.sys_req_arg(0),
+                oldpath: ctx.sys_req_ptr(1),
+                newdirfd: ctx.sys_req_arg(2),
+                newpath: ctx.sys_req_ptr(3),
+                flags: 0,
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::rename => SyscallRequest::Renameat2 {
+                // `rename` is `renameat2` with both dirfds AT_FDCWD and flags 0.
+                olddirfd: AT_FDCWD,
+                oldpath: ctx.sys_req_ptr(0),
+                newdirfd: AT_FDCWD,
+                newpath: ctx.sys_req_ptr(1),
+                flags: 0,
+            },
             Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::unlink => {

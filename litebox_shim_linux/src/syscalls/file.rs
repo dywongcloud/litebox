@@ -626,6 +626,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// Handle syscall `renameat2` (and `renameat`/`rename`, which the dispatcher
+    /// forwards here with the absent dirfds/flags defaulted to `AT_FDCWD`/0).
+    ///
+    /// Only the default (flags 0) and `RENAME_NOREPLACE` behaviours are
+    /// implemented; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` are rejected with
+    /// `EINVAL`, which is what a backend that does not support them reports.
+    /// Neither path's trailing component is dereferenced -- `rename(2)` acts on a
+    /// symlink itself, never its target -- matching `sys_unlinkat` above.
+    pub(crate) fn sys_renameat2(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        const RENAME_NOREPLACE: u32 = 1 << 0;
+        const RENAME_EXCHANGE: u32 = 1 << 1;
+        const RENAME_WHITEOUT: u32 = 1 << 2;
+
+        // Reject unknown bits outright, and the two behaviours LiteBox does not
+        // model.
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
+            || flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+        let noreplace = flags & RENAME_NOREPLACE != 0;
+
+        let oldpath = self.resolve_path_at(olddirfd, oldpath)?;
+        let newpath = self.resolve_path_at(newdirfd, newpath)?;
+        self.files
+            .borrow()
+            .fs
+            .rename(oldpath, newpath, noreplace)
+            .map_err(Errno::from)
+    }
+
     /// Handle syscall `fchmodat`.
     ///
     /// `chmod` has no wrapper of its own here, matching this file's existing convention for the

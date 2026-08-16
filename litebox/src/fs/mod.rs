@@ -30,8 +30,8 @@ mod tests;
 
 use errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError,
-    UtimeError, WriteError,
+    ReadError, ReadlinkError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, UtimeError, WriteError,
 };
 
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
@@ -185,6 +185,25 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn readlink(&self, path: impl path::Arg) -> Result<alloc::string::String, ReadlinkError> {
         Err(ReadlinkError::NotASymlink)
+    }
+
+    /// Atomically rename `oldpath` to `newpath` within the same filesystem.
+    ///
+    /// If `newpath` already exists it is replaced (subject to the usual
+    /// type/emptiness rules) unless `noreplace` is set, in which case an existing
+    /// `newpath` is [`RenameError::AlreadyExists`]. A rename that would cross a
+    /// filesystem boundary is [`RenameError::CrossDevice`]; the default body
+    /// reports that unconditionally, which is the correct answer for any backend
+    /// that cannot move an entry in place -- callers such as libuv/Node then fall
+    /// back to copy-then-unlink.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn rename(
+        &self,
+        oldpath: impl path::Arg,
+        newpath: impl path::Arg,
+        noreplace: bool,
+    ) -> Result<(), RenameError> {
+        Err(RenameError::CrossDevice)
     }
 
     /// Read directory entries from a directory file descriptor.

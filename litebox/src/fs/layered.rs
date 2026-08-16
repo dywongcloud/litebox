@@ -16,8 +16,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError,
-    UnlinkError, UtimeError, WriteError,
+    ReadDirError, ReadError, ReadlinkError, RenameError, RmdirError, SeekError, SymlinkError,
+    TruncateError, UnlinkError, UtimeError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, Timestamp};
 
@@ -1199,6 +1199,62 @@ impl<
             .entries
             .insert(path, Arc::new(EntryX::Tombstone));
         Ok(())
+    }
+
+    fn rename(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+        noreplace: bool,
+    ) -> Result<(), RenameError> {
+        let old = self.absolute_path(oldpath)?;
+        let new = self.absolute_path(newpath)?;
+
+        // Renaming a path to itself succeeds as long as it resolves in either layer.
+        if old == new {
+            return if self.upper.file_status(old.as_str()).is_ok()
+                || self.ensure_lower_contains(&old).is_ok()
+            {
+                Ok(())
+            } else {
+                Err(PathError::NoSuchFileOrDirectory)?
+            };
+        }
+
+        // `RENAME_NOREPLACE` must also honour a destination visible only through the
+        // lower layer, which the upper backend cannot see by itself.
+        if noreplace && self.ensure_lower_contains(&new).is_ok() {
+            return Err(RenameError::AlreadyExists);
+        }
+
+        match self.upper.rename(old.as_str(), new.as_str(), noreplace) {
+            Ok(()) => {
+                // The source is gone from the upper layer; if the lower layer holds
+                // an entry at the same path it would resurface, so tombstone it.
+                if self.ensure_lower_contains(&old).is_ok() {
+                    self.root
+                        .write()
+                        .entries
+                        .insert(old, Arc::new(EntryX::Tombstone));
+                }
+                Ok(())
+            }
+            // The source, or the destination's parent, lives only in the read-only
+            // lower layer. An in-place move across that boundary isn't supported;
+            // report `EXDEV` so callers (libuv/Node) fall back to copy-then-unlink --
+            // unless the source truly exists nowhere, which is a genuine `ENOENT`.
+            Err(RenameError::PathError(
+                PathError::MissingComponent | PathError::NoSuchFileOrDirectory,
+            )) => {
+                if self.upper.file_status(old.as_str()).is_err()
+                    && self.ensure_lower_contains(&old).is_err()
+                {
+                    return Err(PathError::NoSuchFileOrDirectory)?;
+                }
+                Err(RenameError::CrossDevice)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {

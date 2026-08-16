@@ -220,6 +220,32 @@ pub enum ReadlinkError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`FileSystem::rename`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RenameError {
+    #[error("a directory in the rename does not allow write permission")]
+    NoWritePerms,
+    #[error("newpath is a non-empty directory")]
+    NotEmpty,
+    #[error("newpath is an existing directory but oldpath is not")]
+    IsADirectory,
+    #[error("oldpath is a directory but newpath is an existing non-directory")]
+    NotADirectory,
+    #[error("newpath already exists and RENAME_NOREPLACE was requested")]
+    AlreadyExists,
+    #[error("the rename would cross a filesystem/mount boundary")]
+    CrossDevice,
+    #[error("oldpath is a prefix of newpath, or another invalid-argument case")]
+    InvalidArgument,
+    #[error("the rename targets a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
 /// Possible errors from [`FileSystem::rmdir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

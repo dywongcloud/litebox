@@ -14,8 +14,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, ReadlinkError, RmdirError, SeekError, SymlinkError, TruncateError,
-    UnlinkError, UtimeError, WriteError,
+    ReadDirError, ReadError, ReadlinkError, RenameError, RmdirError, SeekError, SymlinkError,
+    TruncateError, UnlinkError, UtimeError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, Timestamp, UserInfo};
 
@@ -722,6 +722,137 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
         assert!(matches!(removed, Entry::File(_) | Entry::SymLink(_)));
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+        noreplace: bool,
+    ) -> Result<(), RenameError> {
+        let old = self.absolute_path(oldpath)?;
+        let new = self.absolute_path(newpath)?;
+
+        // Renaming a path to itself is a no-op success, provided the path exists.
+        if old == new {
+            let root = self.root.read();
+            let (_, entry) = root.parent_and_entry(&old, self.current_user)?;
+            return if entry.is_some() {
+                Ok(())
+            } else {
+                Err(PathError::NoSuchFileOrDirectory)?
+            };
+        }
+
+        // A directory can never be moved inside its own subtree (`/a` -> `/a/b`).
+        let mut old_prefix = old.clone();
+        old_prefix.push('/');
+        if new.starts_with(&old_prefix) {
+            return Err(RenameError::InvalidArgument);
+        }
+
+        let mut root = self.root.write();
+
+        // Resolve source and destination. `parent_and_entry` hands back the parent
+        // path as a `&str` borrowed from `root`; project it away (keeping the parent
+        // `Arc`) so the later `root.entries` mutation is permitted.
+        let (old_parent, old_entry) = root.parent_and_entry(&old, self.current_user)?;
+        let old_parent = old_parent.map(|(_, dir)| dir);
+        let Some(old_val) = old_entry else {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        };
+        let Some(old_parent) = old_parent else {
+            // `old` is the root directory itself.
+            return Err(RenameError::InvalidArgument);
+        };
+
+        let (new_parent, new_entry) = root.parent_and_entry(&new, self.current_user)?;
+        let new_parent = new_parent.map(|(_, dir)| dir);
+        let Some(new_parent) = new_parent else {
+            // `new` is the root directory itself.
+            return Err(RenameError::InvalidArgument);
+        };
+
+        // Write permission is required on both the source and destination directories.
+        if !self.current_user.can_write(&old_parent.read().perms) {
+            return Err(RenameError::NoWritePerms);
+        }
+        if !self.current_user.can_write(&new_parent.read().perms) {
+            return Err(RenameError::NoWritePerms);
+        }
+
+        let old_is_dir = matches!(&old_val, Entry::Dir(_));
+
+        // Validate an existing destination against `rename(2)`'s type/emptiness rules.
+        if let Some(new_val) = &new_entry {
+            if noreplace {
+                return Err(RenameError::AlreadyExists);
+            }
+            match (old_is_dir, new_val) {
+                (true, Entry::Dir(new_dir)) => {
+                    if !new_dir.read().children.is_empty() {
+                        return Err(RenameError::NotEmpty);
+                    }
+                }
+                // A directory cannot replace an existing non-directory.
+                (true, Entry::File(_) | Entry::SymLink(_)) => {
+                    return Err(RenameError::NotADirectory);
+                }
+                // A non-directory cannot replace an existing directory.
+                (false, Entry::Dir(_)) => {
+                    return Err(RenameError::IsADirectory);
+                }
+                (false, Entry::File(_) | Entry::SymLink(_)) => {
+                    // Non-directory replacing a non-directory: allowed.
+                }
+            }
+        }
+
+        let old_name: String = old.components().unwrap().last().unwrap().into();
+        let new_name: String = new.components().unwrap().last().unwrap().into();
+        let old_ft = match &old_val {
+            Entry::File(_) => FileType::RegularFile,
+            Entry::Dir(_) => FileType::Directory,
+            Entry::SymLink(_) => FileType::SymLink,
+        };
+
+        // Detach the source name from its parent directory.
+        old_parent.write().children.remove(&old_name);
+
+        // Drop a validated existing destination (an in-place replace): unlink its
+        // name from the destination directory and its node from `entries`. The
+        // destination is a non-directory or an empty directory, so it owns no
+        // descendant keys.
+        if new_entry.is_some() {
+            new_parent.write().children.remove(&new_name);
+            root.entries.remove(&new);
+        }
+
+        // Attach the source name -- carrying the source's own type -- under the
+        // destination directory.
+        new_parent.write().children.insert(new_name, old_ft);
+
+        // Re-key the moved node, and for a directory every descendant (whose
+        // `entries` keys embed the old absolute path), from the `old` prefix to the
+        // `new` prefix.
+        let moved_keys: Vec<String> = root
+            .entries
+            .keys()
+            .filter(|k| **k == old || k.starts_with(&old_prefix))
+            .cloned()
+            .collect();
+        for k in moved_keys {
+            let entry = root.entries.remove(&k).unwrap();
+            let new_key = if k == old {
+                new.clone()
+            } else {
+                let mut nk = new.clone();
+                nk.push_str(&k[old.len()..]);
+                nk
+            };
+            root.entries.insert(new_key, entry);
+        }
         Ok(())
     }
 

@@ -1228,6 +1228,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 _ => Err(Errno::EFAULT),
             },
+            SyscallRequest::Renameat2 {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => match (
+                oldpath.to_cstring::<Platform>(),
+                newpath.to_cstring::<Platform>(),
+            ) {
+                (Some(oldpath), Some(newpath)) => {
+                    syscall!(sys_renameat2(olddirfd, oldpath, newdirfd, newpath, flags))
+                }
+                _ => Err(Errno::EFAULT),
+            },
             SyscallRequest::Fchmodat {
                 dirfd,
                 pathname,
