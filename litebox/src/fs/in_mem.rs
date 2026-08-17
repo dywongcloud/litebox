@@ -593,6 +593,44 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
+    fn fd_chown(
+        &self,
+        fd: &FileFd<Platform>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd).ok_or(ChownError::ClosedFd)?;
+        match &entry.entry {
+            Descriptor::File { file, .. } => {
+                let perms = &mut file.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChownError::NotTheOwner);
+                }
+                if let Some(new_user) = user {
+                    perms.userinfo.user = new_user;
+                }
+                if let Some(new_group) = group {
+                    perms.userinfo.group = new_group;
+                }
+                Ok(())
+            }
+            Descriptor::Dir { dir } => {
+                let perms = &mut dir.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChownError::NotTheOwner);
+                }
+                if let Some(new_user) = user {
+                    perms.userinfo.user = new_user;
+                }
+                if let Some(new_group) = group {
+                    perms.userinfo.group = new_group;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn utimensat(
         &self,
         path: impl crate::path::Arg,

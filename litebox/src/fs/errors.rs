@@ -138,6 +138,12 @@ pub enum ChownError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
+    /// Only relevant to [`FileSystem::fd_chown`].
+    #[error("fd has been closed already")]
+    ClosedFd,
+    /// Only relevant to [`FileSystem::fd_chown`].
+    #[error("operation not permitted on an `O_PATH` fd")]
+    PathOnlyFd,
 }
 
 /// Possible errors from [`FileSystem::utimensat`]

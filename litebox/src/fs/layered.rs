@@ -1041,6 +1041,10 @@ impl<
                 ChownError::NotTheOwner
                 | ChownError::Io
                 | ChownError::ReadOnlyFileSystem
+                // `ClosedFd`/`PathOnlyFd` are only produced by `fd_chown`, never by this
+                // path-based `chown`, but the match must be exhaustive over the enum.
+                | ChownError::ClosedFd
+                | ChownError::PathOnlyFd
                 | ChownError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
@@ -1072,6 +1076,24 @@ impl<
         // Since it has been migrated, we can just re-trigger, causing it to apply to the
         // upper layer
         self.chown(path, user, group)
+    }
+
+    fn fd_chown(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .ok_or(ChownError::ClosedFd)?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.fd_chown(fd, user, group),
+            EntryX::Lower { fd } => self.lower.fd_chown(fd, user, group),
+            EntryX::Tombstone => unreachable!(),
+        }
     }
 
     fn utimensat(

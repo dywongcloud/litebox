@@ -2735,6 +2735,13 @@ pub enum SyscallRequest {
         fd: i32,
         mode: u32,
     },
+    /// Reached through `fchown`. `owner`/`group` carry the raw `uid_t`/`gid_t`; a value of
+    /// `(uid_t)-1` (`u32::MAX`) means "leave unchanged", which the shim maps to `None`.
+    Fchown {
+        fd: i32,
+        owner: u32,
+        group: u32,
+    },
     /// Reached through `chown` (dirfd `AT_FDCWD`, flags empty), `lchown` (dirfd
     /// `AT_FDCWD`, flags `AT_SYMLINK_NOFOLLOW`), and `fchownat`. `owner`/`group`
     /// carry the raw `uid_t`/`gid_t`; a value of `(uid_t)-1` (`u32::MAX`) means
@@ -3070,6 +3077,7 @@ impl SyscallRequest {
                 flags: AtFlags::empty(),
             },
             Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
+            Sysno::fchown => sys_req!(Fchown { fd, owner, group }),
             Sysno::fchmodat => sys_req!(Fchmodat {
                 dirfd,
                 pathname:*,

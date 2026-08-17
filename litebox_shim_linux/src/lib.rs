@@ -1265,6 +1265,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     syscall!(sys_fchownat(dirfd, path, owner, group, flags))
                 }),
             SyscallRequest::Fchmod { fd, mode } => syscall!(sys_fchmod(fd, mode)),
+            SyscallRequest::Fchown { fd, owner, group } => {
+                syscall!(sys_fchown(fd, owner, group))
+            }
             SyscallRequest::Utimensat {
                 dirfd,
                 pathname,

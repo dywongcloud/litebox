@@ -746,6 +746,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .flatten()
     }
 
+    /// Handle syscall `fchown`.
+    ///
+    /// `owner`/`group` are the raw `uid_t`/`gid_t`; the `(uid_t)-1` (`u32::MAX`) "unchanged"
+    /// sentinel does not fit LiteBox's `u16` id model, so `u16::try_from` maps it to `None`,
+    /// which is exactly "leave this id alone".
+    pub fn sys_fchown(&self, fd: i32, owner: u32, group: u32) -> Result<(), Errno> {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        let owner = u16::try_from(owner).ok();
+        let group = u16::try_from(group).ok();
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |fd| files.fs.fd_chown(fd, owner, group).map_err(Errno::from),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()
+    }
+
     /// Resolve a single raw `timespec` from `utimensat`/`futimens` into fs-layer semantics: `None`
     /// means "leave unchanged" (`UTIME_OMIT`), `Some` carries a concrete timestamp (resolving
     /// `UTIME_NOW` against the current wall-clock time).

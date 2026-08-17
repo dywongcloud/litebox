@@ -665,6 +665,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         self.backend.chown_at(parent, name, user, group)
     }
 
+    fn fd_chown(
+        &self,
+        fd: &TypedFd<Self>,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ChownError::ClosedFd)?;
+        let entry = entry.get_entry();
+        if entry.entry.path_only {
+            return Err(ChownError::PathOnlyFd);
+        }
+        // The resolver's backends do not support changing ownership through an open handle
+        // (there is no `chown`-by-handle in the `Backend` trait, only the path-based
+        // `chown_at`). In the layered stack a writable file is migrated to the upper layer
+        // before it is chowned, so the resolver only ever holds read-only descriptors here.
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
     fn utimensat(
         &self,
         path: impl Arg,

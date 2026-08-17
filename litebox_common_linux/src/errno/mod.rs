@@ -297,6 +297,8 @@ impl From<litebox::fs::errors::ChownError> for Errno {
             litebox::fs::errors::ChownError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::ChownError::Io => Errno::EIO,
             litebox::fs::errors::ChownError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::ChownError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::ChownError::PathOnlyFd => Errno::EBADF,
             _ => unimplemented!(),
         }
     }

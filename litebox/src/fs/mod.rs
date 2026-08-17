@@ -131,6 +131,18 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         group: Option<u16>,
     ) -> Result<(), ChownError>;
 
+    /// Change the owner of an already-open file descriptor.
+    ///
+    /// Unlike [`Self::chown`], this does not re-resolve a path, so (matching `fchown(2)`) it keeps
+    /// working even if the path used to open `fd` has since been unlinked or replaced. `None` for
+    /// either id leaves it unchanged.
+    fn fd_chown(
+        &self,
+        fd: &TypedFd<Self>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError>;
+
     /// Update the access and/or modification time of a file/directory.
     ///
     /// `None` for either parameter leaves that timestamp unchanged (mirroring `UTIME_OMIT`).

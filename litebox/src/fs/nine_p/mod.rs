@@ -861,6 +861,46 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         result.map_err(ChownError::from)
     }
 
+    fn fd_chown(
+        &self,
+        fd: &FileFd<Platform, T>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), super::errors::ChownError> {
+        // The fd carries its own open fid; unlike the path-based `chown` it is not clunked here
+        // (it stays open for the descriptor), matching `fd_chmod` above.
+        let fid = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| desc.entry.fid.clone())
+            .ok_or(ChownError::ClosedFd)?;
+
+        let mut valid = fcall::SetattrMask::empty();
+        let uid = match user {
+            Some(u) => {
+                valid |= fcall::SetattrMask::UID;
+                u32::from(u)
+            }
+            None => 0,
+        };
+        let gid = match group {
+            Some(g) => {
+                valid |= fcall::SetattrMask::GID;
+                u32::from(g)
+            }
+            None => 0,
+        };
+        let stat = fcall::SetAttr {
+            uid,
+            gid,
+            ..Default::default()
+        };
+
+        self.client
+            .setattr(&fid, valid, stat)
+            .map_err(ChownError::from)
+    }
+
     fn utimensat(
         &self,
         path: impl crate::path::Arg,
