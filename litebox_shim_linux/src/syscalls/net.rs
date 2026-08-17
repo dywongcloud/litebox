@@ -1071,7 +1071,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Errno::EMFILE
                 })?
             }
-            AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
+            AddressFamily::NETLINK => {
+                // A `NETLINK_ROUTE` socket, just enough for `getifaddrs(3)` /
+                // `os.networkInterfaces()`. `ty` (SOCK_RAW/SOCK_DGRAM) and `protocol`
+                // (NETLINK_ROUTE) are accepted without distinction -- no real link or
+                // address state is ever touched; see `crate::syscalls::netlink`.
+                let socket = crate::syscalls::netlink::NetlinkSocket::new();
+                let typed = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<crate::syscalls::netlink::NetlinkSubsystem<Platform>>(socket);
+                if flags.contains(SockFlags::CLOEXEC) {
+                    let old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
+                }
+                files.insert_raw_fd(typed).map_err(|typed| {
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    Errno::EMFILE
+                })?
+            }
+            AddressFamily::INET6 => return Err(Errno::EAFNOSUPPORT),
             // `AddressFamily` is `#[non_exhaustive]` but only declares these four variants, all
             // matched above; `domain` only reaches here via `AddressFamily::try_from`, which
             // rejects anything else before construction.
@@ -1421,6 +1445,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        // A `NETLINK_ROUTE` socket is bound to a `sockaddr_nl`, not the inet/unix
+        // address `read_sockaddr_from_user` understands -- so resolve it before
+        // parsing the address (which would otherwise reject AF_NETLINK). Accept it
+        // as a no-op: there is no per-socket netlink group state to register.
+        if self.netlink_fd(sockfd).is_some() {
+            return Ok(());
+        }
         let sockaddr = read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?;
         self.do_bind(sockfd, sockaddr)
     }
@@ -1436,6 +1467,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
                 file.bind(self, addr)
             },
+        )
+    }
+
+    /// If `sockfd` is a `NETLINK_ROUTE` socket, return its typed fd; otherwise
+    /// `None` (a non-netlink or absent fd falls through to the normal socket path).
+    fn netlink_fd(
+        &self,
+        sockfd: u32,
+    ) -> Option<alloc::sync::Arc<litebox::fd::TypedFd<crate::syscalls::netlink::NetlinkSubsystem<Platform>>>>
+    {
+        self.files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<crate::syscalls::netlink::NetlinkSubsystem<Platform>>(
+                sockfd as usize,
+            )
+            .ok()
+    }
+
+    /// `send`/`sendto`/`write` on a netlink socket: enqueue the dump the matching
+    /// reads will drain. `Some` iff `sockfd` is a netlink socket.
+    pub(crate) fn netlink_send(&self, sockfd: u32, buf: &[u8]) -> Option<Result<usize, Errno>> {
+        let nl = self.netlink_fd(sockfd)?;
+        Some(
+            self.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&nl, |sock| sock.handle_send(buf))
+                .ok_or(Errno::EBADF),
+        )
+    }
+
+    /// `recv`/`recvfrom`/`read` on a netlink socket: drain pending dump bytes.
+    /// `Some` iff `sockfd` is a netlink socket.
+    pub(crate) fn netlink_recv(&self, sockfd: u32, buf: &mut [u8]) -> Option<Result<usize, Errno>> {
+        let nl = self.netlink_fd(sockfd)?;
+        Some(
+            self.global
+                .litebox
+                .descriptor_table()
+                .with_entry(&nl, |sock| sock.handle_recv(buf))
+                .unwrap_or(Err(Errno::EBADF)),
         )
     }
 
@@ -1481,6 +1555,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
+        if let Some(res) = self.netlink_send(sockfd, buf) {
+            return res;
+        }
         let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1692,6 +1769,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
+        if let Some(res) = self.netlink_recv(sockfd, buf) {
+            return res;
+        }
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
@@ -1840,7 +1920,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 msg_ptr.as_usize()
                     + core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_namelen),
             );
-            if let Some(src_addr) = source_addr {
+            if self.netlink_fd(sockfd).is_some() {
+                // A `recvmsg` on a netlink socket reports a `sockaddr_nl` source:
+                // `{ u16 nl_family = AF_NETLINK, u16 pad, u32 nl_pid = 0 (from the
+                // kernel), u32 nl_groups = 0 }`. iproute2/busybox `ip` reject a
+                // reply whose sender length isn't `sizeof(sockaddr_nl)` or whose
+                // `nl_pid` is nonzero, so this must be present and zero-pid.
+                let mut nl = [0u8; 12];
+                nl[0..2].copy_from_slice(&(AddressFamily::NETLINK as u16).to_ne_bytes());
+                let cap = msg.msg_namelen as usize;
+                let n = nl.len().min(cap);
+                msg_name
+                    .write_slice_at_offset::<Platform>(0, &nl[..n])
+                    .ok_or(Errno::EFAULT)?;
+                // `sizeof(struct sockaddr_nl)` == 12.
+                addrlen_ptr
+                    .write_at_offset::<Platform>(0, 12u32)
+                    .ok_or(Errno::EFAULT)?;
+            } else if let Some(src_addr) = source_addr {
                 write_sockaddr_to_user::<Platform>(src_addr, msg_name, addrlen_ptr)?;
             } else {
                 // No source address (e.g. connected stream socket) — zero out msg_namelen.

@@ -961,6 +961,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
+        // A `read()` from a `NETLINK_ROUTE` socket (iproute2/busybox `ip`) drains
+        // pending dump bytes; `pread` (an offset) never targets a socket. The
+        // `&mut buf` is auto-reborrowed, so it stays usable on the non-netlink path.
+        if offset.is_none()
+            && let Some(res) = self.netlink_recv(fd, buf)
+        {
+            return res;
+        }
         let files = self.files.borrow();
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
@@ -1041,9 +1049,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `offset` is an optional offset to write to. If `None`, it will write to the current file position.
     /// If `Some`, it will write to the specified offset without changing the current file position.
     pub fn sys_write(&self, fd: i32, buf: &[u8], offset: Option<usize>) -> Result<usize, Errno> {
-        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+        let Ok(fd_u32) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+        let raw_fd = fd_u32 as usize;
+        // A `write()` to a `NETLINK_ROUTE` socket (as iproute2/busybox `ip` do,
+        // rather than `send()`) enqueues a dump; `pwrite` (an offset) never targets
+        // a socket.
+        if offset.is_none()
+            && let Some(res) = self.netlink_send(fd_u32, buf)
+        {
+            return res;
+        }
         let files = self.files.borrow();
         let res = files
             .run_on_raw_fd(
@@ -1358,6 +1375,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
             Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
             Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>>),
+            Netlink(alloc::sync::Arc<TypedFd<super::netlink::NetlinkSubsystem<Platform>>>),
         }
 
         let files = self.files.borrow();
@@ -1394,6 +1412,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     )
                 {
                     ConsumedFd::Unix(fd)
+                } else if let Ok(fd) = rds
+                    .fd_consume_raw_integer::<super::netlink::NetlinkSubsystem<Platform>>(raw_fd)
+                {
+                    ConsumedFd::Netlink(fd)
                 } else {
                     unreachable!("all subsystems covered")
                 }
@@ -1448,6 +1470,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(())
             }
             ConsumedFd::Unix(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
+            ConsumedFd::Netlink(fd) => {
                 let entry = {
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     dt.remove(&fd)
