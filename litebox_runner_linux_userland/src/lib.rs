@@ -72,6 +72,29 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub tun_device_name: Option<String>,
+    /// Host-side address of the attached --tun-device-name link, i.e. the
+    /// guest's default gateway. Defaults to 10.0.0.1. Must be given together
+    /// with --net-guest-ip.
+    #[arg(
+        long = "net-host-ip",
+        value_name = "IP",
+        requires_all = ["unstable", "net_guest_ip"],
+        help_heading = "Unstable Options"
+    )]
+    pub net_host_ip: Option<std::net::Ipv4Addr>,
+    /// The guest's own address on the attached --tun-device-name link.
+    /// Defaults to 10.0.0.2. Every guest otherwise answers on the same
+    /// hardcoded pair, so two boxes on distinct devices can't address each
+    /// other directly; overriding this (and --net-host-ip, to match the
+    /// device's actual host-side address) is what makes that possible. Must
+    /// be given together with --net-host-ip, in the same /24.
+    #[arg(
+        long = "net-guest-ip",
+        value_name = "IP",
+        requires_all = ["unstable", "net_host_ip"],
+        help_heading = "Unstable Options"
+    )]
+    pub net_guest_ip: Option<std::net::Ipv4Addr>,
     /// Load the program binary from the tar file instead of from the host filesystem.
     ///
     /// When set, the program path refers to a path inside the tar filesystem.
@@ -264,6 +287,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } else {
         litebox_shim_linux::LinuxShimBuilder::new(platform)
     };
+    if let (Some(guest_ip), Some(host_ip)) = (cli_args.net_guest_ip, cli_args.net_host_ip) {
+        if guest_ip.octets()[..3] != host_ip.octets()[..3] {
+            anyhow::bail!(
+                "--net-guest-ip {guest_ip} and --net-host-ip {host_ip} must be in the same /24 subnet"
+            );
+        }
+        if guest_ip == host_ip {
+            anyhow::bail!("--net-guest-ip and --net-host-ip must be different addresses");
+        }
+        shim_builder.net_addrs(guest_ip, host_ip);
+    }
     let litebox = shim_builder.litebox();
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) }

@@ -237,6 +237,9 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     /// [`Self::build`] moves this into [`GlobalState`] so the shim can publish the guest task's
     /// identity into it as that becomes known (see `syscalls::process::Task::set_task_comm`).
     proc_handle: Cell<Option<litebox::fs::proc::Proc<Platform>>>,
+    /// Overrides for the guest's network interface/gateway addresses, set via
+    /// [`Self::net_addrs`]. `None` keeps `Network::new`'s defaults.
+    net_addrs: Cell<Option<(core::net::Ipv4Addr, core::net::Ipv4Addr)>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -251,12 +254,25 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform,
             litebox,
             proc_handle: Cell::new(None),
+            net_addrs: Cell::new(None),
         }
     }
 
     /// Returns the litebox object for the shim.
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
+    }
+
+    /// Overrides the guest's network interface/gateway addresses (default
+    /// `10.0.0.2`/`10.0.0.1`, see [`litebox::net::Network::new`]).
+    ///
+    /// Every guest otherwise answers on the same hardcoded pair, so two boxes
+    /// on distinct network devices can't address each other directly -- each
+    /// looks identical from the other's point of view. Set this to the
+    /// address actually assigned to this guest's device (and its matching
+    /// gateway) so direct addressing works.
+    pub fn net_addrs(&self, interface_ip: core::net::Ipv4Addr, gateway_ip: core::net::Ipv4Addr) {
+        self.net_addrs.set(Some((interface_ip, gateway_ip)));
     }
 
     /// Create a default layered file system with the given in-memory layer and tar data.
@@ -278,7 +294,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
 
     /// Build the shim.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
-        let mut net = Network::new(&self.litebox);
+        let mut net = match self.net_addrs.get() {
+            Some((interface_ip, gateway_ip)) => {
+                Network::new_with_addrs(&self.litebox, interface_ip, gateway_ip)
+            }
+            None => Network::new(&self.litebox),
+        };
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,

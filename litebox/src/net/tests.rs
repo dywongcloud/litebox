@@ -182,3 +182,97 @@ fn test_udp_socket_table_does_not_grow_with_many_distinct_destinations() {
         "closing the fd should remove its socket_set entry"
     );
 }
+
+/// Real reproduction/regression test for the "every guest answers on the same hardcoded
+/// address" limitation `docs/roadmap.md` records: two guests built with `Network::new` alone
+/// are indistinguishable, so a box composed of several guests could never address one another
+/// directly. `Network::new_with_addrs` is the fix -- this drives a full bidirectional TCP
+/// handshake and data transfer (not just an address-field check) through two independently
+/// configured `Network`s, on two disjoint, non-default subnets, proving each guest's overridden
+/// address is genuinely load-bearing in the real smoltcp interface, not just stored and ignored.
+#[test]
+fn test_new_with_addrs_gives_each_guest_a_working_distinguishing_address() {
+    // A connect() aimed at an address the interface doesn't actually own never reaches accept()
+    // -- smoltcp just has nowhere to route it -- so this bounds the wait instead of spinning
+    // forever, turning a broken override into a clear failure instead of a hang.
+    const MAX_ACCEPT_ATTEMPTS: u32 = 1_000_000;
+
+    fn round_trip(interface_ip: Ipv4Addr, gateway_ip: Ipv4Addr, port: u16) {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut network = Network::new_with_addrs(&litebox, interface_ip, gateway_ip);
+        network.set_platform_interaction(PlatformInteraction::Automatic);
+
+        let listen_addr = SocketAddr::V4(SocketAddrV4::new(interface_ip, port));
+
+        let listener_fd = network
+            .socket(Protocol::Tcp)
+            .expect("Failed to create TCP socket");
+        network
+            .bind(&listener_fd, &listen_addr)
+            .unwrap_or_else(|e| {
+                panic!("Failed to bind to overridden address {listen_addr}: {e:?}")
+            });
+        network
+            .listen(&listener_fd, 1)
+            .expect("Failed to listen on TCP socket");
+
+        let client_fd = network
+            .socket(Protocol::Tcp)
+            .expect("Failed to create TCP socket");
+        let err = network
+            .connect(&client_fd, &listen_addr, false)
+            .unwrap_err();
+        assert!(
+            matches!(err, ConnectError::InProgress),
+            "Expected InProgress error, got {err:?}",
+        );
+
+        let server_fd = (0..MAX_ACCEPT_ATTEMPTS)
+            .find_map(|_| match network.accept(&listener_fd, None) {
+                Ok(fd) => Some(fd),
+                Err(AcceptError::NoConnectionsReady) => None,
+                Err(other) => panic!(
+                    "connect to the overridden interface address {listen_addr} failed: {other:?}"
+                ),
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "connect to {listen_addr} never reached accept() after {MAX_ACCEPT_ATTEMPTS} \
+                     attempts -- the interface likely isn't actually configured with this address"
+                )
+            });
+
+        let data = b"hello over the overridden address";
+        let bytes_sent = network
+            .send(&client_fd, data, SendFlags::empty(), None)
+            .expect("Failed to send data");
+        assert_eq!(bytes_sent, data.len());
+
+        let mut buffer = [0u8; 64];
+        let bytes_received = network
+            .receive(&server_fd, &mut buffer, ReceiveFlags::empty(), None)
+            .expect("Failed to receive data");
+        assert_eq!(
+            &buffer[..bytes_received],
+            data,
+            "data received over {listen_addr} was corrupted"
+        );
+
+        network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+        network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+        network
+            .close(&listener_fd, CloseBehavior::Immediate)
+            .unwrap();
+    }
+
+    // Two guests, each on its own disjoint /24 with its own overridden address -- the shape two
+    // `boxer run --net <device> --net-guest-ip ... --net-host-ip ...` boxes need to avoid
+    // aliasing onto the same 10.0.0.2/10.0.0.1 pair `Network::new` alone would give both.
+    round_trip(Ipv4Addr::new(10, 0, 1, 2), Ipv4Addr::new(10, 0, 1, 1), 8080);
+    round_trip(Ipv4Addr::new(10, 0, 2, 2), Ipv4Addr::new(10, 0, 2, 1), 8080);
+
+    // A guest with no override still gets a working interface, at the same address a bare
+    // `Network::new` would give it -- new_with_addrs generalizes the default rather than
+    // requiring every caller to migrate.
+    round_trip(INTERFACE_IP_ADDR, GATEWAY_IP_ADDR, 8080);
+}

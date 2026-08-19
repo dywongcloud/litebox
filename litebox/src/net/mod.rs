@@ -31,12 +31,14 @@ use errors::{
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
-/// IP address for LiteBox interface
-// TODO: Make this configurable
+/// Default IP address for the LiteBox interface, used unless [`Network::new_with_addrs`]
+/// overrides it. A guest that needs a distinguishing address -- e.g. so a
+/// second box on a different `--net` device can be reached directly instead
+/// of aliasing onto this same address -- picks its own via that constructor.
 const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 
-/// IP address for the gateway
-// TODO: Make this configurable
+/// Default IP address for the gateway, used unless [`Network::new_with_addrs`]
+/// overrides it.
 const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Maximum size of rx/tx buffers for sockets
@@ -87,29 +89,47 @@ where
     Platform:
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
-    /// Construct a new `Network` instance
+    /// Construct a new `Network` instance with the default interface/gateway
+    /// addresses ([`INTERFACE_IP_ADDR`]/[`GATEWAY_IP_ADDR`]).
     ///
     /// This function is expected to only be invoked once per platform, as an initialization step,
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        Self::new_with_addrs(litebox, INTERFACE_IP_ADDR, GATEWAY_IP_ADDR)
+    }
+
+    /// Construct a new `Network` instance whose guest interface answers on
+    /// `interface_ip` and routes through `gateway_ip`, instead of the
+    /// defaults [`Network::new`] uses.
+    ///
+    /// Every guest otherwise shares the same hardcoded pair, so two boxes
+    /// wired to distinct `--net` devices cannot address each other directly
+    /// -- each looks identical from the other's point of view. Giving each
+    /// guest a distinguishing address (matching the host-side address its
+    /// TUN device was actually assigned) is what makes direct box-to-box
+    /// addressing possible.
+    ///
+    /// Same one-per-platform expectation as [`Network::new`].
+    pub fn new_with_addrs(
+        litebox: &LiteBox<Platform>,
+        interface_ip: Ipv4Addr,
+        gateway_ip: Ipv4Addr,
+    ) -> Self {
         let mut device = phy::Device::new(litebox.x.platform);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
         interface.update_ip_addrs(|ip_addrs| {
             match ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
+                smoltcp::wire::IpAddress::Ipv4(interface_ip),
                 24,
             )) {
                 Ok(()) => {}
                 Err(_) => unreachable!(),
             }
         });
-        match interface
-            .routes_mut()
-            .add_default_ipv4_route(GATEWAY_IP_ADDR)
-        {
+        match interface.routes_mut().add_default_ipv4_route(gateway_ip) {
             Ok(None) => {}
             _ => unreachable!(),
         }

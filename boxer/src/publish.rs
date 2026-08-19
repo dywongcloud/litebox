@@ -22,8 +22,9 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, bail};
 
-/// The address LiteBox's network stack answers on, matching the guest IP the
-/// shim configures for the TUN interface.
+/// Default address LiteBox's network stack answers on, used unless
+/// `boxer run --net-guest-ip` overrides it, matching the guest IP the shim
+/// configures for the TUN interface by default.
 pub const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 
 /// Transport protocol of a published port.
@@ -129,7 +130,11 @@ pub struct PublishedPorts {
 /// guest. Binding happens before this returns, so a port that is already in
 /// use is reported before the workload starts rather than racing it.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub fn publish(mappings: &[PortMapping], verbose: bool) -> anyhow::Result<PublishedPorts> {
+pub fn publish(
+    mappings: &[PortMapping],
+    verbose: bool,
+    guest_ip: Ipv4Addr,
+) -> anyhow::Result<PublishedPorts> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -138,8 +143,8 @@ pub fn publish(mappings: &[PortMapping], verbose: bool) -> anyhow::Result<Publis
 
     for mapping in mappings {
         match mapping.protocol {
-            Protocol::Tcp => publish_tcp(&runtime, *mapping, verbose)?,
-            Protocol::Udp => publish_udp(&runtime, *mapping, verbose)?,
+            Protocol::Tcp => publish_tcp(&runtime, *mapping, verbose, guest_ip)?,
+            Protocol::Udp => publish_udp(&runtime, *mapping, verbose, guest_ip)?,
         }
     }
 
@@ -152,12 +157,13 @@ fn publish_tcp(
     runtime: &tokio::runtime::Runtime,
     mapping: PortMapping,
     verbose: bool,
+    guest_ip: Ipv4Addr,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::{TcpListener, TcpStream};
 
     let host_addr = mapping.host_addr;
-    let guest_addr = SocketAddr::V4(SocketAddrV4::new(GUEST_IP, mapping.guest_port));
+    let guest_addr = SocketAddr::V4(SocketAddrV4::new(guest_ip, mapping.guest_port));
 
     // Bind on this thread's runtime context so the error surfaces here, before
     // the guest is started.
@@ -231,6 +237,7 @@ fn publish_udp(
     runtime: &tokio::runtime::Runtime,
     mapping: PortMapping,
     verbose: bool,
+    guest_ip: Ipv4Addr,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -248,7 +255,7 @@ fn publish_udp(
     }
 
     let host_addr = mapping.host_addr;
-    let guest_addr = SocketAddr::V4(SocketAddrV4::new(GUEST_IP, mapping.guest_port));
+    let guest_addr = SocketAddr::V4(SocketAddrV4::new(guest_ip, mapping.guest_port));
 
     let socket = runtime
         .block_on(async { UdpSocket::bind(host_addr).await })
@@ -359,6 +366,10 @@ fn publish_udp(
 pub struct PublishedPorts;
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub fn publish(_mappings: &[PortMapping], _verbose: bool) -> anyhow::Result<PublishedPorts> {
+pub fn publish(
+    _mappings: &[PortMapping],
+    _verbose: bool,
+    _guest_ip: Ipv4Addr,
+) -> anyhow::Result<PublishedPorts> {
     bail!("publishing ports needs the x86_64 Linux runner")
 }

@@ -18,11 +18,8 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use anyhow::{Context, bail};
 
-/// Host-side address of the point-to-point link, matching the address the
-/// LiteBox shim expects to talk to.
-pub const HOST_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
 /// Prefix length of the link's subnet, which must contain both the host
-/// address and [`crate::publish::GUEST_IP`].
+/// address and the guest address (default [`crate::publish::GUEST_IP`]).
 const PREFIX_LEN: u32 = 24;
 
 // `ioctl` request numbers. The TUN ones are `_IOW('T', n, int)`; the socket
@@ -64,11 +61,11 @@ impl IfReq {
     }
 }
 
-/// Ensure `device` exists, carries the host address, and is up.
+/// Ensure `device` exists, carries `host_ip`, and is up.
 ///
 /// Returns `Ok(true)` when this call created the device and `Ok(false)` when
 /// it was already there, so callers can say which happened.
-pub fn ensure_device(device: &str) -> anyhow::Result<bool> {
+pub fn ensure_device(device: &str, host_ip: std::net::Ipv4Addr) -> anyhow::Result<bool> {
     let existed = device_exists(device);
     if existed {
         // A name that already exists might be a real NIC or bridge. Configuring
@@ -86,9 +83,9 @@ pub fn ensure_device(device: &str) -> anyhow::Result<bool> {
         // Reconfiguring its address would sever that program's connectivity --
         // and the runner's own "already in use" check only fires later, after
         // the clobber. A TUN boxer made and left idle carries either no address
-        // or [`HOST_IP`]; anything else is in use, so refuse it here.
+        // or `host_ip`; anything else is in use, so refuse it here.
         if let Some(addr) = current_ipv4(device)?
-            && addr != HOST_IP
+            && addr != host_ip
         {
             bail!(
                 "network device '{device}' already carries address {addr}, so it is \
@@ -99,7 +96,7 @@ pub fn ensure_device(device: &str) -> anyhow::Result<bool> {
     } else {
         create_device(device)?;
     }
-    configure_device(device)?;
+    configure_device(device, host_ip)?;
     Ok(!existed)
 }
 
@@ -192,8 +189,8 @@ fn create_device(device: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Give the device its host address and bring it up.
-fn configure_device(device: &str) -> anyhow::Result<()> {
+/// Give the device `host_ip` and bring it up.
+fn configure_device(device: &str, host_ip: std::net::Ipv4Addr) -> anyhow::Result<()> {
     // SAFETY: creating a socket with constant arguments; the result is checked.
     let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if socket < 0 {
@@ -204,8 +201,8 @@ fn configure_device(device: &str) -> anyhow::Result<()> {
     // after this guard drops it.
     let socket = unsafe { OwnedFd::from_raw_fd_checked(socket) };
 
-    set_address(socket.as_raw_fd(), device, SIOCSIFADDR, HOST_IP)
-        .with_context(|| format!("failed to set {HOST_IP} on '{device}'"))?;
+    set_address(socket.as_raw_fd(), device, SIOCSIFADDR, host_ip)
+        .with_context(|| format!("failed to set {host_ip} on '{device}'"))?;
     set_address(
         socket.as_raw_fd(),
         device,

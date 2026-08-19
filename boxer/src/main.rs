@@ -51,6 +51,19 @@ enum Cli {
         /// (see litebox_platform_linux_userland/scripts/tun-setup.sh).
         #[arg(long = "net", value_name = "TUN_DEVICE")]
         net: Option<String>,
+        /// Host-side address of the --net device (the guest's gateway).
+        /// Defaults to 10.0.0.1. Every box otherwise answers on the same
+        /// hardcoded pair, so two boxes on distinct --net devices can't
+        /// address each other directly; overriding this (together with
+        /// --net-guest-ip, on a distinct subnet per box) makes that
+        /// possible. Must be given together with --net-guest-ip.
+        #[arg(long = "net-host-ip", value_name = "IP", requires = "net_guest_ip")]
+        net_host_ip: Option<std::net::Ipv4Addr>,
+        /// The guest's own address on the --net device. Defaults to
+        /// 10.0.0.2. Must be given together with --net-host-ip, in the same
+        /// /24.
+        #[arg(long = "net-guest-ip", value_name = "IP", requires = "net_host_ip")]
+        net_guest_ip: Option<std::net::Ipv4Addr>,
         /// Publish a port to the host: PORT, HOST:GUEST, or IP:HOST:GUEST.
         /// Implies --net.
         #[arg(short = 'p', long = "publish", value_name = "SPEC")]
@@ -128,6 +141,8 @@ fn main() -> anyhow::Result<()> {
         Cli::Run {
             box_path,
             net,
+            net_host_ip,
+            net_guest_ip,
             publish,
             publish_all,
             verbose,
@@ -137,6 +152,8 @@ fn main() -> anyhow::Result<()> {
             &args,
             &run::NetOptions {
                 tun_device: net,
+                net_host_ip,
+                net_guest_ip,
                 publish,
                 publish_all,
                 verbose,

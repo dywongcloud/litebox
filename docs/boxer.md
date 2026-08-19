@@ -65,6 +65,17 @@ datagrams with one guest-side socket per client source address so replies
 route back to the right client. `--net <device>` selects a different TUN
 device, and is implied by publishing.
 
+Every box otherwise answers on the same hardcoded `10.0.0.2`/`10.0.0.1` pair
+regardless of which `--net <device>` it is attached to, so two boxes on
+distinct devices look identical from each other's point of view and cannot
+address each other directly. `--net-host-ip <IP> --net-guest-ip <IP>`
+(given together, in the same /24) override that pair per box -- e.g.
+`boxer run --net tun98 --net-host-ip 10.0.1.1 --net-guest-ip 10.0.1.2 ...`
+alongside a second box on `--net tun99` with a distinct pair -- so composing
+several boxes into one multi-process workload (an X11 display server plus
+clients, say) gives each guest a distinguishing address instead of aliasing
+onto the same one.
+
 Forwarding is async (tokio): every connection is its own task, each direction
 is copied independently so a half-close propagates, and a workload that
 refuses one connection fails only that connection. This is where async earns

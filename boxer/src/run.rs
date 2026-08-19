@@ -55,6 +55,12 @@ pub fn inspect(box_path: &Path) -> anyhow::Result<()> {
 #[derive(Debug, Default)]
 pub struct NetOptions {
     pub tun_device: Option<String>,
+    /// Host-side address of `tun_device` (the guest's gateway). Paired with
+    /// `net_guest_ip`; `None` keeps the default ([`DEFAULT_NET_HOST_IP`]).
+    pub net_host_ip: Option<std::net::Ipv4Addr>,
+    /// The guest's own address on `tun_device`. Paired with `net_host_ip`;
+    /// `None` keeps the default ([`crate::publish::GUEST_IP`]).
+    pub net_guest_ip: Option<std::net::Ipv4Addr>,
     pub publish: Vec<String>,
     pub publish_all: bool,
     pub verbose: bool,
@@ -63,6 +69,14 @@ pub struct NetOptions {
 /// The TUN device used when ports are published without naming one, matching
 /// the default in `litebox_platform_linux_userland/scripts/tun-setup.sh`.
 const DEFAULT_TUN_DEVICE: &str = "tun99";
+
+/// Default host-side address of a `--net` device (the guest's gateway).
+///
+/// Defined here, rather than in [`crate::tun`], because that module only
+/// compiles on Linux (it configures a real device with Linux-only ioctls),
+/// while this default is needed on every host to resolve `--net-host-ip`
+/// before `run_native` is called.
+pub(crate) const DEFAULT_NET_HOST_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
 
 /// Whether two port mappings would try to bind the same host socket -- same
 /// host address and transport. TCP and UDP on one port are distinct listeners.
@@ -90,6 +104,17 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
 
     // Resolve the networking flags before anything else, so a bad -p or an
     // empty --publish-all is reported without first resolving a workload.
+    let host_ip = net.net_host_ip.unwrap_or(DEFAULT_NET_HOST_IP);
+    let guest_ip = net.net_guest_ip.unwrap_or(crate::publish::GUEST_IP);
+    if host_ip == guest_ip {
+        bail!("--net-host-ip and --net-guest-ip must be different addresses");
+    }
+    if host_ip.octets()[..3] != guest_ip.octets()[..3] {
+        bail!(
+            "--net-host-ip {host_ip} and --net-guest-ip {guest_ip} must be in the same /24 subnet"
+        );
+    }
+
     let mut mappings: Vec<crate::publish::PortMapping> = net
         .publish
         .iter()
@@ -183,9 +208,9 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
     // takes one command rather than a privileged setup step first.
     #[cfg(target_os = "linux")]
     if let Some(device) = &tun_device {
-        let created = crate::tun::ensure_device(device)?;
+        let created = crate::tun::ensure_device(device, host_ip)?;
         if created {
-            eprintln!("Created network device {device} ({})", crate::tun::HOST_IP);
+            eprintln!("Created network device {device} ({host_ip})");
         }
     }
 
@@ -194,14 +219,13 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
     let _published = if mappings.is_empty() {
         None
     } else {
-        Some(crate::publish::publish(&mappings, net.verbose)?)
+        Some(crate::publish::publish(&mappings, net.verbose, guest_ip)?)
     };
 
     if tun_device.is_some() && !meta.exposed_ports.is_empty() {
         eprintln!(
-            "Box exposes {} on {}",
+            "Box exposes {} on {guest_ip}",
             meta.exposed_ports.join(", "),
-            crate::publish::GUEST_IP
         );
     }
 
@@ -228,6 +252,8 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
         program_args,
         meta.working_dir.as_deref(),
         tun_device.as_deref(),
+        guest_ip,
+        host_ip,
     )
 }
 
@@ -252,6 +278,8 @@ fn run_native(
     args: Vec<String>,
     working_dir: Option<&str>,
     tun_device: Option<&str>,
+    guest_ip: std::net::Ipv4Addr,
+    host_ip: std::net::Ipv4Addr,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
@@ -280,6 +308,8 @@ fn run_native(
         program_from_tar: true,
         broker_control_socket: None,
         working_directory: working_dir.filter(|w| !w.is_empty()).map(String::from),
+        net_guest_ip: Some(guest_ip),
+        net_host_ip: Some(host_ip),
     };
     litebox_runner_linux_userland::run(cli)
 }
@@ -291,6 +321,8 @@ fn run_native(
     _args: Vec<String>,
     _working_dir: Option<&str>,
     _tun_device: Option<&str>,
+    _guest_ip: std::net::Ipv4Addr,
+    _host_ip: std::net::Ipv4Addr,
 ) -> anyhow::Result<()> {
     bail!(
         "running boxes natively is supported on x86_64 Linux hosts today; \
