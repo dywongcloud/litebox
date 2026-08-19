@@ -24,6 +24,7 @@ const LOOPBACK_QUEUE_CAP: usize = 256;
 
 pub(crate) struct Device<Platform: platform::IPInterfaceProvider + 'static> {
     pub(crate) platform: &'static Platform,
+    interface_ip: core::net::Ipv4Addr,
     receive_buffer: [u8; DEVICE_MTU],
     send_buffer: [u8; DEVICE_MTU],
     /// Packets the guest sent to a local interface address (`127.0.0.0/8`, or
@@ -40,6 +41,7 @@ impl<Platform: platform::IPInterfaceProvider> Device<Platform> {
     pub(crate) fn new(platform: &'static Platform) -> Self {
         Self {
             platform,
+            interface_ip: super::INTERFACE_IP_ADDR,
             receive_buffer: [0u8; DEVICE_MTU],
             send_buffer: [0u8; DEVICE_MTU],
             loopback: RefCell::new(VecDeque::new()),
@@ -47,18 +49,69 @@ impl<Platform: platform::IPInterfaceProvider> Device<Platform> {
     }
 }
 
+impl<Platform> super::Network<Platform>
+where
+    Platform: platform::IPInterfaceProvider
+        + platform::TimeProvider
+        + crate::sync::RawSyncPrimitivesProvider,
+{
+    /// Construct a network with optional interface and gateway address overrides.
+    pub fn new_with_optional_addrs(
+        litebox: &crate::LiteBox<Platform>,
+        interface_ip: Option<core::net::Ipv4Addr>,
+        gateway_ip: Option<core::net::Ipv4Addr>,
+    ) -> Self {
+        let mut network = Self::new(litebox);
+        if let Some(interface_ip) = interface_ip {
+            let default_interface_cidr = smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(super::INTERFACE_IP_ADDR),
+                24,
+            );
+            let configured_interface_cidr =
+                smoltcp::wire::IpCidr::new(smoltcp::wire::IpAddress::Ipv4(interface_ip), 24);
+            network.interface.update_ip_addrs(|ip_addrs| {
+                for cidr in ip_addrs.iter_mut() {
+                    if *cidr == default_interface_cidr {
+                        *cidr = configured_interface_cidr;
+                    }
+                }
+            });
+            network.device.interface_ip = interface_ip;
+        }
+        if let Some(gateway_ip) = gateway_ip {
+            let default_route_cidr = smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(core::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            );
+            network.interface.routes_mut().update(|routes| {
+                for route in routes.iter_mut() {
+                    if route.cidr == default_route_cidr {
+                        route.via_router = smoltcp::wire::IpAddress::Ipv4(gateway_ip);
+                    }
+                }
+            });
+        }
+        network
+    }
+
+    /// Return the configured IPv4 address for this network's synthetic interface.
+    pub fn interface_ip(&self) -> core::net::Ipv4Addr {
+        self.device.interface_ip
+    }
+}
+
 /// Whether an IPv4 packet's destination address is one the interface loops
 /// back to itself: any `127.0.0.0/8` address, or its own external IP (so a
 /// guest connecting to its own `10.0.0.2` also reaches its local servers). A
 /// malformed/short packet is not looped.
-fn is_loopback_destination(packet: &[u8]) -> bool {
+fn is_loopback_destination(packet: &[u8], interface_ip: core::net::Ipv4Addr) -> bool {
     // The IPv4 destination address is bytes 16..20; require at least an IPv4
     // header's worth of bytes and IP version 4.
     if packet.len() < 20 || packet[0] >> 4 != 4 {
         return false;
     }
     let dst = [packet[16], packet[17], packet[18], packet[19]];
-    dst[0] == 127 || dst == super::INTERFACE_IP_ADDR.octets()
+    dst[0] == 127 || dst == interface_ip.octets()
 }
 
 impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Platform> {
@@ -85,6 +138,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
                 RxToken::Owned(packet),
                 TxToken {
                     platform: self.platform,
+                    interface_ip: self.interface_ip,
                     buffer: &mut self.send_buffer,
                     loopback: &self.loopback,
                 },
@@ -95,6 +149,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
                 RxToken::Borrowed(&self.receive_buffer[..size]),
                 TxToken {
                     platform: self.platform,
+                    interface_ip: self.interface_ip,
                     buffer: &mut self.send_buffer,
                     loopback: &self.loopback,
                 },
@@ -106,6 +161,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(TxToken {
             platform: self.platform,
+            interface_ip: self.interface_ip,
             buffer: &mut self.send_buffer,
             loopback: &self.loopback,
         })
@@ -140,6 +196,7 @@ impl smoltcp::phy::RxToken for RxToken<'_> {
 
 pub(crate) struct TxToken<'a, Platform: platform::IPInterfaceProvider> {
     platform: &'a Platform,
+    interface_ip: core::net::Ipv4Addr,
     buffer: &'a mut [u8],
     loopback: &'a RefCell<VecDeque<Vec<u8>>>,
 }
@@ -151,7 +208,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
     {
         let packet = &mut self.buffer[..len];
         let res = f(packet);
-        if is_loopback_destination(packet) {
+        if is_loopback_destination(packet, self.interface_ip) {
             // Loop it back into this interface's own receive path instead of
             // handing it to the platform. The copy is required: `buffer` is
             // the device's reused `send_buffer`.

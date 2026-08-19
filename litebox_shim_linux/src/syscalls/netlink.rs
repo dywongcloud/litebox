@@ -36,6 +36,7 @@ impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for NetlinkSocket<Platform>
 /// later `recv`s drain, in order.
 pub(crate) struct NetlinkSocket<Platform: RawSyncPrimitivesProvider> {
     pending: Mutex<Platform, Vec<u8>>,
+    interface_addr: [u8; 4],
 }
 
 // rtnetlink constants (see `linux/rtnetlink.h`, `linux/netlink.h`, `linux/if.h`).
@@ -71,11 +72,9 @@ const IFA_F_PERMANENT: u8 = 0x80;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_HOST: u8 = 254;
 
-// The synthetic interface addresses, kept in step with `litebox::net`'s
-// `INTERFACE_IP_ADDR` (10.0.0.2) and `LOOPBACK_IP_ADDR` (127.0.0.1).
+// The synthetic loopback address; eth0's address comes from the Network that
+// owns this netlink socket.
 const LO_ADDR: [u8; 4] = [127, 0, 0, 1];
-const ETH_ADDR: [u8; 4] = [10, 0, 0, 2];
-const ETH_BROADCAST: [u8; 4] = [10, 0, 0, 255];
 const ETH_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 
 #[expect(
@@ -152,7 +151,7 @@ fn build_link_dump(out: &mut Vec<u8>, seq: u32) {
 }
 
 /// Build the `RTM_GETADDR` reply: one `RTM_NEWADDR` per address, then `NLMSG_DONE`.
-fn build_addr_dump(out: &mut Vec<u8>, seq: u32) {
+fn build_addr_dump(out: &mut Vec<u8>, seq: u32, eth_addr: [u8; 4]) {
     // lo: 127.0.0.1/8, host scope
     let mut body = ifaddrmsg(8, RT_SCOPE_HOST, 1);
     push_attr(&mut body, IFA_ADDRESS, &LO_ADDR);
@@ -160,11 +159,12 @@ fn build_addr_dump(out: &mut Vec<u8>, seq: u32) {
     push_attr(&mut body, IFA_LABEL, b"lo\0");
     push_msg(out, RTM_NEWADDR, seq, &body);
 
-    // eth0: 10.0.0.2/24, universe scope
+    // eth0: configured address with the fixed /24 prefix, universe scope
+    let broadcast = [eth_addr[0], eth_addr[1], eth_addr[2], 255];
     let mut body = ifaddrmsg(24, RT_SCOPE_UNIVERSE, 2);
-    push_attr(&mut body, IFA_ADDRESS, &ETH_ADDR);
-    push_attr(&mut body, IFA_LOCAL, &ETH_ADDR);
-    push_attr(&mut body, IFA_BROADCAST, &ETH_BROADCAST);
+    push_attr(&mut body, IFA_ADDRESS, &eth_addr);
+    push_attr(&mut body, IFA_LOCAL, &eth_addr);
+    push_attr(&mut body, IFA_BROADCAST, &broadcast);
     push_attr(&mut body, IFA_LABEL, b"eth0\0");
     push_msg(out, RTM_NEWADDR, seq, &body);
 
@@ -172,9 +172,10 @@ fn build_addr_dump(out: &mut Vec<u8>, seq: u32) {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> NetlinkSocket<Platform> {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(interface_ip: core::net::Ipv4Addr) -> Self {
         Self {
             pending: Mutex::new(Vec::new()),
+            interface_addr: interface_ip.octets(),
         }
     }
 
@@ -190,7 +191,7 @@ impl<Platform: RawSyncPrimitivesProvider> NetlinkSocket<Platform> {
             let seq = u32::from_ne_bytes([req[off + 8], req[off + 9], req[off + 10], req[off + 11]]);
             match nlmsg_type {
                 RTM_GETLINK => build_link_dump(&mut out, seq),
-                RTM_GETADDR => build_addr_dump(&mut out, seq),
+                RTM_GETADDR => build_addr_dump(&mut out, seq, self.interface_addr),
                 // Any other request type: reply with a bare DONE so the caller's
                 // dump loop terminates instead of hanging.
                 _ => push_msg(&mut out, NLMSG_DONE, seq, &0i32.to_ne_bytes()),

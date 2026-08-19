@@ -1076,7 +1076,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // `os.networkInterfaces()`. `ty` (SOCK_RAW/SOCK_DGRAM) and `protocol`
                 // (NETLINK_ROUTE) are accepted without distinction -- no real link or
                 // address state is ever touched; see `crate::syscalls::netlink`.
-                let socket = crate::syscalls::netlink::NetlinkSocket::new();
+                let interface_ip = self.global.net.lock().interface_ip();
+                let socket = crate::syscalls::netlink::NetlinkSocket::new(interface_ip);
                 let typed = self
                     .global
                     .litebox

@@ -319,7 +319,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         interface_ip: Option<core::net::Ipv4Addr>,
         gateway_ip: Option<core::net::Ipv4Addr>,
     ) -> LinuxShim<Platform, FS> {
-        let mut net = Network::new_with_addrs(&self.litebox, interface_ip, gateway_ip);
+        let mut net = Network::new_with_optional_addrs(&self.litebox, interface_ip, gateway_ip);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,
