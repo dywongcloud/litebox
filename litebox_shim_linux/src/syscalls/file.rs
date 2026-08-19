@@ -61,10 +61,21 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
 }
 
 impl<Platform: ShimPlatform> FsState<Platform> {
-    pub fn new() -> Self {
+    /// A new state starting the process at `initial_cwd` (`/` for the
+    /// filesystem root) -- the image `WORKDIR` a fresh process execs into, so a
+    /// relative program path or relative file access resolves against it
+    /// instead of always resolving against the root.
+    pub fn with_cwd(initial_cwd: &str) -> Self {
+        let mut cwd = String::from(initial_cwd);
+        if !cwd.starts_with('/') {
+            cwd.insert(0, '/');
+        }
+        if !cwd.ends_with('/') {
+            cwd.push('/');
+        }
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
-            cwd: litebox::sync::RwLock::new(String::from("/")),
+            cwd: litebox::sync::RwLock::new(cwd),
         }
     }
 

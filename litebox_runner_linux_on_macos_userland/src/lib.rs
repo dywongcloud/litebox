@@ -136,6 +136,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         initial_file_system,
         platform.init_task(),
         prog_path,
+        "/",
         argv,
         envp,
     )?;

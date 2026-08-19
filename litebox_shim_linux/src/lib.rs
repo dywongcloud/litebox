@@ -310,12 +310,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// Loads the program at `path` as the shim's initial task, returning the
-    /// initial register state.
+    /// initial register state. The task's initial working directory is `cwd`
+    /// (e.g. the image's `WORKDIR`), which a relative `path` is opened against
+    /// -- matching how a real OS resolves a relative exec path against the
+    /// calling process's cwd.
     pub fn load_program(
         &self,
         fs: alloc::sync::Arc<FS>,
         task: litebox_common_linux::TaskParams,
         path: &str,
+        cwd: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<Platform, FS>, loader::elf::ElfLoaderError> {
@@ -359,7 +363,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                     .into(),
                 ),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
-                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                fs: Arc::new(syscalls::file::FsState::with_cwd(cwd)).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
             },
@@ -1501,7 +1505,7 @@ mod test_utils {
                     egid: 0,
                 })),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
-                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                fs: Arc::new(syscalls::file::FsState::with_cwd("/")).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 global: self,

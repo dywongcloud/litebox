@@ -80,7 +80,14 @@ impl TestLauncher {
         let envp = vec![CString::new("PATH=/bin").unwrap()];
         let shim = self.shim_builder.build();
         let program = shim
-            .load_program(fs, self.platform.init_task(), executable_path, argv, envp)
+            .load_program(
+                fs,
+                self.platform.init_task(),
+                executable_path,
+                "/",
+                argv,
+                envp,
+            )
             .unwrap();
         unsafe {
             litebox_platform_windows_userland::run_thread(

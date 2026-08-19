@@ -213,12 +213,22 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
             extra_args.to_vec(),
         )
     } else {
-        // Shell-less image (e.g. FROM scratch): exec the argv directly.
+        // Shell-less image (e.g. FROM scratch): exec the argv directly. There is
+        // no config script to `cd` into WORKDIR first, so the runner's own
+        // initial working directory carries that (below) -- including letting a
+        // relative ENTRYPOINT/CMD (`["./server"]`) resolve against it, the same
+        // way a real exec resolves a relative path against the caller's cwd.
         let mut argv = argv;
         (argv.remove(0), argv)
     };
 
-    run_native(&parsed, program, program_args, tun_device.as_deref())
+    run_native(
+        &parsed,
+        program,
+        program_args,
+        meta.working_dir.as_deref(),
+        tun_device.as_deref(),
+    )
 }
 
 /// ENTRYPOINT + (args-or-CMD) merge per OCI semantics.
@@ -240,6 +250,7 @@ fn run_native(
     parsed: &ParsedBox,
     program: String,
     args: Vec<String>,
+    working_dir: Option<&str>,
     tun_device: Option<&str>,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
@@ -268,6 +279,7 @@ fn run_native(
         tun_device_name: tun_device.map(String::from),
         program_from_tar: true,
         broker_control_socket: None,
+        working_directory: working_dir.filter(|w| !w.is_empty()).map(String::from),
     };
     litebox_runner_linux_userland::run(cli)
 }
@@ -277,6 +289,7 @@ fn run_native(
     _parsed: &ParsedBox,
     _program: String,
     _args: Vec<String>,
+    _working_dir: Option<&str>,
     _tun_device: Option<&str>,
 ) -> anyhow::Result<()> {
     bail!(

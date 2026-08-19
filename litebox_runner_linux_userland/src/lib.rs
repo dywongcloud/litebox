@@ -94,6 +94,16 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub broker_control_socket: Option<PathBuf>,
+    /// The guest process's initial working directory (e.g. the image's
+    /// `WORKDIR`). Defaults to `/`. A relative `program_and_arguments[0]` is
+    /// resolved against this, not the host's current directory.
+    #[arg(
+        long = "working-directory",
+        value_name = "PATH",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub working_directory: Option<String>,
 }
 
 struct MmappedFile {
@@ -144,12 +154,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
-    // When loading from tar, the program path is a guest-internal path and must
-    // be absolute — LiteBox does not resolve programs via PATH.
-    if cli_args.program_from_tar && !cli_args.program_and_arguments[0].starts_with('/') {
+    // When loading from tar, the program path is a guest-internal path. A
+    // relative path is resolved against --working-directory (matching how a
+    // relative exec path resolves against a process's cwd), but a bare command
+    // name with no `/` at all would need a PATH search -- LiteBox does not
+    // resolve programs via PATH, so that case is rejected up front rather than
+    // failing later with a confusing "not found".
+    if cli_args.program_from_tar
+        && !cli_args.program_and_arguments[0].starts_with('/')
+        && !cli_args.program_and_arguments[0].contains('/')
+    {
         anyhow::bail!(
-            "--program-from-tar requires an absolute path (e.g., /usr/bin/ls), \
-             got: {}",
+            "--program-from-tar does not resolve a bare command name via PATH; \
+             use an absolute path (e.g., /usr/bin/ls) or a path relative to \
+             --working-directory (e.g., ./server), got: {}",
             cli_args.program_and_arguments[0]
         );
     }
@@ -421,7 +439,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         &broker_shutdown_fds,
     );
 
-    let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
+    let cwd = cli_args.working_directory.as_deref().unwrap_or("/");
+    let program =
+        shim.load_program(initial_file_system, task_params, prog_path, cwd, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
