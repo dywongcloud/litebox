@@ -41,7 +41,7 @@ const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// The loopback address. Packets destined anywhere in `127.0.0.0/8` are looped
 /// back into the interface's own receive path (see [`phy`]).
-const LOOPBACK_IP_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+const LOOPBACK_IP_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
 /// Maximum size of rx/tx buffers for sockets
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;

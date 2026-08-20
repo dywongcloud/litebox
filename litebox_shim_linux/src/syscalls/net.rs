@@ -1476,8 +1476,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn netlink_fd(
         &self,
         sockfd: u32,
-    ) -> Option<alloc::sync::Arc<litebox::fd::TypedFd<crate::syscalls::netlink::NetlinkSubsystem<Platform>>>>
-    {
+    ) -> Option<
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<crate::syscalls::netlink::NetlinkSubsystem<Platform>>,
+        >,
+    > {
         self.files
             .borrow()
             .raw_descriptor_store

@@ -1271,7 +1271,7 @@ impl<
                 if self.upper.file_status(old.as_str()).is_err()
                     && self.ensure_lower_contains(&old).is_err()
                 {
-                    return Err(PathError::NoSuchFileOrDirectory)?;
+                    Err(PathError::NoSuchFileOrDirectory)?;
                 }
                 Err(RenameError::CrossDevice)
             }
@@ -1528,7 +1528,7 @@ impl<
                 EntryX::Upper { fd } => self.upper.fd_file_status(fd)?,
                 EntryX::Lower { fd } => self.lower.fd_file_status(fd)?,
                 EntryX::Tombstone => {
-                    return Err(PathError::NoSuchFileOrDirectory)?;
+                    return Err(PathError::NoSuchFileOrDirectory.into());
                 }
             };
             return Ok(FileStatus {

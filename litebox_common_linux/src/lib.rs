@@ -3156,12 +3156,8 @@ impl SyscallRequest {
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Now),
-                        TCSETSW => {
-                            IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Drain)
-                        }
-                        TCSETSF => {
-                            IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Flush)
-                        }
+                        TCSETSW => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Drain),
+                        TCSETSF => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Flush),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),

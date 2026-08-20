@@ -180,7 +180,12 @@ impl super::backend::Backend for TarRo {
             // read it. A symlink's mode is a fixed `lrwxrwxrwx`.
             IndexedChild::SymLink(sym_idx) => {
                 let sym = &self.tar_index.symlinks[sym_idx];
-                (sym_idx, true, Mode::RWXU | Mode::RWXG | Mode::RWXO, sym.owner)
+                (
+                    sym_idx,
+                    true,
+                    Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                    sym.owner,
+                )
             }
         };
         Ok(super::backend::Permissioned {
@@ -344,7 +349,9 @@ impl super::backend::Backend for TarRo {
         match self.tar_index.dirs[dir.idx].children.get(name) {
             Some(IndexedChild::Dir(_)) => Err(RmdirError::ReadOnlyFileSystem),
             // Neither a file nor a symlink is a directory.
-            Some(IndexedChild::File(_) | IndexedChild::SymLink(_)) => Err(RmdirError::NotADirectory),
+            Some(IndexedChild::File(_) | IndexedChild::SymLink(_)) => {
+                Err(RmdirError::NotADirectory)
+            }
             None => Err(PathError::NoSuchFileOrDirectory.into()),
         }
     }

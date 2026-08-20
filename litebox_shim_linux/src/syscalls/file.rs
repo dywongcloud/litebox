@@ -1412,8 +1412,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     )
                 {
                     ConsumedFd::Unix(fd)
-                } else if let Ok(fd) = rds
-                    .fd_consume_raw_integer::<super::netlink::NetlinkSubsystem<Platform>>(raw_fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::netlink::NetlinkSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Netlink(fd)
                 } else {
@@ -1788,7 +1788,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `access(2)`/`faccessat(2)` dereference a trailing symlink, so a dangling
         // link correctly reports as absent (ENOENT) and a link's target's
         // permissions -- not the always-`rwxrwxrwx` link node -- are checked.
-        let resolved = self.resolve_path_symlinks(pathname.as_rust_str().map_err(|_| Errno::EINVAL)?)?;
+        let resolved =
+            self.resolve_path_symlinks(pathname.as_rust_str().map_err(|_| Errno::EINVAL)?)?;
         let status = self.files.borrow().fs.file_status(resolved.as_str())?;
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -1865,7 +1866,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // A real symbolic link in the filesystem: return its target verbatim.
         // `readlink(2)` is EINVAL on a non-symlink and ENOENT on a missing path,
         // which is exactly how `FileSystem::readlink` maps.
-        self.files.borrow().fs.readlink(fullpath).map_err(Errno::from)
+        self.files
+            .borrow()
+            .fs
+            .readlink(fullpath)
+            .map_err(Errno::from)
     }
 
     /// Handle syscall `readlink`

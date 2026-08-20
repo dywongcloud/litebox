@@ -389,7 +389,13 @@ jobs:
           #
           # - `dev_bench` is meant to only be used for benchmarking, and thus
           #   can safely use std.
+          #
+          # - `vendor/` holds vendored third-party crates that are workspace
+          #   members; building them standalone trips cargo's "believes it's
+          #   in a workspace" error, and litebox's own no_std check already
+          #   covers them as dependencies.
           find . -type f -name 'Cargo.toml' \
+            -not -path './vendor/*' \
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \

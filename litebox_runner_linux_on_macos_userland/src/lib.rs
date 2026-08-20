@@ -153,8 +153,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // under the default `env_reset` policy strips arbitrary env vars
     // (confirmed live: "sudo: sorry, you are not allowed to set the
     // following environment variables") but always passes argv through.
-    let shim =
-        shim_builder.build_with_net_config(cli_args.guest_ip, cli_args.gateway_ip);
+    let shim = shim_builder.build_with_net_config(cli_args.guest_ip, cli_args.gateway_ip);
     let argv = cli_args
         .program_and_arguments
         .iter()

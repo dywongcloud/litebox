@@ -188,7 +188,8 @@ impl<Platform: RawSyncPrimitivesProvider> NetlinkSocket<Platform> {
             let nlmsg_len =
                 u32::from_ne_bytes([req[off], req[off + 1], req[off + 2], req[off + 3]]) as usize;
             let nlmsg_type = u16::from_ne_bytes([req[off + 4], req[off + 5]]);
-            let seq = u32::from_ne_bytes([req[off + 8], req[off + 9], req[off + 10], req[off + 11]]);
+            let seq =
+                u32::from_ne_bytes([req[off + 8], req[off + 9], req[off + 10], req[off + 11]]);
             match nlmsg_type {
                 RTM_GETLINK => build_link_dump(&mut out, seq),
                 RTM_GETADDR => build_addr_dump(&mut out, seq, self.interface_addr),
@@ -206,7 +207,10 @@ impl<Platform: RawSyncPrimitivesProvider> NetlinkSocket<Platform> {
 
     /// Handle a `recv`: copy out (and consume) up to `buf.len()` pending bytes.
     /// Empty pending buffer reports `EAGAIN` (getifaddrs uses `MSG_DONTWAIT`).
-    pub(crate) fn handle_recv(&self, buf: &mut [u8]) -> Result<usize, litebox_common_linux::errno::Errno> {
+    pub(crate) fn handle_recv(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
         let mut pending = self.pending.lock();
         if pending.is_empty() {
             return Err(litebox_common_linux::errno::Errno::EAGAIN);
