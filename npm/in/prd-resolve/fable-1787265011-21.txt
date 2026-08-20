@@ -1,0 +1,1 @@
+{"SESSION_ID":"fable-1787265011","id":"npm-release-refresh-user-guidance","resolution":"Landed in 4a62d24: SHELL_CAVEAT removed from npm/bin/litebox.js, README fork-limitation section replaced with working usage modes, x18 note updated to describe the shipped rewrite. npm 0.1.1 pins rev 4815891 which contains fork and the x18 rewriter."}

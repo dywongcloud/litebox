@@ -1,0 +1,1 @@
+{"SESSION_ID":"fable-1787265011","id":"npm-pin-current-source-revision","resolution":"Landed in 4a62d24: PINNED_REV updated to 4815891d363351e8bab675736d19b8b7cff16fad, the Node-enabled revision (fork, x18 rewrite, AF_NETLINK). npm version bumped to 0.1.1."}

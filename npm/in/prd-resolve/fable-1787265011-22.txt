@@ -1,0 +1,1 @@
+{"SESSION_ID":"fable-1787265011","id":"npm-revision-input-containment","resolution":"Landed in 4a62d24: --rev now rejects anything but a full 40-char hex commit SHA (lowercased before use). Verified live: --rev deadbeef exits 1 with a clear error; a full SHA is accepted."}

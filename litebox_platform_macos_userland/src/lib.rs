@@ -819,7 +819,7 @@ unsafe fn migrate_range_to_jit(
         let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         // `_SC_PAGESIZE` is always a positive power of two on this platform;
         // fall back to Apple Silicon's 16 KiB if the query ever fails.
-        if p > 0 { p as usize } else { 16384 }
+        usize::try_from(p).ok().filter(|&p| p > 0).unwrap_or(16384)
     };
     let n_pages = range.len().div_ceil(page);
     let mut resident = alloc::vec![0u8; n_pages];
@@ -2982,7 +2982,7 @@ fn init_synthetic_ctr_el0() {
         .unwrap_or(64)
         .max(16);
     let words = (line_bytes / 4).max(1);
-    let log2_words = (u64::BITS - 1 - words.leading_zeros()) as u64;
+    let log2_words = u64::from(u64::BITS - 1 - words.leading_zeros());
     // Only `IminLine` [3:0] and `DminLine` [19:16] matter to `__clear_cache`'s
     // stride; deriving both from the coherency granule can only *over*-flush
     // (a stride no larger than the true line), which is always safe. Bit 31 is

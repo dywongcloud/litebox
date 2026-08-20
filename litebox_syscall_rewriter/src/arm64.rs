@@ -1371,8 +1371,10 @@ mod tests {
     fn shared_svc_handler_words() -> vec::Vec<u32> {
         let mut buf = vec::Vec::new();
         emit_shared_svc_handler(&mut buf, 0, 0x1000).unwrap();
-        buf.chunks_exact(4)
-            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        buf.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
             .collect()
     }
 
