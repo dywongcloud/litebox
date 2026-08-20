@@ -36,22 +36,6 @@ First run downloads a pinned source revision and builds it with cargo, which
 takes a few minutes. Later runs reuse the cache. A Rust toolchain is required.
 `;
 
-/// Stated up front rather than discovered at the prompt.
-///
-/// `fork(2)` is not implemented on any LiteBox platform yet. An *interactive*
-/// shell has to fork for every external command, because it must outlive the
-/// child it starts -- so in this shell only builtins run, and `ls` produces
-/// nothing at all. Running a program directly (`-- <program>`) needs no fork,
-/// because the runner execs it as the guest's only process, and that path works
-/// fully. Someone typing `ls` into what looks like an ordinary shell and getting
-/// silence deserves to know why before concluding the sandbox is broken.
-const SHELL_CAVEAT = `note: fork(2) is not implemented yet, so in this INTERACTIVE shell:
-        works    builtins only -- echo, cd, pwd, test, exit
-        fails    every external command (ls, cat, ...), pipes, $(...), job control
-      To actually run a program, exec it directly instead of through the shell:
-        npx @openclew/litebox -- /bin/busybox ls -l /etc
-      Status: https://github.com/dywongcloud/litebox`;
-
 function parseArgs(argv) {
   const opts = {
     image: DEFAULT_IMAGE,
@@ -70,7 +54,13 @@ function parseArgs(argv) {
       break;
     } else if (a === '--image') opts.image = argv[++i];
     else if (a === '--shell') opts.shell = argv[++i];
-    else if (a === '--rev') opts.rev = argv[++i];
+    else if (a === '--rev') {
+      const rev = argv[++i];
+      if (!/^[0-9a-f]{40}$/i.test(rev || '')) {
+        return { error: '--rev requires a full 40-character hexadecimal commit SHA.' };
+      }
+      opts.rev = rev.toLowerCase();
+    }
     else if (a === '--rebuild') opts.rebuild = true;
     else if (a === '--refresh-image') opts.refreshImage = true;
     else if (a === '--where') opts.where = true;
@@ -91,6 +81,10 @@ function parseArgs(argv) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.error) {
+    process.stderr.write(`litebox: ${opts.error}\n`);
+    return 1;
+  }
   const plat = detect();
 
   if (opts.where) {
@@ -132,10 +126,7 @@ async function main() {
     ? opts.command
     : [opts.shell || '/bin/busybox', ...(opts.shell ? [] : ['sh'])];
 
-  if (!opts.command) {
-    log(`starting ${guestArgv.join(' ')}`);
-    if (!opts.quiet) process.stderr.write(SHELL_CAVEAT + '\n');
-  }
+  if (!opts.command) log(`starting ${guestArgv.join(' ')}`);
 
   // `inherit` hands the guest the real terminal, which is what makes this an
   // interactive session rather than a pipe: the shim's terminal support reads

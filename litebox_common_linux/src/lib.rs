@@ -902,12 +902,27 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
+
+/// When a new terminal attribute value takes effect, per `tcsetattr(3)`'s
+/// `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSetAction {
+    /// Apply immediately (`TCSETS`/`TCSANOW`).
+    Now,
+    /// Apply after all pending output has been written (`TCSETSW`/`TCSADRAIN`).
+    Drain,
+    /// Apply after pending output is written, discarding unread input first
+    /// (`TCSETSF`/`TCSAFLUSH`).
+    Flush,
+}
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
@@ -916,7 +931,7 @@ pub enum IoctlArg {
     /// Get the current serial port settings.
     TCGETS(UserPtrMut<Termios>),
     /// Set the current serial port settings.
-    TCSETS(UserPtr<Termios>),
+    TCSETS(UserPtr<Termios>, TerminalSetAction),
     /// Get the foreground process group ID of the controlling terminal.
     TIOCGPGRP(UserPtrMut<i32>),
     /// Set the foreground process group ID of the controlling terminal.
@@ -3140,7 +3155,13 @@ impl SyscallRequest {
                     let cmd = ctx.sys_req_arg(1);
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
-                        TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Now),
+                        TCSETSW => {
+                            IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Drain)
+                        }
+                        TCSETSF => {
+                            IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Flush)
+                        }
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),

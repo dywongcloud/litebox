@@ -97,13 +97,28 @@ where
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        Self::new_with_addrs(litebox, None, None)
+    }
+
+    /// Same as [`Self::new`], but lets the caller override the interface/gateway
+    /// addresses instead of the fixed `INTERFACE_IP_ADDR`/`GATEWAY_IP_ADDR`
+    /// defaults (`None` = use the default). Needed by any caller that runs more
+    /// than one `Network` on the same host at once (each one needs a distinct
+    /// address to be independently reachable).
+    pub fn new_with_addrs(
+        litebox: &LiteBox<Platform>,
+        interface_ip: Option<Ipv4Addr>,
+        gateway_ip: Option<Ipv4Addr>,
+    ) -> Self {
+        let interface_ip = interface_ip.unwrap_or(INTERFACE_IP_ADDR);
+        let gateway_ip = gateway_ip.unwrap_or(GATEWAY_IP_ADDR);
         let mut device = phy::Device::new(litebox.x.platform);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
         interface.update_ip_addrs(|ip_addrs| {
             match ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
+                smoltcp::wire::IpAddress::Ipv4(interface_ip),
                 24,
             )) {
                 Ok(()) => {}
@@ -125,10 +140,7 @@ where
                 Err(_) => unreachable!(),
             }
         });
-        match interface
-            .routes_mut()
-            .add_default_ipv4_route(GATEWAY_IP_ADDR)
-        {
+        match interface.routes_mut().add_default_ipv4_route(gateway_ip) {
             Ok(None) => {}
             _ => unreachable!(),
         }
@@ -1221,7 +1233,8 @@ where
                 }
                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
                     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                        addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                        addr: (!addr.ip().is_unspecified())
+                            .then(|| smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
                         port: new_port,
                     },
                     backlog: None,
@@ -1234,7 +1247,8 @@ where
                     .allocate_local_port(addr.port())
                     .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
                 let local_endpoint = smoltcp::wire::IpListenEndpoint {
-                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                    addr: (!addr.ip().is_unspecified())
+                        .then(|| smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
                     port: lp.port(),
                 };
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);

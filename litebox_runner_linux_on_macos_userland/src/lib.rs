@@ -55,6 +55,25 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub tun_device_name: Option<String>,
+    /// Override this guest's own address (default: `10.0.0.2`). Needed to run
+    /// more than one instance on the same host at once, each independently
+    /// reachable — a CLI flag rather than an env var so it survives a
+    /// `sudo`-invoked launch even under `env_reset` (the default policy),
+    /// which strips arbitrary environment variables but never argv.
+    #[arg(
+        long = "guest-ip",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub guest_ip: Option<std::net::Ipv4Addr>,
+    /// Override this guest's default-route gateway (default: `10.0.0.1`).
+    /// See `--guest-ip`.
+    #[arg(
+        long = "gateway-ip",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub gateway_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// Run a Linux program with LiteBox on unmodified macOS.
@@ -125,7 +144,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
-    let shim = shim_builder.build();
+    // Per-invocation network identity override (mirrors the Linux host
+    // runner's fleet-hive patch): lets many concurrent litebox processes on
+    // one host each own a distinct, independently-reachable address instead
+    // of all defaulting to the same hardcoded 10.0.0.2/10.0.0.1. Unset =
+    // identical to upstream behavior. CLI flags rather than env vars
+    // (`--guest-ip`/`--gateway-ip`, `CliArgs`) — a `sudo`-invoked launch
+    // under the default `env_reset` policy strips arbitrary env vars
+    // (confirmed live: "sudo: sorry, you are not allowed to set the
+    // following environment variables") but always passes argv through.
+    let shim =
+        shim_builder.build_with_net_config(cli_args.guest_ip, cli_args.gateway_ip);
     let argv = cli_args
         .program_and_arguments
         .iter()

@@ -112,6 +112,19 @@ impl StdinPump {
         None
     }
 
+    /// Discards every byte currently sitting in the ring buffer, without waiting for the guest
+    /// to read them. Backs `TCSETSF`/`TCSAFLUSH`'s "discard unread input" contract: a plain host
+    /// `tcsetattr(TCSAFLUSH)` only flushes the host tty driver's own queue, not bytes this pump's
+    /// background reader thread has already pulled off that queue and pushed into the ring, so
+    /// callers must invoke this in addition to (after) the host-level flush.
+    pub fn discard_buffered(&self) {
+        let mut cons = self.cons.lock();
+        let discarded = cons.occupied_len();
+        if discarded > 0 {
+            cons.clear();
+        }
+    }
+
     fn notify(&self, events: Events) {
         let mut observers = self.observers.lock();
         if observers.is_empty() {

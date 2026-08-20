@@ -1654,12 +1654,32 @@ impl litebox::platform::StdioProvider for MacOsUserland {
     }
 
     fn set_terminal_raw_mode(&self, stream: litebox::platform::StdioStream, raw: bool, echo: bool) {
+        self.set_terminal_raw_mode_with_action(
+            stream,
+            raw,
+            echo,
+            litebox::platform::TerminalSetAction::Now,
+        );
+    }
+
+    fn set_terminal_raw_mode_with_action(
+        &self,
+        stream: litebox::platform::StdioStream,
+        raw: bool,
+        echo: bool,
+        action: litebox::platform::TerminalSetAction,
+    ) {
         // Only stdin's line discipline affects how input bytes arrive at the pump thread.
         if stream != litebox::platform::StdioStream::Stdin
             || !self.stdio_is_tty[litebox::platform::StdioStream::Stdin as usize]
         {
             return;
         }
+        let host_action = match action {
+            litebox::platform::TerminalSetAction::Now => libc::TCSANOW,
+            litebox::platform::TerminalSetAction::Drain => libc::TCSADRAIN,
+            litebox::platform::TerminalSetAction::Flush => libc::TCSAFLUSH,
+        };
         // SAFETY: `STDIN_FILENO` is valid for the process lifetime; `term` is fully initialized
         // by `tcgetattr` before any field is read or written.
         unsafe {
@@ -1679,7 +1699,14 @@ impl litebox::platform::StdioProvider for MacOsUserland {
             } else {
                 term.c_lflag &= !(libc::ECHO as libc::tcflag_t);
             }
-            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const term);
+            let _ = libc::tcsetattr(libc::STDIN_FILENO, host_action, &raw const term);
+        }
+        // The host `TCSAFLUSH` above only discards bytes still sitting in the host tty driver's
+        // own input queue; it cannot see bytes this pump's background reader thread has already
+        // pulled off that queue and pushed into the ring, so those need a separate discard,
+        // performed strictly after the host flush call returns.
+        if action == litebox::platform::TerminalSetAction::Flush {
+            self.stdin_pump.discard_buffered();
         }
     }
 

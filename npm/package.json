@@ -1,6 +1,6 @@
 {
   "name": "@openclew/litebox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Boot an interactive Linux shell inside LiteBox, a userspace syscall-translation sandbox. Builds from a pinned source revision on first run.",
   "bin": {
     "litebox": "bin/litebox.js"

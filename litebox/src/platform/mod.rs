@@ -541,6 +541,18 @@ pub enum StdioStream {
     Stderr = 2,
 }
 
+/// When a new terminal attribute value takes effect, mirroring POSIX
+/// `tcsetattr(3)`'s `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSetAction {
+    /// Apply immediately.
+    Now,
+    /// Apply after all pending output has been written.
+    Drain,
+    /// Apply after pending output is written, discarding unread input first.
+    Flush,
+}
+
 /// A provider of standard input/output functionality.
 pub trait StdioProvider {
     /// Read from standard input. Returns number of bytes read.
@@ -570,6 +582,27 @@ pub trait StdioProvider {
     /// this a no-op -- the guest-visible termios state is tracked independently regardless.
     fn set_terminal_raw_mode(&self, stream: StdioStream, raw: bool, echo: bool) {
         let _ = (stream, raw, echo);
+    }
+
+    /// Like [`Self::set_terminal_raw_mode`], but additionally honors when the change takes
+    /// effect: [`TerminalSetAction::Drain`] must not apply the change until pending output has
+    /// been written to the terminal, and [`TerminalSetAction::Flush`] must additionally discard
+    /// any input the guest has not yet read -- including bytes already buffered by a background
+    /// [`StdinPump`](crate::platform::stdin_pump::StdinPump), not only the host tty's own input
+    /// queue.
+    ///
+    /// The default implementation ignores `action` and delegates to
+    /// [`Self::set_terminal_raw_mode`], matching every platform's pre-existing `TCSANOW`-only
+    /// behavior until a platform opts into the finer distinction.
+    fn set_terminal_raw_mode_with_action(
+        &self,
+        stream: StdioStream,
+        raw: bool,
+        echo: bool,
+        action: TerminalSetAction,
+    ) {
+        let _ = action;
+        self.set_terminal_raw_mode(stream, raw, echo);
     }
 
     /// Best-effort: returns the real terminal's current `(rows, cols)`, for platforms that can

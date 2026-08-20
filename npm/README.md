@@ -32,29 +32,17 @@ deliberate trade: prebuilt binaries would mean publishing five platform/arch
 combinations that cannot all be tested, and a binary nobody has ever executed is
 not a nicer user experience than a build.
 
-## Known limitations — please read this before trying it
+## Usage modes
 
-**`fork(2)` is not implemented on any platform yet, and this severely limits the
-interactive shell.** An interactive shell must fork for every external command,
-because it has to outlive the child it starts. Without `fork`, it cannot.
-
-| Mode | What works |
-|---|---|
-| `npx @openclew/litebox`<br>(interactive shell) | **Builtins only** — `echo`, `cd`, `pwd`, `test`, `exit`. Every external command (`ls`, `cat`, …) silently produces nothing. Pipes, `$(…)`, background jobs and job control all fail. |
-| `npx @openclew/litebox -- <program>`<br>(direct exec) | **Fully works.** The runner execs the program as the guest's only process, so no fork is needed. This is the mode to use for anything real. |
-
-Concretely:
+The pinned revision implements `fork(2)`, so the interactive shell can launch
+external commands. Direct execution remains useful for scripts and automation
+because the guest program's output goes straight to the host process:
 
 ```sh
-npx @openclew/litebox -- /bin/busybox cat /etc/alpine-release   # -> 3.24.1
-npx @openclew/litebox -- /bin/busybox ls -l /etc                # works
-npx @openclew/litebox        # shell starts, but `ls` inside it does nothing
+npx @openclew/litebox
+npx @openclew/litebox -- /bin/busybox cat /etc/alpine-release
+npx @openclew/litebox -- /bin/busybox ls -l /etc
 ```
-
-So the interactive shell is real — it starts, it's attached to your terminal, and
-builtins work — but it is close to a demonstration until `fork` lands. Direct
-exec is the useful mode today. This is stated plainly because discovering it at a
-silent prompt is worse than reading it here.
 
 ## Platform support
 
@@ -71,11 +59,10 @@ implies:
 "Builds, unverified" means the runner exists and is expected to compile, but no
 guest has been run there by us. It may work. Reports welcome.
 
-Additionally on macOS arm64: XNU zeroes the AArch64 platform register `x18` on
-every return to EL0, and Linux binaries use `x18` freely as a general-purpose
-register. Programs that keep a live value there — Node.js among them — crash.
-Small static binaries such as BusyBox are usually unaffected. See `docs/roadmap.md`
-in the repository.
+On macOS arm64, LiteBox rewrites Linux guests' use of `x18`, allowing Node.js and
+its child processes to run. A separate Node shutdown issue can print `pure virtual
+method called` and discard buffered `console.log` output; use `fs.writeSync` when
+the final output must be observed synchronously.
 
 ## Usage
 

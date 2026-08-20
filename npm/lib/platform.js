@@ -5,7 +5,7 @@
 
 /// The commit this package builds. Pinned rather than tracking a branch so a
 /// given npm version always produces the same binaries.
-const PINNED_REV = '497433858b0f8c52ea335df3576afb3e23e3a2e3';
+const PINNED_REV = '4815891d363351e8bab675736d19b8b7cff16fad';
 
 /// Which runner crate serves a Linux guest on each host OS.
 ///

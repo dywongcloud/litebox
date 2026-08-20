@@ -2543,18 +2543,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            IoctlArg::TCSETS(termios) => {
+            IoctlArg::TCSETS(termios, action) => {
                 let new_termios = termios.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 let lflag = litebox_common_linux::LFlag::from_bits_truncate(new_termios.c_lflag);
                 let raw = !lflag.contains(litebox_common_linux::LFlag::ICANON);
                 let echo = lflag.contains(litebox_common_linux::LFlag::ECHO);
                 *self.global.termios.lock() = new_termios;
                 // Mirror the raw/echo-relevant bits onto the real host terminal so keystrokes
-                // actually arrive byte-at-a-time once the guest disables canonical mode -- a
-                // no-op on platforms/streams without a real backing terminal.
-                self.global
-                    .platform
-                    .set_terminal_raw_mode(stream, raw, echo);
+                // actually arrive byte-at-a-time once the guest disables canonical mode, honoring
+                // TCSETS/TCSETSW/TCSETSF's NOW/DRAIN/FLUSH distinction -- a no-op on
+                // platforms/streams without a real backing terminal.
+                let platform_action = match action {
+                    litebox_common_linux::TerminalSetAction::Now => {
+                        litebox::platform::TerminalSetAction::Now
+                    }
+                    litebox_common_linux::TerminalSetAction::Drain => {
+                        litebox::platform::TerminalSetAction::Drain
+                    }
+                    litebox_common_linux::TerminalSetAction::Flush => {
+                        litebox::platform::TerminalSetAction::Flush
+                    }
+                };
+                self.global.platform.set_terminal_raw_mode_with_action(
+                    stream,
+                    raw,
+                    echo,
+                    platform_action,
+                );
                 Ok(0)
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
