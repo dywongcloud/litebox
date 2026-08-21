@@ -10,6 +10,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -97,12 +98,24 @@ static int test_nonblocking_and_lifecycle(void) {
 
     unsigned char data[3] = {1, 2, 3};
     unsigned char output[3] = {0};
+    // Diagnostic only: a nonzero-length wrong-direction read distinguishes a
+    // zero-length shortcut bug from a missing direction check entirely
+    // (correct: -1/EBADF; empty-pipe nonblocking misdispatch: -1/EAGAIN).
     errno = 0;
-    if (read(fds[1], output, 0) != -1 || errno != EBADF) {
+    ssize_t probe = read(fds[1], output, 1);
+    fprintf(stderr, "lifecycle-probe: read(write_end, 1) = %zd errno=%d\n", probe, errno);
+    errno = 0;
+    ssize_t wrong_read = read(fds[1], output, 0);
+    if (wrong_read != -1 || errno != EBADF) {
+        fprintf(stderr, "lifecycle: read(write_end, 0) = %zd errno=%d (want -1/EBADF=%d)\n",
+                wrong_read, errno, EBADF);
         return 4;
     }
     errno = 0;
-    if (write(fds[0], data, 0) != -1 || errno != EBADF) {
+    ssize_t wrong_write = write(fds[0], data, 0);
+    if (wrong_write != -1 || errno != EBADF) {
+        fprintf(stderr, "lifecycle: write(read_end, 0) = %zd errno=%d (want -1/EBADF=%d)\n",
+                wrong_write, errno, EBADF);
         return 4;
     }
     errno = 0;
