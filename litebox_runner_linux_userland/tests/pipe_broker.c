@@ -152,6 +152,7 @@ static int test_blocking_read_wakeup(void) {
     atomic_init(&args.started, 0);
     atomic_init(&args.completed, 0);
     pthread_t thread;
+    fprintf(stderr, "read_wakeup: creating io thread\n");
     if (pthread_create(&thread, NULL, io_thread, &args) != 0) {
         return 2;
     }
@@ -166,6 +167,7 @@ static int test_blocking_read_wakeup(void) {
         return 3;
     }
     unsigned char value = 42;
+    fprintf(stderr, "read_wakeup: thread started, waking blocked read\n");
     arm_alarm(3);
     ssize_t wake_result = write(fds[1], &value, 1);
     alarm(0);
@@ -177,6 +179,7 @@ static int test_blocking_read_wakeup(void) {
     unsigned char input[65536];
     unsigned char output[65536];
     memset(input, 0x5a, sizeof(input));
+    fprintf(stderr, "read_wakeup: 64 KiB blocking write\n");
     arm_alarm(4);
     ssize_t large_write_result = write(fds[1], input, sizeof(input));
     alarm(0);
@@ -230,6 +233,7 @@ static int test_blocking_write_wakeup(void) {
     atomic_init(&args.started, 0);
     atomic_init(&args.completed, 0);
     pthread_t thread;
+    fprintf(stderr, "write_wakeup: creating io thread\n");
     if (pthread_create(&thread, NULL, io_thread, &args) != 0) {
         return 3;
     }
@@ -282,18 +286,26 @@ int main(void) {
     if (signal(SIGALRM, on_alarm) == SIG_ERR) {
         return 9;
     }
+    fprintf(stderr, "pipe_broker: nonblocking_and_lifecycle\n");
     int result = test_nonblocking_and_lifecycle();
     if (result != 0) {
         return 10 + result;
     }
+    fprintf(stderr, "pipe_broker: blocking_read_wakeup\n");
     result = test_blocking_read_wakeup();
     if (result != 0) {
         return 20 + result;
     }
+    fprintf(stderr, "pipe_broker: blocking_write_wakeup\n");
     result = test_blocking_write_wakeup();
     if (result != 0) {
         return 30 + result;
     }
+    fprintf(stderr, "pipe_broker: closed_peers\n");
     result = test_closed_peers();
-    return result == 0 ? 0 : 40 + result;
+    if (result != 0) {
+        return 40 + result;
+    }
+    fprintf(stderr, "pipe_broker: all sub-tests passed\n");
+    return 0;
 }
