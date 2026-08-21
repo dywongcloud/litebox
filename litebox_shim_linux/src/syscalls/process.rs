@@ -3913,16 +3913,20 @@ mod tests {
                 "nanosleep should have been interrupted"
             );
             let millis = remain.tv_sec.cast_unsigned() * 1000 + remain.tv_nsec / 1_000_000;
-            // Allow tolerance for timer imprecision (especially on Windows).
+            // The upper bound guards against the alarm firing early; the lower
+            // bound only bounds scheduler lateness, which loaded CI runners
+            // stretch past 100 ms (witnessed: 1888 on the CI macOS runner).
             assert!(
-                (1900..=2100).contains(&millis),
+                (1500..=2100).contains(&millis),
                 "expected ~2s remaining, got {millis:?}"
             );
 
             let elapsed_ms = elapsed.as_millis();
             std::println!("Alarm fired after {elapsed_ms} ms");
+            // The lower bound guards against the alarm firing early; the
+            // upper bound only bounds scheduler lateness on loaded runners.
             assert!(
-                (900..=1100).contains(&elapsed_ms),
+                (900..=1500).contains(&elapsed_ms),
                 "expected alarm after ~1000 ms, got {elapsed_ms} ms"
             );
 

@@ -1700,7 +1700,7 @@ mod tests {
     extern crate std;
 
     use alloc::{string::String, vec, vec::Vec};
-    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+    use litebox::platform::RawPointerProvider;
     use litebox_common_windows::loader::{
         ApiSetHashEntry, ApiSetNamespace, ApiSetNamespaceEntry, ApiSetValueEntry,
         MAX_API_SET_NAMESPACE_SIZE, api_set_hash_prefix,
