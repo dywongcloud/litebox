@@ -482,7 +482,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
-    std::process::exit(program.process.wait())
+    let status = program.process.wait();
+    if status >= 256 {
+        // `exit` truncates mod 256, which would alias death-by-signal-N with a
+        // guest's normal `exit(N)`; disambiguate on stderr before it is lost.
+        eprintln!("guest terminated by signal {}", status - 256);
+    }
+    std::process::exit(status)
 }
 
 /// Pin the current thread to a specific CPU core
