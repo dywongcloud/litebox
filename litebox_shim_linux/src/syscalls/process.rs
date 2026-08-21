@@ -159,7 +159,7 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// child does nothing but the classic dup2/close/execve dance), the
     /// forking thread closes this gate: every sibling parks here -- woken out
     /// of any interruptible wait by [`ThreadRemote::interrupt`] and caught at
-    /// the [`CheckForInterrupt::check_for_interrupt`]/
+    /// the `CheckForInterrupt::check_for_interrupt`/
     /// [`Task::prepare_to_run_guest`] choke points before it can touch guest
     /// memory again -- until the parent's turn resumes and the gate reopens.
     ///
@@ -673,7 +673,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
     /// The fast path -- gate open, the only case any thread sees outside a
     /// concurrent multithreaded `fork` -- is a single atomic load. A parked
     /// thread blocks on the raw gate word (never an interruptible wait: this
-    /// is called from [`CheckForInterrupt::check_for_interrupt`], whose
+    /// is called from `CheckForInterrupt::check_for_interrupt`, whose
     /// contract forbids interruptible waiting) and resumes when
     /// [`ForkGateGuard`] reopens the gate. An exiting thread never parks --
     /// it proceeds to detach, and `detach_thread` wakes the gate so the
@@ -813,7 +813,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// code back into the shim via the platform interrupt), then block on the
     /// gate word until the parked count accounts for every sibling. A sibling
     /// mid-syscall parks at the next
-    /// [`CheckForInterrupt::check_for_interrupt`] or
+    /// `CheckForInterrupt::check_for_interrupt` or
     /// [`Task::prepare_to_run_guest`] point -- in particular, one mid-copy
     /// into guest memory finishes that copy *before* parking, so the snapshot
     /// taken after this returns cannot lose an in-flight write. Siblings that
@@ -4784,10 +4784,6 @@ mod tests {
         assert_eq!(
             rusage.ru_maxrss, 0,
             "unmeasured fields are zeroed, not sentinel garbage"
-        );
-        assert_eq!(
-            rusage._reserved, [0i64; 16],
-            "the musl reserved tail is zeroed too, not left as sentinel garbage"
         );
     }
 

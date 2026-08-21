@@ -99,7 +99,7 @@ unsafe extern "C" {
 /// because the platform provably stops working without it:
 ///
 /// * `sysctl-read` restricted to the `hw.optional.` prefix.
-///   [`crate::MacOsUserland::get_hwcap`] reads ~30 `hw.optional.*` sysctls to
+///   `MacOsUserland::get_hwcap` reads ~30 `hw.optional.*` sysctls to
 ///   synthesize the guest's `AT_HWCAP`/`AT_HWCAP2`, and it does so from inside
 ///   `load_program`, i.e. *after* this profile is installed. The prefix filter
 ///   is what keeps this from being a blanket `(allow sysctl-read)`: `kern.*`,

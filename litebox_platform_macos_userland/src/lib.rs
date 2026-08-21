@@ -118,7 +118,7 @@ pub struct MacOsUserland {
     /// [`Self::new`]. See [`litebox::platform::StdinPump`].
     stdin_pump: litebox::platform::StdinPump,
     /// Doorbell the stdin-pump background thread notifies after every push/EOF, so
-    /// [`StdioProvider::read_from_stdin`]'s blocking path can sleep instead of busy-polling.
+    /// `StdioProvider::read_from_stdin`'s blocking path can sleep instead of busy-polling.
     stdin_doorbell: (std::sync::Mutex<()>, Condvar),
     /// Serializes real host writes to stdout, so concurrent guest threads' `write()` calls to the
     /// same stream don't interleave mid-write.
@@ -481,7 +481,7 @@ const GUEST_ADDR_MAX: usize = 0x0000_4000_0000_0000;
 ///
 /// For a [`FixedAddressBehavior::Hint`] request, `suggested_range.start` is
 /// offered to `mmap` as an advisory address -- mirroring what
-/// [`MacOsUserland::allocate_pages`]'s non-JIT `Hint` branch does -- so Darwin
+/// `MacOsUserland::allocate_pages`'s non-JIT `Hint` branch does -- so Darwin
 /// gets a real chance to place the mapping there directly instead of this
 /// function relying solely on the correction below. `Replace`/`NoReplace`
 /// instead always request a kernel-chosen address here: both finish with an
@@ -1550,7 +1550,7 @@ impl litebox::platform::RawPointerProvider for MacOsUserland {
 
 /// Spawns the single background host thread that blockingly reads the real stdin and feeds
 /// [`MacOsUserland::stdin_pump`], notifying [`MacOsUserland::stdin_doorbell`] after every push or
-/// EOF so [`StdioProvider::read_from_stdin`]'s blocking path wakes promptly instead of polling.
+/// EOF so `StdioProvider::read_from_stdin`'s blocking path wakes promptly instead of polling.
 ///
 /// Spawned unconditionally in [`MacOsUserland::new`] -- real host stdin (whether an interactive
 /// terminal, a pipe, or a redirected file) always needs pumping so both blocking reads and
@@ -1600,7 +1600,7 @@ fn spawn_stdin_pump_thread(platform: &'static MacOsUserland) {
 }
 
 impl MacOsUserland {
-    /// Wakes any thread parked in [`StdioProvider::read_from_stdin`]'s blocking wait.
+    /// Wakes any thread parked in `StdioProvider::read_from_stdin`'s blocking wait.
     fn notify_stdin_doorbell(&self) {
         let (lock, cvar) = &self.stdin_doorbell;
         drop(lock.lock().unwrap());
@@ -1798,7 +1798,7 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
 /// `true` selects `AT_HWCAP2`; `false` selects `AT_HWCAP`. Only features that (a) the CPU
 /// genuinely implements and (b) do not change how guest code is expected to run (unlike, say,
 /// pointer authentication or branch-target identification, which could interact with this
-/// platform's own guest-entry control flow) are included -- see [`SystemInfoProvider::get_hwcap`]'s
+/// platform's own guest-entry control flow) are included -- see `SystemInfoProvider::get_hwcap`'s
 /// doc comment for why any *included* bit is always safe to report.
 const HWCAP_SYSCTLS: &[(&str, u8, bool)] = &[
     ("hw.optional.floatingpoint", 0, false),     // HWCAP_FP
@@ -2119,7 +2119,7 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
 /// The interrupt signal has two independent jobs. Every delivery, regardless
 /// of what follows, already accomplishes the older one just by arriving: EINTR
 /// -ing a blocking host call (`SA_RESTART` is deliberately absent below), the
-/// mechanism [`TimerProvider::create_timer`]'s doc comment describes. The
+/// mechanism `TimerProvider::create_timer`'s doc comment describes. The
 /// newer one is routing to [`litebox::shim::EnterShim::interrupt`] when the
 /// signalled thread is genuinely executing guest code, mirroring
 /// `litebox_platform_linux_userland`'s `interrupt_signal_handler` (a TLS
@@ -2132,31 +2132,31 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
 /// Four cases, matching the Linux reference's own four-way split
 /// (`litebox_platform_linux_userland::interrupt_signal_handler`'s doc
 /// comment), reached in the same priority order that keeps
-/// [`guest::GUEST_OWNS_CPU`]'s own ordering safe: the flag first, then a
+/// `guest::GUEST_OWNS_CPU`'s own ordering safe: the flag first, then a
 /// PC-range check, so a captured `mcontext` is only ever handed to the guest
 /// when both agree.
 ///
-/// 1. **Not in guest** ([`guest::GUEST_OWNS_CPU`] false): includes ordinary
+/// 1. **Not in guest** (`guest::GUEST_OWNS_CPU` false): includes ordinary
 ///    host code between guest entries, *and* the tail of
-///    [`guest::syscall_callback`]/[`guest::sigreturn_trampoline`] once their
+///    `guest::syscall_callback`/`guest::sigreturn_trampoline` once their
 ///    own first couple of instructions have already cleared the flag. Record
-///    [`guest::PENDING_INTERRUPT`] for [`guest::enter_guest_asm`] to re-check
+///    `guest::PENDING_INTERRUPT` for `guest::enter_guest_asm` to re-check
 ///    the next time it is about to hand control to the guest -- otherwise an
 ///    interrupt racing exactly this narrow window (the shim already decided
 ///    to signal a thread it saw as "running in guest," but the platform has
 ///    not yet set the flag for *this* entry) would be silently lost until the
 ///    guest's next syscall, defeating the entire point of interrupting a
 ///    compute-bound guest with no syscalls at all.
-/// 2. **In guest, but inside [`guest::syscall_callback`]'s or
+/// 2. **In guest, but inside `guest::syscall_callback`'s or
 ///    [`guest::sigreturn_trampoline`]'s own brief ownership-clearing prologue**
-///    (their address ranges, checked because [`guest::GUEST_OWNS_CPU`] has not
+///    (their address ranges, checked because `guest::GUEST_OWNS_CPU` has not
 ///    been cleared yet at this exact PC -- see those functions' own doc
 ///    comments): the guest is about to reach the shim on its own via the
 ///    ordinary syscall/sigreturn path within a couple of instructions.
 ///    [`litebox::shim::EnterShim::interrupt`]'s own doc comment says this is
 ///    fine ("the platform may just call the corresponding handler instead");
 ///    same handling as case 1 -- record and let it proceed.
-/// 3. **In guest, inside [`guest::enter_guest_asm`]'s own restore range**
+/// 3. **In guest, inside `guest::enter_guest_asm`'s own restore range**
 ///    (mid-restoring a [`litebox_common_linux::PtRegs`] that is still fully
 ///    authoritative -- nothing has consumed it yet): abandon this entry
 ///    attempt without capturing anything, since the existing `*ctx` already
@@ -2164,7 +2164,7 @@ unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
 /// 4. **Genuinely executing guest code** (flag true, PC outside every above
 ///    range): capture the interrupted `mcontext`'s general and vector
 ///    registers the same way [`guest::prepare_exception_delivery`] does for a
-///    hardware fault, and redirect to [`guest::interrupt_callback`].
+///    hardware fault, and redirect to `guest::interrupt_callback`.
 ///
 /// # Safety
 ///
@@ -2468,7 +2468,7 @@ struct ThreadHandleInner {
 }
 
 /// A handle to a LiteBox-managed thread, used to interrupt it and to record a
-/// pending signal on it from another thread (see [`ThreadHandle::record_pending_signal`]).
+/// pending signal on it from another thread (see `ThreadHandle::record_pending_signal`).
 pub struct ThreadHandle(Arc<ThreadHandleInner>);
 
 impl Clone for ThreadHandle {
@@ -2760,7 +2760,7 @@ fn guest_tp_tsd_key() -> Option<libc::pthread_key_t> {
 
 /// The byte offset a `Host::MacOs` gate must add to `TPIDRRO_EL0` to reach this
 /// process's guest thread-pointer slot, or `None` before
-/// [`reserve_guest_tpidr_tsd_slot`] has run.
+/// `reserve_guest_tpidr_tsd_slot` has run.
 ///
 /// This is the number a loader writes into the trampoline's guest-TP header slot
 /// so the ahead-of-time gates address the key this process actually reserved,

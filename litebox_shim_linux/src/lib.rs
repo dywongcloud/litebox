@@ -291,7 +291,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// Create a default layered file system with the given in-memory layer and tar data.
     ///
     /// Also mounts a `/proc` backend and stashes a handle to it on `self`; [`Self::build`] moves
-    /// that handle into the built shim's [`GlobalState`] so the guest task's identity can be
+    /// that handle into the built shim's `GlobalState` so the guest task's identity can be
     /// published into `/proc/<pid>/*` once it's known. Calling this more than once replaces the
     /// stashed handle with the most recent call's -- only the `/proc` mounted by the filesystem
     /// actually passed to `LinuxShim::load_program` should be kept live.

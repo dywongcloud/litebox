@@ -588,7 +588,7 @@ pub trait StdioProvider {
     /// effect: [`TerminalSetAction::Drain`] must not apply the change until pending output has
     /// been written to the terminal, and [`TerminalSetAction::Flush`] must additionally discard
     /// any input the guest has not yet read -- including bytes already buffered by a background
-    /// [`StdinPump`](crate::platform::stdin_pump::StdinPump), not only the host tty's own input
+    /// [`StdinPump`], not only the host tty's own input
     /// queue.
     ///
     /// The default implementation ignores `action` and delegates to

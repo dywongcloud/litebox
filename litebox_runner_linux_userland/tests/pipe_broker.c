@@ -18,6 +18,21 @@
 #define OPERATION_TIMEOUT_SECONDS 2
 #define THREAD_JOIN_TIMEOUT_SECONDS 2
 
+// Which alarm()-guarded window is armed; a SIGALRM that fires inside window N
+// exits 60+N so the harness log names the hung operation instead of showing a
+// bare death-by-SIGALRM (exit 14).
+static volatile sig_atomic_t alarm_window;
+
+static void on_alarm(int sig) {
+    (void)sig;
+    _exit(60 + alarm_window);
+}
+
+static void arm_alarm(int window) {
+    alarm_window = window;
+    arm_alarm(1);
+}
+
 struct io_thread_args {
     int fd;
     unsigned char value;
@@ -127,7 +142,7 @@ static int test_blocking_read_wakeup(void) {
     if (pthread_create(&thread, NULL, io_thread, &args) != 0) {
         return 2;
     }
-    alarm(OPERATION_TIMEOUT_SECONDS);
+    arm_alarm(2);
     while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
         sched_yield();
     }
@@ -138,7 +153,7 @@ static int test_blocking_read_wakeup(void) {
         return 3;
     }
     unsigned char value = 42;
-    alarm(OPERATION_TIMEOUT_SECONDS);
+    arm_alarm(3);
     ssize_t wake_result = write(fds[1], &value, 1);
     alarm(0);
     int join_result = join_thread(thread, fds[1]);
@@ -149,14 +164,14 @@ static int test_blocking_read_wakeup(void) {
     unsigned char input[65536];
     unsigned char output[65536];
     memset(input, 0x5a, sizeof(input));
-    alarm(OPERATION_TIMEOUT_SECONDS);
+    arm_alarm(4);
     ssize_t large_write_result = write(fds[1], input, sizeof(input));
     alarm(0);
     if (large_write_result != sizeof(input)) {
         return 4;
     }
     size_t read_size = 0;
-    alarm(OPERATION_TIMEOUT_SECONDS);
+    arm_alarm(5);
     while (read_size < sizeof(output)) {
         ssize_t size =
             read(fds[0], output + read_size, sizeof(output) - read_size);
@@ -180,7 +195,7 @@ static int test_blocking_write_wakeup(void) {
     unsigned char data[4096] = {0};
     size_t total_written = 0;
     ssize_t write_result;
-    alarm(OPERATION_TIMEOUT_SECONDS);
+    arm_alarm(6);
     while ((write_result = write(fds[1], data, sizeof(data))) == sizeof(data)) {
         total_written += sizeof(data);
         if (total_written > 65536) {
@@ -205,7 +220,7 @@ static int test_blocking_write_wakeup(void) {
     if (pthread_create(&thread, NULL, io_thread, &args) != 0) {
         return 3;
     }
-    alarm(OPERATION_TIMEOUT_SECONDS);
+    arm_alarm(7);
     while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
         sched_yield();
     }
@@ -216,7 +231,7 @@ static int test_blocking_write_wakeup(void) {
         return 4;
     }
     unsigned char value;
-    alarm(OPERATION_TIMEOUT_SECONDS);
+    arm_alarm(8);
     ssize_t wake_result = read(fds[0], &value, 1);
     alarm(0);
     int join_result = join_thread(thread, fds[0]);
@@ -251,6 +266,9 @@ static int test_closed_peers(void) {
 }
 
 int main(void) {
+    if (signal(SIGALRM, on_alarm) == SIG_ERR) {
+        return 9;
+    }
     int result = test_nonblocking_and_lifecycle();
     if (result != 0) {
         return 10 + result;

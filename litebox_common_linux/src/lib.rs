@@ -1196,6 +1196,13 @@ pub struct TimeVal {
 /// as the real ABI struct. Only `ru_utime`/`ru_stime` currently carry a real, host-measured value
 /// (see `Task::sys_wait4`); every other field is explicitly zeroed rather than left as
 /// guest-visible uninitialized memory.
+///
+/// Exactly the 144-byte kernel ABI, deliberately WITHOUT musl's trailing
+/// `__reserved[16]`: musl reserves that space in its own definition, but the
+/// kernel never writes it, and glibc's `struct rusage` is only these 144
+/// bytes -- copying a 272-byte musl-shaped struct into a glibc guest's stack
+/// buffer overruns it by 128 bytes (witnessed: iperf3's `cpu_util()` canary
+/// trip, "*** stack smashing detected ***", on the Linux CI runner).
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
 pub struct Rusage {
@@ -1215,11 +1222,6 @@ pub struct Rusage {
     pub ru_nsignals: i64,
     pub ru_nvcsw: i64,
     pub ru_nivcsw: i64,
-    /// Past the POSIX-visible fields; matches musl's LP64 `struct rusage`, which reserves this
-    /// space. Kept and zeroed explicitly (rather than omitted) so a copy of this struct's full
-    /// size never leaves any byte of the guest's buffer uninitialized.
-    #[allow(clippy::pub_underscore_fields)]
-    pub _reserved: [i64; 16],
 }
 
 #[repr(C)]
