@@ -719,6 +719,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         count: usize,
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
+        // A zero-length write must still dispatch: Linux checks fd validity
+        // and writability before it looks at count, so write(read_end, buf, 0)
+        // is EBADF, not a silent 0 (witnessed live by pipe_broker's lifecycle
+        // sub-test under the broker runner). The descriptor layers already
+        // handle empty buffers correctly past that check.
+        if count == 0 {
+            return self.sys_write(fd, &[], offset);
+        }
         let mut written_total = 0;
         while written_total < count {
             let to_write = (count - written_total).min(MAX_KERNEL_BUF_SIZE);
