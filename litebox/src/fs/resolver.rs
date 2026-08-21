@@ -276,7 +276,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         #[cfg(debug_assertions)] absolute_components: &[&str],
         outcome: &WalkOutcome<WalkingDirHandle<'_>>,
     ) -> Result<(), PathError> {
-        for (idx, walked) in outcome.components.iter().enumerate() {
+        for (_idx, walked) in outcome.components.iter().enumerate() {
             match &walked.permissions {
                 PermissionCheck::ByBackend => {}
                 PermissionCheck::ByResolver(permissions) => {
@@ -285,7 +285,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                             #[cfg(debug_assertions)]
                             dir: {
                                 let mut path = String::new();
-                                for component in &absolute_components[..=idx] {
+                                #[cfg(debug_assertions)]
+                                for component in &absolute_components[..=_idx] {
                                     path.push('/');
                                     path.push_str(component);
                                 }
