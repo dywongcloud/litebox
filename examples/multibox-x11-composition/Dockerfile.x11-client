@@ -1,0 +1,21 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    x11-apps \
+    x11-utils \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create X11 socket directory (for local connections, though we use TCP)
+RUN mkdir -p /tmp/.X11-unix
+
+# X11 client will connect to remote server via TCP
+# DISPLAY format for TCP: hostname:display.screen
+# e.g., DISPLAY=10.0.1.2:0 means host 10.0.1.2, display :0, screen 0
+# X11 will connect to 10.0.1.2:6000 (6000 + display number)
+
+ENV DISPLAY=:0
+
+# Use xeyes as a simple test client
+# It will attempt to connect to the X11 server specified by DISPLAY
+CMD ["sh", "-c", "echo 'X11 client starting, connecting to remote display: '$DISPLAY && xeyes"]
