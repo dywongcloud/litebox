@@ -701,6 +701,7 @@ mod tests {
 
     type TestPlatform = crate::tests::TestPlatform;
 
+    #[cfg(debug_assertions)]
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
         let _ = crate::tests::test_platform();
         <TestPlatform as ThreadProvider>::run_test_thread(f)

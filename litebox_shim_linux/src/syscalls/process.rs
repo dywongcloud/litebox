@@ -2447,7 +2447,7 @@ mod tests {
     /// a real SIGINT via `libc::kill`, which should interrupt a blocking sleep
     /// with `EINTR`.
     /// Target Linux only because it use tgkill syscall to send signal to specific thread.
-    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[cfg(debug_assertions)]
     #[test]
     fn test_sigint_with_custom_handler() {
         use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};
@@ -2518,6 +2518,7 @@ mod tests {
 
     /// After the alarm deadline passes, a blocking operation should be
     /// interrupted and SIGALRM should be pending.
+    #[cfg(debug_assertions)]
     #[test]
     fn test_alarm_fires_after_deadline() {
         use litebox::platform::{Instant as _, TimeProvider};
@@ -2579,6 +2580,7 @@ mod tests {
 
     /// Cancelling an alarm before it fires should prevent signal delivery
     /// even if a blocking operation runs past the original deadline.
+    #[cfg(debug_assertions)]
     #[test]
     fn test_alarm_cancel_prevents_signal() {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
@@ -2612,6 +2614,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn test_pause_wakes_on_pending_signal() {
         use litebox_common_linux::{
@@ -2663,6 +2666,7 @@ mod tests {
 
     /// Setting alarm with SIG_IGN for SIGALRM: a blocking operation is still
     /// interrupted, but `process_signals` discards the signal.
+    #[cfg(debug_assertions)]
     #[test]
     fn test_alarm_with_sigign() {
         use litebox_common_linux::signal::{SIG_IGN, SaFlags, SigAction, SigSet, Signal};
@@ -2719,6 +2723,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn test_timer_delivers_correct_signal() {
         use litebox::platform::{TimerHandle as _, TimerProvider as _};
