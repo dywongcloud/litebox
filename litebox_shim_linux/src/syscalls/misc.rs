@@ -55,7 +55,7 @@ const fn to_fixed_size_array<const N: usize>(s: &str) -> [u8; N] {
     arr
 }
 const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
-    sysname: to_fixed_size_array::<65>("LiteBox"),
+    sysname: to_fixed_size_array::<65>("Linux"),
     nodename: to_fixed_size_array::<65>("litebox"),
     release: to_fixed_size_array::<65>("5.11.0"), // libc seems to expect this to be not too old
     version: to_fixed_size_array::<65>("5.11.0"),
