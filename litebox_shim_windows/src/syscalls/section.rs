@@ -1188,6 +1188,7 @@ mod tests {
 
     use core::mem::{size_of, size_of_val};
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
     use litebox_common_windows::nt_status::NtStatus;
 
