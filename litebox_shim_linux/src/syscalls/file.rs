@@ -371,6 +371,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         use litebox::fs::FileType;
         use litebox::fs::errors::{FileStatusError, PathError};
 
+        let rewritten;
+        let path = if let Some(stripped) = path.strip_prefix("/proc/self/fd/") {
+            let (fd, rest) = stripped
+                .split_once('/')
+                .map_or((stripped, None), |(fd, rest)| (fd, Some(rest)));
+            match Self::proc_self_fd_symlink_target(fd) {
+                Some(target) => {
+                    rewritten = match rest {
+                        Some(rest) => alloc::format!("{target}/{rest}"),
+                        None => target.to_string(),
+                    };
+                    rewritten.as_str()
+                }
+                None => path,
+            }
+        } else {
+            path
+        };
+
         let into_components = |s: &str| -> VecDeque<String> {
             s.split('/')
                 .filter(|component| !component.is_empty() && *component != ".")
@@ -1843,6 +1862,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    fn proc_self_fd_symlink_target(fd_component: &str) -> Option<&'static str> {
+        match fd_component {
+            "0" => Some("/dev/stdin"),
+            "1" => Some("/dev/stdout"),
+            "2" => Some("/dev/stderr"),
+            _ => None,
+        }
+    }
+
+    fn proc_self_fd_link_status(
+        &self,
+        path: &str,
+    ) -> Result<Option<litebox::fs::FileStatus>, Errno> {
+        let Some(target) = path
+            .strip_prefix("/proc/self/fd/")
+            .and_then(Self::proc_self_fd_symlink_target)
+        else {
+            return Ok(None);
+        };
+        let mut status = self.files.borrow().fs.file_status(target)?;
+        status.file_type = litebox::fs::FileType::SymLink;
+        status.mode = litebox::fs::Mode::RWXU;
+        status.size = 0;
+        Ok(Some(status))
+    }
+
     /// Read the target of a symbolic link
     ///
     /// The caller must pass an absolute path.
@@ -1851,15 +1896,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// - `/proc/self/fd/<fd>`
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
-            let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            match fd {
-                0 => return Ok("/dev/stdin".to_string()),
-                1 => return Ok("/dev/stdout".to_string()),
-                2 => return Ok("/dev/stderr".to_string()),
-                // Other `/proc/self/fd/N` are not modeled as symlinks yet; fall
-                // through to the real filesystem, which answers ENOENT/EINVAL
-                // rather than panicking (full /proc/self/fd is a separate task).
-                _ => {}
+            stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
+            if let Some(target) = Self::proc_self_fd_symlink_target(stripped) {
+                return Ok(target.to_string());
             }
         }
 
@@ -2059,7 +2098,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             normalized_path
         };
-        let status = self.files.borrow().fs.file_status(path)?;
+        let status = match self.proc_self_fd_link_status(&path)? {
+            Some(status) => status,
+            None => self.files.borrow().fs.file_status(path)?,
+        };
         Ok(T::from(status))
     }
 
