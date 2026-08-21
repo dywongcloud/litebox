@@ -71,7 +71,17 @@ fn ratchet_globals() -> Result<()> {
             // `static`, so it cannot be expressed any other way; its own armed
             // flag and counter are deliberately struct fields rather than
             // further `static`s so the scaffolding costs exactly one.
-            ("litebox_platform_macos_userland/", 9),
+            //
+            // The tenth is `JIT_FAULT` (661ecea's MAP_JIT W^X fault-toggling
+            // and CTR_EL0 emulation): JIT region bounds, the overflow
+            // warn-once flag, and the synthesized CTR_EL0, all read from
+            // inside the SIGSEGV/SIGBUS/SIGILL handler, which receives no
+            // user-data pointer and may not lock, allocate, or touch TLS --
+            // so the state must be static-reachable -- and is process-wide
+            // (V8 threads execute code written by other threads), so
+            // per-thread state is wrong. Its three fields are struct fields
+            // rather than further `static`s so the scaffolding costs one.
+            ("litebox_platform_macos_userland/", 10),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
             ("litebox_runner_lvbs/", 5),

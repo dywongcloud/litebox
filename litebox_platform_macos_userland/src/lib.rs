@@ -340,14 +340,33 @@ fn needs_jit(permissions: MemoryRegionPermissions) -> bool {
 /// logged once and simply means faults in the overflow region are delivered
 /// to the guest as before (correct, just un-toggled).
 const JIT_REGISTRY_CAP: usize = 64;
-static JIT_REGIONS: [(AtomicUsize, AtomicUsize); JIT_REGISTRY_CAP] =
-    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; JIT_REGISTRY_CAP];
-static JIT_REGISTRY_OVERFLOWED: AtomicBool = AtomicBool::new(false);
+
+/// Everything [`fault_handler`] consults to service a JIT-related or
+/// `CTR_EL0` trap, folded into one static: a POSIX signal handler receives no
+/// user-data pointer and may not lock, allocate, or touch TLS, so this state
+/// must be static-reachable, and it is process-wide (V8 threads execute code
+/// other threads wrote), so per-thread `GuestThreadState` is the wrong home.
+/// Fields rather than separate `static`s, so the scaffolding costs exactly
+/// one global (the `PROBE_ALLOCATOR` accounting; see `dev_tests`' ratchet).
+struct JitFaultGlobals {
+    /// Live `MAP_JIT` `(start, end)` bounds; `start == 0` marks a free slot.
+    regions: [(AtomicUsize, AtomicUsize); JIT_REGISTRY_CAP],
+    /// Warn-once flag for registry overflow.
+    registry_overflowed: AtomicBool,
+    /// The synthetic `CTR_EL0` served to a guest `mrs Xt, CTR_EL0`; computed
+    /// once by [`init_synthetic_ctr_el0`].
+    synthetic_ctr_el0: AtomicU64,
+}
+static JIT_FAULT: JitFaultGlobals = JitFaultGlobals {
+    regions: [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; JIT_REGISTRY_CAP],
+    registry_overflowed: AtomicBool::new(false),
+    synthetic_ctr_el0: AtomicU64::new(0),
+};
 
 /// Records `[start, start+len)` as a `MAP_JIT` region for the fault handler.
 fn register_jit_region(start: usize, len: usize) {
     let end = start + len;
-    for (s, e) in &JIT_REGIONS {
+    for (s, e) in &JIT_FAULT.regions {
         // Claim a free slot (start == 0) atomically. `Relaxed` is enough: the
         // only reader is this process's own signal handler, always on a thread
         // that is strictly later than the `mmap`/`mprotect` that produced the
@@ -360,7 +379,7 @@ fn register_jit_region(start: usize, len: usize) {
             return;
         }
     }
-    if !JIT_REGISTRY_OVERFLOWED.swap(true, Ordering::Relaxed) {
+    if !JIT_FAULT.registry_overflowed.swap(true, Ordering::Relaxed) {
         litebox_util_log::warn!(
             cap:? = JIT_REGISTRY_CAP;
             "MAP_JIT region registry full; further JIT regions will not get \
@@ -373,7 +392,7 @@ fn register_jit_region(start: usize, len: usize) {
 /// Whether `addr` falls in any registered `MAP_JIT` region. Async-signal-safe:
 /// plain atomic loads, no lock or allocation.
 fn addr_in_jit_region(addr: usize) -> bool {
-    for (s, e) in &JIT_REGIONS {
+    for (s, e) in &JIT_FAULT.regions {
         let start = s.load(Ordering::Acquire);
         if start != 0 && addr >= start && addr < e.load(Ordering::Acquire) {
             return true;
@@ -388,7 +407,7 @@ fn addr_in_jit_region(addr: usize) -> bool {
 /// `deallocate_pages`.
 fn unregister_jit_region(start: usize, len: usize) {
     let end = start + len;
-    for (s, e) in &JIT_REGIONS {
+    for (s, e) in &JIT_FAULT.regions {
         let rs = s.load(Ordering::Acquire);
         if rs != 0 && rs < end && start < e.load(Ordering::Acquire) {
             // Free the slot. `start`-first: a concurrent reader either sees the
@@ -1901,7 +1920,7 @@ fn decode_mrs_ctr_el0_matches_only_the_real_instruction() {
 #[test]
 fn synthetic_ctr_el0_is_well_formed_and_never_understates_the_line() {
     init_synthetic_ctr_el0();
-    let ctr = SYNTHETIC_CTR_EL0.load(Ordering::Relaxed);
+    let ctr = JIT_FAULT.synthetic_ctr_el0.load(Ordering::Relaxed);
     assert_ne!(ctr, 0, "must be initialized");
     assert_eq!(ctr >> 31 & 1, 1, "bit 31 is RES1");
     let imin_words = 1u64 << (ctr & 0xf);
@@ -2973,8 +2992,6 @@ pub(crate) fn install_fault_handlers() {
 /// register either (same EL, same restriction), so the value is synthesized
 /// from the cache-line size the kernel *does* expose via `sysctl`, and
 /// [`fault_handler`] emulates the read. See `fault_handler`'s own comment.
-static SYNTHETIC_CTR_EL0: AtomicU64 = AtomicU64::new(0);
-
 fn init_synthetic_ctr_el0() {
     // `hw.cachelinesize` is the coherency granule in bytes. `CTR_EL0` encodes
     // I/D minimum line sizes as log2 of the number of 4-byte *words*.
@@ -2989,7 +3006,7 @@ fn init_synthetic_ctr_el0() {
     // RES1. `L1Ip` [15:14] = 0b11 (PIPT), the Apple Silicon value, so a reader
     // that inspects it draws no wrong conclusion about aliasing.
     let ctr = (1u64 << 31) | (log2_words << 16) | (0b11u64 << 14) | log2_words;
-    SYNTHETIC_CTR_EL0.store(ctr, Ordering::Relaxed);
+    JIT_FAULT.synthetic_ctr_el0.store(ctr, Ordering::Relaxed);
 }
 
 /// Decodes `insn` as `mrs Xt, CTR_EL0` and returns the destination register
@@ -3084,7 +3101,7 @@ unsafe extern "C" fn fault_handler(
         // instruction-cache maintenance loop, so every AArch64 JIT (V8) and
         // libgcc's own cache-sync path hits it right after writing code, and a
         // real guest cannot proceed without an answer. Supply the synthesized
-        // value (see `SYNTHETIC_CTR_EL0`) and step over the instruction.
+        // value (see `JitFaultGlobals::synthetic_ctr_el0`) and step over the instruction.
         //
         // Only for the exception classes where a validly-fetched instruction
         // trapped: `0x00` (unknown -- how Darwin surfaces an EL0 system-register
@@ -3107,7 +3124,7 @@ unsafe extern "C" fn fault_handler(
             0 // decodes to `None`
         };
         if let Some(rt) = decode_mrs_ctr_el0(insn) {
-            let ctr = SYNTHETIC_CTR_EL0.load(Ordering::Relaxed);
+            let ctr = JIT_FAULT.synthetic_ctr_el0.load(Ordering::Relaxed);
             // `x0`-`x28` live in the `x` array; `x29`/`x30` are the separate
             // `fp`/`lr` fields; `x31` in this position is the zero register
             // (the write is discarded).

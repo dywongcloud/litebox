@@ -1113,9 +1113,7 @@ where
                 // `local_endpoint`, so reading it here returns `0.0.0.0:0` and
                 // a guest's `getsockname` (Node's `server.address().port`)
                 // sees port 0. The bound listen endpoint recorded at `bind`
-                // time is the authoritative answer for a server socket; use
-                // it, and fall back to the plain bound `local_port` for a
-                // socket that was bound but not yet listened.
+                // time is the authoritative answer for a server socket.
                 let tcp = socket_handle.tcp();
                 if let Some(server) = tcp.server_socket.as_ref() {
                     let ep = &server.ip_listen_endpoint;
@@ -1124,6 +1122,20 @@ where
                         None => Ipv4Addr::UNSPECIFIED,
                     };
                     return Ok(SocketAddr::V4(SocketAddrV4::new(addr, ep.port)));
+                }
+                // An accepted or connected socket also carries a `local_port`
+                // (copied at `accept` time), but its authoritative identity is
+                // the established endpoint smoltcp chose: getsockname on an
+                // accepted connection must report the concrete local address
+                // (e.g. 10.0.0.2:8080), not 0.0.0.0. Only fall back to the
+                // bare bound port when no endpoint is established.
+                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
+                if let Some(endpoint) = socket.local_endpoint() {
+                    match endpoint.addr {
+                        smoltcp::wire::IpAddress::Ipv4(ipv4) => {
+                            return Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)));
+                        }
+                    }
                 }
                 if let Some(local_port) = tcp.local_port.as_ref() {
                     let port = local_port.port();
@@ -1134,15 +1146,7 @@ where
                         )));
                     }
                 }
-                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
-                match socket.local_endpoint() {
-                    Some(endpoint) => match endpoint.addr {
-                        smoltcp::wire::IpAddress::Ipv4(ipv4) => {
-                            Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
-                        }
-                    },
-                    None => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
-                }
+                Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
             }
             Protocol::Udp => {
                 let socket: &udp::Socket = self.socket_set.get(socket_handle.handle);

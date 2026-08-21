@@ -1419,7 +1419,7 @@ mod tests {
     // Only `test_collision_with_global_allocator` needs these, and it is gated to
     // the hosts whose allocator layout it knows.
     use litebox::platform::PageManagementProvider;
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox_common_linux::MRemapFlags;
     use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
@@ -1641,7 +1641,12 @@ mod tests {
         task.sys_munmap(addr2, PAGE_SIZE).unwrap();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    // Not on macOS: `MacOsUserland::GUEST_ADDR_MIN` is 1 TiB (8a65efa), so a
+    // Darwin host allocation (~4-39 GiB) can never satisfy the in-guest-range
+    // mmap this loop searches for -- the collision under test is impossible by
+    // construction and the search spins forever (witnessed as the CI macOS
+    // job's 420 s slow-timeout SIGKILL).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_collision_with_global_allocator() {
         let _guard = crate::syscalls::tests::address_space_guard();

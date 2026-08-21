@@ -37,10 +37,14 @@ fn find_objdump(candidates: &[&str]) -> Option<String> {
     candidates
         .iter()
         .find(|cmd| {
-            Command::new(cmd)
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success())
+            // The committed snapshots are GNU-objdump renderings; LLVM's
+            // objdump (macOS /usr/bin/objdump, llvm-objdump) formats operands,
+            // byte grouping, and the file header differently (including the
+            // nondeterministic temp path), so anything non-GNU can only
+            // produce format noise. Skip rather than fail on such hosts.
+            Command::new(cmd).arg("--version").output().is_ok_and(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GNU objdump")
+            })
         })
         .map(|cmd| (*cmd).to_owned())
 }
@@ -142,7 +146,14 @@ fn run_snapshot_test(objdump_cmd: &str, input: &[u8], snapshot: &str) {
 
 #[test]
 fn snapshot_test_hello_world_x86_64() {
-    run_snapshot_test("objdump", HELLO_INPUT_64, "hello-diff");
+    // Skip (rather than fail) where no GNU objdump exists: macOS'
+    // /usr/bin/objdump is LLVM and renders GNU-format-incompatible output
+    // (see `find_objdump`).
+    let Some(objdump_cmd) = find_objdump(&["x86_64-linux-gnu-objdump", "objdump"]) else {
+        eprintln!("skipping snapshot_test_hello_world_x86_64: no GNU objdump (install binutils)");
+        return;
+    };
+    run_snapshot_test(&objdump_cmd, HELLO_INPUT_64, "hello-diff");
 }
 
 #[test]
@@ -154,13 +165,14 @@ fn snapshot_test_hello_world_aarch64() {
     // objdump only disassembles the original `.text`, so the diff captures the
     // call-site rewriting, not the appended trampoline's gate internals.
     //
-    // The host objdump usually cannot disassemble AArch64; prefer a cross or
-    // LLVM objdump. Skip (rather than fail) when no capable tool is installed,
-    // so x86-only dev environments still pass.
-    let Some(objdump_cmd) = find_objdump(&["aarch64-linux-gnu-objdump", "llvm-objdump"]) else {
+    // The host objdump usually cannot disassemble AArch64; a GNU cross
+    // objdump is required (see `find_objdump` for why LLVM's is excluded).
+    // Skip (rather than fail) when none is installed, so x86-only and macOS
+    // dev environments still pass.
+    let Some(objdump_cmd) = find_objdump(&["aarch64-linux-gnu-objdump"]) else {
         eprintln!(
-            "skipping snapshot_test_hello_world_aarch64: no AArch64-capable objdump \
-             (install binutils-aarch64-linux-gnu or llvm)"
+            "skipping snapshot_test_hello_world_aarch64: no AArch64-capable GNU objdump \
+             (install binutils-aarch64-linux-gnu)"
         );
         return;
     };

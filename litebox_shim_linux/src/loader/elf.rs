@@ -586,13 +586,19 @@ mod tests {
         // with whatever it picks. That is easy to miss on a host whose guest
         // range sits well clear of the host's own image; on arm64 macOS both
         // live above the 4 GiB `__PAGEZERO` floor, so the collision is routine.
+        // Each synthetic image maps exactly one PT_LOAD page (`minimal_elf`
+        // sets filesz == memsz == PAGE_SIZE). Do NOT derive the length from
+        // `brk`: on a platform that requires syscall rewriting, `load_mapped`
+        // pushes brk DEFAULT_RESERVED_SPACE_SIZE (16 MiB) past the image
+        // without mapping that space, so a brk-derived munmap overshoots --
+        // the top-down interpreter ends exactly at TASK_ADDR_MAX, which on
+        // Linux x86-64 is the host TASK_SIZE (munmap EINVAL panics
+        // deallocate_pages), and Windows' region walk asserts on the
+        // never-committed tail.
         let exec_start = usize::try_from(EXEC_LOAD_ADDR).expect("load address fits usize");
-        task.sys_munmap(UserPtrMut::from_usize(exec_start), main.brk - exec_start)
+        task.sys_munmap(UserPtrMut::from_usize(exec_start), PAGE_SIZE)
             .expect("main image should unmap");
-        task.sys_munmap(
-            UserPtrMut::from_usize(interp.base_addr),
-            interp.brk - interp.base_addr,
-        )
-        .expect("interpreter image should unmap");
+        task.sys_munmap(UserPtrMut::from_usize(interp.base_addr), PAGE_SIZE)
+            .expect("interpreter image should unmap");
     }
 }
