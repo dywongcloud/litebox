@@ -39,12 +39,12 @@
 //!   means a guest signal handler must supply its own `sa_restorer`.
 //! * **Seatbelt instead of seccomp.** The second line of defense behind
 //!   LiteBox's own guest/host boundary is a `(deny default)` Seatbelt profile
-//!   installed by [`enable_seatbelt_sandbox`], the counterpart of the Linux
+//!   installed by `enable_seatbelt_sandbox`, the counterpart of the Linux
 //!   platform's seccomp filter. Its source module (`src/seatbelt.rs`) documents
 //!   what it denies, what it deliberately cannot deny, and why a failure to
 //!   install it is fatal rather than a warning.
 //!
-//! # Residual risk after [`enable_seatbelt_sandbox`]
+//! # Residual risk after `enable_seatbelt_sandbox`
 //!
 //! Seatbelt mediates *operations*, not syscalls, and it only mediates the
 //! operations it has hooks for. Code that has already subverted the shim or this
@@ -202,7 +202,7 @@ impl MacOsUserland {
     /// "persistent across LiteBox invocations, reset by a true reboot" guarantee
     /// the trait describes.
     ///
-    /// Must be called *before* [`enable_seatbelt_sandbox`]: `kern.bootsessionuuid`
+    /// Must be called *before* `enable_seatbelt_sandbox`: `kern.bootsessionuuid`
     /// sits outside the `hw.optional.` prefix that profile admits, so afterwards
     /// this returns `EPERM` rather than a key. No macOS runner calls it today;
     /// one that does must do so during start-up, alongside the other host
