@@ -142,8 +142,8 @@ fn handle_ta_command_output(params: &UteeParams) {
                 if let Ok(Some((value_a, value_b))) = params.get_values(idx) {
                     litebox_util_log::info!(
                         idx:% = idx,
-                        value_a:% = format_args!("{:#x}", value_a),
-                        value_b:% = format_args!("{:#x}", value_b);
+                        value_a:x,
+                        value_b:x;
                         "output"
                     );
                     // TODO: return the outcome to VTL0
@@ -157,20 +157,20 @@ fn handle_ta_command_output(params: &UteeParams) {
                     if slice.is_empty() {
                         litebox_util_log::info!(
                             idx:% = idx,
-                            addr:% = format_args!("{:#x}", addr);
+                            addr:x;
                             "output"
                         );
                     } else if slice.len() < 16 {
                         litebox_util_log::info!(
                             idx:% = idx,
-                            addr:% = format_args!("{:#x}", addr),
+                            addr:x,
                             data:? = slice;
                             "output"
                         );
                     } else {
                         litebox_util_log::info!(
                             idx:% = idx,
-                            addr:% = format_args!("{:#x}", addr),
+                            addr:x,
                             data:? = &slice[..16],
                             total:% = slice.len();
                             "output"

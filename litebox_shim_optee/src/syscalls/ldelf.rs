@@ -89,9 +89,9 @@ impl Task {
     ) -> Result<(usize, Cleanup), TeeResult> {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
-            va:% = format_args!("{:#x}", va),
+            va:x,
             num_bytes:% = num_bytes,
-            flags:% = format_args!("{:#x}", flags);
+            flags:x;
             "sys_map_zi"
         );
 
@@ -164,7 +164,7 @@ impl Task {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
             ta_uuid:? = ta_uuid,
-            handle:% = format_args!("{:#x}", handle.as_usize());
+            handle:x = handle.as_usize();
             "sys_open_bin"
         );
 
@@ -208,14 +208,14 @@ impl Task {
 
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
-            va:% = format_args!("{:#x}", va.as_usize()),
-            addr:% = format_args!("{:#x}", addr),
+            va:x = va.as_usize(),
+            addr:x,
             num_bytes:% = num_bytes,
             handle:% = handle,
             offs:% = offs,
             pad_begin:% = pad_begin,
             pad_end:% = pad_end,
-            flags:% = format_args!("{:#x}", flags);
+            flags:x;
             "sys_map_bin"
         );
 
@@ -376,7 +376,7 @@ impl Task {
     ) -> Result<(), TeeResult> {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
-            dst:% = format_args!("{:#x}", dst),
+            dst:x,
             offs:% = offs,
             num_bytes:% = num_bytes,
             handle:% = handle;
