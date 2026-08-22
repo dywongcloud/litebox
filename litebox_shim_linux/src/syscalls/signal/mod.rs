@@ -950,6 +950,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Decoding an exception vector into a signal is entirely architectural,
         // so it lives alongside the rest of the per-architecture frame handling.
         let (signal, fault_address) = arch::exception_signal(info);
+        litebox_util_log::error!(
+            info:? = info,
+            signal:? = signal,
+            fault_address:? = fault_address,
+            pid:% = self.pid,
+            tid:% = self.tid;
+            "guest hardware exception"
+        );
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
