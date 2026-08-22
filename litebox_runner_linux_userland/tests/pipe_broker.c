@@ -19,9 +19,9 @@
 #define OPERATION_TIMEOUT_SECONDS 2
 #define THREAD_JOIN_TIMEOUT_SECONDS 2
 
-// Which alarm()-guarded window is armed; a SIGALRM that fires inside window N
-// exits 60+N so the harness log names the hung operation instead of showing a
-// bare death-by-SIGALRM (exit 14).
+// Which alarm()-guarded window (2-8, textual order) is armed; a SIGALRM that
+// fires inside window N exits 60+N so the harness log names the hung operation
+// instead of showing a bare death-by-SIGALRM (exit 14).
 static volatile sig_atomic_t alarm_window;
 
 static void on_alarm(int sig) {
@@ -31,7 +31,7 @@ static void on_alarm(int sig) {
 
 static void arm_alarm(int window) {
     alarm_window = window;
-    arm_alarm(1);
+    alarm(OPERATION_TIMEOUT_SECONDS);
 }
 
 struct io_thread_args {
