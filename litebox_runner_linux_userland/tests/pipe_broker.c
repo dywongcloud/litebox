@@ -45,6 +45,7 @@ struct io_thread_args {
 
 static void *io_thread(void *arg) {
     struct io_thread_args *args = arg;
+    fprintf(stderr, "io_thread: alive (write=%d)\n", args->write);
     unsigned char value = args->value;
     atomic_store_explicit(&args->started, 1, memory_order_release);
     ssize_t result = args->write ? write(args->fd, &value, 1)
