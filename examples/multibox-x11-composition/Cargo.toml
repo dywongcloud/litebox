@@ -1,0 +1,25 @@
+[package]
+name = "multibox-x11-composition"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone from the litebox workspace: these are demo fixtures for the
+# `boxer compose` example, not part of the shipped product surface.
+[workspace]
+
+[[bin]]
+name = "x11-server"
+path = "src/bin/x11_server.rs"
+
+[[bin]]
+name = "x11-app"
+path = "src/bin/x11_app.rs"
+
+[[bin]]
+name = "vnc-bridge"
+path = "src/bin/vnc_bridge.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true

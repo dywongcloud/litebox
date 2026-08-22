@@ -74,7 +74,13 @@ address each other directly. `--net-host-ip <IP> --net-guest-ip <IP>`
 alongside a second box on `--net tun99` with a distinct pair -- so composing
 several boxes into one multi-process workload (an X11 display server plus
 clients, say) gives each guest a distinguishing address instead of aliasing
-onto the same one.
+onto the same one. See `boxer compose` below for the tool that drives this
+automatically across many boxes.
+
+`-e KEY=VALUE` (repeatable) sets a guest environment variable, overriding the
+image's own value for the same key. Meant primarily for `boxer compose` to
+inject a peer's resolved address into a box without rebuilding it, but works
+standalone too: `boxer run -e DISPLAY=10.0.1.2:0 client.box.wasm`.
 
 Forwarding is async (tokio): every connection is its own task, each direction
 is copied independently so a half-close propagates, and a workload that
@@ -93,6 +99,84 @@ a real HTTP server inside a box:
 - `shutdown(2)` returned `EOPNOTSUPP` for TCP, so a guest could not even
   half-close explicitly. It is implemented: `SHUT_WR` flushes and sends FIN,
   `SHUT_RD` makes later receives report end-of-file.
+
+## Composition (`boxer compose`)
+
+LiteBox is single-process/thread-only per box: `clone()` requires
+`CLONE_THREAD` for every task, so there is no fork-like path to a second
+process, and `execve` replaces the calling task's own image rather than
+spawning one. A workload that is *itself* multiple cooperating processes --
+an X11 display server plus its clients, a display server plus a VNC bridge,
+any producer/consumer pair -- cannot live inside one box. It can still run
+under LiteBox: give each role its own box, on its own TUN device/subnet
+(`--net-host-ip`/`--net-guest-ip` above), and let the boxes address each
+other directly over TCP through the host's normal IP routing between those
+subnets. `boxer compose` is the tool that drives that instead of by hand.
+
+```sh
+boxer compose composition.json
+```
+
+The config is JSON:
+
+```json
+{
+  "instances": [
+    {
+      "name": "x11server",
+      "box": "images/x11server.box.wasm",
+      "net_host_ip": "10.90.0.1",
+      "net_guest_ip": "10.90.0.2",
+      "env": { "BIND_IP": "${x11server.guest_ip}" }
+    },
+    {
+      "name": "app",
+      "box": "images/app.box.wasm",
+      "depends_on": ["x11server"],
+      "env": { "DISPLAY": "${x11server.guest_ip}:0" }
+    },
+    {
+      "name": "vncbridge",
+      "box": "images/vncbridge.box.wasm",
+      "depends_on": ["x11server"],
+      "env": { "DISPLAY": "${x11server.guest_ip}:0" },
+      "publish": ["5900:5900"]
+    }
+  ]
+}
+```
+
+- `box` is resolved relative to the config file's own directory.
+- `net_host_ip`/`net_guest_ip` are optional -- omit both and `boxer compose`
+  allocates a fresh `10.90.<n>.0/24` per instance. Give both, or neither
+  (giving only one is refused).
+- `tun_device` is likewise optional, auto-named `bxc<n>` when omitted.
+- `depends_on` orders startup (a topological sort; a cycle is refused by
+  name) and gates on `ready_delay_ms` (default 1000ms) after each
+  dependency starts before its dependents start -- a coarse readiness proxy
+  good enough for a process that binds its listening socket promptly, not a
+  real health check.
+- `env` values may reference `${name.guest_ip}` or `${name.host_ip}`
+  (including the instance's own name), substituted from every instance's
+  resolved address before spawning. This is the actual mechanism: the box
+  images themselves bake in no addresses, only the composition config does,
+  so the same box image is reusable across different topologies.
+- `publish` takes the same specs as `boxer run -p`.
+
+`boxer compose` enables `net.ipv4.ip_forward` if it can (best-effort --
+routing between subnets needs it, and the actual `boxer run` calls surface a
+real error if it is missing and can't be set here), spawns each instance as
+its own `boxer run` child process with its logs prefixed `[name]`, and stays
+attached -- Ctrl+C (or one instance exiting on its own) tears the whole
+composition down, killing every child cleanly before returning.
+
+A full worked example -- a from-scratch minimal X11 server, an X11 client
+that draws into it, and a VNC bridge exposing it to a real external VNC
+client, all as separate boxes -- is in
+`examples/multibox-x11-composition/`, including why it hand-rolls the X11
+server rather than packaging real Xvfb (guest uid, `link()`), and a real
+network-throughput caveat this composition ran into and worked around (see
+that directory's README).
 
 ## The box format
 
@@ -200,6 +284,38 @@ persist back out of the sandbox -- a builder needs real writes. Consequences:
   `auth` entry docker/podman's `config.json` holds for the registry
   (honoring `DOCKER_CONFIG`). Public pulls stay anonymous. Credentials are
   used only for the request and never logged or stored in the box.
-- `USER` is recorded in the config but not enforced by the runner.
+- `USER` is recorded in the config but not enforced by the runner: every
+  guest process runs as a fixed non-root uid/gid
+  (`litebox_runner_linux_userland::DEFAULT_GUEST_UID`/`_GID`, currently
+  1000), regardless of what the image's `USER` says, including `root`/`0`.
+  A program that specifically requires the guest to be uid 0 (e.g. real
+  Xvfb's `-nolock`, which checks `getuid() == 0` before skipping its
+  lock-file `link()` call) cannot get that today. Wiring `BoxMeta.user`
+  through to the guest's actual credentials is tracked as follow-up work,
+  not implemented here.
+- `link`/`linkat`, `symlink`/`symlinkat`, and `rename`/`renameat` have no
+  syscall handler in `litebox_shim_linux` at all (confirmed by their absence
+  in `litebox_shim_linux/src/syscalls/file.rs`; a program calling any of
+  them gets `ENOSYS`). This is the guest-runtime-mutation side of the
+  filesystem gap above the tar-reader-side hard-link/symlink limitation
+  already named there -- a real, currently-missing capability, not merely a
+  packaging cost.
+- A large single TCP payload (tens of KB+) sent across a *routed* box-to-box
+  connection -- two separate `boxer run` instances on distinct
+  `--net`/`--net-guest-ip` subnets, bridged by the host kernel's IP
+  forwarding rather than a single guest's own TUN device -- was observed to
+  vanish in transit: the sender's `write()` calls report every byte
+  accepted, but the receiver's `read()` never sees any of it and hangs
+  indefinitely. A small reply (tens of bytes) on the very same connection
+  arrives immediately, and the identical payload over a single box's direct
+  host-published port (no second TUN hop) also works fine -- so the fault is
+  specific to the two-TUN-hop routed case, most likely somewhere in how the
+  guest network stack's poll/wake loop handles a receive that spans more
+  than one incoming packet on that path. Sending in small chunks (a few
+  hundred bytes) with a short pause between chunks reliably works around it
+  -- see `write_all_retrying` in `examples/multibox-x11-composition/src/x11proto.rs`
+  -- but the underlying gap is in `litebox`'s network stack, not an
+  application bug, and is worth a focused follow-up rather than treating
+  the chunked-write workaround as the real fix.
 - Upstream boxer's `compile` subcommand (marcotte-based C-to-wasm) is not
   reproduced here; its repository does not include the marcotte sources.

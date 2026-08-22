@@ -10,6 +10,8 @@
 //! box under the litebox sandbox on a matching host. See `docs/boxer.md`.
 
 mod boxfmt;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod compose;
 mod dockerfile;
 mod publish;
 mod run;
@@ -75,6 +77,12 @@ enum Cli {
         /// Print each published connection as it is forwarded.
         #[arg(short = 'v', long = "verbose")]
         verbose: bool,
+        /// Set an environment variable in the guest (KEY=VALUE, repeatable).
+        /// Overrides the image's own value for the same key, so a caller
+        /// (e.g. a composition orchestrator wiring several boxes together)
+        /// can inject a peer's address without rebuilding the box.
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
         /// Arguments overriding the image CMD.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -83,6 +91,16 @@ enum Cli {
     Inspect {
         /// Path to the .box.wasm artifact.
         box_path: PathBuf,
+    },
+    /// Run several boxer instances together, wired over TCP: LiteBox is
+    /// single-process/thread-only per box, so a multi-process workload (a
+    /// display server plus its clients, say) needs one box per role,
+    /// coordinated by this command instead of by `fork` inside one box.
+    /// See `examples/multibox-x11-composition/` for a worked example.
+    Compose {
+        /// Path to the composition config (JSON; see the example directory
+        /// for the schema).
+        config: PathBuf,
     },
 }
 
@@ -146,10 +164,12 @@ fn main() -> anyhow::Result<()> {
             publish,
             publish_all,
             verbose,
+            env,
             args,
         } => run::run(
             &box_path,
             &args,
+            &env,
             &run::NetOptions {
                 tun_device: net,
                 net_host_ip,
@@ -160,7 +180,21 @@ fn main() -> anyhow::Result<()> {
             },
         ),
         Cli::Inspect { box_path } => run::inspect(&box_path),
+        Cli::Compose { config } => compose_command(&config),
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn compose_command(config: &std::path::Path) -> anyhow::Result<()> {
+    compose::up(config)
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn compose_command(_config: &std::path::Path) -> anyhow::Result<()> {
+    bail!(
+        "boxer compose needs the x86_64 Linux native runner, the same \
+         requirement as boxer run"
+    );
 }
 
 #[cfg(all(

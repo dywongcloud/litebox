@@ -85,7 +85,16 @@ fn clashes(a: &crate::publish::PortMapping, b: &crate::publish::PortMapping) -> 
 }
 
 /// Run a box: `extra_args` override the image CMD (docker semantics).
-pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::Result<()> {
+/// `extra_env` entries are `KEY=VALUE` pairs merged on top of the image's
+/// own baked environment, last-wins on a repeated key -- the mechanism a
+/// composition orchestrator uses to inject a peer's address into a box
+/// without rebuilding it.
+pub fn run(
+    box_path: &Path,
+    extra_args: &[String],
+    extra_env: &[String],
+    net: &NetOptions,
+) -> anyhow::Result<()> {
     let parsed = parse_box_file(box_path)?;
     let meta = &parsed.meta;
 
@@ -250,11 +259,28 @@ pub fn run(box_path: &Path, extra_args: &[String], net: &NetOptions) -> anyhow::
         &parsed,
         program,
         program_args,
+        &merge_env(&meta.env, extra_env),
         meta.working_dir.as_deref(),
-        tun_device.as_deref(),
-        guest_ip,
-        host_ip,
+        NativeNet {
+            tun_device: tun_device.as_deref(),
+            guest_ip,
+            host_ip,
+        },
     )
+}
+
+/// Merge `overrides` (`KEY=VALUE`, as given to `-e`) onto `base` (the
+/// image's own baked env), last-wins on a repeated key, preserving `base`'s
+/// relative order for untouched keys and appending genuinely new keys.
+fn merge_env(base: &[String], overrides: &[String]) -> Vec<String> {
+    let key = |entry: &str| entry.split('=').next().unwrap_or(entry).to_string();
+    let mut merged: Vec<String> = base
+        .iter()
+        .filter(|entry| !overrides.iter().any(|o| key(o) == key(entry)))
+        .cloned()
+        .collect();
+    merged.extend(overrides.iter().cloned());
+    merged
 }
 
 /// ENTRYPOINT + (args-or-CMD) merge per OCI semantics.
@@ -271,15 +297,22 @@ fn effective_argv(meta: &BoxMeta, extra_args: &[String]) -> anyhow::Result<Vec<S
     Ok(argv)
 }
 
+/// The resolved networking parameters for a native run, grouped so
+/// `run_native` takes one struct instead of three separate scalars.
+struct NativeNet<'a> {
+    tun_device: Option<&'a str>,
+    guest_ip: std::net::Ipv4Addr,
+    host_ip: std::net::Ipv4Addr,
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn run_native(
     parsed: &ParsedBox,
     program: String,
     args: Vec<String>,
+    env: &[String],
     working_dir: Option<&str>,
-    tun_device: Option<&str>,
-    guest_ip: std::net::Ipv4Addr,
-    host_ip: std::net::Ipv4Addr,
+    net: NativeNet<'_>,
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
@@ -298,18 +331,18 @@ fn run_native(
 
     let cli = litebox_runner_linux_userland::CliArgs {
         program_and_arguments,
-        environment_variables: parsed.meta.env.clone(),
+        environment_variables: env.to_vec(),
         forward_environment_variables: false,
         unstable: true,
         insert_files: Vec::new(),
         initial_files: Some(tar_file.path().to_path_buf()),
         rewrite_syscalls: false,
-        tun_device_name: tun_device.map(String::from),
+        tun_device_name: net.tun_device.map(String::from),
         program_from_tar: true,
         broker_control_socket: None,
         working_directory: working_dir.filter(|w| !w.is_empty()).map(String::from),
-        net_guest_ip: Some(guest_ip),
-        net_host_ip: Some(host_ip),
+        net_guest_ip: Some(net.guest_ip),
+        net_host_ip: Some(net.host_ip),
     };
     litebox_runner_linux_userland::run(cli)
 }
@@ -319,10 +352,9 @@ fn run_native(
     _parsed: &ParsedBox,
     _program: String,
     _args: Vec<String>,
+    _env: &[String],
     _working_dir: Option<&str>,
-    _tun_device: Option<&str>,
-    _guest_ip: std::net::Ipv4Addr,
-    _host_ip: std::net::Ipv4Addr,
+    _net: NativeNet<'_>,
 ) -> anyhow::Result<()> {
     bail!(
         "running boxes natively is supported on x86_64 Linux hosts today; \
