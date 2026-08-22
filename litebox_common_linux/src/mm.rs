@@ -105,7 +105,11 @@ pub fn sys_munmap<
     let aligned_len = len
         .checked_next_multiple_of(PAGE_SIZE)
         .ok_or(Errno::EINVAL)?;
-    if addr.as_usize().checked_add(aligned_len).is_none() {
+    let end = addr
+        .as_usize()
+        .checked_add(aligned_len)
+        .ok_or(Errno::EINVAL)?;
+    if end > Platform::TASK_ADDR_MAX {
         return Err(Errno::EINVAL);
     }
 

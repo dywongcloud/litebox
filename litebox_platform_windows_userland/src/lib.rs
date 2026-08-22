@@ -1899,16 +1899,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
-                debug_assert_ne!(
-                    state,
-                    Win32_Memory::MEM_FREE,
-                    "Trying to deallocate a free region: {:p}-{:p}",
-                    r.start as *mut c_void,
-                    r.end as *mut c_void
-                );
-                Ok(unsafe {
-                    VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
-                } != 0)
+                Ok(state == Win32_Memory::MEM_FREE
+                    || unsafe {
+                        VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
+                    } != 0)
             },
         )
         .expect("deallocate_pages failed");
