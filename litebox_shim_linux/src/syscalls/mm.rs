@@ -540,19 +540,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
     #[inline]
     fn sys_munmap_raw(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
-        let result = litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len);
-        if result == Err(Errno::EINVAL)
-            && let Some(aligned_len) = len.checked_next_multiple_of(PAGE_SIZE)
-            && let Some(end) = addr.as_usize().checked_add(aligned_len)
-            && end > <Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX
-        {
-            litebox_util_log::error!(
-                addr:? = addr.as_usize(), len:? = len, aligned_len:? = aligned_len, end:? = end,
-                task_addr_max:? = <Platform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
-                "guest munmap range exceeds platform task ceiling"
-            );
-        }
-        result
+        litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
     }
 
     /// Clear `file_mappings` entries for any segments that overlap the
