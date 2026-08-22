@@ -222,7 +222,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             );
             #[cfg(target_arch = "x86_64")]
             litebox_util_log::debug!(
-                rip:% = symbolize(ctx.rip), exception:? = info.exception;
+                rip:% = symbolize(ctx.rip), rsp:% = alloc::format!("{:#x}", ctx.rsp),
+                exception:? = info.exception;
                 "guest fault location"
             );
         }

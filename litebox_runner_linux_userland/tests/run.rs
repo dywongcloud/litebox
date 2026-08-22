@@ -167,7 +167,8 @@ impl Runner {
         self.prepare_command();
         // Surface the runner's error-level diagnostics (e.g. the shim's
         // guest-hardware-exception report) in captured test output.
-        self.command.env("LITEBOX_LOG", "error");
+        self.command
+            .env("LITEBOX_LOG", "error,litebox_shim_linux=debug");
         self.command.stderr(std::process::Stdio::inherit());
         if !capture_stdout {
             self.command.stdout(std::process::Stdio::inherit());
