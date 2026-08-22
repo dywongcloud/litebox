@@ -43,9 +43,22 @@ struct io_thread_args {
     atomic_int completed;
 };
 
+static void print_stack_range(const char *who) {
+    pthread_attr_t attr;
+    void *addr = NULL;
+    size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0 &&
+        pthread_attr_getstack(&attr, &addr, &size) == 0) {
+        fprintf(stderr, "%s: stack [%p, %p) size=%zu local=%p\n", who, addr,
+                (void *)((char *)addr + size), size, (void *)&attr);
+        pthread_attr_destroy(&attr);
+    }
+}
+
 static void *io_thread(void *arg) {
     struct io_thread_args *args = arg;
     fprintf(stderr, "io_thread: alive (write=%d)\n", args->write);
+    print_stack_range("io_thread");
     unsigned char value = args->value;
     atomic_store_explicit(&args->started, 1, memory_order_release);
     ssize_t result = args->write ? write(args->fd, &value, 1)
@@ -287,6 +300,7 @@ int main(void) {
     if (signal(SIGALRM, on_alarm) == SIG_ERR) {
         return 9;
     }
+    print_stack_range("main");
     fprintf(stderr, "pipe_broker: nonblocking_and_lifecycle\n");
     int result = test_nonblocking_and_lifecycle();
     if (result != 0) {
