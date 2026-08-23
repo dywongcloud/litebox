@@ -258,7 +258,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $artifacts = cargo build --locked -p litebox_runner_windows_userland --message-format=json 2>$null |
+          $artifacts = cargo build --locked -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland --message-format=json 2>$null |
             Where-Object { $_ } |
             ForEach-Object {
               try { $_ | ConvertFrom-Json -ErrorAction Stop } catch { $null }
