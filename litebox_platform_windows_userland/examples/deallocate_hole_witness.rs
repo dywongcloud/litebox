@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 #[cfg(windows)]
 mod imp {
     use litebox::platform::PageManagementProvider;
