@@ -257,9 +257,23 @@ jobs:
       - name: Live-witness Windows deallocation across free holes
         shell: pwsh
         run: |
-          $litebox = Get-ChildItem target/debug/deps/litebox-*.rlib | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          $platform = Get-ChildItem target/debug/deps/litebox_platform_windows_userland-*.rlib | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          $windows = Get-ChildItem target/debug/deps/windows_sys-*.rlib | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $ErrorActionPreference = "Stop"
+          $artifacts = cargo build --locked -p litebox_runner_windows_userland --message-format=json 2>$null |
+            Where-Object { $_ } |
+            ForEach-Object {
+              try { $_ | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+            } |
+            Where-Object { $_ -and $_.reason -eq 'compiler-artifact' }
+          function Resolve-Rlib([string]$name) {
+            $match = $artifacts | Where-Object { $_.target.name -eq $name } | Select-Object -Last 1
+            if (-not $match) { throw "no compiler-artifact reported for crate '$name'" }
+            $rlib = $match.filenames | Where-Object { $_ -like '*.rlib' } | Select-Object -First 1
+            if (-not $rlib) { throw "no .rlib filename reported for crate '$name'" }
+            return $rlib
+          }
+          $litebox = Resolve-Rlib 'litebox'
+          $platform = Resolve-Rlib 'litebox_platform_windows_userland'
+          $windows = Resolve-Rlib 'windows_sys'
           $source = @'
           use litebox::platform::PageManagementProvider;
           use litebox_platform_windows_userland::WindowsUserland;
@@ -372,9 +386,9 @@ jobs:
             '-',
             '--edition=2024',
             '-L', 'dependency=target/debug/deps',
-            '--extern', "litebox=$($litebox.FullName)",
-            '--extern', "litebox_platform_windows_userland=$($platform.FullName)",
-            '--extern', "windows_sys=$($windows.FullName)",
+            '--extern', "litebox=$litebox",
+            '--extern', "litebox_platform_windows_userland=$platform",
+            '--extern', "windows_sys=$windows",
             '-o', 'target/windows-deallocate-hole-witness.exe'
           )
           try {
