@@ -254,6 +254,137 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
       - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
+      - name: Live-witness Windows deallocation across free holes
+        shell: pwsh
+        run: |
+          $litebox = Get-ChildItem target/debug/deps/litebox-*.rlib | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $platform = Get-ChildItem target/debug/deps/litebox_platform_windows_userland-*.rlib | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $windows = Get-ChildItem target/debug/deps/windows_sys-*.rlib | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $source = @'
+          use litebox::platform::PageManagementProvider;
+          use litebox_platform_windows_userland::WindowsUserland;
+          use windows_sys::Win32::System::Memory::{
+              MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+          };
+
+          const GRANULARITY: usize = 0x1_0000;
+
+          fn ensure(condition: bool, error: &'static str) -> Result<(), &'static str> {
+              condition.then_some(()).ok_or(error)
+          }
+
+          fn run() -> Result<(), &'static str> {
+              let arena = unsafe {
+                  VirtualAlloc(
+                      core::ptr::null_mut(),
+                      7 * GRANULARITY,
+                      MEM_RESERVE,
+                      PAGE_NOACCESS,
+                  )
+              };
+              ensure(!arena.is_null(), "initial reserve failed")?;
+              ensure(
+                  unsafe { VirtualFree(arena, 0, MEM_RELEASE) } != 0,
+                  "initial release failed",
+              )?;
+              let segment = |index: usize| arena.wrapping_byte_add(index * GRANULARITY);
+              for index in [0, 2, 4, 6] {
+                  ensure(
+                      unsafe {
+                          VirtualAlloc(
+                              segment(index),
+                              GRANULARITY,
+                              MEM_RESERVE | MEM_COMMIT,
+                              PAGE_READWRITE,
+                          )
+                      } == segment(index),
+                      "fixed sentinel or target allocation failed",
+                  )?;
+              }
+              unsafe {
+                  segment(0).cast::<u8>().write_volatile(0x5a);
+                  segment(6).cast::<u8>().write_volatile(0xa5);
+              }
+              let platform = WindowsUserland::new();
+              let target = segment(1) as usize..segment(6) as usize;
+              unsafe {
+                  <WindowsUserland as PageManagementProvider<4096>>::deallocate_pages(
+                      platform,
+                      target.clone(),
+                  )
+                  .map_err(|_| "mixed deallocation failed")?;
+                  <WindowsUserland as PageManagementProvider<4096>>::deallocate_pages(
+                      platform,
+                      segment(1) as usize..segment(2) as usize,
+                  )
+                  .map_err(|_| "all-free deallocation failed")?;
+                  <WindowsUserland as PageManagementProvider<4096>>::deallocate_pages(platform, target)
+                      .map_err(|_| "replayed deallocation failed")?;
+              }
+              ensure(
+                  unsafe { segment(0).cast::<u8>().read_volatile() } == 0x5a,
+                  "leading sentinel changed",
+              )?;
+              ensure(
+                  unsafe { segment(6).cast::<u8>().read_volatile() } == 0xa5,
+                  "trailing sentinel changed",
+              )?;
+              for index in [1, 3, 5] {
+                  ensure(
+                      unsafe {
+                          VirtualAlloc(
+                              segment(index),
+                              GRANULARITY,
+                              MEM_RESERVE | MEM_COMMIT,
+                              PAGE_READWRITE,
+                          )
+                      } == segment(index),
+                      "free hole did not remain free",
+                  )?;
+              }
+              for index in [2, 4] {
+                  ensure(
+                      unsafe { VirtualAlloc(segment(index), GRANULARITY, MEM_COMMIT, PAGE_READWRITE) }
+                          == segment(index),
+                      "committed target did not become decommitted",
+                  )?;
+              }
+              for index in 0..7 {
+                  ensure(
+                      unsafe { VirtualFree(segment(index), 0, MEM_RELEASE) } != 0,
+                      "final release failed",
+                  )?;
+              }
+              Ok(())
+          }
+
+          fn main() {
+              if let Err(error) = run() {
+                  eprintln!("WINDOWS_DEALLOCATE_HOLE_WITNESS=FAIL error={error}");
+                  std::process::exit(1);
+              }
+              println!(
+                  "WINDOWS_DEALLOCATE_HOLE_WITNESS=PASS cases=leading,interior,trailing,all-free,replay sentinels=preserved"
+              );
+          }
+          '@
+          $rustcArgs = @(
+            '-',
+            '--edition=2024',
+            '-L', 'dependency=target/debug/deps',
+            '--extern', "litebox=$($litebox.FullName)",
+            '--extern', "litebox_platform_windows_userland=$($platform.FullName)",
+            '--extern', "windows_sys=$($windows.FullName)",
+            '-o', 'target/windows-deallocate-hole-witness.exe'
+          )
+          try {
+            $source | & rustc @rustcArgs
+            if ($LASTEXITCODE -ne 0) { throw "rustc failed with exit code $LASTEXITCODE" }
+            & target/windows-deallocate-hole-witness.exe
+            if ($LASTEXITCODE -ne 0) { throw "witness failed with exit code $LASTEXITCODE" }
+          } finally {
+            Remove-Item target/windows-deallocate-hole-witness.* -Force -ErrorAction SilentlyContinue
+          }
       - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
       - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
       - run: cargo nextest run --locked --profile ci -p litebox_shim_windows
