@@ -69,7 +69,7 @@ jobs:
             cargo test --locked -p litebox_runner_linux_userland --test run -- \
             test_runner_broker_integration_with_rewriter --exact --nocapture
           echo "---runner-process PIDs---"
-          RUNNER_PIDS=$(awk '/execve\(".*litebox_runner_linux_userland"/ {print $1}' /tmp/landlock_probe.strace | sort -u)
+          RUNNER_PIDS=$(awk '/execve\("[^"]*\/litebox_runner_linux_userland"/ {print $1}' /tmp/landlock_probe.strace | sort -u)
           echo "$RUNNER_PIDS"
           echo "---opens made by those PIDs---"
           { for pid in $RUNNER_PIDS; do
