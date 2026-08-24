@@ -62,6 +62,18 @@ jobs:
       - name: Remove restored transient guest staging
         timeout-minutes: 5
         run: rm -rf target/tmp/tar_files_*
+      - name: DIAGNOSTIC - trace real host file opens for the Landlock re-enablement investigation
+        run: |
+          sudo apt install -y strace
+          strace -f -e trace=openat,open -s 200 -o /tmp/landlock_probe.strace \
+            cargo test --locked -p litebox_runner_linux_userland --test run -- \
+            test_runner_broker_integration_with_rewriter --exact --nocapture
+          echo "---non-cow real host opens---"
+          { grep -oE '"[^"]+"' /tmp/landlock_probe.strace \
+            | tr -d '"' \
+            | grep -vE '^(/proc/|/tmp/|/dev/|/sys/)' \
+            | grep -vE '(litebox|/target/|/\.cargo/|/rustup/|/home/runner/work/litebox/litebox/)' \
+            | sort -u ; } || echo "(no non-cow real host opens found)"
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
