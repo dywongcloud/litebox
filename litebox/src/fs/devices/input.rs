@@ -490,7 +490,9 @@ fn capability_bitmap(kind: DeviceKind, ev: u16) -> Vec<u8> {
                         set_bit(&mut bits, code);
                     }
                 }
-                DeviceKind::Pointer => {
+                // `mice` never reaches here (no evdev ioctls on it); the pointer shape is
+                // the honest fallback if it ever did.
+                DeviceKind::Pointer | DeviceKind::Mice => {
                     set_bit(&mut bits, BTN_LEFT);
                     set_bit(&mut bits, BTN_RIGHT);
                     set_bit(&mut bits, BTN_MIDDLE);
