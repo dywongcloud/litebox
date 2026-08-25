@@ -67,6 +67,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         }
     }
 
+    /// Set the identity every subsequent operation runs as (and thus records as the owner of
+    /// anything it creates). The single-user default is 1000/1000; a runner presenting the
+    /// guest as root (`--guest-root`) must set 0/0 here too, or everything the guest creates
+    /// is owned by a uid it doesn't have -- observed live as Xorg refusing to bind
+    /// `/tmp/.X11-unix/X0` (its socket dir "owned" by 1000 while X ran as 0) and dbus
+    /// rejecting `XDG_RUNTIME_DIR` for the same mismatch.
+    pub fn set_current_user(&mut self, user: u16, group: u16) {
+        self.current_user = UserInfo { user, group };
+    }
+
     /// Execute `f` with superuser/root privileges.
     ///
     /// This function primarily exists to initialize files. Most regular interaction with the file

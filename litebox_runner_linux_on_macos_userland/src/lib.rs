@@ -378,6 +378,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
+        if cli_args.guest_root {
+            // Files the guest creates must be owned by the identity the guest runs as; see
+            // `set_current_user`'s doc comment for the X/dbus failures a mismatch causes.
+            in_mem.set_current_user(0, 0);
+        }
+
         shim_builder.default_fs(in_mem, tar_data.into())
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);
