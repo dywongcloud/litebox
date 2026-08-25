@@ -194,6 +194,19 @@ for pkg in "${PACKAGES[@]}"; do
         # residual ELF/symbol/source map and is still subject to the final
         # zero-x18 artifact gate.
         case "$pkg" in
+            gcc)
+                # A native three-stage bootstrap deliberately replaces the
+                # package CFLAGS with BOOT_CFLAGS in stages 2/3, reintroducing
+                # x18 and spending ~30 minutes compiling a compiler the guest
+                # never installs. One stage uses the stock host compiler but
+                # preserves CFLAGS for libgcc/libstdc++ and all packaged code.
+                next_configure_line="$(sed -n "/--disable-cet/{n;p;q;}" "$dir/APKBUILD")"
+                if ! printf "%s" "$next_configure_line" | grep -q -- "--disable-bootstrap"; then
+                    matches="$(grep -c -- "--disable-cet" "$dir/APKBUILD")"
+                    [ "$matches" -eq 1 ] || { echo "unexpected GCC configure stanza" >&2; exit 1; }
+                    sed -i "/--disable-cet/a\\\t\t--disable-bootstrap" "$dir/APKBUILD"
+                fi
+                ;;
             fontconfig)
                 cat > "$dir/litebox-x18.patch" <<EOF
 --- a/src/fcfreetype.c
