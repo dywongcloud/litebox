@@ -3413,12 +3413,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if sigsetpack.size != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
                 return Err(Errno::EINVAL);
             }
-            Some(
-                sigsetpack
-                    .sigset
-                    .read_at_offset::<Platform>(0)
-                    .ok_or(Errno::EFAULT)?,
-            )
+            // A null sigset inside a non-null pack means "don't touch the mask" -- exactly how
+            // the kernel reads it, and exactly what musl's plain `select` always passes
+            // (`{ss: NULL, ss_len: _NSIG/8}`).
+            if sigsetpack.sigset.is_null() {
+                None
+            } else {
+                Some(
+                    sigsetpack
+                        .sigset
+                        .read_at_offset::<Platform>(0)
+                        .ok_or(Errno::EFAULT)?,
+                )
+            }
         } else {
             None
         };
