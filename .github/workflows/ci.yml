@@ -391,6 +391,12 @@ jobs:
           # - `litebox_packager` is allowed to have `std` access since it is a
           #   userland CLI tool that packages ELF programs for LiteBox.
           #
+          # - `litebox_rfb` is allowed to have `std` access since it is a
+          #   userland VNC (RFB) server presenting a guest framebuffer to a
+          #   remote viewer, using `std::net`/`std::thread` -- it only ever
+          #   runs from an already-userland runner (never linked into the
+          #   `no_std` shim/platform layers).
+          #
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
           #
           # - `dev_tests` is meant to only be used for tests, and thus can
@@ -424,6 +430,7 @@ jobs:
             -not -path './litebox_shim_windows/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
+            -not -path './litebox_rfb/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
