@@ -271,6 +271,11 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     /// [`Self::build`] moves this into [`GlobalState`] so `sys_ioctl` can service `FBIO*`
     /// requests directly, without threading the framebuffer through the generic `FS` type.
     framebuffer: Cell<Option<litebox::fs::devices::Framebuffer<Platform>>>,
+    /// Handle to the `/dev/input` event-device registry mounted by [`Self::default_fs`], if it
+    /// was called. Same lifecycle as `framebuffer`: [`Self::build`] moves it into
+    /// [`GlobalState`] for `sys_ioctl`/`sys_read`/poll interception, and the runner takes a
+    /// clone (via [`LinuxShim::input_registry`]) to inject RFB input events through.
+    input_registry: Cell<Option<litebox::fs::devices::InputRegistry<Platform>>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -286,6 +291,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox,
             proc_handle: Cell::new(None),
             framebuffer: Cell::new(None),
+            input_registry: Cell::new(None),
         }
     }
 
@@ -307,9 +313,11 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
-        let (fs, proc_handle, framebuffer) = default_fs(&self.litebox, in_mem_fs, tar_data);
+        let (fs, proc_handle, framebuffer, input_registry) =
+            default_fs(&self.litebox, in_mem_fs, tar_data);
         self.proc_handle.set(Some(proc_handle));
         self.framebuffer.set(Some(framebuffer));
+        self.input_registry.set(Some(input_registry));
         fs
     }
 
@@ -339,6 +347,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             proc_handle: self.proc_handle.take(),
             framebuffer: self.framebuffer.take(),
+            input_registry: self.input_registry.take(),
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
@@ -369,6 +378,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     #[must_use]
     pub fn framebuffer(&self) -> Option<litebox::fs::devices::Framebuffer<Platform>> {
         self.0.framebuffer.clone()
+    }
+
+    /// A cheap handle to this shim's `/dev/input` event-device registry, if
+    /// [`LinuxShimBuilder::default_fs`] mounted one -- for a runner-side injector (e.g. the RFB
+    /// server's input events) to feed guest-visible keyboard/pointer events through.
+    #[must_use]
+    pub fn input_registry(&self) -> Option<litebox::fs::devices::InputRegistry<Platform>> {
+        self.0.input_registry.clone()
     }
 
     /// Loads the program at `path` as the shim's initial task, returning the
@@ -524,9 +541,12 @@ fn default_fs<Platform: ShimPlatform>(
     LinuxFS<Platform>,
     litebox::fs::proc::Proc<Platform>,
     litebox::fs::devices::Framebuffer<Platform>,
+    litebox::fs::devices::InputRegistry<Platform>,
 ) {
     let mut proc_handle = None;
     let mut framebuffer = None;
+    let input_registry = litebox::fs::devices::InputRegistry::new();
+    let input_registry_for_mount = input_registry.clone();
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
@@ -534,6 +554,9 @@ fn default_fs<Platform: ShimPlatform>(
                 let devices = litebox::fs::devices::Devices::new(litebox, allocator);
                 framebuffer = Some(devices.framebuffer());
                 devices
+            })
+            .mount("/dev/input", |allocator| {
+                litebox::fs::devices::InputDevices::new(allocator, input_registry_for_mount)
             })
             .mount("/proc", |allocator| {
                 let proc = litebox::fs::proc::Proc::new(allocator);
@@ -569,7 +592,7 @@ fn default_fs<Platform: ShimPlatform>(
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     );
-    (fs, proc_handle, framebuffer)
+    (fs, proc_handle, framebuffer, input_registry)
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
@@ -1600,6 +1623,11 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// type, not on the `FileSystem`/`Backend` traits, so there's no generic path from an `FS`-typed
     /// fd to them.
     framebuffer: Option<litebox::fs::devices::Framebuffer<Platform>>,
+    /// Handle to the `/dev/input` event-device registry mounted by
+    /// [`LinuxShimBuilder::default_fs`], if any -- `None` when the shim was built with a
+    /// filesystem that doesn't mount one. `sys_read`/`sys_ioctl`/poll intercept evdev fds
+    /// through this, and the runner injects input events into it.
+    input_registry: Option<litebox::fs::devices::InputRegistry<Platform>>,
     /// The process group ID both of the controlling terminal's foreground group (as set by
     /// `TIOCSPGRP` / read by `TIOCGPGRP`) and of every guest process (as set by `setpgid` / read
     /// by `getpgid` -- see `syscalls::process::Task::sys_setpgid`/`sys_getpgid`). All four

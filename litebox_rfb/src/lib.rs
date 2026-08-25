@@ -21,6 +21,7 @@
 //! one thread per connection matches the existing `std::thread`-based pattern the runner already
 //! uses for its network-interaction worker.
 
+pub mod keymap;
 mod proto;
 mod server;
 

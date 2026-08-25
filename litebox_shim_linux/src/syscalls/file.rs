@@ -196,6 +196,27 @@ pub const PATH_MAX: usize = 4096;
 #[derive(Clone, Debug)]
 struct FdPath(CString);
 
+/// Entry metadata tagging a `/dev/input/event*` fd with its evdev minor number, attached at
+/// open time (see `insert_raw_file_fd`). Entry-scoped (not fd-scoped) so `dup`ed copies share
+/// it, and reachable from epoll's descriptor-table-only context where no filesystem handle is
+/// in scope.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InputEventMinor(pub(crate) usize);
+
+/// The evdev minor for `file`, if it was tagged as a `/dev/input/event*` device at open time --
+/// the descriptor-table-only lookup epoll's poll path uses (it has `GlobalState` but no
+/// filesystem access).
+pub(crate) fn input_event_minor_of<Platform: ShimPlatform, FS: ShimFS>(
+    global: &crate::GlobalState<Platform, FS>,
+    file: &TypedFd<FS>,
+) -> Option<usize> {
+    global
+        .litebox
+        .descriptor_table()
+        .with_metadata(file, |InputEventMinor(minor)| *minor)
+        .ok()
+}
+
 impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
     ///
@@ -526,6 +547,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .descriptor_table_mut()
                 .set_entry_metadata(&file, FdPath(path));
             debug_assert!(old.is_none());
+        }
+        // Tag `/dev/input/event*` fds with their evdev minor at open time (recognized by the
+        // input-core rdev major, same idea as `is_stdio`'s major check), so the read/ioctl/poll
+        // paths -- epoll in particular, which has no filesystem access, only the descriptor
+        // table -- can identify them by metadata lookup alone. Mirrors the `StdioStream`
+        // metadata the stdio fds carry.
+        {
+            let files = self.files.borrow();
+            if let Ok(status) = files.fs.fd_file_status(&file)
+                && status.file_type == litebox::fs::FileType::CharacterDevice
+                && let Some(rdev) = status.node_info.rdev
+                && rdev.get() >> 8 == litebox::fs::devices::INPUT_MAJOR
+            {
+                let old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_entry_metadata(&file, InputEventMinor(rdev.get() & 0xff));
+                debug_assert!(old.is_none());
+            }
         }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
@@ -998,6 +1039,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |fd| {
                     if self.stdin_read_would_block(fd) {
                         return Err(Errno::EAGAIN);
+                    }
+                    if let Some(minor) = self.input_event_minor(&files.fs, fd) {
+                        return self.read_input_events(minor, &mut buf.borrow_mut());
                     }
                     files
                         .fs
@@ -2672,6 +2716,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// If `fd` names a `/dev/input/event*` device, its evdev minor number -- read from the
+    /// [`InputEventMinor`] metadata attached at open time. `None` for every other fd (the
+    /// read/ioctl paths then fall through to their normal handling).
+    fn input_event_minor(&self, _fs: &FS, fd: &TypedFd<FS>) -> Option<usize> {
+        input_event_minor_of(&self.global, fd)
+    }
+
+    /// Blocking-capable `read()` for a `/dev/input/event*` fd: waits on the device's event
+    /// queue with this task's wait context (which the `Backend` trait's `read` cannot do), per
+    /// evdev semantics -- whole 24-byte events only, `EINVAL` for a short buffer, `EAGAIN`
+    /// only under `O_NONBLOCK`.
+    fn read_input_events(&self, minor: usize, buf: &mut [u8]) -> Result<usize, Errno> {
+        if buf.len() < litebox::fs::devices::INPUT_EVENT_SIZE {
+            return Err(Errno::EINVAL);
+        }
+        let Some(registry) = self.global.input_registry.as_ref() else {
+            return Err(Errno::ENODEV);
+        };
+        // Per-fd `O_NONBLOCK` isn't tracked for FS-backend fds (only stdio carries
+        // `StdioStatusFlags` metadata); evdev consumers that set `O_NONBLOCK` do so via
+        // `open()` flags this path can't currently observe, so reads block until an event
+        // arrives -- correct for every poll-driven consumer (they only read after readiness).
+        registry
+            .read_blocking(&self.wait_cx(), minor, buf, false)
+            .map_err(|e| match e {
+                // A timeout maps to EAGAIN like an empty non-blocking read would -- though with
+                // no timeout on this wait context it never actually fires.
+                litebox::event::polling::TryOpError::TryAgain
+                | litebox::event::polling::TryOpError::WaitError(
+                    litebox::event::wait::WaitError::TimedOut,
+                ) => Errno::EAGAIN,
+                litebox::event::polling::TryOpError::WaitError(
+                    litebox::event::wait::WaitError::Interrupted,
+                ) => Errno::EINTR,
+                litebox::event::polling::TryOpError::Other(infallible) => match infallible {},
+            })
+    }
+
     /// Whether `fd` names `/dev/fb0` -- recognized the same way [`Self::is_stdio`] recognizes a
     /// tty (by the `rdev` major number [`litebox::fs::devices`] assigns it), rather than by
     /// requiring a distinct fd-table subsystem for one device.
@@ -2936,6 +3018,55 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
             )?,
+            // The `EVIOC*` family ('E' = 0x45 in the ioctl type byte) arrives undecoded as
+            // `Raw` -- the variable-length getters (`EVIOCGNAME(len)` etc.) encode the caller's
+            // buffer length in the command itself, so there's nothing for the static decoder in
+            // `litebox_common_linux` to name per-command. Dispatched to the input registry when
+            // the fd is a `/dev/input/event*` device; every other fd falls through to the
+            // unsupported catch-all below.
+            IoctlArg::Raw { cmd, arg: raw_arg } if (cmd >> 8) & 0xff == 0x45 => files
+                .run_on_raw_fd(
+                    desc,
+                    |fd| -> Result<u32, Errno> {
+                        let Some(minor) = self.input_event_minor(&files.fs, fd) else {
+                            return Err(Errno::EINVAL);
+                        };
+                        let Some(registry) = self.global.input_registry.as_ref() else {
+                            return Err(Errno::ENODEV);
+                        };
+                        // The only write-direction commands this registry accepts carry an
+                        // `int`: `EVIOCGRAB`'s flag rides in the argument value itself (the
+                        // kernel never dereferences it), `EVIOCSCLOCKID`'s clockid is in user
+                        // memory. Read the user int only for the latter.
+                        let write_arg = if cmd & 0xff == 0xa0 {
+                            let ptr = litebox_common_linux::user_pointers::UserPtr::<i32>::from_usize(
+                                raw_arg.as_usize(),
+                            );
+                            ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?
+                        } else {
+                            i32::try_from(raw_arg.as_usize() & 0xffff_ffff)
+                                .unwrap_or(i32::MAX)
+                        };
+                        match registry.evdev_ioctl(minor, cmd, write_arg) {
+                            litebox::fs::devices::EvdevIoctlReply::Copy { data, rc } => {
+                                let dst = litebox_common_linux::user_pointers::UserPtrMut::<u8>::from_usize(
+                                    raw_arg.as_usize(),
+                                );
+                                dst.copy_from_slice::<Platform>(0, &data)
+                                    .ok_or(Errno::EFAULT)?;
+                                Ok(rc)
+                            }
+                            litebox::fs::devices::EvdevIoctlReply::Plain { rc } => Ok(rc),
+                            litebox::fs::devices::EvdevIoctlReply::NoEntry => Err(Errno::ENOENT),
+                            litebox::fs::devices::EvdevIoctlReply::Invalid => Err(Errno::EINVAL),
+                        }
+                    },
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                )?,
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)

@@ -24,7 +24,12 @@ use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
 
 pub use self::framebuffer::{FbFixScreeninfo, FbVarScreeninfo, Framebuffer, FramebufferGeometry};
+pub use self::input::{
+    ABS_RANGE_MAX, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EVENT_MINOR_BASE, EvdevIoctlReply,
+    INPUT_EVENT_SIZE, INPUT_MAJOR, InputDevices, InputRegistry,
+};
 mod framebuffer;
+mod input;
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: usize = 1024;

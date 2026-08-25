@@ -230,13 +230,71 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             "vnc server listening"
         );
         let shutdown_handle = server.shutdown_handle();
+        let input_registry = shim.input_registry();
+        let input_framebuffer = shim.framebuffer();
         let worker = std::thread::spawn(move || {
-            if let Err(e) = server.run(|event| {
-                // Input injection (evdev emulation) doesn't exist yet -- see
-                // `litebox-fb-evdev-input` in the roadmap. Logged at trace level so a connected
-                // client's keystrokes/clicks are visible during bring-up without spamming a
-                // normal run.
-                litebox_util_log::trace!(event:? = event; "vnc input received, no evdev sink yet");
+            // RFB `PointerEvent`s carry a whole button-state mask per event; evdev wants
+            // per-button transitions. Tracked under a mutex because `on_input` can be called
+            // concurrently from several connected clients' threads -- last-writer-wins on the
+            // shared mask matches how a real single mouse would behave with two hands on it.
+            let last_buttons = std::sync::Mutex::new(0u8);
+            // Timestamps only need to be monotonic with microsecond-ish resolution; consumers
+            // compare deltas, never absolute values.
+            let epoch = std::time::Instant::now();
+            if let Err(e) = server.run(move |event| {
+                let Some(registry) = input_registry.as_ref() else {
+                    return;
+                };
+                let now = epoch.elapsed();
+                match event {
+                    litebox_rfb::InputEvent::Key(key) => {
+                        if let Some(code) = litebox_rfb::keymap::keysym_to_evdev(key.key) {
+                            registry.inject_key(code, key.down, now);
+                        }
+                    }
+                    litebox_rfb::InputEvent::Pointer(p) => {
+                        // Scale the RFB screen coordinate into the tablet's fixed 0..=32767
+                        // range against the *current* framebuffer geometry (resizes included).
+                        let (width, height) =
+                            input_framebuffer.as_ref().map_or((1024, 768), |fb| {
+                                let geo = fb.geometry();
+                                (geo.xres.max(1), geo.yres.max(1))
+                            });
+                        let range = i64::from(litebox::fs::devices::ABS_RANGE_MAX);
+                        let scale = |v: u16, extent: u32| -> i32 {
+                            let clamped = i64::from(v).min(i64::from(extent) - 1);
+                            i32::try_from(clamped * range / i64::from(extent.max(1)))
+                                .unwrap_or(litebox::fs::devices::ABS_RANGE_MAX)
+                        };
+                        let x = scale(p.x, width);
+                        let y = scale(p.y, height);
+                        let mut last = last_buttons
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let changed = *last ^ p.button_mask;
+                        let mut transitions = Vec::new();
+                        for (bit, btn) in [
+                            (0u8, litebox::fs::devices::BTN_LEFT),
+                            (1, litebox::fs::devices::BTN_MIDDLE),
+                            (2, litebox::fs::devices::BTN_RIGHT),
+                        ] {
+                            if changed & (1 << bit) != 0 {
+                                transitions.push((btn, p.button_mask & (1 << bit) != 0));
+                            }
+                        }
+                        // RFB encodes each scroll click as a press+release of button 4/5; a
+                        // press edge is one wheel step.
+                        if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
+                            registry.inject_wheel(1, now);
+                        }
+                        if changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0 {
+                            registry.inject_wheel(-1, now);
+                        }
+                        *last = p.button_mask;
+                        drop(last);
+                        registry.inject_pointer_abs(x, y, &transitions, now);
+                    }
+                }
             }) {
                 litebox_util_log::warn!(error:% = e; "vnc server stopped");
             }

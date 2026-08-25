@@ -133,6 +133,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         mask: Events,
         observer: Option<Weak<dyn Observer<Events>>>,
     ) -> Option<Events> {
+        // `/dev/input/event*` fds have real queue-backed readiness through the input registry
+        // (X11/libinput poll these and only read after `IN` -- dummy always-ready would spin
+        // them on empty reads). Checked before the generic closure below so `observer` is still
+        // whole to hand to the registry.
+        if let EpollDescriptor::File(file) = self
+            && let Some(registry) = global.input_registry.as_ref()
+            && let Some(minor) = crate::syscalls::file::input_event_minor_of(global, file)
+            && let Some(events) = registry.check_io_events(minor)
+        {
+            if let Some(observer) = observer {
+                registry.register_observer(minor, observer, mask);
+            }
+            return Some(events & (mask | Events::ALWAYS_POLLED));
+        }
         let poll = |iop: &dyn IOPollable| {
             if let Some(observer) = observer {
                 iop.register_observer(observer, mask);
