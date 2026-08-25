@@ -14,6 +14,8 @@ extern crate alloc;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_macos_userland::MacOsUserland as Platform;
+
+mod net_proxy;
 use std::path::PathBuf;
 
 /// Adapts [`litebox::fs::devices::Framebuffer`] to [`litebox_rfb::FramebufferSource`] --
@@ -119,6 +121,17 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub vnc_bind_all: bool,
+    /// Give the guest web access without root: an HTTP proxy (CONNECT + absolute-URI) on the
+    /// guest's loopback at `127.0.0.1:3128`, bridged to real host connections. Point the guest
+    /// at it (`http_proxy=http://127.0.0.1:3128`, `links -http-proxy 127.0.0.1:3128`). Widens
+    /// the Seatbelt profile with `(allow network-outbound)` -- outbound only; inbound stays
+    /// denied.
+    #[arg(
+        long = "net-proxy",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub net_proxy: bool,
 }
 
 /// Translate an RFB `KeyEvent` keysym into the byte sequence a Linux console keyboard would
@@ -374,6 +387,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         None
     };
 
+    // The guest-web-access bridge. Same lifecycle position and reasoning as the VNC server
+    // above: the in-guest listener and the resolver snapshot (`/etc/resolv.conf` becomes
+    // unreadable under the sandbox) must both exist before `enable_seatbelt_sandbox*` runs;
+    // the widened profile then keeps the bridge's outbound `connect`s working after.
+    if cli_args.net_proxy {
+        let listener = shim
+            .listen_in_guest(std::net::SocketAddr::from(net_proxy::PROXY_ADDR), 16)
+            .map_err(|e| anyhow!("failed to start the in-guest proxy listener: {e:?}"))?;
+        let resolvers = net_proxy::snapshot_resolvers();
+        litebox_util_log::info!(
+            addr:? = net_proxy::PROXY_ADDR, resolvers:? = resolvers;
+            "guest http proxy listening"
+        );
+        std::thread::spawn(move || net_proxy::serve(&listener, resolvers));
+    }
+
     let argv = cli_args
         .program_and_arguments
         .iter()
@@ -405,7 +434,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     //
     // This panics rather than warning if the sandbox cannot be installed; see
     // `enable_seatbelt_sandbox`'s doc comment for the fail-safe argument.
-    litebox_platform_macos_userland::enable_seatbelt_sandbox();
+    if cli_args.net_proxy {
+        litebox_platform_macos_userland::enable_seatbelt_sandbox_with_outbound_network();
+    } else {
+        litebox_platform_macos_userland::enable_seatbelt_sandbox();
+    }
 
     let program = shim.load_program(
         initial_file_system,

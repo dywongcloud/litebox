@@ -46,6 +46,7 @@ macro_rules! log_unsupported {
 }
 
 pub(crate) mod channel;
+pub mod host_service;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -496,6 +497,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
 
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.0.litebox
+    }
+
+    /// Create a host-owned TCP listener inside the guest's network stack (typically on the
+    /// guest's loopback), whose accepted connections host code services directly -- the
+    /// listening-side counterpart of [`Self::tcp_connection`]. The guest never sees an fd for
+    /// any of these sockets.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the socket cannot be created, bound (e.g. the guest already owns the port), or
+    /// put into the listening state.
+    pub fn listen_in_guest(
+        &self,
+        addr: core::net::SocketAddr,
+        backlog: u16,
+    ) -> Result<host_service::GuestListener<Platform>, Errno> {
+        host_service::listen_in_guest(&self.0, addr, backlog)
     }
 
     /// Returns the platform this shim was built with.

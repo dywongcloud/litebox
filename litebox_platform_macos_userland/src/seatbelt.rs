@@ -162,6 +162,22 @@ const RUNNER_PROFILE: &CStr = c"(version 1)
 (allow sysctl-read (sysctl-name-prefix \"hw.optional.\"))
 ";
 
+/// [`RUNNER_PROFILE`] plus `(allow network-outbound)` and the `system-socket` right that
+/// `socket(2)` for an outbound dial needs on some macOS versions. Installed instead of the
+/// base profile when the runner's `--net-proxy` bridge is active: the bridge terminates guest
+/// TCP inside the smoltcp stack and re-originates it as ordinary host connections, which are
+/// exactly the operations `(deny default)` refuses. Everything else -- file reads, inbound
+/// binds/accepts, mach lookups (so `getaddrinfo`'s mDNSResponder path stays closed; the bridge
+/// does its own UDP DNS) -- remains denied.
+const RUNNER_PROFILE_WITH_OUTBOUND_NETWORK: &CStr = c"(version 1)
+(deny default)
+(allow sysctl-read (sysctl-name-prefix \"hw.optional.\"))
+(allow network-outbound)
+(allow network-bind (local udp))
+(allow network-inbound (local udp))
+(allow system-socket)
+";
+
 /// Why [`enable_seatbelt_sandbox`] could not put this process in a sandbox.
 ///
 /// Deliberately not part of the crate's public API: the only caller,
@@ -266,6 +282,23 @@ fn apply_profile(profile: &CStr) -> Result<(), SeatbeltError> {
 /// operator in control of the trade-off.
 pub fn enable_seatbelt_sandbox() {
     if let Err(err) = apply_profile(RUNNER_PROFILE) {
+        panic!(
+            "refusing to run the guest without the Seatbelt sandbox: {err}\n\
+             (this is fail-safe by design; see litebox_platform_macos_userland::seatbelt)"
+        );
+    }
+}
+
+/// [`enable_seatbelt_sandbox`], but with outbound network access left open for the runner's
+/// guest-to-host network bridge. See `RUNNER_PROFILE_WITH_OUTBOUND_NETWORK` for exactly what
+/// widens and why; same fail-safe panic contract.
+///
+/// # Panics
+///
+/// Panics if the profile cannot be installed, for the same reasons as
+/// [`enable_seatbelt_sandbox`].
+pub fn enable_seatbelt_sandbox_with_outbound_network() {
+    if let Err(err) = apply_profile(RUNNER_PROFILE_WITH_OUTBOUND_NETWORK) {
         panic!(
             "refusing to run the guest without the Seatbelt sandbox: {err}\n\
              (this is fail-safe by design; see litebox_platform_macos_userland::seatbelt)"

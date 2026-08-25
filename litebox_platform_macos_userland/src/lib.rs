@@ -87,7 +87,7 @@ mod guest;
 mod net;
 mod seatbelt;
 
-pub use seatbelt::enable_seatbelt_sandbox;
+pub use seatbelt::{enable_seatbelt_sandbox, enable_seatbelt_sandbox_with_outbound_network};
 
 use darwin::{
     MAP_JIT, ReservationError, mach_vm_region_iter, release_reservation, remap_to_fixed,
