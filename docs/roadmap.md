@@ -873,6 +873,28 @@ any guest:
   `litebox_packager` sidesteps this by writing `Header::new_ustar()` itself; a
   hand-built archive needs a writer that emits no extended headers.
 
+**The blast radius is the whole stock userland, not just relocation windows
+(measured 2026-08, XFCE image on this M-series host).** Stock Alpine busybox's
+`sha256sum` over a 7 MB in-image library returned a *different wrong digest on
+every invocation* -- four runs, four hashes -- while `cat` of the same file was
+byte-perfect every time, isolating the corruption to the guest's own hot-loop
+*arithmetic* (a live `x18` in the SHA-256 round computation), not litebox's
+read path. The same busybox rebuilt with `-ffixed-x18` produced the correct
+digest 4/4 in the same session. Consequences observed live before the
+diagnosis: musl's ld.so intermittently reporting `Exec format error` for
+byte-intact libraries, GTK components (xfwm4/xfdesktop/xfce4-panel) running
+but never painting, and an X client wedged awaiting a reply the server never
+sent -- all the same mechanism landing in different hot loops.
+`litebox_packager/scripts/build-x18-desktop-repo.sh` rebuilds the
+rendering-critical Alpine package closure (~55 packages: glib/GTK/cairo/
+pixman/pango/harfbuzz, the X client libraries, Xorg and its drivers, the XFCE
+components, busybox, dbus) with `-ffixed-x18` into a local APK repository an
+image build overlays via `apk upgrade`; `-ffixed-x18` code is ABI-compatible
+with stock code (`x18` is caller-saved), so partial coverage degrades
+gracefully rather than breaking. Off-path packages (webkit2gtk, ffmpeg, mesa,
+librsvg) stay stock and can still misbehave internally; the true fix for
+arbitrary binaries remains the binary-rewriting work tracked above.
+
 ### A further, distinct crash past both the `x18` and `SIGILL` fixes
 
 With a `-ffixed-x18`-rebuilt `ld-musl-aarch64.so.1`/`libc.musl-aarch64.so.1`
