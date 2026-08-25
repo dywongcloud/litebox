@@ -557,7 +557,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// `mmap(MAP_SHARED | PROT_WRITE)` of `/dev/fb0`: allocate ordinary anonymous pages in the
-    /// (shared shim/guest) address space, then register them with the [`Framebuffer`] as its
+    /// (shared shim/guest) address space, then register them with the
+    /// [`litebox::fs::devices::Framebuffer`] as its
     /// live pixel store -- pre-filled with the current contents, adopted until munmap. Guest
     /// stores through the mapping are immediately visible to the runner's RFB snapshot with no
     /// flush step, which is the coherence contract every fbdev graphics client assumes.

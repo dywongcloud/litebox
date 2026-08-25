@@ -47,6 +47,8 @@ use super::super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Times
 pub const INPUT_MAJOR: usize = 13;
 /// `event0`'s minor; `eventN` = `EVENT_MINOR_BASE + N`, matching real Linux.
 pub const EVENT_MINOR_BASE: usize = 64;
+/// `/dev/input/mice`'s minor (13:63), matching real Linux `mousedev`.
+pub const MICE_MINOR: usize = 63;
 
 /// `EV_VERSION` from `linux/input.h` -- what `EVIOCGVERSION` must report.
 const EV_VERSION: u32 = 0x0001_0001;
@@ -81,22 +83,31 @@ const KEY_BITMAP_BYTES: usize = (KEY_MAX + 1).div_ceil(8);
 enum DeviceKind {
     Keyboard,
     Pointer,
+    /// `/dev/input/mice`: the `mousedev` PS/2-protocol aggregate device, a *byte* stream
+    /// rather than `struct input_event`s. Served from [`RegistryInner::mice`], not the
+    /// event queues; [`Self::index`] therefore must never be called on it.
+    Mice,
 }
 
 impl DeviceKind {
     const ALL: &'static [(&'static str, DeviceKind)] = &[
         ("event0", DeviceKind::Keyboard),
         ("event1", DeviceKind::Pointer),
+        ("mice", DeviceKind::Mice),
     ];
 
     fn index(self) -> usize {
         match self {
             DeviceKind::Keyboard => 0,
             DeviceKind::Pointer => 1,
+            DeviceKind::Mice => unreachable!("mice is not an evdev event queue"),
         }
     }
 
     fn from_minor(minor: usize) -> Option<Self> {
+        if minor == MICE_MINOR {
+            return Some(DeviceKind::Mice);
+        }
         match minor.checked_sub(EVENT_MINOR_BASE)? {
             0 => Some(DeviceKind::Keyboard),
             1 => Some(DeviceKind::Pointer),
@@ -108,6 +119,7 @@ impl DeviceKind {
         match self {
             DeviceKind::Keyboard => "litebox-keyboard",
             DeviceKind::Pointer => "litebox-pointer",
+            DeviceKind::Mice => "litebox-mice",
         }
     }
 }
