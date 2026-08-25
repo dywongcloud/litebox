@@ -2728,7 +2728,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// evdev semantics -- whole 24-byte events only, `EINVAL` for a short buffer, `EAGAIN`
     /// only under `O_NONBLOCK`.
     fn read_input_events(&self, minor: usize, buf: &mut [u8]) -> Result<usize, Errno> {
-        if buf.len() < litebox::fs::devices::INPUT_EVENT_SIZE {
+        // `/dev/input/mice` is a plain byte stream (its handshake reads 1 byte at a time);
+        // only the evdev event devices insist on whole 24-byte events.
+        if minor != litebox::fs::devices::MICE_MINOR
+            && buf.len() < litebox::fs::devices::INPUT_EVENT_SIZE
+        {
             return Err(Errno::EINVAL);
         }
         let Some(registry) = self.global.input_registry.as_ref() else {

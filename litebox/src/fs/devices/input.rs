@@ -157,8 +157,60 @@ struct DeviceState<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static>
     pollee: Pollee<Platform>,
 }
 
+/// PS/2 protocol emulation modes, exactly `mousedev`'s: plain 3-byte PS/2 until the ImPS/2
+/// magic knock (rate 200,100,80) upgrades to 4-byte-with-wheel, and the Explorer knock
+/// (200,200,80) to 4-byte-with-wheel-and-side-buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiceMode {
+    Ps2,
+    Imps,
+    Exps,
+}
+
+impl MiceMode {
+    fn id(self) -> u8 {
+        match self {
+            MiceMode::Ps2 => 0,
+            MiceMode::Imps => 3,
+            MiceMode::Exps => 4,
+        }
+    }
+
+    fn packet_len(self) -> usize {
+        match self {
+            MiceMode::Ps2 => 3,
+            MiceMode::Imps | MiceMode::Exps => 4,
+        }
+    }
+}
+
+/// Protocol + conversion state for `/dev/input/mice`, all under one lock.
+struct MiceCtl {
+    mode: MiceMode,
+    imps_progress: usize,
+    imex_progress: usize,
+    /// Command responses; REPLACED wholesale by each `write` (mousedev semantics: its response
+    /// buffer is rewritten per byte, so only the last command's response is ever readable --
+    /// which is exactly what links2's read-until-ACK-then-read-ID handshake depends on).
+    responses: VecDeque<u8>,
+    /// Motion packets, appended per injected pointer event, drained after `responses`.
+    packets: VecDeque<u8>,
+    /// Last absolute pixel position, for delta conversion; `None` until the first event
+    /// (which then moves by (0,0) rather than jumping).
+    last: Option<(i32, i32)>,
+}
+
+struct MiceDev<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
+    ctl: Mutex<Platform, MiceCtl>,
+    pollee: Pollee<Platform>,
+}
+
+/// Bound on buffered mice packet bytes; oldest whole packets are dropped on overflow.
+const MICE_PACKET_CAP: usize = 4096;
+
 struct RegistryInner<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
     devices: [DeviceState<Platform>; 2],
+    mice: MiceDev<Platform>,
 }
 
 /// A cheap-to-clone handle to the two virtual input devices' shared state: the runner side
@@ -210,6 +262,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
         Self {
             inner: Arc::new(RegistryInner {
                 devices: [device(), device()],
+                mice: MiceDev {
+                    ctl: Mutex::new(MiceCtl {
+                        mode: MiceMode::Ps2,
+                        imps_progress: 0,
+                        imex_progress: 0,
+                        responses: VecDeque::new(),
+                        packets: VecDeque::new(),
+                        last: None,
+                    }),
+                    pollee: Pollee::new(),
+                },
             }),
         }
     }
@@ -293,8 +356,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
             // Unknown minor: nothing will ever arrive; report as would-block rather than hang.
             return Err(crate::event::polling::TryOpError::TryAgain);
         };
-        let dev = &self.inner.devices[kind.index()];
-        dev.pollee.wait(cx, nonblock, Events::IN, || {
+        let pollee = if kind == DeviceKind::Mice {
+            &self.inner.mice.pollee
+        } else {
+            &self.inner.devices[kind.index()].pollee
+        };
+        pollee.wait(cx, nonblock, Events::IN, || {
             let n = self.try_drain(minor, buf);
             if n == 0 {
                 Err(crate::event::polling::TryOpError::TryAgain)
@@ -315,6 +382,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
         let Some(kind) = DeviceKind::from_minor(minor) else {
             return 0;
         };
+        if kind == DeviceKind::Mice {
+            return self.mice_try_drain(buf);
+        }
         let dev = &self.inner.devices[kind.index()];
         let mut queue = dev.queue.lock();
         let mut written = 0;
@@ -337,8 +407,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
     /// outside the two devices this registry hosts.
     pub fn check_io_events(&self, minor: usize) -> Option<Events> {
         let kind = DeviceKind::from_minor(minor)?;
-        let dev = &self.inner.devices[kind.index()];
         let mut events = Events::empty();
+        if kind == DeviceKind::Mice {
+            let ctl = self.inner.mice.ctl.lock();
+            if !ctl.responses.is_empty() || !ctl.packets.is_empty() {
+                events |= Events::IN;
+            }
+            return Some(events);
+        }
+        let dev = &self.inner.devices[kind.index()];
         if !dev.queue.lock().is_empty() {
             events |= Events::IN;
         }
@@ -353,11 +430,165 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
         observer: alloc::sync::Weak<dyn Observer<Events>>,
         mask: Events,
     ) {
-        if let Some(kind) = DeviceKind::from_minor(minor) {
-            self.inner.devices[kind.index()]
-                .pollee
-                .register_observer(observer, mask);
+        match DeviceKind::from_minor(minor) {
+            Some(DeviceKind::Mice) => {
+                self.inner.mice.pollee.register_observer(observer, mask);
+            }
+            Some(kind) => {
+                self.inner.devices[kind.index()]
+                    .pollee
+                    .register_observer(observer, mask);
+            }
+            None => {}
         }
+    }
+
+    /// The `mousedev` magic knock upgrading to ImPS/2 (`set rate 200, 100, 80`).
+    const IMPS_SEQ: [u8; 6] = [0xf3, 200, 0xf3, 100, 0xf3, 80];
+    /// The knock upgrading to Explorer PS/2 (`set rate 200, 200, 80`).
+    const IMEX_SEQ: [u8; 6] = [0xf3, 200, 0xf3, 200, 0xf3, 80];
+
+    /// Guest bytes written to `/dev/input/mice`: run `mousedev`'s exact protocol. Every byte
+    /// advances the mode-upgrade sequence matchers; the response buffer is REPLACED by each
+    /// byte's response (so only the last command's response survives a multi-byte write --
+    /// the `mousedev` behavior links2's handshake depends on). Returns `data.len()`.
+    pub fn mice_write(&self, data: &[u8]) -> usize {
+        let mice = &self.inner.mice;
+        {
+            let mut ctl = mice.ctl.lock();
+            for &c in data {
+                if c == Self::IMEX_SEQ[ctl.imex_progress] {
+                    ctl.imex_progress += 1;
+                    if ctl.imex_progress == Self::IMEX_SEQ.len() {
+                        ctl.imex_progress = 0;
+                        ctl.mode = MiceMode::Exps;
+                    }
+                } else {
+                    ctl.imex_progress = 0;
+                }
+                if c == Self::IMPS_SEQ[ctl.imps_progress] {
+                    ctl.imps_progress += 1;
+                    if ctl.imps_progress == Self::IMPS_SEQ.len() {
+                        ctl.imps_progress = 0;
+                        ctl.mode = MiceMode::Imps;
+                    }
+                } else {
+                    ctl.imps_progress = 0;
+                }
+                ctl.responses.clear();
+                ctl.responses.push_back(0xfa);
+                match c {
+                    // Get ID: the mode's device ID.
+                    0xf2 => {
+                        let id = ctl.mode.id();
+                        ctl.responses.push_back(id);
+                    }
+                    // Get info: rate/resolution/scaling placeholders, as mousedev reports.
+                    0xe9 => ctl.responses.extend([100, 100, 100]),
+                    // Reset: back to bare PS/2, self-test passed, mouse ID 0.
+                    0xff => {
+                        ctl.mode = MiceMode::Ps2;
+                        ctl.imps_progress = 0;
+                        ctl.imex_progress = 0;
+                        ctl.responses.extend([0xaa, 0x00]);
+                    }
+                    // Poll: one zero-motion packet.
+                    0xeb => {
+                        let len = ctl.mode.packet_len();
+                        ctl.responses.push_back(0x08);
+                        for _ in 1..len {
+                            ctl.responses.push_back(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        mice.pollee.notify_observers(Events::IN);
+        data.len()
+    }
+
+    /// Drain protocol responses (first) then motion packets into `buf`, non-blocking.
+    pub fn mice_try_drain(&self, buf: &mut [u8]) -> usize {
+        let mice = &self.inner.mice;
+        let mut ctl = mice.ctl.lock();
+        let mut written = 0;
+        while written < buf.len() {
+            let Some(b) = ctl.responses.pop_front() else {
+                break;
+            };
+            buf[written] = b;
+            written += 1;
+        }
+        while written < buf.len() {
+            let Some(b) = ctl.packets.pop_front() else {
+                break;
+            };
+            buf[written] = b;
+            written += 1;
+        }
+        let more = !ctl.responses.is_empty() || !ctl.packets.is_empty();
+        drop(ctl);
+        if more {
+            mice.pollee.notify_observers(Events::IN);
+        }
+        written
+    }
+
+    /// Inject a pointer event as PS/2 motion packets: `px`/`py` are absolute screen pixels
+    /// (converted to deltas against the last event -- a PS/2 mouse only speaks deltas),
+    /// `buttons` is the PS/2 button byte (bit0 left, bit1 right, bit2 middle), `wheel` a
+    /// scroll step (+1 toward the user / scroll down, -1 away, matching what a consumer of
+    /// byte 3 expects). Large motions split across packets (per-packet delta is 8-bit).
+    pub fn inject_mice_pointer(&self, px: i32, py: i32, buttons: u8, wheel: i8) {
+        let mice = &self.inner.mice;
+        {
+            let mut ctl = mice.ctl.lock();
+            let (lx, ly) = ctl.last.unwrap_or((px, py));
+            ctl.last = Some((px, py));
+            let mut dx = px - lx;
+            // Screen y grows downward; PS/2 y grows upward.
+            let mut dy = ly - py;
+            let mut wheel = wheel;
+            loop {
+                let sx = dx.clamp(-127, 127);
+                let sy = dy.clamp(-127, 127);
+                dx -= sx;
+                dy -= sy;
+                let sw = wheel;
+                wheel = 0;
+                let mut b0 = 0x08 | (buttons & 0x07);
+                if sx < 0 {
+                    b0 |= 0x10;
+                }
+                if sy < 0 {
+                    b0 |= 0x20;
+                }
+                let mode = ctl.mode;
+                let packet_len = mode.packet_len();
+                while ctl.packets.len() + packet_len > MICE_PACKET_CAP {
+                    for _ in 0..packet_len {
+                        ctl.packets.pop_front();
+                    }
+                }
+                ctl.packets.push_back(b0);
+                // Two's-complement low byte; the sign rides in `b0`'s overflow bits.
+                ctl.packets
+                    .push_back(i8::try_from(sx).unwrap_or(0).cast_unsigned());
+                ctl.packets
+                    .push_back(i8::try_from(sy).unwrap_or(0).cast_unsigned());
+                match mode {
+                    MiceMode::Ps2 => {}
+                    MiceMode::Imps => ctl.packets.push_back(sw.cast_unsigned()),
+                    // Explorer: wheel is a 4-bit signed field; buttons 4/5 unimplemented.
+                    MiceMode::Exps => ctl.packets.push_back(sw.cast_unsigned() & 0x0f),
+                }
+                if dx == 0 && dy == 0 {
+                    break;
+                }
+            }
+        }
+        mice.pollee.notify_observers(Events::IN);
     }
 
     /// Answer one `EVIOC*` ioctl for the device at `minor`. `cmd` is the raw ioctl number;
@@ -374,6 +605,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
         let Some(kind) = DeviceKind::from_minor(minor) else {
             return EvdevIoctlReply::Invalid;
         };
+        if kind == DeviceKind::Mice {
+            // `mousedev` is not an evdev device; it answers no `EVIOC*` command.
+            return EvdevIoctlReply::Invalid;
+        }
         let nr = cmd & 0xff;
         let size = (cmd >> 16) as usize & 0x3fff;
 
@@ -539,7 +774,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputDevices<
         }
     }
 
+    fn device_minor(kind: DeviceKind) -> usize {
+        match kind {
+            DeviceKind::Mice => MICE_MINOR,
+            _ => EVENT_MINOR_BASE + kind.index(),
+        }
+    }
+
     fn device_status(kind: DeviceKind) -> FileStatus {
+        let minor = Self::device_minor(kind);
         FileStatus {
             file_type: FileType::CharacterDevice,
             mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
@@ -547,10 +790,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputDevices<
             owner: UserInfo::ROOT,
             node_info: NodeInfo {
                 dev: 5,
-                ino: 32 + kind.index(),
-                rdev: core::num::NonZeroUsize::new(
-                    (INPUT_MAJOR << 8) | (EVENT_MINOR_BASE + kind.index()),
-                ),
+                ino: 32 + minor,
+                rdev: core::num::NonZeroUsize::new((INPUT_MAJOR << 8) | minor),
             },
             blksize: 0x1000,
             atime: Timestamp::default(),
@@ -662,7 +903,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> Backend
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
-        let minor = EVENT_MINOR_BASE + h.kind.index();
+        let minor = Self::device_minor(h.kind);
         let n = self.registry.try_drain(minor, buf);
         if n == 0 {
             // Empty queue: a real evdev fd would block here, but this trait has no wait
@@ -674,7 +915,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> Backend
         Ok(n)
     }
 
-    fn write(&self, _h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+        if h.get_typed::<Self>().kind == DeviceKind::Mice {
+            // PS/2 command bytes drive the mousedev protocol state machine.
+            return Ok(self.registry.mice_write(buf));
+        }
         // Guests write LED/MSC events back to input devices (X11 sets keyboard LEDs on
         // CapsLock). There is no LED to light; accept and discard so the caller never fails.
         Ok(buf.len())

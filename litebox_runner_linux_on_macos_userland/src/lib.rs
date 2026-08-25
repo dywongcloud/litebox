@@ -376,6 +376,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         *last = p.button_mask;
                         drop(last);
                         registry.inject_pointer_abs(x, y, &transitions, now);
+                        // Also feed `/dev/input/mice` (PS/2 button byte: bit0 left, bit1
+                        // right, bit2 middle; wheel +1 = scroll down). Consumers read one
+                        // device or the other, never both.
+                        let ps2_buttons = (p.button_mask & 0x01)
+                            | ((p.button_mask >> 2) & 0x01) << 1
+                            | ((p.button_mask >> 1) & 0x01) << 2;
+                        let wheel = if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
+                            -1i8
+                        } else {
+                            i8::from(changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0)
+                        };
+                        registry.inject_mice_pointer(
+                            i32::from(p.x),
+                            i32::from(p.y),
+                            ps2_buttons,
+                            wheel,
+                        );
                     }
                 }
             }) {

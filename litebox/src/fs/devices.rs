@@ -26,7 +26,7 @@ use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, U
 pub use self::framebuffer::{FbFixScreeninfo, FbVarScreeninfo, Framebuffer, FramebufferGeometry};
 pub use self::input::{
     ABS_RANGE_MAX, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EVENT_MINOR_BASE, EvdevIoctlReply,
-    INPUT_EVENT_SIZE, INPUT_MAJOR, InputDevices, InputRegistry,
+    INPUT_EVENT_SIZE, INPUT_MAJOR, InputDevices, InputRegistry, MICE_MINOR,
 };
 mod framebuffer;
 mod input;
