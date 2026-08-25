@@ -3094,15 +3094,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // VT_GETMODE: `struct vt_mode { char mode; char waitv; short
                             // relsig; short acqsig; short frsig; }` -- VT_AUTO, no signals.
                             0x5601 => write_bytes(&[0u8; 8]),
-                            // VT_SETMODE: accepted and ignored; with no VT switching the
-                            // release/acquire signals it configures can never fire.
-                            0x5602 => Ok(0),
                             // VT_GETSTATE: `struct vt_stat { u16 v_active; u16 v_signal;
                             // u16 v_state; }` -- VT 1 active, VTs 0/1 open.
                             0x5603 => write_bytes(&[1, 0, 0, 0, 3, 0]),
-                            // VT_RELDISP / VT_ACTIVATE / VT_WAITACTIVE: the sole VT is
-                            // always already active.
-                            0x5605 | 0x5606 | 0x5607 => Ok(0),
+                            // VT_SETMODE (accepted and ignored; with no VT switching the
+                            // release/acquire signals it configures can never fire), and
+                            // VT_RELDISP / VT_ACTIVATE / VT_WAITACTIVE (the sole VT is
+                            // always already active).
+                            0x5602 | 0x5605..=0x5607 => Ok(0),
                             _ => {
                                 log_unsupported!("VT ioctl {cmd:#x}");
                                 Err(Errno::EINVAL)
