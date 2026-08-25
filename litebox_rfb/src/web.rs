@@ -217,7 +217,7 @@ fn serve_websocket<F: FramebufferSource>(
                 message.extend_from_slice(&width.to_be_bytes());
                 message.extend_from_slice(&height.to_be_bytes());
                 // XRGB8888 little-endian memory order is B,G,R,X; the canvas wants R,G,B,A.
-                for px in pixels.chunks_exact(4) {
+                for px in pixels.as_chunks::<4>().0 {
                     message.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
                 }
                 if write_ws_binary(&mut write_stream, &message).is_err() {
@@ -355,10 +355,10 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         msg.push(0);
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut sched = [0u32; 80];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            sched[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            sched[i] = u32::from_be_bytes(*word);
         }
         for i in 16..80 {
             sched[i] = (sched[i - 3] ^ sched[i - 8] ^ sched[i - 14] ^ sched[i - 16]).rotate_left(1);
