@@ -36,7 +36,7 @@ use tar::{Builder, Header};
 #[command(name = "litebox-packager")]
 pub struct CliArgs {
     /// ELF files to package (host mode). Not used in OCI mode.
-    #[arg(required_unless_present = "oci_image")]
+    #[arg(required_unless_present_any = ["oci_image", "oci_rootfs_tar"])]
     pub input_files: Vec<PathBuf>,
 
     /// Pull and package an OCI container image instead of local files.
@@ -48,6 +48,20 @@ pub struct CliArgs {
         conflicts_with = "input_files"
     )]
     pub oci_image: Option<String>,
+
+    /// Package a locally-exported container rootfs tar (`podman export` /
+    /// `docker export` output) instead of pulling from a registry -- the path
+    /// for locally-built images that exist in no registry. Same pipeline as
+    /// `--oci-image` from extraction onward; the container config
+    /// (ENTRYPOINT/ENV) is not present in an exported rootfs, so no
+    /// `config_and_run.sh` is generated -- name the program to run explicitly
+    /// on the runner command line.
+    #[arg(
+        long = "oci-rootfs-tar",
+        value_name = "PATH_TO_TAR",
+        conflicts_with_all = ["input_files", "oci_image"]
+    )]
+    pub oci_rootfs_tar: Option<PathBuf>,
 
     /// Output tar file path.
     #[arg(short = 'o', long = "output", default_value = "litebox_packager.tar")]
@@ -100,6 +114,23 @@ fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
 
 /// Run the packaging tool.
 pub fn run(args: CliArgs) -> anyhow::Result<()> {
+    if let Some(ref rootfs_tar) = args.oci_rootfs_tar {
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_vendor = "apple")
+        ))]
+        {
+            return run_oci_rootfs_tar(rootfs_tar, &args);
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_vendor = "apple")
+        )))]
+        {
+            let _ = rootfs_tar;
+            bail!("--oci-rootfs-tar is only supported on x86-64 hosts and Apple Silicon");
+        }
+    }
     if let Some(ref image_ref) = args.oci_image {
         #[cfg(any(
             target_arch = "x86_64",
@@ -292,7 +323,27 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     // --- Phase 1: Pull and extract OCI image ---
     eprintln!("Pulling OCI image: {image_ref}");
     let extracted = oci::pull_and_extract(image_ref, args.verbose)?;
+    package_extracted(&extracted, args)
+}
 
+/// Package a locally-exported container rootfs tar: same pipeline as [`run_oci`] from
+/// extraction onward, minus the registry pull.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
+fn run_oci_rootfs_tar(rootfs_tar: &Path, args: &CliArgs) -> anyhow::Result<()> {
+    eprintln!("Extracting rootfs tar: {}", rootfs_tar.display());
+    let extracted = oci::extract_rootfs_tar(rootfs_tar, args.verbose)?;
+    package_extracted(&extracted, args)
+}
+
+/// The shared post-extraction packaging pipeline: scan, rewrite, config, tar.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
+fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow::Result<()> {
     // --- Phase 2: Scan rootfs for files ---
     eprintln!("Scanning rootfs...");
     let file_map = oci::scan_rootfs(
@@ -368,7 +419,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
             }
             tar_entries.push(TarEntry {
                 tar_path: CONFIG_JSON_TAR_PATH.to_string(),
-                data: extracted.config_json,
+                data: extracted.config_json.clone(),
                 mode: 0o644,
             });
         } else {

@@ -248,6 +248,47 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     })
 }
 
+/// Extract a locally-exported container rootfs tar (`podman export` / `docker export` output)
+/// through the same layer-extraction and symlink-materialization pipeline `pull_and_extract`
+/// runs on registry layers -- an exported rootfs IS one flattened layer. The container config
+/// (ENTRYPOINT/CMD/ENV) is not part of an exported rootfs, so [`ExtractedImage::config`] is
+/// default-empty and `config_json` is an empty JSON object.
+pub fn extract_rootfs_tar(tar_path: &Path, verbose: bool) -> anyhow::Result<ExtractedImage> {
+    let data = std::fs::read(tar_path)
+        .with_context(|| format!("failed to read rootfs tar {}", tar_path.display()))?;
+
+    let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
+    let rootfs_path = tempdir.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs_path).context("failed to create rootfs directory")?;
+
+    let mut symlinks: Vec<DeferredSymlink> = Vec::new();
+    let mut permissions: HashMap<PathBuf, u32> = HashMap::new();
+    if verbose {
+        eprintln!("  Extracting rootfs tar ({} bytes)...", data.len());
+    }
+    // `podman export` output is a plain tar; `extract_layer` also tolerates gzip by sniffing.
+    extract_layer(&data, "", &rootfs_path, &mut symlinks, &mut permissions)
+        .context("failed to extract rootfs tar")?;
+
+    let symlink_map: HashMap<PathBuf, PathBuf> = symlinks
+        .iter()
+        .map(|s| (s.rel_path.clone(), s.link_target.clone()))
+        .collect();
+    if verbose {
+        eprintln!("  Resolving {} symlinks...", symlinks.len());
+    }
+    materialize_symlinks(&symlink_map, &rootfs_path, &mut permissions, verbose)?;
+
+    Ok(ExtractedImage {
+        tempdir,
+        rootfs_path,
+        config: ImageConfig::default(),
+        config_json: b"{}".to_vec(),
+        symlink_map,
+        permissions,
+    })
+}
+
 /// Generate a `litebox/config_and_run.sh` shell script from the OCI image config.
 ///
 /// The script:
