@@ -419,7 +419,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Framebuffer<Platform> {
     /// # Safety
     ///
     /// `guest_addr` must address `len` readable+writable bytes in this process that stay
-    /// valid until [`Self::clear_guest_mapping`] runs; the caller (the shim's `mmap`/`munmap`
+    /// valid until [`Self::clear_guest_mapping_overlapping`] runs; the caller (the shim's `mmap`/`munmap`
     /// paths) must clear the registration before the pages are ever unmapped.
     pub unsafe fn set_guest_mapping(&self, guest_addr: usize, len: usize) {
         let mut state = self.inner.lock();
