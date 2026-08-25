@@ -84,8 +84,8 @@ enum DeviceKind {
     Keyboard,
     Pointer,
     /// `/dev/input/mice`: the `mousedev` PS/2-protocol aggregate device, a *byte* stream
-    /// rather than `struct input_event`s. Served from [`RegistryInner::mice`], not the
-    /// event queues; [`Self::index`] therefore must never be called on it.
+    /// rather than `struct input_event`s. Served from the registry's dedicated mice state,
+    /// not the event queues; `index` therefore must never be called on it.
     Mice,
 }
 
