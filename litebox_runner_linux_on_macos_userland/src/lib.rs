@@ -121,18 +121,6 @@ pub struct CliArgs {
     pub vnc_bind_all: bool,
 }
 
-/// Run a Linux program with LiteBox on unmodified macOS.
-///
-/// # Errors
-///
-/// Returns an error when the tar archive cannot be read, or when the shim
-/// cannot load the requested program out of it.
-///
-/// # Panics
-///
-/// Panics if the host is not set up as expected -- notably if a second guest
-/// thread starts, which this platform's process-global guest-entry save area
-/// does not yet support (see `docs/roadmap.md`).
 /// Translate an RFB `KeyEvent` keysym into the byte sequence a Linux console keyboard would
 /// deliver on that key, for feeding the guest's stdin. Latin-1 keysyms are their own byte
 /// (X11 keysyms already encode the shifted character); control keys map to the `linux`
@@ -182,6 +170,18 @@ fn keysym_to_tty_bytes(keysym: u32, ctrl: bool) -> Option<Vec<u8>> {
     }
 }
 
+/// Run a Linux program with LiteBox on unmodified macOS.
+///
+/// # Errors
+///
+/// Returns an error when the tar archive cannot be read, or when the shim
+/// cannot load the requested program out of it.
+///
+/// # Panics
+///
+/// Panics if the host is not set up as expected -- notably if a second guest
+/// thread starts, which this platform's process-global guest-entry save area
+/// does not yet support (see `docs/roadmap.md`).
 pub fn run(cli_args: CliArgs) -> Result<()> {
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())

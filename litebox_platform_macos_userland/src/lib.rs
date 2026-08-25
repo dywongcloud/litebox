@@ -173,6 +173,10 @@ impl MacOsUserland {
     /// VNC keyboard) passes `true` so a closed or redirected host stdin doesn't read as EOF to
     /// a guest whose real keyboard is the bridge. Set at construction rather than after because
     /// a redirected host stdin hits EOF in the pump thread within microseconds of spawn.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::new`].
     pub fn new_with_options(tun_device_name: Option<&str>, hold_stdin_open: bool) -> &'static Self {
         install_fault_handlers();
         install_async_signal_handlers();
