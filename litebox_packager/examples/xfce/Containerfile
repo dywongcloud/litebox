@@ -1,0 +1,35 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+# Keep this release synchronized with build-xfce-image.sh's aports branch.
+FROM alpine:3.24
+
+RUN apk add --no-cache \
+        dbus dbus-x11 font-cursor-misc font-dejavu font-misc-misc \
+        xf86-input-evdev xf86-video-fbdev xfce4 xfce4-terminal \
+        xclock xeyes xmessage xorg-server xrandr xset xterm \
+    && fc-cache -f \
+    && mkdir -p /etc/X11 /home/user \
+    && chmod 700 /home/user
+
+# Overlay only rebuilt packages already installed at the exact same version.
+# Naming paths explicitly is required: repository add/upgrade is a no-op for
+# same-version packages, while a local path is applied as "Replacing x -> x".
+COPY x18repo /x18repo
+RUN set -eux; \
+    overlay=""; \
+    for installed in $(awk -F: '$1 == "P" { name=$2 } $1 == "V" { print name "-" $2 ".apk" }' /lib/apk/db/installed); do \
+        candidate=$(find /x18repo -type f -name "$installed" -print -quit); \
+        [ -z "$candidate" ] || overlay="$overlay $candidate"; \
+    done; \
+    [ -n "$overlay" ]; \
+    plan=$(apk add --simulate --no-network --repositories-file /dev/null \
+        --allow-untrusted $overlay 2>&1); \
+    printf '%s\n' "$plan"; \
+    printf '%s\n' "$plan" | grep 'Replacing '; \
+    ! printf '%s\n' "$plan" | grep -E 'unavailable|(^| )(Installing|Upgrading|Downgrading|Purging) '; \
+    apk add --no-network --repositories-file /dev/null --allow-untrusted $overlay; \
+    rm -rf /x18repo
+
+COPY xorg.conf /etc/X11/xorg.conf
+COPY start-desktop.sh /usr/bin/start-desktop.sh
