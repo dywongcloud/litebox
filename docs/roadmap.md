@@ -885,15 +885,23 @@ diagnosis: musl's ld.so intermittently reporting `Exec format error` for
 byte-intact libraries, GTK components (xfwm4/xfdesktop/xfce4-panel) running
 but never painting, and an X client wedged awaiting a reply the server never
 sent -- all the same mechanism landing in different hot loops.
-`litebox_packager/scripts/build-x18-desktop-repo.sh` rebuilds the
-rendering-critical Alpine package closure (~55 packages: glib/GTK/cairo/
-pixman/pango/harfbuzz, the X client libraries, Xorg and its drivers, the XFCE
-components, busybox, dbus) with `-ffixed-x18` into a local APK repository an
-image build overlays via `apk upgrade`; `-ffixed-x18` code is ABI-compatible
-with stock code (`x18` is caller-saved), so partial coverage degrades
-gracefully rather than breaking. Off-path packages (webkit2gtk, ffmpeg, mesa,
-librsvg) stay stock and can still misbehave internally; the true fix for
-arbitrary binaries remains the binary-rewriting work tracked above.
+`litebox_packager/scripts/build-x18-desktop-repo.sh` rebuilds 108 aports
+origins: the conservative 90-origin loaded/paint closure (musl is covered by
+the companion cache) plus 18 XFCE utilities/session components. C/C++ code
+uses `-ffixed-x18`; Cargo code (Glycin/libglycin/librsvg, which Alpine 3.24
+uses for the default SVG backdrop and panel artwork) uses LLVM's
+`+reserve-x18`. A failing post-build disassembly gate catches hand-written
+assembly and prebuilt compiler helpers; narrow source fixes disable libffi's
+x18-based Go-closure ABI, remove libXt LTO, avoid fontconfig's stock
+`__divtf3`, and save only x19 in pixman's AArch64 NEON frames. Rebuilt APKs
+retain stock versions -- changing pkgrel after APKBUILD evaluation breaks
+exact split-package dependencies -- and image builds overlay only exact
+installed matches by passing local APK paths to apk (same-version repository
+upgrade is a no-op). Fixed-register code is ABI-compatible with stock code
+(`x18` is caller-saved), so partial coverage degrades gracefully rather than
+breaking. Off-path packages (webkit2gtk, ffmpeg/GStreamer, Mesa/LLVM) stay
+stock and can still misbehave internally; the true fix for arbitrary binaries
+remains the binary-rewriting work tracked above.
 
 ### A further, distinct crash past both the `x18` and `SIGILL` fixes
 
