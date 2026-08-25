@@ -333,7 +333,15 @@ where
     /// If shrinking the program break, the caller must ensure that the released memory region is no longer used.
     pub unsafe fn brk(&self, brk: usize) -> Result<usize, MappingError> {
         let mut vmem = self.vmem.write();
-        assert_ne!(vmem.brk, 0, "initial brk is not set yet");
+        if vmem.brk == 0 {
+            // No break is installed. Under the shim's per-process swap protocol this means the
+            // calling process's own break was never initialized (its exec skipped break
+            // setup). Refusing is safe -- libc mallocs fall back to `mmap` on `brk` failure --
+            // while the previous `assert!` here took down the whole runner from inside the
+            // shim's global brk critical section, deadlocking every other process's heap
+            // (observed live as a desktop-wide freeze).
+            return Err(MappingError::OutOfMemory);
+        }
         if brk == 0 {
             // Calling `brk` with 0 can be used to find the current location of the program break.
             return Ok(vmem.brk);

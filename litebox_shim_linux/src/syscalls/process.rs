@@ -3231,9 +3231,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let load_info = {
             let _guard = self.global.brk_lock.lock();
             let load_info = loader.load(argv, envp, self.init_auxv())?;
-            self.process()
-                .brk
-                .store(self.global.pm.swap_brk(0), Ordering::Relaxed);
+            let initial_brk = self.global.pm.swap_brk(0);
+            if initial_brk == 0 {
+                // The loader did not publish a break for this image; the first `brk` this
+                // process makes will fail (see `PageManager::brk`'s zero-break refusal) and
+                // its libc will fall back to mmap. Loud, because it means a loader path
+                // skipped `set_initial_brk` -- the root cause worth fixing.
+                litebox_util_log::warn!(pid:? = self.pid; "execve: loader left no initial brk");
+            }
+            self.process().brk.store(initial_brk, Ordering::Relaxed);
             load_info
         };
 
