@@ -423,7 +423,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             cli_args.vnc_port,
             std::sync::Arc::new(FramebufferAdapter(framebuffer)),
         )
-        .map_err(|e| anyhow!("failed to bind VNC listener: {e}"))?;
+        .map_err(|e| {
+            anyhow!(
+                "failed to bind VNC listener on port {}: {e}\n\
+                 (most often another runner instance is still running -- stop it or pick a \
+                 different --vnc-port)",
+                cli_args.vnc_port
+            )
+        })?;
         litebox_util_log::info!(
             addr:% = server.local_addr().map_err(|e| anyhow!("{e}"))?;
             "vnc server listening"
@@ -451,7 +458,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             port,
             std::sync::Arc::new(FramebufferAdapter(framebuffer)),
         )
-        .map_err(|e| anyhow!("failed to bind the web viewer listener: {e}"))?;
+        .map_err(|e| {
+            anyhow!(
+                "failed to bind the web viewer listener on port {port}: {e}\n\
+                 (most often another runner instance is still running -- stop it or pick a \
+                 different --vnc-web port)"
+            )
+        })?;
         litebox_util_log::info!(
             addr:% = server.local_addr().map_err(|e| anyhow!("{e}"))?;
             "web viewer listening -- open http://127.0.0.1 at this port"
