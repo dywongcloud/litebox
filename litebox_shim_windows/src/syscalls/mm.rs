@@ -2312,7 +2312,28 @@ mod tests {
                 // reuse into STATUS_CONFLICTING_ADDRESSES -- observed repeatedly on CI runners.
                 // A conflict means the probe address went stale, not that alignment fidelity
                 // broke, so re-probe at a fresh address, bounded.
-                let mut attempts_left = 8;
+                //
+                // Pre-warm the guest allocation path once before any probe: its first call
+                // grows the shim's own heap and tracking structures, and on some runners that
+                // growth deterministically landed exactly in the just-freed probe range,
+                // exhausting every retry. After a throwaway round trip, the machinery is
+                // allocated and the probe-to-attempt window contains no shim-side heap growth.
+                {
+                    let task = crate::tests::test_task();
+                    let mut warm_base = 0usize;
+                    let mut warm_size = 1usize;
+                    let warm_status = task.sys_nt_allocate_virtual_memory(
+                        ProcessHandle::CURRENT,
+                        mut_ptr(&mut warm_base),
+                        0,
+                        mut_ptr(&mut warm_size),
+                        AllocationType::MEM_RESERVE.bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                    );
+                    assert_eq!(warm_status, NtStatus::SUCCESS);
+                    release_allocation(&task, warm_base);
+                }
+                let mut attempts_left = 32;
                 loop {
                     attempts_left -= 1;
 
