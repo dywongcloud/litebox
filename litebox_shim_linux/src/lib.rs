@@ -539,8 +539,7 @@ fn default_fs<Platform: ShimPlatform>(
     // above, so `framebuffer` is always `Some` here in practice; falling back to a fresh,
     // unmounted `Framebuffer` rather than panicking keeps this path total even if that
     // invariant is ever violated by a future refactor.
-    let framebuffer =
-        framebuffer.unwrap_or_else(litebox::fs::devices::Framebuffer::new);
+    let framebuffer = framebuffer.unwrap_or_else(litebox::fs::devices::Framebuffer::new);
     let tar_ro = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()

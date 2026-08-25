@@ -129,15 +129,15 @@ const FB_ACCEL_NONE: u32 = 0;
 
 /// Live `/dev/fb0` geometry plus the pixel store it describes.
 ///
-/// `yres_virtual = 2 * yres` by construction (see [`Self::new`]/[`Self::resize`]): the lower half
-/// is the visible page, the upper half a second page a `FBIOPAN_DISPLAY` caller can flip to for
-/// tear-free double buffering. `xres_virtual == xres` -- litebox's fbdev never supports horizontal
-/// virtual panning (`xpanstep == 0` in [`Self::fix_screeninfo`] advertises exactly that).
+/// `yres_virtual = 2 * yres` by construction (see `resize` below): the lower half is the visible
+/// page, the upper half a second page a `FBIOPAN_DISPLAY` caller can flip to for tear-free double
+/// buffering. `xres_virtual == xres` -- litebox's fbdev never supports horizontal virtual panning
+/// (`xpanstep == 0` in `fix_screeninfo` advertises exactly that).
 struct FramebufferState {
     xres: u32,
     yres: u32,
     /// Pan offset in the Y direction, in pixels; `0` or `yres`, the top of whichever page is
-    /// currently visible. See [`FramebufferState::pan`].
+    /// currently visible. See `pan` below.
     yoffset: u32,
     /// `xres * (2 * yres) * BYTES_PER_PIXEL` bytes, row-major, top-left first, `line_length`
     /// stride between rows -- exactly what every fbdev consumer's `mmap` expects to find.
@@ -275,7 +275,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Clone for Framebuffer<Platfo
 }
 
 impl<Platform: RawSyncPrimitivesProvider + 'static> Framebuffer<Platform> {
-    /// Construct a new framebuffer at the default geometry ([`DEFAULT_XRES`]x[`DEFAULT_YRES`]).
+    /// Construct a new framebuffer at the default geometry (1024x768).
     #[must_use]
     pub fn new() -> Self {
         let mut state = FramebufferState {
@@ -318,7 +318,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Framebuffer<Platform> {
     }
 
     /// Apply a `FBIOPAN_DISPLAY` request. Returns `false` (caller maps to `EINVAL`) for any
-    /// `yoffset` other than `0` or the current `yres` -- see [`FramebufferState::pan`].
+    /// `yoffset` other than `0` or the current `yres`.
     #[must_use]
     pub fn pan_display(&self, yoffset: u32) -> bool {
         self.inner.lock().pan(yoffset)
@@ -351,7 +351,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Framebuffer<Platform> {
     }
 
     /// Read the currently *visible* page (post-pan) into `dst`, for a runner-side presenter/RFB
-    /// server -- distinct from [`Self::read_at`], which serves the raw fbdev byte-offset
+    /// server -- distinct from the fbdev `read`/`write` path, which serves the raw byte-offset
     /// contract over the full two-page store.
     pub fn read_visible_into(&self, dst: &mut Vec<u8>) {
         let state = self.inner.lock();

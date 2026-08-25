@@ -23,9 +23,7 @@ use super::errors::{
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
 
-pub use self::framebuffer::{
-    FbFixScreeninfo, FbVarScreeninfo, Framebuffer, FramebufferGeometry,
-};
+pub use self::framebuffer::{FbFixScreeninfo, FbVarScreeninfo, Framebuffer, FramebufferGeometry};
 mod framebuffer;
 
 /// Block size for stdio devices
@@ -35,9 +33,9 @@ const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
 /// `/dev/fb0`'s major device number, matching real Linux's `fb` major
-/// (https://www.kernel.org/doc/Documentation/admin-guide/devices.txt). Public so callers outside
-/// this crate (the shim's `sys_ioctl`) can recognize an fb0 fd by its `rdev` major, the same way
-/// [`super::layered`]'s tty recognition works off a major-number range.
+/// (<https://www.kernel.org/doc/Documentation/admin-guide/devices.txt>). Public so callers
+/// outside this crate (the shim's `sys_ioctl`) can recognize an fb0 fd by its `rdev` major, the
+/// same way a tty is recognized by its own major-number range.
 pub const FB_MAJOR: usize = 29;
 /// Block size for /dev/fb0
 const FB_BLOCK_SIZE: usize = 0x1000;
@@ -70,8 +68,8 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     rdev: core::num::NonZeroUsize::new(0x109),
 };
 /// Node info for /dev/fb0. Major 29 matches real Linux's `fb` major
-/// (https://www.kernel.org/doc/Documentation/admin-guide/devices.txt); minor 0 is the first (and
-/// here, only) framebuffer device.
+/// (<https://www.kernel.org/doc/Documentation/admin-guide/devices.txt>); minor 0 is the first
+/// (and here, only) framebuffer device.
 const FB0_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 10,
