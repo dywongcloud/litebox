@@ -120,6 +120,10 @@ pub struct MacOsUserland {
     /// Doorbell the stdin-pump background thread notifies after every push/EOF, so
     /// `StdioProvider::read_from_stdin`'s blocking path can sleep instead of busy-polling.
     stdin_doorbell: (std::sync::Mutex<()>, Condvar),
+    /// When set, host-stdin EOF does NOT mark the pump EOF: another producer (the runner's VNC
+    /// keyboard bridge via [`Self::inject_stdin`]) can still deliver guest stdin, so the guest
+    /// must keep seeing an open (momentarily empty) stream. See `spawn_stdin_pump_thread`.
+    stdin_held_open: core::sync::atomic::AtomicBool,
     /// Serializes real host writes to stdout, so concurrent guest threads' `write()` calls to the
     /// same stream don't interleave mid-write.
     stdout_lock: std::sync::Mutex<()>,
@@ -161,6 +165,15 @@ impl MacOsUserland {
     /// or if the guest thread-pointer TSD slot the rewriter's `Host::MacOs`
     /// gates have baked in cannot be reserved (see `reserve_guest_tpidr_tsd_slot`).
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+        Self::new_with_options(tun_device_name, false)
+    }
+
+    /// [`Self::new`], with `hold_stdin_open` additionally controlling whether host-stdin EOF is
+    /// forwarded to the guest: a runner that bridges another input source into guest stdin (the
+    /// VNC keyboard) passes `true` so a closed or redirected host stdin doesn't read as EOF to
+    /// a guest whose real keyboard is the bridge. Set at construction rather than after because
+    /// a redirected host stdin hits EOF in the pump thread within microseconds of spawn.
+    pub fn new_with_options(tun_device_name: Option<&str>, hold_stdin_open: bool) -> &'static Self {
         install_fault_handlers();
         install_async_signal_handlers();
         reserve_guest_tpidr_tsd_slot();
@@ -181,6 +194,7 @@ impl MacOsUserland {
                 litebox::platform::stdin_pump::DEFAULT_CAPACITY,
             ),
             stdin_doorbell: (std::sync::Mutex::new(()), Condvar::new()),
+            stdin_held_open: core::sync::atomic::AtomicBool::new(hold_stdin_open),
             stdout_lock: std::sync::Mutex::new(()),
             stderr_lock: std::sync::Mutex::new(()),
             tun,
@@ -1576,10 +1590,16 @@ fn spawn_stdin_pump_thread(platform: &'static MacOsUserland) {
                     {
                         continue;
                     }
-                    // EOF (n == 0) or a real error: either way, real stdin will never produce
-                    // more data, so mark EOF and stop pumping.
-                    platform.stdin_pump.mark_eof();
-                    platform.notify_stdin_doorbell();
+                    // EOF (n == 0) or a real error: real stdin will never produce more
+                    // data. Unless another producer holds the stream open (the VNC keyboard
+                    // bridge), mark EOF; either way this pump is done.
+                    if !platform
+                        .stdin_held_open
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                    {
+                        platform.stdin_pump.mark_eof();
+                        platform.notify_stdin_doorbell();
+                    }
                     break;
                 }
                 let mut data = &buf[..n.unsigned_abs()];
@@ -1600,6 +1620,23 @@ fn spawn_stdin_pump_thread(platform: &'static MacOsUserland) {
 }
 
 impl MacOsUserland {
+    /// Deliver `bytes` to the guest's stdin as if they had been typed on the host terminal:
+    /// pushed through the same pump `spawn_stdin_pump_thread` feeds, so blocking reads,
+    /// non-blocking reads, and poll/select observers all see them identically. Blocks briefly
+    /// (1ms backoff) when the ring is full, exactly like the host pump does.
+    pub fn inject_stdin(&self, bytes: &[u8]) {
+        let mut data = bytes;
+        while !data.is_empty() {
+            let pushed = self.stdin_pump.push(data);
+            self.notify_stdin_doorbell();
+            if pushed == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            data = &data[pushed..];
+        }
+    }
+
     /// Wakes any thread parked in `StdioProvider::read_from_stdin`'s blocking wait.
     fn notify_stdin_doorbell(&self) {
         let (lock, cvar) = &self.stdin_doorbell;

@@ -133,6 +133,55 @@ pub struct CliArgs {
 /// Panics if the host is not set up as expected -- notably if a second guest
 /// thread starts, which this platform's process-global guest-entry save area
 /// does not yet support (see `docs/roadmap.md`).
+/// Translate an RFB `KeyEvent` keysym into the byte sequence a Linux console keyboard would
+/// deliver on that key, for feeding the guest's stdin. Latin-1 keysyms are their own byte
+/// (X11 keysyms already encode the shifted character); control keys map to the `linux`
+/// terminfo sequences. `ctrl` folds letters onto C0 controls the way a terminal does.
+/// Returns `None` for keysyms with no console byte representation (bare modifiers,
+/// multimedia keys).
+fn keysym_to_tty_bytes(keysym: u32, ctrl: bool) -> Option<Vec<u8>> {
+    if ctrl {
+        // ^A..^Z (either letter case), plus the punctuation controls a terminal produces.
+        let c = if (0x61..=0x7a).contains(&keysym) {
+            keysym - 0x20
+        } else {
+            keysym
+        };
+        if (0x40..=0x5f).contains(&c) {
+            return Some(vec![u8::try_from(c & 0x1f).unwrap_or(0)]);
+        }
+    }
+    match keysym {
+        // Latin-1 printables (X keysyms 0x20..=0xff are the characters themselves).
+        0x20..=0x7e | 0xa0..=0xff => Some(vec![u8::try_from(keysym).unwrap_or(b'?')]),
+        0xff0d | 0xff8d => Some(vec![b'\r']), // Return / KP_Enter
+        0xff08 => Some(vec![0x7f]),           // BackSpace (linux console sends DEL)
+        0xff09 => Some(vec![b'\t']),          // Tab
+        0xff1b => Some(vec![0x1b]),           // Escape
+        0xff51 => Some(b"\x1b[D".to_vec()),   // Left
+        0xff52 => Some(b"\x1b[A".to_vec()),   // Up
+        0xff53 => Some(b"\x1b[C".to_vec()),   // Right
+        0xff54 => Some(b"\x1b[B".to_vec()),   // Down
+        0xff50 => Some(b"\x1b[1~".to_vec()),  // Home
+        0xff57 => Some(b"\x1b[4~".to_vec()),  // End
+        0xff55 => Some(b"\x1b[5~".to_vec()),  // Page Up
+        0xff56 => Some(b"\x1b[6~".to_vec()),  // Page Down
+        0xff63 => Some(b"\x1b[2~".to_vec()),  // Insert
+        0xffff => Some(b"\x1b[3~".to_vec()),  // Delete
+        0xffbe => Some(b"\x1b[[A".to_vec()),  // F1 (linux console)
+        0xffbf => Some(b"\x1b[[B".to_vec()),  // F2
+        0xffc0 => Some(b"\x1b[[C".to_vec()),  // F3
+        0xffc1 => Some(b"\x1b[[D".to_vec()),  // F4
+        0xffc2 => Some(b"\x1b[[E".to_vec()),  // F5
+        0xffc3 => Some(b"\x1b[17~".to_vec()), // F6
+        0xffc4 => Some(b"\x1b[18~".to_vec()), // F7
+        0xffc5 => Some(b"\x1b[19~".to_vec()), // F8
+        0xffc6 => Some(b"\x1b[20~".to_vec()), // F9
+        0xffc7 => Some(b"\x1b[21~".to_vec()), // F10
+        _ => None,
+    }
+}
+
 pub fn run(cli_args: CliArgs) -> Result<()> {
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
@@ -151,7 +200,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let tar_data = std::fs::read(tar_file)
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
 
-    let platform = Platform::new(cli_args.tun_device_name.as_deref());
+    // `--vnc` makes the VNC keyboard a second stdin producer, so a closed/redirected host
+    // stdin must not read as EOF to the guest (a console program would exit on it).
+    let platform = Platform::new_with_options(cli_args.tun_device_name.as_deref(), cli_args.vnc);
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
@@ -238,6 +289,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             // concurrently from several connected clients' threads -- last-writer-wins on the
             // shared mask matches how a real single mouse would behave with two hands on it.
             let last_buttons = std::sync::Mutex::new(0u8);
+            // Control-key state for the tty translation below: RFB sends Control_L down,
+            // then the letter with its plain keysym, so the modifier must be remembered.
+            let ctrl_held = std::sync::atomic::AtomicBool::new(false);
             // Timestamps only need to be monotonic with microsecond-ish resolution; consumers
             // compare deltas, never absolute values.
             let epoch = std::time::Instant::now();
@@ -250,6 +304,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     litebox_rfb::InputEvent::Key(key) => {
                         if let Some(code) = litebox_rfb::keymap::keysym_to_evdev(key.key) {
                             registry.inject_key(code, key.down, now);
+                        }
+                        // Also deliver the key to the guest tty: fbdev-console programs
+                        // (links2 -g, shells, editors) read the keyboard from stdin, not
+                        // evdev. Dual delivery is harmless -- a given program only ever
+                        // consumes one of the two.
+                        match key.key {
+                            0xffe3 | 0xffe4 => {
+                                ctrl_held.store(key.down, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            _ if key.down => {
+                                let ctrl = ctrl_held.load(std::sync::atomic::Ordering::Relaxed);
+                                if let Some(bytes) = keysym_to_tty_bytes(key.key, ctrl) {
+                                    platform.inject_stdin(&bytes);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     litebox_rfb::InputEvent::Pointer(p) => {
