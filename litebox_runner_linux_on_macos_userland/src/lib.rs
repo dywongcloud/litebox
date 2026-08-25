@@ -121,6 +121,17 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub vnc_bind_all: bool,
+    /// Serve a browser-based viewer for the guest's `/dev/fb0` on this HTTP port: open
+    /// `http://127.0.0.1:<port>/` for a canvas with full keyboard and mouse. Same
+    /// framebuffer/input plumbing as `--vnc` without needing a VNC client (macOS's built-in
+    /// Screen Sharing refuses to dial localhost). Binds `127.0.0.1` only.
+    #[arg(
+        long = "vnc-web",
+        value_name = "PORT",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub vnc_web: Option<u16>,
     /// Give the guest web access without root: an HTTP proxy (CONNECT + absolute-URI) on the
     /// guest's loopback at `127.0.0.1:3128`, bridged to real host connections. Point the guest
     /// at it (`http_proxy=http://127.0.0.1:3128`, `links -http-proxy 127.0.0.1:3128`). Widens
@@ -183,6 +194,109 @@ fn keysym_to_tty_bytes(keysym: u32, ctrl: bool) -> Option<Vec<u8>> {
     }
 }
 
+/// Build the closure that routes one viewer's [`litebox_rfb::InputEvent`]s into the guest:
+/// evdev + PS/2-mice injection for pointer events, evdev + tty-byte injection for keys. Each
+/// attached viewer (RFB or web) gets its own instance; the small per-viewer state (button
+/// mask, Ctrl) means two concurrent viewers behave like two hands on one mouse, exactly as
+/// the RFB server's `run` doc comment describes.
+fn build_input_handler(
+    input_registry: Option<litebox::fs::devices::InputRegistry<Platform>>,
+    input_framebuffer: Option<litebox::fs::devices::Framebuffer<Platform>>,
+    platform: &'static Platform,
+) -> impl Fn(litebox_rfb::InputEvent) + Send + Sync + 'static {
+    // RFB `PointerEvent`s carry a whole button-state mask per event; evdev wants
+    // per-button transitions. Tracked under a mutex because the handler can be called
+    // concurrently from several connected clients' threads.
+    let last_buttons = std::sync::Mutex::new(0u8);
+    // Control-key state for the tty translation: RFB sends Control_L down, then the letter
+    // with its plain keysym, so the modifier must be remembered.
+    let ctrl_held = std::sync::atomic::AtomicBool::new(false);
+    // Timestamps only need to be monotonic; consumers compare deltas, never absolute values.
+    let epoch = std::time::Instant::now();
+    move |event| {
+        let Some(registry) = input_registry.as_ref() else {
+            return;
+        };
+        let now = epoch.elapsed();
+        match event {
+            litebox_rfb::InputEvent::Key(key) => {
+                if let Some(code) = litebox_rfb::keymap::keysym_to_evdev(key.key) {
+                    registry.inject_key(code, key.down, now);
+                }
+                // Also deliver the key to the guest tty: fbdev-console programs
+                // (links2 -g, shells, editors) read the keyboard from stdin, not
+                // evdev. Dual delivery is harmless -- a given program only ever
+                // consumes one of the two.
+                match key.key {
+                    0xffe3 | 0xffe4 => {
+                        ctrl_held.store(key.down, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ if key.down => {
+                        let ctrl = ctrl_held.load(std::sync::atomic::Ordering::Relaxed);
+                        if let Some(bytes) = keysym_to_tty_bytes(key.key, ctrl) {
+                            platform.inject_stdin(&bytes);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            litebox_rfb::InputEvent::Pointer(p) => {
+                // Scale the RFB screen coordinate into the tablet's fixed 0..=32767
+                // range against the *current* framebuffer geometry (resizes included).
+                let (width, height) = input_framebuffer.as_ref().map_or((1024, 768), |fb| {
+                    let geo = fb.geometry();
+                    (geo.xres.max(1), geo.yres.max(1))
+                });
+                let range = i64::from(litebox::fs::devices::ABS_RANGE_MAX);
+                let scale = |v: u16, extent: u32| -> i32 {
+                    let clamped = i64::from(v).min(i64::from(extent) - 1);
+                    i32::try_from(clamped * range / i64::from(extent.max(1)))
+                        .unwrap_or(litebox::fs::devices::ABS_RANGE_MAX)
+                };
+                let x = scale(p.x, width);
+                let y = scale(p.y, height);
+                let mut last = last_buttons
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let changed = *last ^ p.button_mask;
+                let mut transitions = Vec::new();
+                for (bit, btn) in [
+                    (0u8, litebox::fs::devices::BTN_LEFT),
+                    (1, litebox::fs::devices::BTN_MIDDLE),
+                    (2, litebox::fs::devices::BTN_RIGHT),
+                ] {
+                    if changed & (1 << bit) != 0 {
+                        transitions.push((btn, p.button_mask & (1 << bit) != 0));
+                    }
+                }
+                // RFB encodes each scroll click as a press+release of button 4/5; a
+                // press edge is one wheel step.
+                if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
+                    registry.inject_wheel(1, now);
+                }
+                if changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0 {
+                    registry.inject_wheel(-1, now);
+                }
+                *last = p.button_mask;
+                drop(last);
+                registry.inject_pointer_abs(x, y, &transitions, now);
+                // Also feed `/dev/input/mice` (PS/2 button byte: bit0 left, bit1
+                // right, bit2 middle; wheel +1 = scroll down). Consumers read one
+                // device or the other, never both.
+                let ps2_buttons = (p.button_mask & 0x01)
+                    | ((p.button_mask >> 2) & 0x01) << 1
+                    | ((p.button_mask >> 1) & 0x01) << 2;
+                let wheel = if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
+                    -1i8
+                } else {
+                    i8::from(changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0)
+                };
+                registry.inject_mice_pointer(i32::from(p.x), i32::from(p.y), ps2_buttons, wheel);
+            }
+        }
+    }
+}
+
 /// Run a Linux program with LiteBox on unmodified macOS.
 ///
 /// # Errors
@@ -213,9 +327,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let tar_data = std::fs::read(tar_file)
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
 
-    // `--vnc` makes the VNC keyboard a second stdin producer, so a closed/redirected host
-    // stdin must not read as EOF to the guest (a console program would exit on it).
-    let platform = Platform::new_with_options(cli_args.tun_device_name.as_deref(), cli_args.vnc);
+    // `--vnc`/`--vnc-web` make the viewer keyboard a second stdin producer, so a
+    // closed/redirected host stdin must not read as EOF to the guest (a console program
+    // would exit on it).
+    let platform = Platform::new_with_options(
+        cli_args.tun_device_name.as_deref(),
+        cli_args.vnc || cli_args.vnc_web.is_some(),
+    );
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
@@ -294,108 +412,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             "vnc server listening"
         );
         let shutdown_handle = server.shutdown_handle();
-        let input_registry = shim.input_registry();
-        let input_framebuffer = shim.framebuffer();
+        let on_input = build_input_handler(shim.input_registry(), shim.framebuffer(), platform);
         let worker = std::thread::spawn(move || {
-            // RFB `PointerEvent`s carry a whole button-state mask per event; evdev wants
-            // per-button transitions. Tracked under a mutex because `on_input` can be called
-            // concurrently from several connected clients' threads -- last-writer-wins on the
-            // shared mask matches how a real single mouse would behave with two hands on it.
-            let last_buttons = std::sync::Mutex::new(0u8);
-            // Control-key state for the tty translation below: RFB sends Control_L down,
-            // then the letter with its plain keysym, so the modifier must be remembered.
-            let ctrl_held = std::sync::atomic::AtomicBool::new(false);
-            // Timestamps only need to be monotonic with microsecond-ish resolution; consumers
-            // compare deltas, never absolute values.
-            let epoch = std::time::Instant::now();
-            if let Err(e) = server.run(move |event| {
-                let Some(registry) = input_registry.as_ref() else {
-                    return;
-                };
-                let now = epoch.elapsed();
-                match event {
-                    litebox_rfb::InputEvent::Key(key) => {
-                        if let Some(code) = litebox_rfb::keymap::keysym_to_evdev(key.key) {
-                            registry.inject_key(code, key.down, now);
-                        }
-                        // Also deliver the key to the guest tty: fbdev-console programs
-                        // (links2 -g, shells, editors) read the keyboard from stdin, not
-                        // evdev. Dual delivery is harmless -- a given program only ever
-                        // consumes one of the two.
-                        match key.key {
-                            0xffe3 | 0xffe4 => {
-                                ctrl_held.store(key.down, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            _ if key.down => {
-                                let ctrl = ctrl_held.load(std::sync::atomic::Ordering::Relaxed);
-                                if let Some(bytes) = keysym_to_tty_bytes(key.key, ctrl) {
-                                    platform.inject_stdin(&bytes);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    litebox_rfb::InputEvent::Pointer(p) => {
-                        // Scale the RFB screen coordinate into the tablet's fixed 0..=32767
-                        // range against the *current* framebuffer geometry (resizes included).
-                        let (width, height) =
-                            input_framebuffer.as_ref().map_or((1024, 768), |fb| {
-                                let geo = fb.geometry();
-                                (geo.xres.max(1), geo.yres.max(1))
-                            });
-                        let range = i64::from(litebox::fs::devices::ABS_RANGE_MAX);
-                        let scale = |v: u16, extent: u32| -> i32 {
-                            let clamped = i64::from(v).min(i64::from(extent) - 1);
-                            i32::try_from(clamped * range / i64::from(extent.max(1)))
-                                .unwrap_or(litebox::fs::devices::ABS_RANGE_MAX)
-                        };
-                        let x = scale(p.x, width);
-                        let y = scale(p.y, height);
-                        let mut last = last_buttons
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let changed = *last ^ p.button_mask;
-                        let mut transitions = Vec::new();
-                        for (bit, btn) in [
-                            (0u8, litebox::fs::devices::BTN_LEFT),
-                            (1, litebox::fs::devices::BTN_MIDDLE),
-                            (2, litebox::fs::devices::BTN_RIGHT),
-                        ] {
-                            if changed & (1 << bit) != 0 {
-                                transitions.push((btn, p.button_mask & (1 << bit) != 0));
-                            }
-                        }
-                        // RFB encodes each scroll click as a press+release of button 4/5; a
-                        // press edge is one wheel step.
-                        if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
-                            registry.inject_wheel(1, now);
-                        }
-                        if changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0 {
-                            registry.inject_wheel(-1, now);
-                        }
-                        *last = p.button_mask;
-                        drop(last);
-                        registry.inject_pointer_abs(x, y, &transitions, now);
-                        // Also feed `/dev/input/mice` (PS/2 button byte: bit0 left, bit1
-                        // right, bit2 middle; wheel +1 = scroll down). Consumers read one
-                        // device or the other, never both.
-                        let ps2_buttons = (p.button_mask & 0x01)
-                            | ((p.button_mask >> 2) & 0x01) << 1
-                            | ((p.button_mask >> 1) & 0x01) << 2;
-                        let wheel = if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
-                            -1i8
-                        } else {
-                            i8::from(changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0)
-                        };
-                        registry.inject_mice_pointer(
-                            i32::from(p.x),
-                            i32::from(p.y),
-                            ps2_buttons,
-                            wheel,
-                        );
-                    }
-                }
-            }) {
+            if let Err(e) = server.run(on_input) {
                 litebox_util_log::warn!(error:% = e; "vnc server stopped");
             }
         });
@@ -403,6 +422,30 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } else {
         None
     };
+
+    // The browser-based viewer: identical lifecycle to the VNC server (bind + spawn before
+    // the sandbox; Seatbelt denies post-sandbox `accept()`), identical input plumbing.
+    if let Some(port) = cli_args.vnc_web {
+        let framebuffer = shim
+            .framebuffer()
+            .ok_or_else(|| anyhow!("--vnc-web requires a filesystem that mounts /dev/fb0"))?;
+        let server = litebox_rfb::web::WebServer::bind(
+            None,
+            port,
+            std::sync::Arc::new(FramebufferAdapter(framebuffer)),
+        )
+        .map_err(|e| anyhow!("failed to bind the web viewer listener: {e}"))?;
+        litebox_util_log::info!(
+            addr:% = server.local_addr().map_err(|e| anyhow!("{e}"))?;
+            "web viewer listening -- open http://127.0.0.1 at this port"
+        );
+        let on_input = build_input_handler(shim.input_registry(), shim.framebuffer(), platform);
+        std::thread::spawn(move || {
+            if let Err(e) = server.run(on_input) {
+                litebox_util_log::warn!(error:% = e; "web viewer server stopped");
+            }
+        });
+    }
 
     // The guest-web-access bridge. Same lifecycle position and reasoning as the VNC server
     // above: the in-guest listener and the resolver snapshot (`/etc/resolv.conf` becomes

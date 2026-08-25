@@ -131,7 +131,7 @@ impl<F: FramebufferSource> RfbServer<F> {
 /// A handle to request shutdown of a running [`RfbServer::run`] loop.
 #[derive(Clone)]
 pub struct ShutdownHandle {
-    flag: Arc<AtomicBool>,
+    pub(crate) flag: Arc<AtomicBool>,
 }
 
 impl ShutdownHandle {

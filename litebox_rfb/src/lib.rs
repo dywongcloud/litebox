@@ -24,6 +24,7 @@
 pub mod keymap;
 mod proto;
 mod server;
+pub mod web;
 
 pub use server::{
     FramebufferSource, InputEvent, KeyEvent, PointerEvent, RfbServer, ShutdownHandle,
