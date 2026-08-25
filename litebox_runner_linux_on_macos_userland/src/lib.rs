@@ -16,12 +16,35 @@ use clap::Parser;
 use litebox_platform_macos_userland::MacOsUserland as Platform;
 use std::path::PathBuf;
 
+/// Adapts [`litebox::fs::devices::Framebuffer`] to [`litebox_rfb::FramebufferSource`] --
+/// `litebox_rfb` deliberately doesn't depend on `litebox` (see its own crate doc comment), so
+/// this thin wrapper lives on the runner side of that boundary instead.
+struct FramebufferAdapter(litebox::fs::devices::Framebuffer<Platform>);
+
+impl litebox_rfb::FramebufferSource for FramebufferAdapter {
+    fn dimensions(&self) -> (u16, u16) {
+        let geo = self.0.geometry();
+        // A real fbdev geometry is always well within u16 range (RFB's own wire format caps
+        // width/height at u16 too); truncation here would only ever fire on a geometry no real
+        // client could display anyway.
+        (
+            u16::try_from(geo.xres).unwrap_or(u16::MAX),
+            u16::try_from(geo.yres).unwrap_or(u16::MAX),
+        )
+    }
+
+    fn snapshot_into(&self, dst: &mut Vec<u8>) {
+        self.0.read_visible_into(dst);
+    }
+}
+
 /// Run Linux programs with LiteBox on unmodified macOS.
 ///
 /// The program binary and all its dependencies must be provided inside a tar
 /// archive via `--initial-files`. The program path refers to a path inside the
 /// tar archive.
 #[derive(Parser, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/bin/ls --color`).
     ///
@@ -74,6 +97,28 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub gateway_ip: Option<std::net::Ipv4Addr>,
+    /// Serve the guest's `/dev/fb0` framebuffer over VNC (RFB), for a real desktop viewer to
+    /// connect to. Binds `127.0.0.1` only by default -- see `--vnc-bind-all` to widen that.
+    #[arg(long = "vnc", requires = "unstable", help_heading = "Unstable Options")]
+    pub vnc: bool,
+    /// Port the VNC server listens on when `--vnc` is set (default: `5900`, the conventional RFB
+    /// display-0 port).
+    #[arg(
+        long = "vnc-port",
+        requires = "vnc",
+        default_value_t = 5900,
+        help_heading = "Unstable Options"
+    )]
+    pub vnc_port: u16,
+    /// Bind the VNC server to all interfaces (`0.0.0.0`) instead of the localhost-only default.
+    /// Off by default: the guest framebuffer is unauthenticated RFB with no encryption, so
+    /// widening past localhost exposes it to the local network without so much as a password.
+    #[arg(
+        long = "vnc-bind-all",
+        requires = "vnc",
+        help_heading = "Unstable Options"
+    )]
+    pub vnc_bind_all: bool,
 }
 
 /// Run a Linux program with LiteBox on unmodified macOS.
@@ -154,6 +199,53 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // (confirmed live: "sudo: sorry, you are not allowed to set the
     // following environment variables") but always passes argv through.
     let shim = shim_builder.build_with_net_config(cli_args.guest_ip, cli_args.gateway_ip);
+
+    // Bind AND run the VNC server's whole accept loop before the Seatbelt sandbox below, which
+    // denies every syscall not explicitly allowed -- and unlike a plain read/write on an
+    // already-open fd (stdio, the `utun` device -- see the sandbox call's own comment below),
+    // `accept()` on a listening socket is itself a mediated network operation with no `allow`
+    // rule in this profile, so it cannot run post-sandbox. This mirrors the tar-file read and
+    // `utun` device open above: every host resource the process will ever need must be acquired
+    // -- and here, USED -- before `enable_seatbelt_sandbox()` runs. Concretely: spawn the whole
+    // `RfbServer::run` (bind already happened in `RfbServer::bind`, accept-loop-and-serve
+    // happens in the spawned thread) before the sandbox call; Seatbelt restrictions apply
+    // process-wide and are inherited by every thread (per this crate's own seatbelt module doc
+    // comment), so a thread spawned pre-sandbox keeps running exactly as before after the main
+    // thread sandboxes itself.
+    let vnc_worker = if cli_args.vnc {
+        let framebuffer = shim
+            .framebuffer()
+            .ok_or_else(|| anyhow!("--vnc requires a filesystem that mounts /dev/fb0"))?;
+        let bind_addr = cli_args
+            .vnc_bind_all
+            .then_some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let server = litebox_rfb::RfbServer::bind(
+            bind_addr,
+            cli_args.vnc_port,
+            std::sync::Arc::new(FramebufferAdapter(framebuffer)),
+        )
+        .map_err(|e| anyhow!("failed to bind VNC listener: {e}"))?;
+        litebox_util_log::info!(
+            addr:% = server.local_addr().map_err(|e| anyhow!("{e}"))?;
+            "vnc server listening"
+        );
+        let shutdown_handle = server.shutdown_handle();
+        let worker = std::thread::spawn(move || {
+            if let Err(e) = server.run(|event| {
+                // Input injection (evdev emulation) doesn't exist yet -- see
+                // `litebox-fb-evdev-input` in the roadmap. Logged at trace level so a connected
+                // client's keystrokes/clicks are visible during bring-up without spamming a
+                // normal run.
+                litebox_util_log::trace!(event:? = event; "vnc input received, no evdev sink yet");
+            }) {
+                litebox_util_log::warn!(error:% = e; "vnc server stopped");
+            }
+        });
+        Some((worker, shutdown_handle))
+    } else {
+        None
+    };
+
     let argv = cli_args
         .program_and_arguments
         .iter()
@@ -241,5 +333,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let exit_code = program.process.wait();
     shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
     let _ = net_worker.join();
+    if let Some((worker, shutdown_handle)) = vnc_worker {
+        shutdown_handle.signal();
+        let _ = worker.join();
+    }
     std::process::exit(exit_code)
 }

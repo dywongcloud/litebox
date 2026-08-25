@@ -1775,6 +1775,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_rfb"
+version = "0.1.0"
+dependencies = [
+ "litebox_util_log",
+]
+
+[[package]]
 name = "litebox_runner_linux_on_macos_userland"
 version = "0.1.0"
 dependencies = [
@@ -1783,6 +1790,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_platform_macos_userland",
+ "litebox_rfb",
  "litebox_shim_linux",
  "litebox_util_log",
  "tracing-subscriber",

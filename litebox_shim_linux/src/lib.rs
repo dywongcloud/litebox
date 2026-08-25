@@ -362,6 +362,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
+    /// A cheap handle to this shim's `/dev/fb0` framebuffer, if [`LinuxShimBuilder::default_fs`]
+    /// mounted one -- for a runner-side reader (e.g. an RFB server) to read guest-painted pixels
+    /// independently of any guest fd. `None` when the shim was built with a filesystem that
+    /// doesn't mount `/dev/fb0`.
+    #[must_use]
+    pub fn framebuffer(&self) -> Option<litebox::fs::devices::Framebuffer<Platform>> {
+        self.0.framebuffer.clone()
+    }
+
     /// Loads the program at `path` as the shim's initial task, returning the
     /// initial register state.
     pub fn load_program(
