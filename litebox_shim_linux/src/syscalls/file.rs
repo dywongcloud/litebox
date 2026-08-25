@@ -3067,6 +3067,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::EINVAL),
                     |_fd| Err(Errno::EINVAL),
                 )?,
+            // The VT console family ('V' = 0x56, legacy non-`_IOC`-encoded commands) also
+            // arrives undecoded as `Raw`. litebox has no virtual terminals to switch between;
+            // fbdev graphics clients (links2's `-g` fb driver is the archetype) nonetheless
+            // require `VT_GETMODE`/`VT_SETMODE` to succeed on their controlling tty before
+            // they will draw, and issue the rest fire-and-forget. Answer as a console whose
+            // single VT (1) is permanently active -- kernel-shaped for a host with exactly one
+            // seat and no console switching.
+            IoctlArg::Raw { cmd, arg: raw_arg } if (cmd >> 8) & 0xff == 0x56 => files
+                .run_on_raw_fd(
+                    desc,
+                    |fd| -> Result<u32, Errno> {
+                        if !self.is_stdio(&files.fs, fd)? {
+                            return Err(Errno::ENOTTY);
+                        }
+                        let write_bytes = |bytes: &[u8]| -> Result<u32, Errno> {
+                            let dst =
+                                litebox_common_linux::user_pointers::UserPtrMut::<u8>::from_usize(
+                                    raw_arg.as_usize(),
+                                );
+                            dst.copy_from_slice::<Platform>(0, bytes)
+                                .ok_or(Errno::EFAULT)?;
+                            Ok(0)
+                        };
+                        match cmd {
+                            // VT_GETMODE: `struct vt_mode { char mode; char waitv; short
+                            // relsig; short acqsig; short frsig; }` -- VT_AUTO, no signals.
+                            0x5601 => write_bytes(&[0u8; 8]),
+                            // VT_SETMODE: accepted and ignored; with no VT switching the
+                            // release/acquire signals it configures can never fire.
+                            0x5602 => Ok(0),
+                            // VT_GETSTATE: `struct vt_stat { u16 v_active; u16 v_signal;
+                            // u16 v_state; }` -- VT 1 active, VTs 0/1 open.
+                            0x5603 => write_bytes(&[1, 0, 0, 0, 3, 0]),
+                            // VT_RELDISP / VT_ACTIVATE / VT_WAITACTIVE: the sole VT is
+                            // always already active.
+                            0x5605 | 0x5606 | 0x5607 => Ok(0),
+                            _ => {
+                                log_unsupported!("VT ioctl {cmd:#x}");
+                                Err(Errno::EINVAL)
+                            }
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )?,
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)
