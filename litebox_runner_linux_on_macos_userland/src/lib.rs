@@ -143,6 +143,17 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub net_proxy: bool,
+    /// Present the guest with root identity (uid/gid 0) instead of the default synthetic
+    /// uid 1000. The identity is synthetic either way -- isolation comes from the litebox
+    /// layer, not the guest uid -- but a desktop stack (Xorg's `-nolock`, dbus, session
+    /// managers) hard-checks for root in places a single-user appliance image never needs
+    /// to distinguish.
+    #[arg(
+        long = "guest-root",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub guest_root: bool,
 }
 
 /// Translate an RFB `KeyEvent` keysym into the byte sequence a Linux console keyboard would
@@ -500,13 +511,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_platform_macos_userland::enable_seatbelt_sandbox();
     }
 
-    let program = shim.load_program(
-        initial_file_system,
-        platform.init_task(),
-        prog_path,
-        argv,
-        envp,
-    )?;
+    let mut task_params = platform.init_task();
+    if cli_args.guest_root {
+        task_params.uid = 0;
+        task_params.euid = 0;
+        task_params.gid = 0;
+        task_params.egid = 0;
+    }
+    let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
 
     // Drive the network stack. The shim keeps its smoltcp interface in
     // `Manual` mode -- nothing polls it unless a runner does -- and the Linux

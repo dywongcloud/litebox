@@ -138,7 +138,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         for raw_fd in alive_fds {
             let cloexec = get_file_descriptor_flags(raw_fd, &task.global, self)
                 .is_ok_and(|flags| flags.contains(FileDescriptorFlags::FD_CLOEXEC));
-            self.run_on_raw_fd(
+            let dup_result = self.run_on_raw_fd(
                 raw_fd,
                 |fd| dup_into(task, &new, fd, raw_fd, cloexec),
                 |fd| dup_into(task, &new, fd, raw_fd, cloexec),
@@ -146,7 +146,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
                 |fd| dup_into(task, &new, fd, raw_fd, cloexec),
                 |fd| dup_into(task, &new, fd, raw_fd, cloexec),
                 |fd| dup_into(task, &new, fd, raw_fd, cloexec),
-            )??;
+            );
+            let dup_result = match dup_result {
+                // Netlink sockets are a seventh subsystem `run_on_raw_fd` doesn't dispatch
+                // to. Anything holding one open across fork -- Xorg keeps libudev's
+                // `NETLINK_KOBJECT_UEVENT` socket for its lifetime, and forks for every
+                // `xkbcomp` keymap compile -- would otherwise fail the whole fork with
+                // `EBADF` (observed live as X's "XKB: Could not invoke xkbcomp").
+                Err(Errno::EBADF) => {
+                    let netlink_fd = self
+                        .raw_descriptor_store
+                        .read()
+                        .fd_from_raw_integer::<crate::syscalls::netlink::NetlinkSubsystem<Platform>>(
+                            raw_fd,
+                        );
+                    match netlink_fd {
+                        Ok(fd) => Ok(dup_into(task, &new, &fd, raw_fd, cloexec)),
+                        Err(_) => Err(Errno::EBADF),
+                    }
+                }
+                other => other,
+            };
+            if !matches!(dup_result, Ok(Ok(()))) {
+                litebox_util_log::debug!(raw_fd:% = raw_fd, result:? = dup_result; "fork_copy: fd duplication failed");
+            }
+            dup_result??;
         }
         Ok(new)
     }
@@ -201,7 +225,14 @@ struct FdPath(CString);
 /// it, and reachable from epoll's descriptor-table-only context where no filesystem handle is
 /// in scope.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct InputEventMinor(pub(crate) usize);
+pub(crate) struct InputEventMinor {
+    pub(crate) minor: usize,
+    /// `O_NONBLOCK`/`O_NDELAY` at open time. A later `fcntl(F_SETFL)` is NOT reflected here
+    /// (the fs-backend SETFL arm has no per-entry flag store yet); every real evdev consumer
+    /// observed (Xorg's evdev driver, libevdev, links2's mice path) picks blocking-ness at
+    /// `open(2)` and never toggles it.
+    pub(crate) nonblock: bool,
+}
 
 /// The evdev minor for `file`, if it was tagged as a `/dev/input/event*` device at open time --
 /// the descriptor-table-only lookup epoll's poll path uses (it has `GlobalState` but no
@@ -210,10 +241,18 @@ pub(crate) fn input_event_minor_of<Platform: ShimPlatform, FS: ShimFS>(
     global: &crate::GlobalState<Platform, FS>,
     file: &TypedFd<FS>,
 ) -> Option<usize> {
+    input_event_meta_of(global, file).map(|m| m.minor)
+}
+
+/// [`input_event_minor_of`], with the open-time `O_NONBLOCK` flag alongside.
+pub(crate) fn input_event_meta_of<Platform: ShimPlatform, FS: ShimFS>(
+    global: &crate::GlobalState<Platform, FS>,
+    file: &TypedFd<FS>,
+) -> Option<InputEventMinor> {
     global
         .litebox
         .descriptor_table()
-        .with_metadata(file, |InputEventMinor(minor)| *minor)
+        .with_metadata(file, |m: &InputEventMinor| *m)
         .ok()
 }
 
@@ -564,7 +603,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .global
                     .litebox
                     .descriptor_table_mut()
-                    .set_entry_metadata(&file, InputEventMinor(rdev.get() & 0xff));
+                    .set_entry_metadata(
+                        &file,
+                        InputEventMinor {
+                            minor: rdev.get() & 0xff,
+                            nonblock: flags.intersects(OFlags::NONBLOCK | OFlags::NDELAY),
+                        },
+                    );
                 debug_assert!(old.is_none());
             }
         }
@@ -604,8 +649,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<u32, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
         let path = self.follow_open_path(path, flags)?;
-        let file = self.do_open(path.clone(), flags, mode)?;
-        self.insert_raw_file_fd(file, flags, Some(path))
+        let result = self
+            .do_open(path.clone(), flags, mode)
+            .and_then(|file| self.insert_raw_file_fd(file, flags, Some(path.clone())));
+        // The `req=Openat` trace line above this only shows the user pointer; the resolved
+        // path with the outcome is what a syscall-level diagnosis actually needs.
+        litebox_util_log::trace!(path:? = path, result:? = result; "openat");
+        result
     }
 
     /// Handle syscall `ftruncate`
@@ -1040,8 +1090,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     if self.stdin_read_would_block(fd) {
                         return Err(Errno::EAGAIN);
                     }
-                    if let Some(minor) = self.input_event_minor(&files.fs, fd) {
-                        return self.read_input_events(minor, &mut buf.borrow_mut());
+                    if let Some(meta) = input_event_meta_of(&self.global, fd) {
+                        return self.read_input_events(meta, &mut buf.borrow_mut());
                     }
                     files
                         .fs
@@ -1417,6 +1467,90 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .fs
             .symlink(target, linkpath)
             .map_err(Errno::from)
+    }
+
+    /// Handle syscalls `link` and `linkat`.
+    ///
+    /// DEVIATION, disclosed: the layered filesystem has no inode-sharing hard links, so this
+    /// creates an exclusive *copy* of the source file at the new path. The dominant real-world
+    /// caller shape -- write a finished file, `link` it into place as an atomic
+    /// create-if-absent, `unlink` the original (Xorg's `/tmp/.X0-lock`, mail spools, lock
+    /// files generally) -- observes identical behavior: `EEXIST` when the name is taken, the
+    /// full content when it wins. What differs from real `link(2)`: post-link writes through
+    /// one name are not visible through the other, and `st_nlink`/inode identity stay
+    /// separate. A guest that round-trips those semantics needs real hard-link support in
+    /// `litebox::fs` first.
+    pub(crate) fn sys_linkat(
+        &self,
+        olddirfd: i32,
+        oldpath: impl path::Arg,
+        newdirfd: i32,
+        newpath: impl path::Arg,
+        flags: u32,
+    ) -> Result<(), Errno> {
+        /// `AT_SYMLINK_FOLLOW`: without it, `linkat` links the symlink itself; following is
+        /// the only mode this copy-based implementation can honor for symlink sources.
+        const AT_SYMLINK_FOLLOW: u32 = 0x400;
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        if flags & AT_EMPTY_PATH != 0 {
+            log_unsupported!("linkat(AT_EMPTY_PATH)");
+            return Err(Errno::EINVAL);
+        }
+        let _ = AT_SYMLINK_FOLLOW; // both modes read through the source path below
+        let oldpath = self.resolve_path_at(olddirfd, oldpath)?;
+        let newpath = self.resolve_path_at(newdirfd, newpath)?;
+        let files = self.files.borrow();
+        let src = files
+            .fs
+            .open(
+                oldpath,
+                litebox::fs::OFlags::RDONLY,
+                litebox::fs::Mode::empty(),
+            )
+            .map_err(Errno::from)?;
+        let status = files.fs.fd_file_status(&src).map_err(|_| Errno::EIO)?;
+        if status.file_type == litebox::fs::FileType::Directory {
+            let _ = files.fs.close(&src);
+            return Err(Errno::EPERM);
+        }
+        let dst = match files.fs.open(
+            newpath,
+            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT | litebox::fs::OFlags::EXCL,
+            status.mode,
+        ) {
+            Ok(dst) => dst,
+            Err(e) => {
+                let _ = files.fs.close(&src);
+                return Err(Errno::from(e));
+            }
+        };
+        let mut offset = 0usize;
+        let mut buf = alloc::vec![0u8; 64 * 1024];
+        let result = loop {
+            match files.fs.read(&src, &mut buf, Some(offset)) {
+                Ok(0) => break Ok(()),
+                Ok(n) => {
+                    let mut written = 0;
+                    while written < n {
+                        match files
+                            .fs
+                            .write(&dst, &buf[written..n], Some(offset + written))
+                        {
+                            Ok(w) if w > 0 => written += w,
+                            Ok(_) | Err(_) => break,
+                        }
+                    }
+                    if written < n {
+                        break Err(Errno::EIO);
+                    }
+                    offset += n;
+                }
+                Err(_) => break Err(Errno::EIO),
+            }
+        };
+        let _ = files.fs.close(&src);
+        let _ = files.fs.close(&dst);
+        result
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
@@ -1969,7 +2103,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?)?;
+        let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?);
+        // Same rationale as `sys_openat`'s trace line: the raw request only carries a user
+        // pointer, and readlink targets are load-bearing for sysfs-probing guests.
+        litebox_util_log::trace!(path:? = pathname, result:? = path; "readlinkat");
+        let path = path?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
         buf[..min_len].copy_from_slice(&bytes[..min_len]);
@@ -2727,7 +2865,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// queue with this task's wait context (which the `Backend` trait's `read` cannot do), per
     /// evdev semantics -- whole 24-byte events only, `EINVAL` for a short buffer, `EAGAIN`
     /// only under `O_NONBLOCK`.
-    fn read_input_events(&self, minor: usize, buf: &mut [u8]) -> Result<usize, Errno> {
+    fn read_input_events(&self, meta: InputEventMinor, buf: &mut [u8]) -> Result<usize, Errno> {
+        let InputEventMinor { minor, nonblock } = meta;
         // `/dev/input/mice` is a plain byte stream (its handshake reads 1 byte at a time);
         // only the evdev event devices insist on whole 24-byte events.
         if minor != litebox::fs::devices::MICE_MINOR
@@ -2738,12 +2877,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(registry) = self.global.input_registry.as_ref() else {
             return Err(Errno::ENODEV);
         };
-        // Per-fd `O_NONBLOCK` isn't tracked for FS-backend fds (only stdio carries
-        // `StdioStatusFlags` metadata); evdev consumers that set `O_NONBLOCK` do so via
-        // `open()` flags this path can't currently observe, so reads block until an event
-        // arrives -- correct for every poll-driven consumer (they only read after readiness).
+        // `nonblock` is the open-time `O_NONBLOCK`/`O_NDELAY` (see `InputEventMinor`); honoring
+        // it is load-bearing: Xorg's evdev driver opens the device `O_NDELAY` and drains it
+        // with reads it expects to `EAGAIN` when empty -- a blocking read here wedged the X
+        // server's whole main loop (observed live as the desktop-wide deadlock).
         registry
-            .read_blocking(&self.wait_cx(), minor, buf, false)
+            .read_blocking(&self.wait_cx(), minor, buf, nonblock)
             .map_err(|e| match e {
                 // A timeout maps to EAGAIN like an empty non-blocking read would -- though with
                 // no timeout on this wait context it never actually fires.

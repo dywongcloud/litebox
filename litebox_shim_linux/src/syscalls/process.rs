@@ -2631,6 +2631,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
+    /// Handle syscall `setresuid` -- also how libc implements `seteuid(2)`
+    /// (`setresuid(-1, euid, -1)`). `u32::MAX` leaves a field unchanged.
+    ///
+    /// LiteBox keeps no saved-set-id, so `suid` is accepted and discarded; the
+    /// privilege model is the same one-uid-0 check every set-id call here uses.
+    ///
+    /// # Errors
+    ///
+    /// `EPERM` if the task is unprivileged and a requested id is not one it
+    /// already holds.
+    pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, _suid: u32) -> Result<(), Errno> {
+        let old = self.credentials.borrow().as_ref().clone();
+        let privileged = self.is_privileged();
+        let (held_real, held_effective) = (old.uid, old.euid);
+        let allowed = |v: u32| privileged || v == held_real || v == held_effective;
+        let mut new = old;
+        if ruid != u32::MAX {
+            if !allowed(ruid) {
+                return Err(Errno::EPERM);
+            }
+            new.uid = ruid;
+        }
+        if euid != u32::MAX {
+            if !allowed(euid) {
+                return Err(Errno::EPERM);
+            }
+            new.euid = euid;
+        }
+        *self.credentials.borrow_mut() = Arc::new(new);
+        Ok(())
+    }
+
+    /// Handle syscall `setresgid`; see [`Self::sys_setresuid`], with gids.
+    ///
+    /// # Errors
+    ///
+    /// `EPERM` under the same policy as [`Self::sys_setresuid`].
+    pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, _sgid: u32) -> Result<(), Errno> {
+        let old = self.credentials.borrow().as_ref().clone();
+        let privileged = self.is_privileged();
+        let (held_real, held_effective) = (old.gid, old.egid);
+        let allowed = |v: u32| privileged || v == held_real || v == held_effective;
+        let mut new = old;
+        if rgid != u32::MAX {
+            if !allowed(rgid) {
+                return Err(Errno::EPERM);
+            }
+            new.gid = rgid;
+        }
+        if egid != u32::MAX {
+            if !allowed(egid) {
+                return Err(Errno::EPERM);
+            }
+            new.egid = egid;
+        }
+        *self.credentials.borrow_mut() = Arc::new(new);
+        Ok(())
+    }
+
     /// Handle syscall `getgroups`.
     ///
     /// The supplementary set is exactly the task's own gid. There is no group

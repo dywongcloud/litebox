@@ -1310,6 +1310,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 _ => Err(Errno::EFAULT),
             },
+            SyscallRequest::Linkat {
+                olddirfd,
+                oldpath,
+                newdirfd,
+                newpath,
+                flags,
+            } => match (
+                oldpath.to_cstring::<Platform>(),
+                newpath.to_cstring::<Platform>(),
+            ) {
+                (Some(oldpath), Some(newpath)) => {
+                    syscall!(sys_linkat(olddirfd, oldpath, newdirfd, newpath, flags))
+                }
+                _ => Err(Errno::EFAULT),
+            },
             SyscallRequest::Renameat2 {
                 olddirfd,
                 oldpath,
@@ -1529,6 +1544,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Getgroups { size, list } => syscall!(sys_getgroups(size, list)),
             SyscallRequest::Setuid { uid } => syscall!(sys_setuid(uid)),
             SyscallRequest::Setgid { gid } => syscall!(sys_setgid(gid)),
+            SyscallRequest::Setresuid { ruid, euid, suid } => {
+                syscall!(sys_setresuid(ruid, euid, suid))
+            }
+            SyscallRequest::Setresgid { rgid, egid, sgid } => {
+                syscall!(sys_setresgid(rgid, egid, sgid))
+            }
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset::<Platform>(0, sysinfo)

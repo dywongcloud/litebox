@@ -2746,6 +2746,16 @@ pub enum SyscallRequest {
         newdirfd: i32,
         linkpath: UserPtr<c_char>,
     },
+    /// Reached through both `link` (both dirfds forced to `AT_FDCWD`, `flags` 0)
+    /// and `linkat`. `flags` carries the raw `AT_*` bits (`AT_SYMLINK_FOLLOW`,
+    /// `AT_EMPTY_PATH`); the shim interprets them.
+    Linkat {
+        olddirfd: i32,
+        oldpath: UserPtr<c_char>,
+        newdirfd: i32,
+        newpath: UserPtr<c_char>,
+        flags: u32,
+    },
     /// Reached through `rename` (both dirfds forced to `AT_FDCWD`, `flags` 0),
     /// `renameat` (both dirfds real, `flags` 0), and `renameat2` (all fields as
     /// passed). `flags` carries the raw `RENAME_*` bits (`NOREPLACE`/`EXCHANGE`/
@@ -2917,6 +2927,19 @@ pub enum SyscallRequest {
     },
     Setgid {
         gid: u32,
+    },
+    /// Reached through `setresuid`; also the syscall libc's `seteuid(2)` wrapper
+    /// makes (`setresuid(-1, euid, -1)`). `u32::MAX` (-1) leaves a field unchanged.
+    Setresuid {
+        ruid: u32,
+        euid: u32,
+        suid: u32,
+    },
+    /// See [`Self::Setresuid`]; `setresgid` / libc `setegid`.
+    Setresgid {
+        rgid: u32,
+        egid: u32,
+        sgid: u32,
     },
     Sysinfo {
         buf: UserPtrMut<Sysinfo>,
@@ -3367,6 +3390,8 @@ impl SyscallRequest {
             Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
             Sysno::setuid => sys_req!(Setuid { uid }),
             Sysno::setgid => sys_req!(Setgid { gid }),
+            Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
+            Sysno::setresgid => sys_req!(Setresgid { rgid, egid, sgid }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::epoll_wait => {
@@ -3470,6 +3495,9 @@ impl SyscallRequest {
                 dev: ctx.sys_req_arg(2),
             },
             Sysno::symlinkat => sys_req!(Symlinkat { target:*, newdirfd, linkpath:* }),
+            Sysno::linkat => {
+                sys_req!(Linkat { olddirfd, oldpath:*, newdirfd, newpath:*, flags })
+            }
             #[cfg(target_arch = "x86_64")]
             Sysno::symlink => {
                 // symlink is symlinkat with newdirfd AT_FDCWD

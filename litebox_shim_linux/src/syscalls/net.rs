@@ -4,7 +4,6 @@
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
 use core::{
-    ffi::CStr,
     mem::{offset_of, size_of},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
@@ -1211,9 +1210,13 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
                     path[1..].to_vec(),
                 )));
             }
-            let s = CStr::from_bytes_until_nul(path).map_err(|_| Errno::EINVAL)?;
+            // The kernel bounds the pathname by `addrlen` with the NUL optional
+            // (`unix(7)`: "the terminating null byte is not required"); dbus and X both
+            // pass exactly `offsetof(sun_path) + strlen(path)`. Requiring an embedded NUL
+            // here rejected every such bind with EINVAL.
+            let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
             Ok(SocketAddress::Unix(UnixSocketAddr::Path(
-                s.to_string_lossy().to_string(),
+                alloc::string::String::from_utf8_lossy(&path[..end]).to_string(),
             )))
         }
         // Unlike `do_socket`'s `AddressFamily` match, `INET6`/`NETLINK` really are reachable
