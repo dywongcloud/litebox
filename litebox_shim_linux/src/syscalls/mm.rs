@@ -485,9 +485,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // - File-backed shared mappings are read-only: writable permission is rejected
         //   upfront and cannot be added later via mprotect, because writes cannot be
         //   propagated back to the underlying file.
+        // ...with one deliberate exception: `/dev/fb0`. Every real fbdev graphics client
+        // draws through a `MAP_SHARED | PROT_WRITE` mmap of the framebuffer, and because the
+        // shim and the guest share one host address space, that mapping can be genuinely
+        // coherent -- see `do_mmap_framebuffer`.
+        let fb0_shared_mapping = flags.contains(MapFlags::MAP_SHARED)
+            && prot.contains(ProtFlags::PROT_WRITE)
+            && !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && self.raw_fd_is_fb0(fd);
         if flags.contains(MapFlags::MAP_SHARED)
             && prot.contains(ProtFlags::PROT_WRITE)
             && !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && !fb0_shared_mapping
         {
             log_unsupported!("MAP_SHARED with PROT_WRITE on file-backed mappings");
             return Err(Errno::EINVAL);
@@ -518,6 +527,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
+        } else if fb0_shared_mapping {
+            self.do_mmap_framebuffer(suggested_addr, aligned_len, prot, flags, offset)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
@@ -525,9 +536,78 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         .map_err(Errno::from)
     }
 
+    /// Whether raw fd `fd` names `/dev/fb0` (see [`Self::is_fb0`]); `false` for anything that
+    /// isn't an open fs-backend fd.
+    fn raw_fd_is_fb0(&self, fd: i32) -> bool {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return false;
+        };
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| self.is_fb0(&files.fs, typed_fd).unwrap_or(false),
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+            )
+            .unwrap_or(false)
+    }
+
+    /// `mmap(MAP_SHARED | PROT_WRITE)` of `/dev/fb0`: allocate ordinary anonymous pages in the
+    /// (shared shim/guest) address space, then register them with the [`Framebuffer`] as its
+    /// live pixel store -- pre-filled with the current contents, adopted until munmap. Guest
+    /// stores through the mapping are immediately visible to the runner's RFB snapshot with no
+    /// flush step, which is the coherence contract every fbdev graphics client assumes.
+    ///
+    /// `MAP_SHARED` (kept on the anonymous mapping) also keeps `Task::save_address_space` from
+    /// private-copying the pages out on a fork handoff, so the registration stays valid across
+    /// guest process switches.
+    fn do_mmap_framebuffer(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        // A nonzero-offset fbdev mmap is legal on Linux but no real client uses it; only the
+        // offset-0 mapping can become the pixel store.
+        if offset != 0 {
+            log_unsupported!("mmap of /dev/fb0 at nonzero offset");
+            return Err(MappingError::Io(Errno::EINVAL.into()));
+        }
+        // A framebuffer-typed fd only exists when `default_fs` mounted one (the sole source of
+        // an fb0 rdev major), so `None` would mean an fd recognized as fb0 by a filesystem this
+        // shim never built.
+        let Some(fb) = self.global.framebuffer.as_ref() else {
+            return Err(MappingError::Io(Errno::ENODEV.into()));
+        };
+        // Replace any previous registration first (a client that mmaps fb0 twice): copy-back
+        // deregistration keeps the old mapping's last-drawn content.
+        if let Some((old_addr, old_len)) = fb.guest_mapping() {
+            fb.clear_guest_mapping_overlapping(old_addr, old_len);
+        }
+        let ptr =
+            self.do_mmap_anonymous(suggested_addr, len, prot, flags | MapFlags::MAP_ANONYMOUS)?;
+        // SAFETY: `ptr` addresses `len` readable+writable bytes in this same address space;
+        // `sys_munmap`, `sys_mremap`, and the execve bulk-release all clear the registration
+        // before those pages can go away.
+        unsafe { fb.set_guest_mapping(ptr.as_usize(), len) };
+        Ok(ptr)
+    }
+
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
+        if let Some(fb) = self.global.framebuffer.as_ref() {
+            // Copy-back + deregister BEFORE the pages go away. On the (guest-bug) path where
+            // the munmap itself then fails, this degrades the framebuffer to snapshot mode
+            // spuriously, which is safe.
+            fb.clear_guest_mapping_overlapping(addr.as_usize(), align_up(len, PAGE_SIZE));
+        }
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
             self.clear_file_mappings_for_range(addr.as_usize(), len);
@@ -613,6 +693,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
+        if let Some(fb) = self.global.framebuffer.as_ref() {
+            // A remap can move or shrink the pages backing a live fb0 registration; deregister
+            // (with copy-back) first rather than track the move -- no fbdev client remaps its
+            // framebuffer mapping.
+            fb.clear_guest_mapping_overlapping(old_addr.as_usize(), align_up(old_size, PAGE_SIZE));
+        }
         litebox_common_linux::mm::sys_mremap(
             &self.global.pm,
             old_addr,

@@ -2757,7 +2757,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Whether `fd` names `/dev/fb0` -- recognized the same way [`Self::is_stdio`] recognizes a
     /// tty (by the `rdev` major number [`litebox::fs::devices`] assigns it), rather than by
     /// requiring a distinct fd-table subsystem for one device.
-    fn is_fb0(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+    pub(crate) fn is_fb0(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
         match fs.fd_file_status(fd) {
             Ok(status) => {
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);

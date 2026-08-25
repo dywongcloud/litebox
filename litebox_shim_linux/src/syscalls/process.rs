@@ -3099,6 +3099,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // parent's, which died on the first libc global it touched after taking its address
             // space back.
             let owned = self.process().owned_ranges.lock();
+            // A live `/dev/fb0` guest mapping (see `do_mmap_framebuffer`) whose pages this
+            // release is about to free must be deregistered first -- the framebuffer would
+            // otherwise keep reading freed memory. A sibling's registration is not in this
+            // process's `owned_ranges` and is left alone.
+            if let Some(fb) = self.global.framebuffer.as_ref()
+                && let Some((fb_addr, fb_len)) = fb.guest_mapping()
+                && owned
+                    .intersect(&(fb_addr..fb_addr.saturating_add(fb_len)))
+                    .next()
+                    .is_some()
+            {
+                fb.clear_guest_mapping_overlapping(fb_addr, fb_len);
+            }
             let release = |r: Range<usize>, vm: VmFlags| {
                 if vm.is_empty() {
                     Vec::new()
