@@ -3,7 +3,7 @@
 
 //! Unix-y devices [`super::backend::Backend`].
 //!
-//! Provides `{stdin,stdout,null,urandom,...}` entries, intended to be mounted at `/dev`.
+//! Provides `{stdin,stdout,null,urandom,fb0,...}` entries, intended to be mounted at `/dev`.
 
 use alloc::string::String;
 use alloc::vec;
@@ -23,12 +23,24 @@ use super::errors::{
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
 
+pub use self::framebuffer::{
+    FbFixScreeninfo, FbVarScreeninfo, Framebuffer, FramebufferGeometry,
+};
+mod framebuffer;
+
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: usize = 1024;
 /// Block size for null device
 const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
+/// `/dev/fb0`'s major device number, matching real Linux's `fb` major
+/// (https://www.kernel.org/doc/Documentation/admin-guide/devices.txt). Public so callers outside
+/// this crate (the shim's `sys_ioctl`) can recognize an fb0 fd by its `rdev` major, the same way
+/// [`super::layered`]'s tty recognition works off a major-number range.
+pub const FB_MAJOR: usize = 29;
+/// Block size for /dev/fb0
+const FB_BLOCK_SIZE: usize = 0x1000;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -57,6 +69,14 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=9
     rdev: core::num::NonZeroUsize::new(0x109),
 };
+/// Node info for /dev/fb0. Major 29 matches real Linux's `fb` major
+/// (https://www.kernel.org/doc/Documentation/admin-guide/devices.txt); minor 0 is the first (and
+/// here, only) framebuffer device.
+const FB0_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 10,
+    rdev: core::num::NonZeroUsize::new(FB_MAJOR << 8), // | minor 0
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
@@ -65,6 +85,7 @@ enum Device {
     Stderr,
     Null,
     URandom,
+    Fb0,
 }
 
 impl Device {
@@ -74,13 +95,14 @@ impl Device {
         ("stderr", Device::Stderr),
         ("null", Device::Null),
         ("urandom", Device::URandom),
+        ("fb0", Device::Fb0),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
     }
 
-    fn file_status(self) -> FileStatus {
+    fn file_status(self, fb_size: u32) -> FileStatus {
         match self {
             Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -115,6 +137,20 @@ impl Device {
                 mtime: Timestamp::default(),
                 ctime: Timestamp::default(),
             },
+            Device::Fb0 => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP,
+                // Real fbdev reports `smem_len` as the file's `st_size`; some readers (notably
+                // x11vnc's `-rawfb` mmap-failure fallback) size their `lseek`+`read` loop off
+                // this rather than `FBIOGET_FSCREENINFO`.
+                size: fb_size as usize,
+                owner: UserInfo::ROOT,
+                node_info: FB0_NODE_INFO,
+                blksize: FB_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
+            },
         }
     }
 }
@@ -131,6 +167,7 @@ where
     /// Stable inode info for this backend's root directory.
     root_inode: NodeInfo,
     _alloc: InodeAllocator,
+    framebuffer: Framebuffer<Platform>,
 }
 
 impl<Platform> Devices<Platform>
@@ -148,7 +185,15 @@ where
             litebox: litebox.clone(),
             root_inode,
             _alloc: allocator,
+            framebuffer: Framebuffer::new(),
         }
+    }
+
+    /// A cheap handle to this backend's `/dev/fb0` state, for a runner-side reader (e.g. an RFB
+    /// server) to read guest-painted pixels from independently of any guest fd.
+    #[must_use]
+    pub fn framebuffer(&self) -> Framebuffer<Platform> {
+        self.framebuffer.clone()
     }
 }
 
@@ -276,12 +321,12 @@ where
             .map(|(n, d)| DirEntry {
                 name: String::from(*n),
                 file_type: FileType::CharacterDevice,
-                ino_info: Some(d.file_status().node_info),
+                ino_info: Some(d.file_status(self.framebuffer.smem_len()).node_info),
             })
             .collect())
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
             Device::Stdin => self
@@ -301,10 +346,11 @@ where
                 self.litebox.x.platform.fill_bytes_crng(buf);
                 Ok(buf.len())
             }
+            Device::Fb0 => Ok(self.framebuffer.read_at(buf, offset)),
         }
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
@@ -321,6 +367,7 @@ where
                 // /dev/urandom here.
                 return Ok(buf.len());
             }
+            Device::Fb0 => return Ok(self.framebuffer.write_at(buf, offset)),
         };
         self.litebox
             .x
@@ -340,11 +387,18 @@ where
         match h.device {
             Device::Stdin | Device::Stdout | Device::Stderr => SeekBehavior::NonSeekable,
             Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
+            // Real position tracking: a plain `cp /dev/fb0 snapshot` (sequential reads with no
+            // explicit offset) must advance through the whole pixel store, and `FBIOPAN_DISPLAY`
+            // callers rely on `lseek`+`read`/`write` at an explicit byte offset behaving like a
+            // normal seekable file.
+            Device::Fb0 => SeekBehavior::PositionBased,
         }
     }
 
     fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
-        Ok(h.get_typed::<Self>().device.file_status())
+        Ok(h.get_typed::<Self>()
+            .device
+            .file_status(self.framebuffer.smem_len()))
     }
 
     fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {

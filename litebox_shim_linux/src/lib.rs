@@ -267,6 +267,10 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     /// [`Self::build`] moves this into [`GlobalState`] so the shim can publish the guest task's
     /// identity into it as that becomes known (see `syscalls::process::Task::set_task_comm`).
     proc_handle: Cell<Option<litebox::fs::proc::Proc<Platform>>>,
+    /// Handle to the `/dev/fb0` framebuffer mounted by [`Self::default_fs`], if it was called.
+    /// [`Self::build`] moves this into [`GlobalState`] so `sys_ioctl` can service `FBIO*`
+    /// requests directly, without threading the framebuffer through the generic `FS` type.
+    framebuffer: Cell<Option<litebox::fs::devices::Framebuffer<Platform>>>,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -281,6 +285,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform,
             litebox,
             proc_handle: Cell::new(None),
+            framebuffer: Cell::new(None),
         }
     }
 
@@ -291,18 +296,20 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
 
     /// Create a default layered file system with the given in-memory layer and tar data.
     ///
-    /// Also mounts a `/proc` backend and stashes a handle to it on `self`; [`Self::build`] moves
-    /// that handle into the built shim's `GlobalState` so the guest task's identity can be
-    /// published into `/proc/<pid>/*` once it's known. Calling this more than once replaces the
-    /// stashed handle with the most recent call's -- only the `/proc` mounted by the filesystem
-    /// actually passed to `LinuxShim::load_program` should be kept live.
+    /// Also mounts a `/proc` backend and a `/dev/fb0` framebuffer, stashing handles to both on
+    /// `self`; [`Self::build`] moves them into the built shim's `GlobalState` so the guest task's
+    /// identity can be published into `/proc/<pid>/*` once it's known, and `sys_ioctl` can
+    /// service `FBIO*` requests. Calling this more than once replaces the stashed handles with
+    /// the most recent call's -- only the filesystem actually passed to
+    /// `LinuxShim::load_program` should be kept live.
     pub fn default_fs(
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
-        let (fs, proc_handle) = default_fs(&self.litebox, in_mem_fs, tar_data);
+        let (fs, proc_handle, framebuffer) = default_fs(&self.litebox, in_mem_fs, tar_data);
         self.proc_handle.set(Some(proc_handle));
+        self.framebuffer.set(Some(framebuffer));
         fs
     }
 
@@ -331,6 +338,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             boot_time: self.platform.now(),
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             proc_handle: self.proc_handle.take(),
+            framebuffer: self.framebuffer.take(),
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
@@ -493,20 +501,30 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
 
 /// Create a default layered file system with the given in-memory layer and tar data.
 ///
-/// Also returns a handle to the mounted `/proc` backend; the caller (`LinuxShimBuilder`) is
-/// responsible for keeping it reachable so the guest task's identity can be published into it
-/// once known -- see `syscalls::process::Task::set_task_comm`.
+/// Also returns a handle to the mounted `/proc` backend, and to the mounted `/dev/fb0`
+/// framebuffer; the caller (`LinuxShimBuilder`) is responsible for keeping the `/proc` handle
+/// reachable so the guest task's identity can be published into it once known -- see
+/// `syscalls::process::Task::set_task_comm` -- and stashes the framebuffer handle into
+/// `GlobalState` so `sys_ioctl` can service `FBIO*` requests without threading it through the
+/// generic `FS` type.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_data: Cow<'static, [u8]>,
-) -> (LinuxFS<Platform>, litebox::fs::proc::Proc<Platform>) {
+) -> (
+    LinuxFS<Platform>,
+    litebox::fs::proc::Proc<Platform>,
+    litebox::fs::devices::Framebuffer<Platform>,
+) {
     let mut proc_handle = None;
+    let mut framebuffer = None;
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
             .mount("/dev", |allocator| {
-                litebox::fs::devices::Devices::new(litebox, allocator)
+                let devices = litebox::fs::devices::Devices::new(litebox, allocator);
+                framebuffer = Some(devices.framebuffer());
+                devices
             })
             .mount("/proc", |allocator| {
                 let proc = litebox::fs::proc::Proc::new(allocator);
@@ -517,6 +535,12 @@ fn default_fs<Platform: ShimPlatform>(
             .unwrap(),
     );
     let proc_handle = proc_handle.expect("mounted immediately above");
+    // `Composer::builder().mount("/dev", ..)`'s closure runs synchronously inside `.build()`
+    // above, so `framebuffer` is always `Some` here in practice; falling back to a fresh,
+    // unmounted `Framebuffer` rather than panicking keeps this path total even if that
+    // invariant is ever violated by a future refactor.
+    let framebuffer =
+        framebuffer.unwrap_or_else(litebox::fs::devices::Framebuffer::new);
     let tar_ro = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
@@ -537,7 +561,7 @@ fn default_fs<Platform: ShimPlatform>(
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     );
-    (fs, proc_handle)
+    (fs, proc_handle, framebuffer)
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
@@ -1560,6 +1584,14 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// `None` when the shim was built with a filesystem that doesn't mount one.
     /// `Task::set_task_comm` publishes the guest task's identity here as it becomes known.
     proc_handle: Option<litebox::fs::proc::Proc<Platform>>,
+    /// Handle to the `/dev/fb0` framebuffer mounted by [`LinuxShimBuilder::default_fs`], if any
+    /// -- `None` when the shim was built with a filesystem that doesn't mount one.
+    /// `syscalls::file::Task::sys_ioctl` services `FBIO*` requests through this handle directly,
+    /// rather than by routing through the generic `FS` backend trait: the ioctl structs
+    /// (`FbVarScreeninfo`/`FbFixScreeninfo`) live on the concrete [`litebox::fs::devices::Framebuffer`]
+    /// type, not on the `FileSystem`/`Backend` traits, so there's no generic path from an `FS`-typed
+    /// fd to them.
+    framebuffer: Option<litebox::fs::devices::Framebuffer<Platform>>,
     /// The process group ID both of the controlling terminal's foreground group (as set by
     /// `TIOCSPGRP` / read by `TIOCGPGRP`) and of every guest process (as set by `setpgid` / read
     /// by `getpgid` -- see `syscalls::process::Task::sys_setpgid`/`sys_getpgid`). All four

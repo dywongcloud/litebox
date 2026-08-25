@@ -910,6 +910,11 @@ pub const TIOCGWINSZ: u32 = 0x5413;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
+pub const FBIOGET_VSCREENINFO: u32 = 0x4600;
+pub const FBIOPUT_VSCREENINFO: u32 = 0x4601;
+pub const FBIOGET_FSCREENINFO: u32 = 0x4602;
+pub const FBIOPAN_DISPLAY: u32 = 0x4606;
+pub const FBIOBLANK: u32 = 0x4611;
 
 /// When a new terminal attribute value takes effect, per `tcsetattr(3)`'s
 /// `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` distinction.
@@ -945,6 +950,20 @@ pub enum IoctlArg {
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
     FIOCLEX,
+    /// Get the framebuffer's variable (mode) screen info.
+    FBIOGET_VSCREENINFO(UserPtrMut<litebox::fs::devices::FbVarScreeninfo>),
+    /// Set the framebuffer's variable (mode) screen info. litebox clamps rather than rejects a
+    /// request it cannot satisfy exactly -- see
+    /// [`litebox::fs::devices::Framebuffer::put_var_screeninfo`]'s doc comment.
+    FBIOPUT_VSCREENINFO(UserPtr<litebox::fs::devices::FbVarScreeninfo>),
+    /// Get the framebuffer's fixed (hardware) screen info.
+    FBIOGET_FSCREENINFO(UserPtrMut<litebox::fs::devices::FbFixScreeninfo>),
+    /// Pan the framebuffer's visible window to a new offset within the virtual screen (double
+    /// buffering / page flip).
+    FBIOPAN_DISPLAY(UserPtr<litebox::fs::devices::FbVarScreeninfo>),
+    /// Blank/unblank the display. litebox has no real hardware to blank; treated as a no-op that
+    /// always succeeds, matching how a real fbdev driver treats an unsupported blank mode.
+    FBIOBLANK,
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -3166,6 +3185,11 @@ impl SyscallRequest {
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
+                        FBIOGET_VSCREENINFO => IoctlArg::FBIOGET_VSCREENINFO(ctx.sys_req_ptr(2)),
+                        FBIOPUT_VSCREENINFO => IoctlArg::FBIOPUT_VSCREENINFO(ctx.sys_req_ptr(2)),
+                        FBIOGET_FSCREENINFO => IoctlArg::FBIOGET_FSCREENINFO(ctx.sys_req_ptr(2)),
+                        FBIOPAN_DISPLAY => IoctlArg::FBIOPAN_DISPLAY(ctx.sys_req_ptr(2)),
+                        FBIOBLANK => IoctlArg::FBIOBLANK,
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),

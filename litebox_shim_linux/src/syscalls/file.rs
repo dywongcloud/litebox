@@ -2672,6 +2672,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// Whether `fd` names `/dev/fb0` -- recognized the same way [`Self::is_stdio`] recognizes a
+    /// tty (by the `rdev` major number [`litebox::fs::devices`] assigns it), rather than by
+    /// requiring a distinct fd-table subsystem for one device.
+    fn is_fb0(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+        match fs.fd_file_status(fd) {
+            Ok(status) => {
+                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
+                Ok(major == litebox::fs::devices::FB_MAJOR
+                    && status.file_type == litebox::fs::FileType::CharacterDevice)
+            }
+            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            // `fd` was already resolved to an open fs-backend fd by the caller's
+            // `run_on_raw_fd`, so a status lookup on it failing with anything other than
+            // `ClosedFd` (`Io`, `PathError`, or any variant `#[non_exhaustive]` may add later)
+            // cannot happen in practice; report "not recognized as fb0" rather than assume a
+            // specific unreachable shape.
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -2861,6 +2881,62 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
             )?,
+            IoctlArg::FBIOGET_VSCREENINFO(..)
+            | IoctlArg::FBIOPUT_VSCREENINFO(..)
+            | IoctlArg::FBIOGET_FSCREENINFO(..)
+            | IoctlArg::FBIOPAN_DISPLAY(..)
+            | IoctlArg::FBIOBLANK => files
+                .run_on_raw_fd(
+                    desc,
+                    |fd| -> Result<u32, Errno> {
+                        if !self.is_fb0(&files.fs, fd)? {
+                            return Err(Errno::ENOTTY);
+                        }
+                        // A framebuffer-typed fd only exists when `default_fs` mounted one (the
+                        // sole source of an fb0 rdev major), so a `None` here would mean an fd
+                        // recognized as fb0 by a filesystem this shim never built -- report
+                        // "not a tty-like device" rather than assume that can't happen.
+                        let Some(fb) = self.global.framebuffer.as_ref() else {
+                            return Err(Errno::ENOTTY);
+                        };
+                        match &arg {
+                            IoctlArg::FBIOGET_VSCREENINFO(out) => {
+                                out.write_at_offset::<Platform>(0, fb.var_screeninfo())
+                                    .ok_or(Errno::EFAULT)?;
+                                Ok(0)
+                            }
+                            IoctlArg::FBIOPUT_VSCREENINFO(req) => {
+                                let req = req.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                                fb.put_var_screeninfo(&req);
+                                Ok(0)
+                            }
+                            IoctlArg::FBIOGET_FSCREENINFO(out) => {
+                                out.write_at_offset::<Platform>(0, fb.fix_screeninfo())
+                                    .ok_or(Errno::EFAULT)?;
+                                Ok(0)
+                            }
+                            IoctlArg::FBIOPAN_DISPLAY(req) => {
+                                let req = req.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                                if fb.pan_display(req.yoffset) {
+                                    Ok(0)
+                                } else {
+                                    Err(Errno::EINVAL)
+                                }
+                            }
+                            // litebox has no real display hardware to blank; treat every blank
+                            // level (including an unrecognized one) as a trivially successful
+                            // no-op, matching how fbdevhw.c tolerates a driver that can't blank.
+                            // (`FBIOBLANK` carries no payload, so this is also the only other
+                            // variant the outer match admits here.)
+                            _ => Ok(0),
+                        }
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                )?,
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)
