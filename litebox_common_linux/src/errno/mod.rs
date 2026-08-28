@@ -133,6 +133,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
             litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
             litebox::fs::errors::OpenError::TooManySymbolicLinks => Errno::ELOOP,
             litebox::fs::errors::OpenError::Io => Errno::EIO,
+            litebox::fs::errors::OpenError::UnsupportedFlags => Errno::EINVAL,
             _ => unimplemented!(),
         }
     }

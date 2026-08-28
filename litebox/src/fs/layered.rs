@@ -206,7 +206,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 // The lower layer holds no symlinks and is opened for reading
                 // (no O_NOFOLLOW), so ELOOP cannot arise here.
                 | OpenError::TooManySymbolicLinks
-                | OpenError::TruncateError(_) => unreachable!(),
+                | OpenError::TruncateError(_)
+                // Called above with OFlags::RDONLY only, always within the supported set.
+                | OpenError::UnsupportedFlags => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
         };
@@ -474,7 +476,7 @@ impl<
             | OFlags::NOFOLLOW
             | OFlags::APPEND;
         if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!("{flags:?}")
+            return Err(OpenError::UnsupportedFlags);
         }
         let path = self.absolute_path(path)?;
         if flags.contains(OFlags::CREAT) {
@@ -560,6 +562,7 @@ impl<
                     | TruncateError::ClosedFd
                     | TruncateError::Io,
                 )
+                | OpenError::UnsupportedFlags
                 | OpenError::PathError(
                     PathError::ComponentNotADirectory
                     | PathError::InvalidPathname
@@ -1388,7 +1391,10 @@ impl<
                 }
                 OpenError::NoWritePerms
                 | OpenError::AlreadyExists
-                | OpenError::TruncateError(_) => {
+                | OpenError::TruncateError(_)
+                // Called above with OFlags::RDONLY | OFlags::DIRECTORY only, always
+                // within the supported set.
+                | OpenError::UnsupportedFlags => {
                     unreachable!()
                 }
             },

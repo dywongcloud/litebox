@@ -833,7 +833,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
                 | OpenError::TooManySymbolicLinks
-                | OpenError::TruncateError(_) => FileStatusError::Io,
+                | OpenError::TruncateError(_)
+                // Called above with OFlags::PATH only, always within Resolver::open's
+                // supported set.
+                | OpenError::UnsupportedFlags => FileStatusError::Io,
             })?;
         let status = self.fd_file_status(&fd);
         self.close(&fd).unwrap();

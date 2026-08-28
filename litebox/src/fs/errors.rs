@@ -34,6 +34,8 @@ pub enum OpenError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
+    #[error("open flags not yet supported by this filesystem")]
+    UnsupportedFlags,
 }
 
 /// Possible errors from [`FileSystem::close`]
