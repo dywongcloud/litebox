@@ -309,6 +309,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
+            next_pid: 2.into(), // start from 2, as 1 is reserved for init (PID 1)
             proc_handle: self.proc_handle.take(),
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
@@ -1441,6 +1442,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
+    /// Next process ID to assign for fork().
+    /// Separate from next_thread_id: threads within a process share PID,
+    /// but fork() creates new processes with distinct PIDs.
+    next_pid: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.

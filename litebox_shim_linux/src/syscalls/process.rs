@@ -845,13 +845,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// - Test: simple fork, fork+exec, fork with FD inheritance, concurrent parent/child
     pub(crate) fn sys_fork(
         &self,
-        _ctx: &litebox_common_linux::PtRegs,
+        ctx: &litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
-        // TODO: Implement full fork() support
-        // This is a placeholder that documents what needs to be done.
-        // Fork is a complex syscall requiring architectural changes to support
-        // separate processes with independent PIDs and memory spaces.
-        Err(Errno::ENOSYS)
+        // Allocate a new PID for the child process.
+        let child_pid = self.global.next_pid.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+        // Create a new thread state for the child. The child process's first thread
+        // has TID equal to its PID (matching Linux convention for single-threaded processes).
+        let child_thread = self.thread.new_thread(child_pid).ok_or(Errno::EBUSY)?;
+
+        // Set up the child's initial state to continue from the fork syscall.
+        // The child will return 0 from fork(), while the parent continues with child_pid.
+        child_thread.init_state.set(ThreadInitState::NewThread {
+            stack: None,  // Use default stack for fork child
+            tls: None,    // Inherit TLS from parent
+            set_child_tid: None,
+        });
+
+        // Spawn the child process as a new task.
+        let r = unsafe {
+            self.global.platform.spawn_thread(
+                ctx,
+                Box::new(NewThreadArgs {
+                    task: crate::Task {
+                        global: self.global.clone(),
+                        wait_state: crate::wait::WaitState::new(self.global.platform),
+                        thread: child_thread,
+                        // New process has its own PID; parent PID is this task's PID
+                        pid: child_pid,
+                        tid: child_pid,
+                        ppid: self.pid,
+                        // Copy credentials from parent
+                        credentials: RefCell::new(self.credentials.borrow().clone()),
+                        comm: self.comm.clone(),
+                        // Copy filesystem state from parent
+                        fs: self.fs.clone(),
+                        // Copy file descriptor table from parent (FDs initially shared)
+                        files: self.files.clone(),
+                        // Clone signals for new process (TODO: reset handlers to SIG_DFL per POSIX)
+                        signals: self.signals.clone_for_new_task(),
+                    },
+                }),
+            )
+        };
+
+        if let Err(err) = r {
+            litebox_util_log::error!(err:% = err; "failed to spawn fork child process");
+            return Err(Errno::ENOMEM);
+        }
+
+        // Return child PID to parent.
+        // The child will return 0 from this same syscall (handled by the platform's
+        // return-value setup for the new thread).
+        Ok(usize::try_from(child_pid).unwrap())
     }
 }
 
