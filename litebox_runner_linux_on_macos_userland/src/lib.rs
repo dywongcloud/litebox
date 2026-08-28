@@ -359,8 +359,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 "/tmp",
                 litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
             )
-            .unwrap();
-            fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
+            .unwrap_or_else(|e| panic!("/tmp creation cannot fail on a fresh in-memory file system: {e}"));
+            fs.chown("/tmp", Some(1000), Some(1000))
+                .unwrap_or_else(|e| panic!("/tmp chown cannot fail on a fresh in-memory file system: {e}"));
 
             // Standard FHS directories that guest tools expect to already exist (e.g. `apk`
             // opens a log file under `/var/log`) but that don't survive as empty-directory
@@ -496,20 +497,29 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let argv = cli_args
         .program_and_arguments
         .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
+        .map(|x| {
+            std::ffi::CString::new(x.bytes().collect::<Vec<u8>>())
+                .map_err(|e| anyhow!("program argument {x:?} contains an embedded NUL byte: {e}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let envp: Vec<_> = cli_args
         .environment_variables
         .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
+        .map(|x| {
+            std::ffi::CString::new(x.bytes().collect::<Vec<u8>>())
+                .map_err(|e| anyhow!("environment variable {x:?} contains an embedded NUL byte: {e}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
+        let forwarded = std::env::vars()
+            .map(|(k, v)| {
                 std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
-                    .unwrap()
-            }))
-            .collect()
+                    .map_err(|e| {
+                        anyhow!("host environment variable {k:?} contains an embedded NUL byte: {e}")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        envp.into_iter().chain(forwarded).collect()
     } else {
         envp
     };
