@@ -82,7 +82,7 @@ DEFAULT_PACKAGES=(
     libxtst libice libsm libxt libxmu libxaw libxkbfile libfontenc
     libxfont2 libxkbcommon libxpresent libxres libxshmfence libxcvt
     # GTK stack
-    glib at-spi2-core gtk+3.0 gtk-layer-shell libnotify libdbusmenu-glib
+    simdutf glib at-spi2-core gtk+3.0 gtk-layer-shell libnotify libdbusmenu-glib
     # X server, drivers, and keymap compiler
     xorg-server xf86-video-fbdev xf86-input-evdev xkbcomp
     # XFCE
