@@ -98,4 +98,6 @@ if __name__ == "__main__":
     build_static_bin_box("x11-app", "app.box.wasm", [], [])
     print("Building vncbridge.box.wasm ...")
     build_static_bin_box("vnc-bridge", "vncbridge.box.wasm", [], ["5900/tcp"])
+    print("Building graphics_demo.box.wasm ...")
+    build_static_bin_box("graphics-demo", "graphics_demo.box.wasm", [], ["5900/tcp"])
     print("Done:", OUT_DIR)

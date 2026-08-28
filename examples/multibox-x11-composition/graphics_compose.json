@@ -1,0 +1,10 @@
+{
+  "instances": [
+    {
+      "name": "graphics",
+      "box": "images/graphics_demo.box.wasm",
+      "env": { "BIND_IP": "${graphics.guest_ip}" },
+      "publish": ["5900:5900"]
+    }
+  ]
+}

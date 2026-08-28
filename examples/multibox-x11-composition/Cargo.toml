@@ -19,6 +19,10 @@ path = "src/bin/x11_app.rs"
 name = "vnc-bridge"
 path = "src/bin/vnc_bridge.rs"
 
+[[bin]]
+name = "graphics-demo"
+path = "src/bin/graphics_demo.rs"
+
 [profile.release]
 opt-level = "s"
 panic = "abort"

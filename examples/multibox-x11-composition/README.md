@@ -31,6 +31,9 @@ working today, not an aspirational design.
 
 - `src/x11proto.rs` -- minimal X11 core protocol client (connection setup,
   `CreateGC`, `PolyFillRectangle`, `GetImage`), from scratch, no libX11.
+- `src/graphics.rs` -- software rasterizer: 32bpp RGBA framebuffer with
+  fill/rect/circle/line/gradient drawing operations. Extensible trait design
+  for GL/Vulkan backends.
 - `src/bin/x11_server.rs` -- minimal X11 *server*: implements exactly the
   request subset the two client binaries below use, against a real
   in-memory framebuffer. See "Why not real Xvfb" for why this exists instead
@@ -40,11 +43,16 @@ working today, not an aspirational design.
 - `src/bin/vnc_bridge.rs` -- connects to the server over TCP (`GetImage`),
   serves the result as a minimal RFB 3.8 server (raw encoding) for real VNC
   clients.
+- `src/bin/graphics_demo.rs` -- standalone graphics demo: soft-rasterizer
+  rendering animated gradients, circles, lines, and rectangles with
+  time-based animation; serves via RFB 3.8 to VNC clients.
 - `build-images.py` -- packages each binary as a `.box.wasm` (docker-save
   layout, no Docker installed) and runs it through `boxer build --archive`.
 - `compose.json` -- the composition: three instances, `x11server` first,
   `app`/`vncbridge` depending on it and referencing its address via
   `${x11server.guest_ip}`.
+- `graphics_compose.json` -- standalone graphics demo composition (single
+  instance).
 - `rfb_client_witness.py` -- a real RFB client (not a mock) that performs the
   actual handshake and checks the actual received pixel color.
 
@@ -77,6 +85,34 @@ RESULT: PASS -- VNC end-to-end verified, real pixels from the app box visible
 
 Ctrl+C the `boxer compose` process to tear the whole composition down
 cleanly.
+
+## Graphics demo
+
+The graphics library (`src/graphics.rs`) provides a simple software-rasterizer
+backend for 2D drawing: rectangles, circles, lines, and gradients with optional
+alpha blending. It is designed to be backend-agnostic: the `Surface` trait can
+be implemented with GL, Vulkan, or other renderers as needed.
+
+The `graphics_demo` binary showcases the rasterizer with animated patterns:
+
+```sh
+cd examples/multibox-x11-composition
+cargo build --release --target x86_64-unknown-linux-musl
+python3 build-images.py                 # includes graphics_demo.box.wasm
+cd ../..
+cargo build --release -p boxer
+./target/release/boxer compose examples/multibox-x11-composition/graphics_compose.json
+```
+
+Then connect with a VNC viewer:
+```sh
+vncviewer 127.0.0.1:5900
+```
+
+The demo renders a 320×240 framebuffer with time-animated gradients, circles,
+spinning lines, and moving rectangles, updating ~30 fps. The graphics library
+API is available for any application needing 2D rendering without GPU
+dependencies.
 
 ## Why not real Xvfb
 
