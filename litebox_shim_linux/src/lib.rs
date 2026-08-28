@@ -1298,6 +1298,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
+            SyscallRequest::Fork => self.sys_fork(ctx),
             SyscallRequest::SetThreadArea { user_desc } => {
                 #[cfg(target_arch = "x86_64")]
                 {

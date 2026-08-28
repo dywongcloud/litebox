@@ -2650,6 +2650,9 @@ pub enum SyscallRequest {
     Clone3 {
         args: UserPtr<CloneArgs>,
     },
+    /// Create a new process (fork).
+    /// Returns child PID to parent, 0 to child.
+    Fork,
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on x86_64.
     SetThreadArea {
@@ -3316,6 +3319,7 @@ impl SyscallRequest {
                     args: ctx.sys_req_ptr(0),
                 }
             }
+            Sysno::fork => SyscallRequest::Fork,
             Sysno::set_robust_list => {
                 if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead>() {
                     sys_req!(SetRobustList { head })

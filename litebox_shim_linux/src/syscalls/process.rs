@@ -812,6 +812,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_gettid(&self) -> i32 {
         self.tid
     }
+
+    /// Handle syscall `fork`.
+    ///
+    /// Fork creates a new process (child) that is an independent copy of the calling process.
+    /// The child process has a distinct PID, separate memory space, and independent file descriptor table.
+    ///
+    /// POSIX semantics:
+    /// - Returns child PID to parent, 0 to child
+    /// - Child inherits: memory image, FD table, signal handlers (reset to default),
+    ///   resource limits, credentials, working directory
+    /// - Child gets: new PID, new session/process group if CLONE_NEWPID set
+    /// - Parent gets: child PID in return value
+    /// - Both parent and child are independently schedulable
+    ///
+    /// Current implementation status: PLANNED for full implementation.
+    /// Requires coordinated changes to:
+    /// 1. Memory model - copy parent address space (COW or full copy)
+    /// 2. PID allocation - separate namespace for process IDs vs thread IDs
+    /// 3. Process tracking - parent-child relationships for wait() syscalls
+    /// 4. Scheduler - support concurrent execution of parent and child
+    /// 5. Signal handlers - reset to SIG_DFL in child per POSIX
+    /// 6. File descriptors - copy table with independent offsets
+    ///
+    /// Until full implementation, returning ENOSYS. To implement:
+    /// - Add PID allocator to GlobalState (separate from next_thread_id)
+    /// - Add parent-child process tracking (children list in Process)
+    /// - Implement memory copy strategy (full copy or COW)
+    /// - Create sys_fork() handler that allocates new PID and spawns child
+    /// - Implement wait4/waitpid for process reaping
+    /// - Reset signal handlers in child (signal handler reset table needed)
+    /// - Test: simple fork, fork+exec, fork with FD inheritance, concurrent parent/child
+    pub(crate) fn sys_fork(
+        &self,
+        _ctx: &litebox_common_linux::PtRegs,
+    ) -> Result<usize, Errno> {
+        // TODO: Implement full fork() support
+        // This is a placeholder that documents what needs to be done.
+        // Fork is a complex syscall requiring architectural changes to support
+        // separate processes with independent PIDs and memory spaces.
+        Err(Errno::ENOSYS)
+    }
 }
 
 // TODO: enforce the following limits:
