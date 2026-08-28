@@ -614,6 +614,10 @@ pub enum FcntlArg {
     SETLK(UserPtr<Flock>),
     /// Set a file lock and wait if blocked
     SETLKW(UserPtr<Flock>),
+    /// Add seals to a memfd
+    ADD_SEALS(u32),
+    /// Get seals from a memfd
+    GET_SEALS,
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
 }
@@ -675,6 +679,8 @@ const F_SETFL: i32 = 4;
 const F_GETLK: i32 = 5;
 const F_SETLK: i32 = 6;
 const F_SETLKW: i32 = 7;
+const F_ADD_SEALS: i32 = 1033;
+const F_GET_SEALS: i32 = 1034;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -696,6 +702,8 @@ impl FcntlArg {
             F_GETLK => Self::GETLK(UserPtrMut::from_usize(arg)),
             F_SETLK => Self::SETLK(UserPtr::from_usize(arg)),
             F_SETLKW => Self::SETLKW(UserPtr::from_usize(arg)),
+            F_ADD_SEALS => Self::ADD_SEALS(arg.trunc()),
+            F_GET_SEALS => Self::GET_SEALS,
             F_DUPFD => Self::DUPFD {
                 cloexec: false,
                 min_fd: arg.trunc(),
@@ -904,12 +912,15 @@ pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
+pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
+pub const TIOCSPTLCK: u32 = 0x40045431;
 pub const FBIOGET_VSCREENINFO: u32 = 0x4600;
 pub const FBIOPUT_VSCREENINFO: u32 = 0x4601;
 pub const FBIOGET_FSCREENINFO: u32 = 0x4602;
@@ -937,15 +948,21 @@ pub enum IoctlArg {
     TCGETS(UserPtrMut<Termios>),
     /// Set the current serial port settings.
     TCSETS(UserPtr<Termios>, TerminalSetAction),
+    /// Set this terminal as the calling session's controlling terminal.
+    TIOCSCTTY(u32),
     /// Get the foreground process group ID of the controlling terminal.
     TIOCGPGRP(UserPtrMut<i32>),
     /// Set the foreground process group ID of the controlling terminal.
     TIOCSPGRP(UserPtr<i32>),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
+    /// Set window size.
+    TIOCSWINSZ(UserPtr<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
+    /// Lock or unlock a Unix98 pseudo-terminal slave device.
+    TIOCSPTLCK(UserPtr<i32>),
     /// Enables or disables non-blocking mode
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
@@ -1002,6 +1019,7 @@ pub enum SockType {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
+    SeqPacket = 5,
 }
 
 bitflags::bitflags! {
@@ -2215,9 +2233,14 @@ pub enum PrctlOption {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum PrctlArg {
+    SetPDeathSig(Option<signal::Signal>),
+    GetPDeathSig(UserPtrMut<i32>),
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
+    GetDumpable,
     CapBSetRead(usize),
+    SetNoNewPrivs,
+    GetNoNewPrivs,
 }
 
 #[repr(i32)]
@@ -2240,6 +2263,8 @@ pub struct ReceiveFlags(u32);
 
 bitflags::bitflags! {
     impl ReceiveFlags: u32 {
+        /// `MSG_CTRUNC`: ancillary data was truncated
+        const CTRUNC = 0x8;
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
         /// `MSG_DONTWAIT`: non-blocking operation
@@ -2727,6 +2752,10 @@ pub enum SyscallRequest {
         fd: i32,
         length: usize,
     },
+    MemfdCreate {
+        name: UserPtr<c_char>,
+        flags: u32,
+    },
     Mknodat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -2828,6 +2857,9 @@ pub enum SyscallRequest {
     Clone3 {
         args: UserPtr<CloneArgs>,
     },
+    Unshare {
+        flags: CloneFlags,
+    },
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on x86_64.
     SetThreadArea {
@@ -2902,6 +2934,8 @@ pub enum SyscallRequest {
         pid: i32,
         pgid: i32,
     },
+    /// `setsid()`: create a new session with the caller as its leader.
+    Setsid,
     /// `wait4(pid, wstatus, options, rusage)`.
     ///
     /// This is the only wait syscall aarch64 offers besides `waitid`; libc's
@@ -2921,6 +2955,10 @@ pub enum SyscallRequest {
     Getgroups {
         size: i32,
         list: UserPtrMut<u32>,
+    },
+    Setgroups {
+        size: usize,
+        list: UserPtr<u32>,
     },
     Setuid {
         uid: u32,
@@ -3202,10 +3240,13 @@ impl SyscallRequest {
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Now),
                         TCSETSW => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Drain),
                         TCSETSF => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Flush),
+                        TIOCSCTTY => IoctlArg::TIOCSCTTY(ctx.sys_req_arg(2)),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
+                        TIOCSPTLCK => IoctlArg::TIOCSPTLCK(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         FBIOGET_VSCREENINFO => IoctlArg::FBIOGET_VSCREENINFO(ctx.sys_req_ptr(2)),
@@ -3377,6 +3418,7 @@ impl SyscallRequest {
             Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getpgid => sys_req!(Getpgid { pid }),
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
+            Sysno::setsid => SyscallRequest::Setsid,
             Sysno::wait4 => sys_req!(Wait4 {
                 pid,
                 wstatus:*,
@@ -3388,6 +3430,7 @@ impl SyscallRequest {
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
             Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
+            Sysno::setgroups => sys_req!(Setgroups { size, list:* }),
             Sysno::setuid => sys_req!(Setuid { uid }),
             Sysno::setgid => sys_req!(Setgid { gid }),
             Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
@@ -3438,15 +3481,51 @@ impl SyscallRequest {
                 let op: u32 = ctx.sys_req_arg(0);
                 if let Ok(op) = PrctlOption::try_from(op) {
                     match op {
+                        PrctlOption::SetPDeathSig => {
+                            let signal: i32 = ctx.sys_req_arg(1);
+                            let signal = if signal == 0 {
+                                None
+                            } else {
+                                Some(signal::Signal::try_from(signal)?)
+                            };
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetPDeathSig(signal),
+                            }
+                        }
+                        PrctlOption::GetPDeathSig => SyscallRequest::Prctl {
+                            args: PrctlArg::GetPDeathSig(ctx.sys_req_ptr(1)),
+                        },
                         PrctlOption::SetName => SyscallRequest::Prctl {
                             args: PrctlArg::SetName(ctx.sys_req_ptr(1)),
                         },
                         PrctlOption::GetName => SyscallRequest::Prctl {
                             args: PrctlArg::GetName(ctx.sys_req_ptr(1)),
                         },
+                        PrctlOption::GetDumpable
+                            if (1..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::GetDumpable,
+                            }
+                        }
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
                         },
+                        PrctlOption::SetNoNewPrivs
+                            if ctx.sys_req_arg::<usize>(1) == 1
+                                && (2..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetNoNewPrivs,
+                            }
+                        }
+                        PrctlOption::GetNoNewPrivs
+                            if (1..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::GetNoNewPrivs,
+                            }
+                        }
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
@@ -3559,6 +3638,7 @@ impl SyscallRequest {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "aarch64")]
@@ -3603,6 +3683,9 @@ impl SyscallRequest {
                     args: ctx.sys_req_ptr(0),
                 }
             }
+            Sysno::unshare => SyscallRequest::Unshare {
+                flags: CloneFlags::from_bits_retain(ctx.sys_req_arg(0)),
+            },
             Sysno::set_robust_list => {
                 if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead>() {
                     sys_req!(SetRobustList { head })

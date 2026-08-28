@@ -241,7 +241,7 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
                 }
                 data
             } else {
-                rewrite_elf(&data, real_path, verbose)
+                rewrite_elf(&data, real_path, verbose)?
             };
 
             let mut entries = Vec::new();
@@ -294,7 +294,7 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
             use std::os::unix::fs::MetadataExt as _;
             std::fs::metadata(&inc.host_path).map_or(0o755, |m| m.mode())
         };
-        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose);
+        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose)?;
         if args.verbose {
             eprintln!(
                 "  including {} as {}",
@@ -384,7 +384,7 @@ fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow:
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
             let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
-                rewrite_elf(&data, &entry.read_path, verbose)
+                rewrite_elf(&data, &entry.read_path, verbose)?
             } else {
                 data
             };
@@ -774,13 +774,13 @@ fn rewrite_host() -> litebox_syscall_rewriter::Host {
 /// through the rewriter. For actual ELF files, benign rewriter errors (already
 /// hooked, no syscalls, unsupported object, missing `.text`) are treated as
 /// warnings and the original bytes are returned.
-fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
+fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8>> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
         if verbose {
             eprintln!("  {} (not ELF, skipping rewrite)", path.display());
         }
-        return data.to_vec();
+        return Ok(data.to_vec());
     }
 
     // Skip ELF files whose architecture doesn't match the target. OCI images
@@ -794,7 +794,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
                 path.display()
             );
         }
-        return data.to_vec();
+        return Ok(data.to_vec());
     }
 
     let host = rewrite_host();
@@ -805,10 +805,10 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
     // host -- see `musl_x18`'s module doc comment and `docs/roadmap.md`'s
     // "XNU destroys a live guest x18" section. Substituting a cached,
     // `-ffixed-x18`-rebuilt replacement before rewriting closes that gap for
-    // any macOS-targeted package containing a standard Alpine musl; a cache
-    // miss changes nothing (packaging still proceeds with the stock bytes,
-    // exactly as it did before this substitution existed) but prints a clear,
-    // actionable warning once.
+    // any macOS-targeted package containing a standard Alpine musl. A cache
+    // miss warns and preserves the historical fail-open behavior unless the
+    // caller sets `LITEBOX_REQUIRE_MUSL_X18=1`, which makes the missing
+    // validated generation fatal.
     let data = if matches!(host, litebox_syscall_rewriter::Host::MacOs)
         && musl_x18::is_musl_libc_filename(path)
     {
@@ -822,6 +822,12 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
             patched
         } else {
             musl_x18::warn_missing_patch(path, data);
+            if musl_x18::patch_is_required() {
+                bail!(
+                    "validated x18-safe musl cache entry is required for {}",
+                    path.display()
+                );
+            }
             data.to_vec()
         }
     } else {
@@ -834,7 +840,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
             }
-            rewritten
+            Ok(rewritten)
         }
         Err(e) => {
             // Include the file as-is when rewriting fails. This can happen for
@@ -845,7 +851,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
                 "  warning: failed to rewrite {}: {e}; including as-is",
                 path.display()
             );
-            data.to_vec()
+            Ok(data.to_vec())
         }
     }
 }

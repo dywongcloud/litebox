@@ -162,8 +162,7 @@ impl MacOsUserland {
     ///
     /// Panics if the requested `utun` device cannot be opened, if the fault
     /// handlers that make guest-memory accesses fallible cannot be installed,
-    /// or if the guest thread-pointer TSD slot the rewriter's `Host::MacOs`
-    /// gates have baked in cannot be reserved (see `reserve_guest_tpidr_tsd_slot`).
+    /// or if reserving a pthread TSD key for the guest thread pointer fails.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         Self::new_with_options(tun_device_name, false)
     }
@@ -205,9 +204,10 @@ impl MacOsUserland {
             cow_regions: std::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         };
 
-        // A platform must outlive every guest thread that can reach it, and
-        // there is exactly one per process, so leaking is the cheapest way to
-        // get a `'static` without reference counting on every access.
+        // A platform must outlive every guest thread that can reach it, so
+        // leaking is the cheapest way to get a `'static` without reference
+        // counting on every access. Runners construct one; tests may construct
+        // more, and every process-global facility is initialized only once.
         let platform: &'static Self = alloc::boxed::Box::leak(alloc::boxed::Box::new(platform));
         spawn_stdin_pump_thread(platform);
         platform
@@ -2714,89 +2714,46 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
 // Guest thread pointer
 // ---------------------------------------------------------------------------
 
-/// The pthread TSD key LiteBox reserved for the guest thread pointer, or
-/// `u32::MAX` before [`reserve_guest_tpidr_tsd_slot`] has run.
-static GUEST_TP_TSD_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The one process-wide pthread TSD key reserved for the guest thread pointer.
+/// Once initialized it is never deleted or replaced, so an already-loaded
+/// trampoline's byte offset remains valid for the process lifetime.
+static GUEST_TP_TSD_KEY: OnceLock<libc::pthread_key_t> = OnceLock::new();
 
-/// Reserve the pthread TSD slot the rewriter's `Host::MacOs` gates read the
-/// guest thread pointer from, recording it in [`GUEST_TP_TSD_KEY`].
+/// Return the process-wide pthread TSD key used for the guest thread pointer,
+/// reserving it on the first call.
 ///
-/// `litebox_syscall_rewriter::arm64`'s `Host::MacOs` gates are emitted
-/// *ahead of time*, when a binary is packaged -- they have
-/// `litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT` baked in as a fixed
-/// byte offset from `TPIDRRO_EL0`. For that to line up at guest-run time, this
-/// process's first `pthread_key_create` call would have to return exactly that
-/// slot. **It does not, and cannot be relied upon to:** measured on real
-/// hardware (Apple M3 Pro, macOS 26.3.1), the first dynamic key is 259 from a
-/// Rust binary and 258 from a C `main` -- libSystem's own startup claims a few
-/// dynamic keys first, and that count is undocumented and not stable across OS
-/// versions or across binaries with different static initializers. The AOT
-/// rewriter (a separate, earlier process) therefore cannot predict the runner's
-/// slot; a fixed baked immediate is fundamentally the wrong model. The real fix
-/// is load-time offset indirection (see the `macos-guest-tp-runtime-offset`
-/// roadmap item and `docs/roadmap.md`).
-///
-/// Both halves of that fix have landed: `Host::MacOs` gates no longer bake the
-/// slot number in, they read a byte offset from the trampoline header at run
-/// time, and `litebox_shim_linux`'s ELF loader (`loader/elf.rs`) already reads
-/// [`guest_tp_slot_byte_offset`] and writes it there via
-/// `litebox_common_linux::loader::ElfParsedFile::parse_trampoline` /
-/// `load_trampoline`, on every macOS load path. The mismatch below is
-/// therefore no longer live for a guest reached through this platform's
-/// loader; it stays as a defensive warning for any other embedder of this
-/// crate that constructs a trampoline without going through that path.
-///
-/// This reserves a key and records it, but does **not** hard fail on a mismatch:
-/// panicking here made the whole platform unconstructable on real hardware,
-/// blocking everything else (memory, syscalls, the context switch) that does not
-/// touch the guest thread pointer at all. Instead it warns loudly. A guest that
-/// never reads/writes `TPIDR_EL0` is unaffected; a guest that does would target
-/// the stale baked slot and is **not supported** until a loader fills the header
-/// slot. `litebox_runner_linux_on_macos_userland` already calls
-/// [`MacOsUserland::new`] for every guest it runs (see `docs/roadmap.md`'s
-/// "Running a guest on macOS"), so this path runs in production on every
-/// syscall-only guest today; only a `TPIDR_EL0`-using guest is unsupported.
+/// The key is assigned at runtime after libSystem has reserved its own dynamic
+/// keys, so it is not predictable when an image is packaged. Host::MacOs gates
+/// therefore read the key's byte offset from their trampoline header. Every
+/// supported macOS ELF load path writes [guest_tp_slot_byte_offset] to that
+/// header before making the trampoline executable; the rewriter's fixed slot
+/// constant is only the on-disk seed.
 ///
 /// # Panics
 ///
-/// Panics only if `pthread_key_create` itself fails (genuine resource
-/// exhaustion), not on a slot-number mismatch.
+/// Panics only if pthread_key_create itself fails due to resource exhaustion.
 fn reserve_guest_tpidr_tsd_slot() -> libc::pthread_key_t {
-    let mut key: libc::pthread_key_t = 0;
-    // SAFETY: `key` is a valid, uniquely-owned out-parameter; no destructor is
-    // needed since the platform (not pthread teardown) manages the guest
-    // thread pointer's lifetime.
-    let rc = unsafe { libc::pthread_key_create(&raw mut key, None) };
-    assert_eq!(
-        rc, 0,
-        "failed to reserve the guest thread-pointer TSD slot: pthread_key_create returned {rc}"
-    );
-    GUEST_TP_TSD_KEY.store(u32::try_from(key).unwrap_or(u32::MAX), Ordering::Relaxed);
-
-    let baked = litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT;
-    if u16::try_from(key).ok() != Some(baked) {
-        litebox_util_log::warn!(
-            key:? = key, baked_slot:? = baked;
-            "guest thread-pointer TSD slot mismatch: pthread_key_create gave a slot the \
-             AOT-rewritten Host::MacOs gates do not use. Guests that access TPIDR_EL0 are \
-             unsupported until load-time offset indirection lands (see docs/roadmap.md, \
-             macos-guest-tp-runtime-offset). Syscall-only guests are unaffected."
+    *GUEST_TP_TSD_KEY.get_or_init(|| {
+        let mut key: libc::pthread_key_t = 0;
+        // SAFETY: key is a valid, uniquely-owned out-parameter; no destructor
+        // is needed since the platform manages the guest thread pointer's
+        // lifetime and keeps the key for the process lifetime.
+        let rc = unsafe { libc::pthread_key_create(&raw mut key, None) };
+        assert_eq!(
+            rc, 0,
+            "failed to reserve the guest thread-pointer TSD slot: pthread_key_create returned {rc}"
         );
-    }
-    key
+        key
+    })
 }
 
-/// The pthread TSD key [`ArchSpecificRegister::TpidrEl0`] accessors and
-/// [`guest_tp_slot_byte_offset`] both address, or `None` before
-/// [`reserve_guest_tpidr_tsd_slot`] has run.
+/// The pthread TSD key [ArchSpecificRegister::TpidrEl0] accessors and
+/// [guest_tp_slot_byte_offset] both address, or None before
+/// [reserve_guest_tpidr_tsd_slot] has run.
 ///
-/// [`ArchSpecificRegister::TpidrEl0`]: litebox::platform::ArchSpecificRegister::TpidrEl0
+/// [ArchSpecificRegister::TpidrEl0]: litebox::platform::ArchSpecificRegister::TpidrEl0
 fn guest_tp_tsd_key() -> Option<libc::pthread_key_t> {
-    let key = GUEST_TP_TSD_KEY.load(Ordering::Relaxed);
-    if key == u32::MAX {
-        return None;
-    }
-    Some(libc::pthread_key_t::from(key))
+    GUEST_TP_TSD_KEY.get().copied()
 }
 
 /// The byte offset a `Host::MacOs` gate must add to `TPIDRRO_EL0` to reach this
@@ -2834,10 +2791,11 @@ pub fn guest_tp_slot_byte_offset() -> Option<usize> {
 ///
 /// # Safety
 ///
-/// `ctx` must describe a runnable guest context: a valid entry `pc`, and an `sp`
-/// addressing a guest stack with at least 16 usable bytes below it (see the
-/// `guest` module's below-`SP` staging note). Only one guest thread may run at a
-/// time on this platform; a second is a loud panic rather than corruption.
+/// `ctx` must be a valid, writable register context. Its guest `pc` or `sp` may
+/// fault when execution begins; the platform routes that as a guest exception
+/// rather than dereferencing either value in host switch code. Only one guest
+/// thread may run at a time on this platform; a second is a loud panic rather
+/// than corruption.
 pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
@@ -2849,6 +2807,24 @@ where
     ThreadHandle::run_with_handle(|| {
         with_signal_alt_stack(|| guest::run_thread(&shim, ctx));
     });
+}
+
+/// Constructing another platform must not invalidate a guest trampoline that
+/// already captured the first platform's guest-TP byte offset.
+#[cfg(test)]
+#[test]
+fn constructing_a_second_platform_preserves_guest_tp_slot_offset() {
+    use litebox::platform::SystemInfoProvider as _;
+
+    let first = MacOsUserland::new(None);
+    let before = first
+        .get_guest_tp_slot_offset()
+        .expect("the first platform reserved the process key");
+    let _second = MacOsUserland::new(None);
+    let after = first
+        .get_guest_tp_slot_offset()
+        .expect("the process key remains reserved");
+    assert_eq!(before, after);
 }
 
 /// The reserved key must convert into a byte offset the gates can actually use:
@@ -2867,18 +2843,16 @@ fn the_guest_tp_slot_offset_is_a_scaled_nonzero_byte_offset() {
     assert_ne!(offset, 0, "offset zero would address live libpthread state");
 }
 
-/// Reserving the guest thread-pointer TSD slot must not panic on real hardware
-/// even when the runtime key does not match the AOT-baked slot (it never does;
-/// see [`reserve_guest_tpidr_tsd_slot`]). A hard panic here previously made the
-/// whole platform unconstructable.
+/// Reserving the guest thread-pointer TSD key records the runtime-assigned key
+/// that both the architecture-specific accessors and trampoline offset use.
 #[cfg(test)]
 #[test]
-fn reserving_the_tsd_slot_does_not_panic_on_mismatch() {
+fn reserving_the_tsd_slot_records_the_runtime_key() {
     let key = reserve_guest_tpidr_tsd_slot();
     assert_eq!(
-        GUEST_TP_TSD_KEY.load(Ordering::Relaxed),
-        u32::try_from(key).unwrap(),
-        "the reserved key should be recorded for the future load-time-offset fix"
+        GUEST_TP_TSD_KEY.get().copied(),
+        Some(key),
+        "the reserved key should be recorded for runtime trampoline patching"
     );
 }
 
@@ -2895,7 +2869,14 @@ fn guest_tp_tsd_key_round_trips_a_pthread_specific_value() {
     reserve_guest_tpidr_tsd_slot();
     let key = guest_tp_tsd_key().expect("the key is recorded by now");
 
-    // SAFETY: `key` was just reserved above and is live for this thread.
+    // The process-wide key may have been used by an earlier test on this
+    // harness thread. Clear it before checking the null baseline.
+    // SAFETY: `key` is process-wide and live for this thread.
+    assert_eq!(
+        unsafe { libc::pthread_setspecific(key, core::ptr::null()) },
+        0
+    );
+    // SAFETY: same live key and thread as the clear above.
     let initial = unsafe { libc::pthread_getspecific(key) };
     assert!(
         initial.is_null(),
@@ -3061,6 +3042,42 @@ fn decode_mrs_ctr_el0(insn: u32) -> Option<u32> {
     }
 }
 
+fn decode_faulted_svc_gate(pc: usize) -> Option<usize> {
+    const SUB_SP_16: u32 = 0xd100_43ff;
+    const STR_X16_SP: u32 = 0xf900_03f0;
+    const STR_X16_SP_8: u32 = 0xf900_07f0;
+    const ADRP_X16_MASK: u32 = 0x9f00_001f;
+    const ADRP_X16: u32 = 0x9000_0010;
+    const ADD_X16_X16_MASK: u32 = 0xffc0_03ff;
+    const ADD_X16_X16: u32 = 0x9100_0210;
+    const B_MASK: u32 = 0xfc00_0000;
+    const B: u32 = 0x1400_0000;
+
+    if !pc.is_multiple_of(4) {
+        return None;
+    }
+    let gate = pc.checked_sub(4)?;
+    let words = darwin::read_task_u32s::<6>(gate)?;
+    if words[0] != SUB_SP_16
+        || words[1] != STR_X16_SP
+        || words[2] & ADRP_X16_MASK != ADRP_X16
+        || words[3] & ADD_X16_X16_MASK != ADD_X16_X16
+        || words[4] != STR_X16_SP_8
+        || words[5] & B_MASK != B
+    {
+        return None;
+    }
+
+    let immlo = (words[2] >> 29) & 0x3;
+    let immhi = (words[2] >> 5) & 0x7ffff;
+    let imm21 = (immhi << 2) | immlo;
+    let page_delta = ((u64::from(imm21) << 43).cast_signed() >> 43) << 12;
+    let adrp_pc = gate.checked_add(8)?;
+    let target_page = (adrp_pc & !0xfff).checked_add_signed(isize::try_from(page_delta).ok()?)?;
+    let continuation = target_page.checked_add(((words[3] >> 10) & 0xfff) as usize)?;
+    continuation.is_multiple_of(4).then_some(continuation)
+}
+
 unsafe extern "C" fn fault_handler(
     signum: libc::c_int,
     _info: *mut libc::siginfo_t,
@@ -3133,6 +3150,22 @@ unsafe extern "C" fn fault_handler(
             // SAFETY: makes JIT mappings executable for this thread; the
             // faulting branch/fetch re-runs and succeeds.
             unsafe { jit_write_protect(true) };
+            return;
+        }
+
+        if ec == 0x24
+            && is_write
+            && let Some(continuation) = decode_faulted_svc_gate(pc.trunc())
+        {
+            let recovery = unsafe {
+                guest::prepare_faulted_syscall_delivery(
+                    guest_state,
+                    &(*machine_context).thread_state,
+                    &(*machine_context).neon_state,
+                    continuation,
+                )
+            };
+            unsafe { (*machine_context).thread_state.pc = recovery as u64 };
             return;
         }
 
@@ -3418,16 +3451,15 @@ const ALT_STACK_GUARD_SIZE: usize = litebox::mm::linux::PAGE_SIZE;
 
 /// Runs `f` with an alternate signal stack installed on the calling thread.
 ///
-/// `guest::enter_guest_asm` stages the guest `PC` and `X0` in the 16 bytes
-/// below the guest `SP` for the brief window before it branches there, and
-/// AArch64 has no red zone protecting that staging area from a signal handler
-/// that runs on the interrupted stack. `darwin::install_handler` sets
-/// `SA_ONSTACK` on every handler this platform installs precisely so that risk
-/// is avoidable, but `SA_ONSTACK` only takes effect once a thread has actually
-/// registered a stack for it to use -- every entry point that can run guest
-/// code ([`ThreadProvider::spawn_thread`](litebox::platform::ThreadProvider::spawn_thread)
-/// and the free [`run_thread`]) wraps its call in this so that registration
-/// always happens first.
+/// Guest execution owns the hardware `SP`, and a hardware fault may mean that
+/// guest-controlled value is itself unmapped. A host signal handler therefore
+/// cannot safely run on the interrupted stack. `darwin::install_handler` sets
+/// `SA_ONSTACK` on every handler this platform installs, but that flag only
+/// takes effect once a thread has registered a stack for it to use. Every entry
+/// point that can run guest code
+/// ([`ThreadProvider::spawn_thread`](litebox::platform::ThreadProvider::spawn_thread)
+/// and the free [`run_thread`]) wraps its call in this so registration always
+/// happens first.
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let alt_stack_size = libc::SIGSTKSZ * 2;
     // SAFETY: an anonymous mapping with no fixed-address request has no

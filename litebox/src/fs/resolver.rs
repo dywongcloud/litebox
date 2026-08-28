@@ -38,17 +38,43 @@ pub struct Resolver<
 > {
     litebox: LiteBox<Platform>,
     backend: Backend,
+    user_info: UserInfo,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
-    /// Construct a new resolver over a `backend`.
+    /// Construct a new resolver over a `backend` for the default 1000/1000 identity.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, backend: Backend) -> Self {
+        Self::new_with_user(
+            litebox,
+            backend,
+            UserInfo {
+                user: 1000,
+                group: 1000,
+            },
+        )
+    }
+
+    /// Construct a new resolver over a `backend` for `user_info`.
+    #[must_use]
+    pub fn new_with_user(
+        litebox: &LiteBox<Platform>,
+        backend: Backend,
+        user_info: UserInfo,
+    ) -> Self {
         Self {
             litebox: litebox.clone(),
             backend,
+            user_info,
+        }
+    }
+
+    fn context(&self) -> Context {
+        Context {
+            cwd: vec![],
+            user_info: self.user_info,
         }
     }
 }
@@ -129,6 +155,10 @@ impl Context {
         } else {
             permissions.mode.contains(Mode::WOTH)
         }
+    }
+
+    fn can_use_noatime(&self, permissions: &PermissionInfo) -> bool {
+        self.user_info.user == 0 || self.user_info.user == permissions.owner.user
     }
 }
 
@@ -277,6 +307,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         outcome: &WalkOutcome<WalkingDirHandle<'_>>,
     ) -> Result<(), PathError> {
         for (idx, walked) in outcome.components.iter().enumerate() {
+            #[cfg(not(debug_assertions))]
+            let _ = idx;
             match &walked.permissions {
                 PermissionCheck::ByBackend => {}
                 PermissionCheck::ByResolver(permissions) => {
@@ -302,12 +334,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 }
 
-/// This exists purely as a migration feature, until we have completely separated contexts. See
-/// comment on `Resolver`.
-fn default_context_pre_context_management_changes() -> Context {
-    Context::new()
-}
-
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     super::FileSystem for Resolver<Platform, Backend>
 {
@@ -322,6 +348,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .union(OFlags::DIRECTORY)
             .union(OFlags::NONBLOCK)
             .union(OFlags::LARGEFILE)
+            .union(OFlags::NOATIME)
             .union(OFlags::NOFOLLOW)
             .union(OFlags::APPEND)
             .union(OFlags::PATH);
@@ -331,7 +358,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         }
         let path_only = flags.contains(OFlags::PATH);
 
-        let context = default_context_pre_context_management_changes();
+        let context = self.context();
         let path = context.resolve(path)?;
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
@@ -387,6 +414,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 let file = self.backend.open_file_at(outcome.last, name, flags)?;
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
+                }
+                if !path_only
+                    && flags.contains(OFlags::NOATIME)
+                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                    && !context.can_use_noatime(permissions)
+                {
+                    return Err(OpenError::OperationNotPermitted);
                 }
                 if !path_only
                     && let PermissionCheck::ByResolver(permissions) = &file.permissions
@@ -605,7 +639,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -646,7 +680,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -693,7 +727,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         atime: Option<Timestamp>,
         mtime: Option<Timestamp>,
     ) -> Result<(), UtimeError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -734,7 +768,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -753,7 +787,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -772,7 +806,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
-        let context = default_context_pre_context_management_changes();
+        let context = self.context();
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -829,6 +863,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 OpenError::PathError(error) => error.into(),
                 OpenError::Io
                 | OpenError::AccessNotAllowed
+                | OpenError::OperationNotPermitted
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists

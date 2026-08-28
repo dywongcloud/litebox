@@ -7,6 +7,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use hashbrown::hash_map::Entry as HashMapEntry;
 use hashbrown::{HashMap, HashSet};
 
 use crate::LiteBox;
@@ -19,7 +20,9 @@ use super::errors::{
     ReadDirError, ReadError, ReadlinkError, RenameError, RmdirError, SeekError, SymlinkError,
     TruncateError, UnlinkError, UtimeError, WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, Timestamp};
+use super::{
+    DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, Timestamp, UserInfo,
+};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'Lyrs'.hex()`.
@@ -68,6 +71,7 @@ pub struct FileSystem<
     layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
+    current_user: UserInfo,
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
 }
 
@@ -82,6 +86,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         lower: Lower,
         layering_semantics: LayeringSemantics,
     ) -> Self {
+        Self::new_with_user(
+            litebox,
+            upper,
+            lower,
+            layering_semantics,
+            UserInfo {
+                user: 1000,
+                group: 1000,
+            },
+        )
+    }
+
+    /// Construct a new `FileSystem` instance for `current_user`.
+    #[must_use]
+    pub fn new_with_user(
+        litebox: &LiteBox<Platform>,
+        upper: Upper,
+        lower: Lower,
+        layering_semantics: LayeringSemantics,
+        current_user: UserInfo,
+    ) -> Self {
         let root = sync::RwLock::new(RootDir::new());
         let node_info_lookup = sync::RwLock::new(HashMap::new());
         Self {
@@ -90,6 +115,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             lower,
             root,
             current_working_dir: "/".into(),
+            current_user,
             layering_semantics,
             node_info_lookup,
         }
@@ -198,7 +224,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let lower_fd = match self.lower.open(path, OFlags::RDONLY, Mode::empty()) {
             Ok(fd) => fd,
             Err(e) => match e {
-                OpenError::AccessNotAllowed => return Err(MigrationError::NoReadPerms),
+                OpenError::AccessNotAllowed | OpenError::OperationNotPermitted => {
+                    return Err(MigrationError::NoReadPerms);
+                }
                 OpenError::Io => return Err(MigrationError::Io),
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
@@ -400,6 +428,73 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         Ok(())
     }
 
+    fn finish_lower_open(
+        &self,
+        path: String,
+        original_flags: OFlags,
+        lower_fd: TypedFd<Lower>,
+    ) -> FileFd<Platform, Upper, Lower> {
+        let (fd, redundant_lower_fd) = if original_flags.contains(OFlags::PATH) {
+            let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+            (
+                self.litebox.descriptor_table_mut().insert(Descriptor {
+                    path,
+                    flags: original_flags,
+                    entry,
+                    position: 0.into(),
+                }),
+                None,
+            )
+        } else {
+            // The initial cache lookup and the lower open cannot be one atomic operation, so
+            // another opener (or an unlink) may have populated this path while the lower backend
+            // was opening it. Select the winning cached entry while holding the root write lock,
+            // and attach the new layered descriptor before releasing that lock so migration and
+            // close cannot observe a cached entry with no descriptor owner.
+            let mut root = self.root.write();
+            let (entry, redundant_lower_fd) = match root.entries.entry(path.clone()) {
+                HashMapEntry::Vacant(slot) => {
+                    let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                    slot.insert(Arc::clone(&entry));
+                    (entry, None)
+                }
+                HashMapEntry::Occupied(slot) => match slot.get().as_ref() {
+                    EntryX::Lower { .. } => (Arc::clone(slot.get()), Some(lower_fd)),
+                    EntryX::Tombstone => {
+                        // The lower open completed before the path was removed. Preserve that open
+                        // as an uncached descriptor without resurrecting the unlinked path.
+                        (Arc::new(EntryX::Lower { fd: lower_fd }), None)
+                    }
+                    EntryX::Upper { .. } => unreachable!(),
+                },
+            };
+            let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
+                path,
+                flags: original_flags,
+                entry,
+                position: 0.into(),
+            });
+            (fd, redundant_lower_fd)
+        };
+        if let Some(redundant_lower_fd) = redundant_lower_fd {
+            self.lower.close(&redundant_lower_fd).unwrap();
+        }
+        fd
+    }
+
+    fn observe_open_error(stage: &'static str, path: &str, error: &OpenError) {
+        if matches!(error, OpenError::PathError(PathError::InvalidPathname)) {
+            litebox_util_log::error!(
+                stage:% = stage,
+                path:% = path,
+                error:? = error,
+                upper:% = core::any::type_name::<Upper>(),
+                lower:% = core::any::type_name::<Lower>();
+                "layered filesystem open failed"
+            );
+        }
+    }
+
     // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     // for any relative paths from current working directory.
     //
@@ -473,12 +568,28 @@ impl<
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
+            | OFlags::NOATIME
             | OFlags::NOFOLLOW
-            | OFlags::APPEND;
+            | OFlags::APPEND
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             return Err(OpenError::UnsupportedFlags);
         }
-        let path = self.absolute_path(path)?;
+        let path = match self.absolute_path(path) {
+            Ok(path) => path,
+            Err(path_error) => {
+                let error = OpenError::PathError(path_error);
+                Self::observe_open_error("normalize", "<unavailable>", &error);
+                return Err(error);
+            }
+        };
+        if flags.contains(OFlags::NOATIME)
+            && let Ok(status) = self.file_status(path.as_str())
+            && self.current_user.user != 0
+            && self.current_user.user != status.owner.user
+        {
+            return Err(OpenError::OperationNotPermitted);
+        }
         if flags.contains(OFlags::CREAT) {
             if flags.contains(OFlags::EXCL) {
                 // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
@@ -548,6 +659,7 @@ impl<
             }
             Err(e) => match &e {
                 OpenError::AccessNotAllowed
+                | OpenError::OperationNotPermitted
                 | OpenError::Io
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
@@ -568,7 +680,7 @@ impl<
                     | PathError::InvalidPathname
                     | PathError::NoSearchPerms { .. },
                 ) => {
-                    // None of these can be handled by lower level, just quit out early
+                    Self::observe_open_error("upper", &path, &e);
                     return Err(e);
                 }
                 OpenError::PathError(PathError::MissingComponent)
@@ -625,21 +737,14 @@ impl<
         }
         // Any errors from lower level now _must_ propagate up, so we can just invoke
         // the lower level and set up the relevant descriptor upon success.
-        let entry = Arc::new(EntryX::Lower {
-            fd: self.lower.open(path.as_str(), flags, mode)?,
-        });
-        let old = self
-            .root
-            .write()
-            .entries
-            .insert(path.clone(), Arc::clone(&entry));
-        assert!(old.is_none());
-        let fd = self.litebox.descriptor_table_mut().insert(Descriptor {
-            path,
-            flags: original_flags,
-            entry,
-            position: 0.into(),
-        });
+        let lower_fd = match self.lower.open(path.as_str(), flags, mode) {
+            Ok(fd) => fd,
+            Err(error) => {
+                Self::observe_open_error("lower", &path, &error);
+                return Err(error);
+            }
+        };
+        let fd = self.finish_lower_open(path, original_flags, lower_fd);
         if original_flags.contains(OFlags::TRUNC) {
             // The only scenario where we need to manually trigger truncation is when a file does
             // not exist at the upper level but exists at the lower level; in that case, our
@@ -712,31 +817,19 @@ impl<
                     // There are _definitely_ other FDs pointing at this file, leave it alone
                     return Ok(());
                 }
-                // Otherwise, either we have ourselves and the root pointing at it OR the root has
-                // been tombstoned out after the FDs have been opened at it.
-                match **root_entries.get(&path).unwrap() {
-                    EntryX::Upper { .. } => unreachable!(),
-                    EntryX::Lower { .. } => {
-                        // We are going to have to deal with it at the entry too, fallthrough
-                    }
-                    EntryX::Tombstone => {
-                        // A tombstone here means that the root doesn't contain the entry. There may
-                        // possibly be other FDs opened for the same file before it was tombstoned
-                        // out, so we'll close it out if we are the sole remaining holder;
-                        // otherwise, it will be someone else's job to do so.
-                        match Arc::into_inner(entry) {
-                            Some(EntryX::Upper { .. } | EntryX::Tombstone) => unreachable!(),
-                            Some(EntryX::Lower { fd }) => {
-                                // We are the sole remaining holder of the FD. Let us clean things
-                                // up at the lower level.
-                                return self.lower.close(&fd);
-                            }
-                            None => {
-                                // Someone else's job. We can quit successfully.
-                                return Ok(());
-                            }
-                        }
-                    }
+                // Otherwise, either the root owns the matching cached entry or this descriptor is
+                // an uncached `O_PATH` open (or its old path was replaced/tombstoned). An uncached
+                // entry closes when its last descriptor goes away and must never remove a different
+                // entry that now occupies the same path.
+                if root_entries
+                    .get(&path)
+                    .is_none_or(|root_entry| !Arc::ptr_eq(&entry, root_entry))
+                {
+                    return match Arc::into_inner(entry) {
+                        Some(EntryX::Upper { .. } | EntryX::Tombstone) => unreachable!(),
+                        Some(EntryX::Lower { fd }) => self.lower.close(&fd),
+                        None => Ok(()),
+                    };
                 }
                 // Pull out the root entry, and perform a quick sanity check, and drop it out
                 // entirely, which should lead us to become the sole owner.
@@ -770,7 +863,7 @@ impl<
             .descriptor_table()
             .with_entry(fd, |descriptor| {
                 let access_mode = descriptor.entry.flags & (OFlags::WRONLY | OFlags::RDWR);
-                if access_mode == OFlags::WRONLY {
+                if descriptor.entry.flags.contains(OFlags::PATH) || access_mode == OFlags::WRONLY {
                     Err(ReadError::NotForReading)
                 } else {
                     Ok(Arc::clone(&descriptor.entry.entry))
@@ -885,8 +978,15 @@ impl<
         let entry = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
-            .ok_or(SeekError::ClosedFd)?;
+            .with_entry(fd, |descriptor| {
+                if descriptor.entry.flags.contains(OFlags::PATH) {
+                    Err(SeekError::NonSeekable)
+                } else {
+                    Ok(Arc::clone(&descriptor.entry.entry))
+                }
+            })
+            .ok_or(SeekError::ClosedFd)
+            .flatten()?;
         // Perform the seek, and update the position info
         let position = match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.seek(fd, offset, whence)?,
@@ -912,6 +1012,9 @@ impl<
                 (descriptor.entry.flags, Arc::clone(&descriptor.entry.entry))
             })
             .ok_or(TruncateError::ClosedFd)?;
+        if flags.contains(OFlags::PATH) {
+            return Err(TruncateError::NotForWriting);
+        }
         let layered_fd = fd;
         match entry.as_ref() {
             EntryX::Upper { fd } => self.upper.truncate(fd, length, reset_offset),
@@ -1384,7 +1487,7 @@ impl<
                     return Err(RmdirError::NotADirectory);
                 }
                 OpenError::PathError(pe) => return Err(pe.into()),
-                OpenError::AccessNotAllowed => todo!(),
+                OpenError::AccessNotAllowed | OpenError::OperationNotPermitted => todo!(),
                 OpenError::Io => return Err(RmdirError::Io),
                 OpenError::ReadOnlyFileSystem => {
                     return Err(RmdirError::ReadOnlyFileSystem);
@@ -1724,4 +1827,154 @@ crate::fd::enable_fds_for_subsystem! {
     @Upper: { super::FileSystem + 'static }, Lower: { super::FileSystem + 'static };
     Descriptor<Upper, Lower>;
     -> FileFd<Platform, Upper, Lower>;
+}
+
+#[cfg(test)]
+mod lower_open_tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+    use core::ptr;
+    use std::sync::Barrier;
+    use std::thread;
+
+    use super::{EntryX, FileSystem, LayeringSemantics};
+    use crate::LiteBox;
+    use crate::fs::errors::{OpenError, PathError};
+    use crate::fs::inode_allocator::InodeAllocator;
+    use crate::fs::{FileSystem as _, Mode, OFlags, in_mem, resolver, tar_ro};
+    use crate::platform::mock::MockPlatform;
+
+    const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
+
+    type Lower = resolver::Resolver<MockPlatform, tar_ro::TarRo>;
+
+    fn lower_fs(litebox: &LiteBox<MockPlatform>) -> Lower {
+        resolver::Resolver::new(
+            litebox,
+            tar_ro::TarRo::new(TEST_TAR_FILE.into(), InodeAllocator::standalone()),
+        )
+    }
+
+    fn lower_descriptor_count(litebox: &LiteBox<MockPlatform>) -> usize {
+        litebox.descriptor_table().iter::<Lower>().count()
+    }
+
+    #[test]
+    fn concurrent_lower_open_reuses_one_cached_entry() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = Arc::new(FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            lower_fs(&litebox),
+            LayeringSemantics::LowerLayerReadOnly,
+        ));
+        let first_lower_fd = fs
+            .lower
+            .open("/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let second_lower_fd = fs
+            .lower
+            .open("/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert_eq!(lower_descriptor_count(&litebox), 2);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let (first_fd, second_fd) = thread::scope(|scope| {
+            let first = scope.spawn({
+                let fs = Arc::clone(&fs);
+                let barrier = Arc::clone(&barrier);
+                move || {
+                    barrier.wait();
+                    fs.finish_lower_open("/foo".into(), OFlags::RDONLY, first_lower_fd)
+                }
+            });
+            let second = scope.spawn({
+                let fs = Arc::clone(&fs);
+                let barrier = Arc::clone(&barrier);
+                move || {
+                    barrier.wait();
+                    fs.finish_lower_open("/foo".into(), OFlags::RDONLY, second_lower_fd)
+                }
+            });
+            barrier.wait();
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert_eq!(lower_descriptor_count(&litebox), 1);
+        let first_entry = litebox
+            .descriptor_table()
+            .with_entry(&first_fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .unwrap();
+        let second_entry = litebox
+            .descriptor_table()
+            .with_entry(&second_fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .unwrap();
+        let root = fs.root.read();
+        let cached_entry = root.entries.get("/foo").unwrap();
+        assert!(Arc::ptr_eq(&first_entry, &second_entry));
+        assert!(Arc::ptr_eq(&first_entry, cached_entry));
+        drop(root);
+        drop(first_entry);
+        drop(second_entry);
+
+        for fd in [&first_fd, &second_fd] {
+            let mut buffer = [0; 8];
+            let size = fs.read(fd, &mut buffer, Some(0)).unwrap();
+            assert_eq!(&buffer[..size], b"testfoo\n");
+        }
+
+        fs.close(&first_fd).unwrap();
+        assert_eq!(lower_descriptor_count(&litebox), 1);
+        assert!(fs.root.read().entries.contains_key("/foo"));
+        let mut buffer = [0; 8];
+        let size = fs.read(&second_fd, &mut buffer, Some(0)).unwrap();
+        assert_eq!(&buffer[..size], b"testfoo\n");
+
+        fs.close(&second_fd).unwrap();
+        assert_eq!(lower_descriptor_count(&litebox), 0);
+        assert!(!fs.root.read().entries.contains_key("/foo"));
+    }
+
+    #[test]
+    fn completed_lower_open_does_not_replace_tombstone() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            lower_fs(&litebox),
+            LayeringSemantics::LowerLayerReadOnly,
+        );
+        let lower_fd = fs
+            .lower
+            .open("/foo", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let tombstone = Arc::new(EntryX::Tombstone);
+        fs.root
+            .write()
+            .entries
+            .insert("/foo".into(), Arc::clone(&tombstone));
+
+        let fd = fs.finish_lower_open("/foo".into(), OFlags::RDONLY, lower_fd);
+        let root = fs.root.read();
+        assert!(ptr::eq(
+            Arc::as_ptr(root.entries.get("/foo").unwrap()),
+            Arc::as_ptr(&tombstone)
+        ));
+        drop(root);
+        assert!(matches!(
+            fs.open("/foo", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+
+        let mut buffer = [0; 8];
+        let size = fs.read(&fd, &mut buffer, Some(0)).unwrap();
+        assert_eq!(&buffer[..size], b"testfoo\n");
+        fs.close(&fd).unwrap();
+        assert_eq!(lower_descriptor_count(&litebox), 0);
+        assert!(ptr::eq(
+            Arc::as_ptr(fs.root.read().entries.get("/foo").unwrap()),
+            Arc::as_ptr(&tombstone)
+        ));
+    }
 }

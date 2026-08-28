@@ -197,10 +197,13 @@ fn remove_node_dynamic<Platform: RawSyncPrimitivesProvider, T>(
                 // recently published `INSERTED` -- i.e. the list `node` is genuinely a member of
                 // right now, not a stale one from before some earlier requeue.
                 let list_ptr = node.data.current_list.load(Ordering::Acquire);
-                assert!(
-                    !list_ptr.is_null(),
-                    "an INSERTED entry must have a current list"
-                );
+                if list_ptr.is_null() {
+                    // A remover can win after the state read above: it changes `INSERTED` to
+                    // `LOANED`, unlinks the node, finalizes it as `REMOVED`, and clears
+                    // `current_list` before this load. Re-read the state instead of treating that
+                    // valid race as a broken state/list pair.
+                    continue;
+                }
                 // SAFETY: every `LoanList` ever stored into `current_list` (via `insert_node` or
                 // `requeue_into`) is one of a `FutexManager`'s fixed set of buckets, which
                 // outlives every entry that can reference it.

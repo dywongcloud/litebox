@@ -32,7 +32,10 @@ use litebox_common_linux::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr};
+use crate::syscalls::{
+    file::TransferredFd,
+    unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
+};
 use crate::{GlobalState, ShimFS, ShimPlatform, Task};
 use crate::{UserPtr, UserPtrMut, syscalls::signal};
 
@@ -258,9 +261,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 NetworkProxy::Datagram(proxy)
             }
             SockType::Raw => NetworkProxy::Raw,
-            // `SockType` is `#[non_exhaustive]` but only declares these three variants, and
-            // `sock_type` only ever reaches here via `SockType::try_from`, which rejects anything
-            // else before construction.
+            SockType::SeqPacket => {
+                unreachable!("AF_UNIX sockets do not use the network proxy")
+            }
+            // `SockType` is `#[non_exhaustive]`; all currently declared variants are matched
+            // above.
             _ => unreachable!(),
         };
         // Save the proxy in both the descriptor table and the network subsystem so that the shim layer
@@ -875,14 +880,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         // `MSG_TRUNC` behavior depends on the socket type
         if flags.contains(ReceiveFlags::TRUNC) {
             match self.get_socket_type(fd)? {
-                SockType::Datagram | SockType::Raw => {
+                SockType::Datagram | SockType::Raw | SockType::SeqPacket => {
                     new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
                 }
                 SockType::Stream => {
                     new_flags.insert(litebox::net::ReceiveFlags::DISCARD);
                 }
-                // `SockType` is `#[non_exhaustive]` but only declares these three variants, all
-                // matched above.
+                // `SockType` is `#[non_exhaustive]`; all currently declared variants are matched
+                // above.
                 _ => unreachable!(),
             }
         }
@@ -1036,8 +1041,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         litebox::net::Protocol::Udp
                     }
                     SockType::Raw => todo!(),
-                    // `SockType` is `#[non_exhaustive]` but only declares these three variants,
-                    // all matched above (`Raw`'s own handling is a separate, real gap -- see the
+                    SockType::SeqPacket => return Err(Errno::ESOCKTNOSUPPORT),
+                    // `SockType` is `#[non_exhaustive]`; all currently declared variants are
+                    // matched above (`Raw`'s own handling is a separate, real gap -- see the
                     // `todo!()` above -- not exhaustiveness padding).
                     _ => unreachable!(),
                 };
@@ -1050,7 +1056,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
-                let socket = UnixSocket::new(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
+                let socket = UnixSocket::new(ty, flags, self).ok_or(Errno::ESOCKTNOSUPPORT)?;
                 let typed =
                     self.global
                         .litebox
@@ -1135,8 +1141,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (desc1, desc2) = match domain {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
-                let (sock1, sock2) =
-                    UnixSocket::new_connected_pair(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
+                let (sock1, sock2) = UnixSocket::new_connected_pair(ty, flags, self)
+                    .ok_or(Errno::ESOCKTNOSUPPORT)?;
                 let files = self.files.borrow();
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed1 =
@@ -1532,7 +1538,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &self.global,
             sockfd,
             |fd| self.global.listen(fd, backlog),
-            |file| file.listen(backlog, &self.global),
+            |file| file.listen(backlog, &self.global, self),
         )
     }
 
@@ -1620,9 +1626,102 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             None
         };
-        if msg.msg_controllen != 0 {
-            log_unsupported!("ancillary data is not supported");
-            return Err(Errno::EINVAL);
+        let msg_control = msg.msg_control;
+        let msg_controllen = msg.msg_controllen;
+        let mut rights = alloc::vec::Vec::new();
+        let mut has_credentials = false;
+        if msg_controllen != 0 {
+            const SOL_SOCKET: u32 = 1;
+            const SCM_RIGHTS: u32 = 1;
+            const SCM_CREDENTIALS: u32 = 2;
+            const SCM_MAX_FD: usize = 253;
+            const CMSG_HEADER_LEN: usize = size_of::<usize>() + 2 * size_of::<u32>();
+
+            let control = msg_control
+                .to_owned_slice::<Platform>(msg_controllen)
+                .ok_or(Errno::EFAULT)?;
+            let read_usize = |bytes: &[u8], offset: usize| -> Result<usize, Errno> {
+                let end = offset
+                    .checked_add(size_of::<usize>())
+                    .ok_or(Errno::EINVAL)?;
+                let bytes: [u8; size_of::<usize>()] = bytes
+                    .get(offset..end)
+                    .ok_or(Errno::EINVAL)?
+                    .try_into()
+                    .map_err(|_| Errno::EINVAL)?;
+                Ok(usize::from_ne_bytes(bytes))
+            };
+            let read_u32 = |bytes: &[u8], offset: usize| -> Result<u32, Errno> {
+                let end = offset.checked_add(size_of::<u32>()).ok_or(Errno::EINVAL)?;
+                let bytes: [u8; size_of::<u32>()] = bytes
+                    .get(offset..end)
+                    .ok_or(Errno::EINVAL)?
+                    .try_into()
+                    .map_err(|_| Errno::EINVAL)?;
+                Ok(u32::from_ne_bytes(bytes))
+            };
+
+            let mut offset = 0usize;
+            while offset < control.len() {
+                let remaining = control.len() - offset;
+                if remaining < CMSG_HEADER_LEN {
+                    return Err(Errno::EINVAL);
+                }
+                let cmsg_len = read_usize(&control, offset)?;
+                if !(CMSG_HEADER_LEN..=remaining).contains(&cmsg_len) {
+                    return Err(Errno::EINVAL);
+                }
+                let level_offset = offset + size_of::<usize>();
+                let type_offset = level_offset + size_of::<u32>();
+                let cmsg_level = read_u32(&control, level_offset)?;
+                let cmsg_type = read_u32(&control, type_offset)?;
+                let data = &control[offset + CMSG_HEADER_LEN..offset + cmsg_len];
+
+                match (cmsg_level, cmsg_type) {
+                    (SOL_SOCKET, SCM_RIGHTS) => {
+                        if data.is_empty() || data.len() % size_of::<i32>() != 0 {
+                            return Err(Errno::EINVAL);
+                        }
+                        let count = data.len() / size_of::<i32>();
+                        if rights.len().checked_add(count).ok_or(Errno::EINVAL)? > SCM_MAX_FD {
+                            return Err(Errno::EINVAL);
+                        }
+                        for raw_fd in data.chunks_exact(size_of::<i32>()) {
+                            let raw_fd = i32::from_ne_bytes(raw_fd.try_into().unwrap());
+                            rights.push(self.transfer_fd(raw_fd)?);
+                        }
+                    }
+                    (SOL_SOCKET, SCM_CREDENTIALS) => {
+                        if has_credentials || data.len() != size_of::<litebox_common_linux::Ucred>()
+                        {
+                            return Err(Errno::EINVAL);
+                        }
+                        let supplied = litebox_common_linux::Ucred {
+                            pid: read_u32(data, 0)?,
+                            uid: read_u32(data, size_of::<u32>())?,
+                            gid: read_u32(data, 2 * size_of::<u32>())?,
+                        };
+                        let credentials = self.credentials.borrow();
+                        if supplied.pid != self.pid.cast_unsigned()
+                            || supplied.uid != credentials.euid
+                            || supplied.gid != credentials.egid
+                        {
+                            return Err(Errno::EPERM);
+                        }
+                        has_credentials = true;
+                    }
+                    _ => return Err(Errno::EINVAL),
+                }
+
+                let aligned = cmsg_len
+                    .checked_add(size_of::<usize>() - 1)
+                    .ok_or(Errno::EINVAL)?
+                    & !(size_of::<usize>() - 1);
+                if aligned >= remaining {
+                    break;
+                }
+                offset = offset.checked_add(aligned).ok_or(Errno::EINVAL)?;
+            }
         }
         if msg.msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
@@ -1636,10 +1735,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)?,
             )
         };
+        let rights = core::cell::RefCell::new(Some(rights));
         let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
+                if has_credentials || !rights.borrow().as_ref().unwrap().is_empty() {
+                    return Err(Errno::EINVAL);
+                }
                 let sock_addr = sock_addr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -1654,7 +1757,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
-                file.sendto(self, &data, flags, unix_addr)
+                file.sendmsg(
+                    self,
+                    &data,
+                    flags,
+                    unix_addr,
+                    rights.borrow_mut().take().unwrap(),
+                )
             },
         );
         if let Err(Errno::EPIPE) = res
@@ -1776,13 +1885,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
+        self.do_recvfrom_with_rights(sockfd, buf, flags, source_addr)
+            .map(|(size, _)| size)
+    }
+
+    fn do_recvfrom_with_rights(
+        &self,
+        sockfd: u32,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+        source_addr: Option<&mut Option<SocketAddress>>,
+    ) -> Result<(usize, alloc::vec::Vec<TransferredFd<Platform, FS>>), Errno> {
         if let Some(res) = self.netlink_recv(sockfd, buf) {
-            return res;
+            return res.map(|size| (size, alloc::vec::Vec::new()));
         }
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
-        let (size, addr) = {
+        let (size, addr, rights) = {
             // We need to do this cell dance because otherwise Rust can't recognize that the two
             // closures are mutually exclusive.
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
@@ -1799,18 +1919,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Inet);
-                    Ok((size, src_addr))
+                    Ok((size, src_addr, alloc::vec::Vec::new()))
                 },
                 |entry| {
                     let mut addr = None;
-                    let size = entry.recvfrom(
+                    let result = entry.recvmsg(
                         &self.wait_cx(),
                         &mut buf.borrow_mut(),
                         flags,
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Unix);
-                    Ok((size, src_addr))
+                    Ok((result.size, src_addr, result.rights))
                 },
             )?
         };
@@ -1818,7 +1938,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
             *source_addr = Some(addr);
         }
-        Ok(size)
+        Ok((size, rights))
     }
 
     /// Handle syscall `recvmsg`
@@ -1832,7 +1952,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
 
-        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC;
+        let supported_flags =
+            ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1846,17 +1967,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         msg_ptr: UserPtrMut<litebox_common_linux::UserMsgHdr>,
         flags: ReceiveFlags,
     ) -> Result<usize, Errno> {
+        const SOL_SOCKET: u32 = 1;
+        const SCM_RIGHTS: u32 = 1;
+        const CMSG_HEADER_LEN: usize = size_of::<usize>() + 2 * size_of::<u32>();
+
         let msg = msg_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
 
         // Copy fields out of the packed struct to avoid unaligned references.
         let msg_name = msg.msg_name;
         let msg_iov = msg.msg_iov;
         let msg_iovlen = msg.msg_iovlen;
+        let msg_control = msg.msg_control;
         let msg_controllen = msg.msg_controllen;
 
-        if msg_controllen != 0 {
-            log_unsupported!("ancillary data is not supported");
-        }
         if msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -1881,10 +2004,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(|_| Errno::ENOMEM)?;
         buffer.resize(total_iov_capacity, 0);
         let recv_buf = &mut buffer[..];
-        let size = self.do_recvfrom(
+        let (size, rights) = self.do_recvfrom_with_rights(
             sockfd,
             recv_buf,
-            flags,
+            flags.difference(ReceiveFlags::CMSG_CLOEXEC),
             if want_source {
                 Some(&mut source_addr)
             } else {
@@ -1954,21 +2077,86 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
-        // Ancillary data is not supported, so report that no control bytes were delivered.
+        let rights_count = rights.len();
+        let max_control_fds = msg_controllen
+            .checked_sub(CMSG_HEADER_LEN)
+            .map_or(0, |space| space / size_of::<i32>());
+        let cloexec = flags.contains(ReceiveFlags::CMSG_CLOEXEC);
+        let mut installed: alloc::vec::Vec<(usize, i32)> = alloc::vec::Vec::new();
+        for transferred in rights.into_iter().take(max_control_fds) {
+            match self.install_transferred_fd(transferred, cloexec) {
+                Ok(raw_fd) => {
+                    let Ok(guest_fd) = i32::try_from(raw_fd) else {
+                        let _ = self.do_close(raw_fd);
+                        break;
+                    };
+                    installed.push((raw_fd, guest_fd));
+                }
+                Err(Errno::EMFILE) => break,
+                Err(error) => {
+                    for (raw_fd, _) in installed.drain(..) {
+                        let _ = self.do_close(raw_fd);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if installed.len() < rights_count {
+            ret_flags.insert(ReceiveFlags::CTRUNC);
+        }
+
+        let control_len = if installed.is_empty() {
+            0
+        } else {
+            let payload_len = installed.len() * size_of::<i32>();
+            let cmsg_len = CMSG_HEADER_LEN + payload_len;
+            let cmsg_space = (cmsg_len + size_of::<usize>() - 1) & !(size_of::<usize>() - 1);
+            let write_len = msg_controllen.min(cmsg_space);
+            let mut control = alloc::vec![0u8; write_len];
+            control[..size_of::<usize>()].copy_from_slice(&cmsg_len.to_ne_bytes());
+            let level_offset = size_of::<usize>();
+            let type_offset = level_offset + size_of::<u32>();
+            control[level_offset..level_offset + size_of::<u32>()]
+                .copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+            control[type_offset..type_offset + size_of::<u32>()]
+                .copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+            for (index, (_, guest_fd)) in installed.iter().enumerate() {
+                let offset = CMSG_HEADER_LEN + index * size_of::<i32>();
+                control[offset..offset + size_of::<i32>()].copy_from_slice(&guest_fd.to_ne_bytes());
+            }
+            let control_ptr = UserPtrMut::<u8>::from_usize(msg_control.as_usize());
+            if control_ptr
+                .write_slice_at_offset::<Platform>(0, &control)
+                .is_none()
+            {
+                for (raw_fd, _) in installed.drain(..) {
+                    let _ = self.do_close(raw_fd);
+                }
+                return Err(Errno::EFAULT);
+            }
+            write_len
+        };
+
         let controllen_offset =
             core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_controllen);
         let controllen_ptr =
             UserPtrMut::<usize>::from_usize(msg_ptr.as_usize() + controllen_offset);
-        controllen_ptr
-            .write_at_offset::<Platform>(0, 0)
-            .ok_or(Errno::EFAULT)?;
-
-        // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
         let flags_offset = core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_flags);
         let flags_ptr = UserPtrMut::<ReceiveFlags>::from_usize(msg_ptr.as_usize() + flags_offset);
-        flags_ptr
-            .write_at_offset::<Platform>(0, ret_flags)
-            .ok_or(Errno::EFAULT)?;
+        let metadata_result = controllen_ptr
+            .write_at_offset::<Platform>(0, control_len)
+            .ok_or(Errno::EFAULT)
+            .and_then(|()| {
+                flags_ptr
+                    .write_at_offset::<Platform>(0, ret_flags)
+                    .ok_or(Errno::EFAULT)
+            });
+        if let Err(error) = metadata_result {
+            for (raw_fd, _) in installed {
+                let _ = self.do_close(raw_fd);
+            }
+            return Err(error);
+        }
 
         Ok(total_received)
     }
@@ -1982,8 +2170,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: ReceiveFlags,
         timeout: litebox_common_linux::TimeParam,
     ) -> Result<usize, Errno> {
-        let supported_flags =
-            ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::WAITFORONE;
+        let supported_flags = ReceiveFlags::DONTWAIT
+            | ReceiveFlags::TRUNC
+            | ReceiveFlags::WAITFORONE
+            | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -2132,8 +2322,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
-            log_unsupported!("setsockopt(level = {level}, optname = {optname})");
-            Errno::EINVAL
+            log_unsupported!("getsockopt(level = {level}, optname = {optname})");
+            Errno::ENOPROTOOPT
         })?;
         let len = optlen.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if len > i32::MAX as u32 {
@@ -3171,9 +3361,10 @@ mod unix_tests {
     use alloc::{string::ToString, vec::Vec};
     use litebox::event::Events;
     use litebox_common_linux::{
-        AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
-        SocketOptionName, TimeParam, errno::Errno,
+        AddressFamily, AtFlags, FileDescriptorFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
+        SocketOption, SocketOptionLevel, SocketOptionName, TimeParam, errno::Errno,
     };
+    use zerocopy::FromZeros as _;
 
     use crate::{
         UserPtr, UserPtrMut,
@@ -3203,6 +3394,215 @@ mod unix_tests {
     fn close_socket(task: &TestTask, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
+    }
+
+    #[test]
+    fn unknown_getsockopt_returns_enoprotoopt() {
+        const SO_PEERPIDFD: u32 = 77;
+
+        let task = init_platform(None);
+        let socket = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        let mut value = 0u32;
+        let mut len = u32::try_from(core::mem::size_of_val(&value)).unwrap();
+
+        let error = task
+            .sys_getsockopt(
+                socket.try_into().unwrap(),
+                SocketOptionLevel::SOCKET as u32,
+                SO_PEERPIDFD,
+                UserPtrMut::from_usize((&raw mut value).cast::<u8>() as usize),
+                UserPtrMut::from_usize(&raw mut len as usize),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, Errno::ENOPROTOOPT);
+        close_socket(&task, socket);
+    }
+
+    #[test]
+    fn unix_stream_peercred_uses_credentials_at_listen() {
+        let task = init_platform(None);
+        let name = b"unix_peercred_listen_time".to_vec();
+        let server = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        task.do_bind(
+            server,
+            SocketAddress::Unix(UnixSocketAddr::Abstract(name.clone())),
+        )
+        .expect("bind server socket");
+
+        task.sys_setuid(1000)
+            .expect("change credentials before listen");
+        task.do_listen(server, 1).expect("listen on server socket");
+
+        let client = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        task.do_connect(client, SocketAddress::Unix(UnixSocketAddr::Abstract(name)))
+            .expect("connect client socket");
+        let accepted = task
+            .do_accept(server, None, SockFlags::empty())
+            .expect("accept client socket");
+
+        let peer_cred = |fd| {
+            let mut value = litebox_common_linux::Ucred {
+                pid: u32::MAX,
+                uid: u32::MAX,
+                gid: u32::MAX,
+            };
+            let len = task
+                .do_getsockopt(
+                    fd,
+                    SocketOptionName::Socket(SocketOption::PEERCRED),
+                    UserPtrMut::from_usize((&raw mut value).cast::<u8>() as usize),
+                    u32::try_from(core::mem::size_of_val(&value)).unwrap(),
+                )
+                .expect("getsockopt SO_PEERCRED");
+            assert_eq!(len, core::mem::size_of_val(&value));
+            value
+        };
+        let server_cred = peer_cred(client);
+        let client_cred = peer_cred(accepted);
+        let expected_pid = u32::try_from(task.pid).unwrap();
+        assert_eq!((server_cred.pid, server_cred.uid), (expected_pid, 1000));
+        assert_eq!((client_cred.pid, client_cred.uid), (expected_pid, 1000));
+
+        close_socket(&task, accepted);
+        close_socket(&task, client);
+        close_socket(&task, server);
+    }
+
+    #[test]
+    fn scm_rights_transfers_open_description_and_receive_cloexec() {
+        const SOL_SOCKET: u32 = 1;
+        const SCM_RIGHTS: u32 = 1;
+        const CMSG_HEADER_LEN: usize =
+            core::mem::size_of::<usize>() + 2 * core::mem::size_of::<u32>();
+        const CMSG_LEN_ONE_FD: usize = CMSG_HEADER_LEN + core::mem::size_of::<i32>();
+        const CMSG_SPACE_ONE_FD: usize = (CMSG_LEN_ONE_FD + core::mem::size_of::<usize>() - 1)
+            & !(core::mem::size_of::<usize>() - 1);
+
+        for receive_cloexec in [false, true] {
+            let task = init_platform(None);
+            let (bus_sender, bus_receiver) = task
+                .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+                .expect("transport socketpair failed");
+            let (payload_sender, payload_peer) = task
+                .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::CLOEXEC, 0)
+                .expect("payload socketpair failed");
+
+            let data = [b'F'];
+            let send_iov = [litebox_common_linux::IoVec {
+                iov_base: UserPtrMut::from_usize(data.as_ptr() as usize),
+                iov_len: data.len(),
+            }];
+            let mut send_control = [0u8; CMSG_SPACE_ONE_FD];
+            send_control[..core::mem::size_of::<usize>()]
+                .copy_from_slice(&CMSG_LEN_ONE_FD.to_ne_bytes());
+            let level_offset = core::mem::size_of::<usize>();
+            let type_offset = level_offset + core::mem::size_of::<u32>();
+            send_control[level_offset..type_offset].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+            send_control[type_offset..CMSG_HEADER_LEN].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+            send_control[CMSG_HEADER_LEN..CMSG_LEN_ONE_FD]
+                .copy_from_slice(&i32::try_from(payload_sender).unwrap().to_ne_bytes());
+            let mut send_header = litebox_common_linux::UserMsgHdr::new_zeroed();
+            send_header.msg_iov = UserPtr::from_usize(send_iov.as_ptr() as usize);
+            send_header.msg_iovlen = send_iov.len();
+            send_header.msg_control = UserPtr::from_usize(send_control.as_ptr() as usize);
+            send_header.msg_controllen = send_control.len();
+
+            task.sys_sendmsg(
+                i32::try_from(bus_sender).unwrap(),
+                UserPtr::from_usize(&raw const send_header as usize),
+                SendFlags::NOSIGNAL,
+            )
+            .expect("SCM_RIGHTS sendmsg failed");
+            close_socket(&task, payload_sender);
+
+            let mut received_data = [0u8; 1];
+            let recv_iov = [litebox_common_linux::IoVec {
+                iov_base: UserPtrMut::from_usize(received_data.as_mut_ptr() as usize),
+                iov_len: received_data.len(),
+            }];
+            let mut recv_control = [0u8; CMSG_SPACE_ONE_FD];
+            let mut recv_header = litebox_common_linux::UserMsgHdr::new_zeroed();
+            recv_header.msg_iov = UserPtr::from_usize(recv_iov.as_ptr() as usize);
+            recv_header.msg_iovlen = recv_iov.len();
+            recv_header.msg_control = UserPtr::from_usize(recv_control.as_mut_ptr() as usize);
+            recv_header.msg_controllen = recv_control.len();
+            let recv_flags = if receive_cloexec {
+                ReceiveFlags::CMSG_CLOEXEC
+            } else {
+                ReceiveFlags::empty()
+            };
+
+            let received = task
+                .sys_recvmsg(
+                    i32::try_from(bus_receiver).unwrap(),
+                    UserPtrMut::from_usize(&raw mut recv_header as usize),
+                    recv_flags,
+                )
+                .expect("SCM_RIGHTS recvmsg failed");
+            assert_eq!(received, 1);
+            assert_eq!(received_data, data);
+            let returned_controllen = recv_header.msg_controllen;
+            let returned_flags = recv_header.msg_flags;
+            assert_eq!(returned_controllen, CMSG_SPACE_ONE_FD);
+            assert!(!returned_flags.contains(ReceiveFlags::CTRUNC));
+            assert_eq!(
+                usize::from_ne_bytes(
+                    recv_control[..core::mem::size_of::<usize>()]
+                        .try_into()
+                        .unwrap()
+                ),
+                CMSG_LEN_ONE_FD
+            );
+            assert_eq!(
+                u32::from_ne_bytes(recv_control[level_offset..type_offset].try_into().unwrap()),
+                SOL_SOCKET
+            );
+            assert_eq!(
+                u32::from_ne_bytes(
+                    recv_control[type_offset..CMSG_HEADER_LEN]
+                        .try_into()
+                        .unwrap()
+                ),
+                SCM_RIGHTS
+            );
+            let received_fd = i32::from_ne_bytes(
+                recv_control[CMSG_HEADER_LEN..CMSG_LEN_ONE_FD]
+                    .try_into()
+                    .unwrap(),
+            );
+            let descriptor_flags = {
+                let files = task.files.borrow();
+                crate::syscalls::file::get_file_descriptor_flags(
+                    usize::try_from(received_fd).unwrap(),
+                    &task.global,
+                    &files,
+                )
+                .expect("F_GETFD failed")
+            };
+            assert_eq!(
+                descriptor_flags.contains(FileDescriptorFlags::FD_CLOEXEC),
+                receive_cloexec
+            );
+
+            task.do_sendto(payload_peer, b"alive", SendFlags::empty(), None)
+                .expect("send through payload peer failed");
+            let mut payload = [0u8; 5];
+            let payload_len = task
+                .do_recvfrom(
+                    u32::try_from(received_fd).unwrap(),
+                    &mut payload,
+                    ReceiveFlags::empty(),
+                    None,
+                )
+                .expect("received descriptor is unusable");
+            assert_eq!(&payload[..payload_len], b"alive");
+
+            close_socket(&task, u32::try_from(received_fd).unwrap());
+            close_socket(&task, payload_peer);
+            close_socket(&task, bus_sender);
+            close_socket(&task, bus_receiver);
+        }
     }
 
     fn ppoll(task: &TestTask, fd: u32, events: Events) {
@@ -3877,9 +4277,75 @@ mod unix_tests {
     fn test_unix_socketpair_bidirectional() {
         unix_socketpair_bidirectional(SockType::Stream, false);
         unix_socketpair_bidirectional(SockType::Datagram, false);
+        unix_socketpair_bidirectional(SockType::SeqPacket, false);
 
         unix_socketpair_bidirectional(SockType::Stream, true);
         unix_socketpair_bidirectional(SockType::Datagram, true);
+        unix_socketpair_bidirectional(SockType::SeqPacket, true);
+    }
+
+    #[test]
+    fn test_unix_seqpacket_socketpair_preserves_records_and_reports_type() {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::SeqPacket,
+                SockFlags::CLOEXEC,
+                0,
+            )
+            .expect("SOCK_SEQPACKET socketpair failed");
+
+        for fd in [sock1, sock2] {
+            let mut socket_type = 0u32;
+            let len = task
+                .do_getsockopt(
+                    fd,
+                    SocketOptionName::Socket(SocketOption::TYPE),
+                    UserPtrMut::from_usize((&raw mut socket_type).cast::<u8>() as usize),
+                    core::mem::size_of::<u32>() as u32,
+                )
+                .expect("SO_TYPE failed");
+            assert_eq!(len, core::mem::size_of::<u32>());
+            assert_eq!(socket_type, SockType::SeqPacket as u32);
+        }
+
+        let first = b"first record";
+        let second = b"second record";
+        task.do_sendto(sock1, first, SendFlags::empty(), None)
+            .expect("first send failed");
+        task.do_sendto(sock1, second, SendFlags::empty(), None)
+            .expect("second send failed");
+
+        let mut buf = [0u8; 64];
+        let n = task
+            .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)
+            .expect("first receive failed");
+        assert_eq!(n, first.len());
+        assert_eq!(&buf[..n], first);
+
+        let n = task
+            .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)
+            .expect("second receive failed");
+        assert_eq!(n, second.len());
+        assert_eq!(&buf[..n], second);
+
+        let oversized = b"truncate this record";
+        task.do_sendto(sock1, oversized, SendFlags::empty(), None)
+            .expect("oversized send failed");
+        let mut short = [0u8; 5];
+        let n = task
+            .do_recvfrom(sock2, &mut short, ReceiveFlags::empty(), None)
+            .expect("truncated receive failed");
+        assert_eq!(n, oversized.len());
+        assert_eq!(&short, &oversized[..short.len()]);
+
+        close_socket(&task, sock1);
+        let n = task
+            .do_recvfrom(sock2, &mut buf, ReceiveFlags::empty(), None)
+            .expect("peer close must become EOF");
+        assert_eq!(n, 0);
+        close_socket(&task, sock2);
     }
 
     fn unix_socket_recv_timeout(ty: SockType) {
@@ -3916,6 +4382,7 @@ mod unix_tests {
     fn test_unix_socket_recv_timeout() {
         unix_socket_recv_timeout(SockType::Stream);
         unix_socket_recv_timeout(SockType::Datagram);
+        unix_socket_recv_timeout(SockType::SeqPacket);
     }
 
     #[test]

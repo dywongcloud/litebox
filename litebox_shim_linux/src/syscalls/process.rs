@@ -6,12 +6,12 @@
 use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
@@ -22,7 +22,7 @@ use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
-    errno::Errno,
+    errno::Errno, signal::Signal,
 };
 
 /// Process-management-related state on [`Task`].
@@ -45,21 +45,25 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
     /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
     robust_list: Cell<Option<UserPtr<litebox_common_linux::RobustListHead>>>,
+    /// Signal requested with `PR_SET_PDEATHSIG`, delivered when this process's parent exits.
+    /// Linux clears it in every freshly cloned task and preserves it across `execve`.
+    parent_death_signal: Cell<Option<Signal>>,
 }
 
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
 unsafe impl<Platform: ShimPlatform> Send for ThreadState<Platform> {}
 
 impl<Platform: ShimPlatform> ThreadState<Platform> {
-    pub fn new_process(pid: i32) -> Self {
+    pub fn new_process(pid: i32, process_group_id: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone())),
+            process: Arc::new(Process::new(pid, process_group_id, remote.clone())),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
+            parent_death_signal: Cell::new(None),
         }
     }
 
@@ -72,6 +76,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             attached_tid: Cell::new(Some(tid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
+            parent_death_signal: Cell::new(None),
         })
     }
 
@@ -175,6 +180,10 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
     }
 }
 
+/// Sentinel used by [`Process::controlling_pty`]. PTY numbers are allocated upward from zero and
+/// never use this value.
+const NO_CONTROLLING_PTY: u32 = u32::MAX;
+
 /// A Linux process, which may have multiple threads.
 pub(crate) struct Process<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
@@ -199,9 +208,9 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// threads. Mirrors how `nr_threads` uses its `RawMutex` word purely as a
     /// blockable atomic.
     fork_gate: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
-    inner: Mutex<Platform, ProcessInner<Platform>>,
+    inner: Arc<Mutex<Platform, ProcessInner<Platform>>>,
     /// Resource limits for this process.
-    pub(crate) limits: ResourceLimits,
+    pub(crate) limits: Arc<ResourceLimits>,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
     /// The address ranges this process (as opposed to some other guest process sharing the same
@@ -211,6 +220,8 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// touching a sibling's -- see [`Task::save_address_space`]. The page manager's own view is
     /// process-blind: it is one flat map of every guest mapping in the shim.
     pub(crate) owned_ranges: Mutex<Platform, OwnedRanges>,
+    /// Runtime ELF rewriting state for this process's fd namespace.
+    pub(crate) elf_patch_cache: Mutex<Platform, super::mm::ElfPatchCache>,
     /// This process's program break.
     ///
     /// Every guest process shares one [`litebox::mm::PageManager`] (they live at disjoint
@@ -226,6 +237,19 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// Reported to a `wait4(..., &rusage)` caller as `ru_utime` once the whole process is a
     /// zombie -- see `Task::sys_wait4`.
     pub(crate) cpu_time_nanos: core::sync::atomic::AtomicU64,
+    /// Session inherited across `fork` and replaced by `setsid`.
+    session_id: AtomicI32,
+    /// Process-group identity inherited across `fork` and shared by every thread in this process.
+    /// The process table keeps only a weak reference to this atomic, so remote parent operations do
+    /// not make the whole (platform-specific and potentially non-`Send`) process object global.
+    #[expect(
+        clippy::struct_field_names,
+        reason = "the full POSIX term distinguishes it from session identity"
+    )]
+    process_group_id: Arc<AtomicI32>,
+    /// Unix98 PTY number serving as this process's controlling terminal, or
+    /// [`NO_CONTROLLING_PTY`] when it has none.
+    controlling_pty: AtomicU32,
 }
 
 /// A set of address ranges, kept sorted and non-overlapping.
@@ -435,13 +459,22 @@ struct ProcessTableInner<Platform: ShimPlatform> {
 /// full of `Cell`s and `RefCell`s that only its own thread may touch. Everything here is
 /// `Sync`.
 struct LiveProcess<Platform: ShimPlatform> {
+    /// The target's process-group identity. Kept separate from `Process` because platform timer
+    /// handles inside that object are not required to be `Send`, while this table is shim-global.
+    process_group_id: Weak<AtomicI32>,
     /// The target's process-wide pending queue -- the same one its own threads drain from.
     /// Survives `execve` (which replaces the handler table, not this).
     signals: crate::syscalls::signal::RemoteSignalTarget<Platform>,
+    /// The target state needed to wake every thread after posting a signal.
+    process_inner: Weak<Mutex<Platform, ProcessInner<Platform>>>,
+    /// The target's live resource limits, used when queueing user-originated signals.
+    limits: Weak<ResourceLimits>,
 }
 
 struct ChildRecord {
     ppid: i32,
+    /// Signal the child asked to receive if `ppid` exits; `None` means disabled.
+    parent_death_signal: Option<Signal>,
     /// `None` while the child is still running; `Some` once it is a zombie awaiting `wait4`.
     status: Option<ExitStatus>,
     /// Total host CPU time (nanoseconds) the child consumed, set alongside `status`. See
@@ -467,6 +500,7 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
             child,
             ChildRecord {
                 ppid: parent,
+                parent_death_signal: None,
                 status: None,
                 cpu_time_nanos: 0,
             },
@@ -479,8 +513,104 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
         &self,
         pid: i32,
         signals: crate::syscalls::signal::RemoteSignalTarget<Platform>,
+        process: &Arc<Process<Platform>>,
     ) {
-        self.inner.lock().live.insert(pid, LiveProcess { signals });
+        self.inner.lock().live.insert(
+            pid,
+            LiveProcess {
+                process_group_id: Arc::downgrade(&process.process_group_id),
+                signals,
+                process_inner: Arc::downgrade(&process.inner),
+                limits: Arc::downgrade(&process.limits),
+            },
+        );
+    }
+
+    pub(crate) fn send_process_signal(
+        &self,
+        pid: i32,
+        signal: litebox_common_linux::signal::Signal,
+        siginfo: litebox_common_linux::signal::Siginfo,
+    ) -> bool {
+        let Some((signals, process_inner, limits)) = ({
+            let inner = self.inner.lock();
+            inner.live.get(&pid).and_then(|live| {
+                Some((
+                    live.signals.clone(),
+                    live.process_inner.upgrade()?,
+                    live.limits.upgrade()?,
+                ))
+            })
+        }) else {
+            return false;
+        };
+        signals.post_from_user(&limits, signal, siginfo);
+        let inner = process_inner.lock();
+        for thread in inner.threads.values() {
+            thread.interrupt();
+        }
+        true
+    }
+
+    /// Posts a process-directed signal to every live process in `process_group_id` except
+    /// `excluded_pid`.
+    ///
+    /// Target discovery and weak-reference upgrades happen under one process-table lock, so an
+    /// exit cannot leave a selected target half-upgraded. Signal delivery and thread wakeups happen
+    /// after releasing that lock.
+    pub(crate) fn send_process_group_signal(
+        &self,
+        process_group_id: i32,
+        excluded_pid: i32,
+        signal: litebox_common_linux::signal::Signal,
+        siginfo: litebox_common_linux::signal::Siginfo,
+    ) -> usize {
+        let targets: Vec<_> = {
+            let inner = self.inner.lock();
+            inner
+                .live
+                .iter()
+                .filter_map(|(&pid, live)| {
+                    if pid == excluded_pid {
+                        return None;
+                    }
+                    let target_group = live.process_group_id.upgrade()?;
+                    if target_group.load(Ordering::Acquire) != process_group_id {
+                        return None;
+                    }
+                    Some((
+                        live.signals.clone(),
+                        live.process_inner.upgrade()?,
+                        live.limits.upgrade()?,
+                    ))
+                })
+                .collect()
+        };
+        for (signals, process_inner, limits) in &targets {
+            signals.post_from_user(limits, signal, siginfo.clone());
+            let inner = process_inner.lock();
+            for thread in inner.threads.values() {
+                thread.interrupt();
+            }
+        }
+        targets.len()
+    }
+
+    /// Returns whether `pid` currently names a live guest process.
+    pub(crate) fn is_live(&self, pid: i32) -> bool {
+        self.inner.lock().live.contains_key(&pid)
+    }
+
+    /// Returns the process-group identity for `child` only when it is a live child of `parent`.
+    ///
+    /// Parentage and liveness are observed under one table lock, so exit cannot interleave between
+    /// validating the relationship and upgrading the live process's weak group reference.
+    fn live_child_process_group_id(&self, parent: i32, child: i32) -> Option<Arc<AtomicI32>> {
+        let inner = self.inner.lock();
+        if inner.children.get(&child)?.ppid != parent {
+            return None;
+        }
+        inner.live.get(&child)?.process_group_id.upgrade()
     }
 
     /// Removes a process that has exited from the live set.
@@ -526,12 +656,39 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
         }
     }
 
-    /// Drops every record naming `parent` as a parent.
+    fn set_parent_death_signal(&self, child: i32, signal: Option<Signal>) {
+        if let Some(record) = self.inner.lock().children.get_mut(&child) {
+            record.parent_death_signal = signal;
+        }
+    }
+
+    /// Drops every record naming `parent` as a parent, delivering each live child's configured
+    /// parent-death signal first.
     ///
     /// Real Linux reparents orphans to init, which then reaps them; this shim has no init, and a
     /// record nobody can ever wait on is just a leak, so they are discarded instead.
-    fn discard_children_of(&self, parent: i32) {
-        self.inner.lock().children.retain(|_, r| r.ppid != parent);
+    fn signal_and_discard_children_of(&self, parent: i32) {
+        let targets = {
+            let mut inner = self.inner.lock();
+            let targets: Vec<_> = inner
+                .children
+                .iter()
+                .filter_map(|(&child, record)| {
+                    (record.ppid == parent && record.status.is_none())
+                        .then_some(record.parent_death_signal.map(|signal| (child, signal)))
+                        .flatten()
+                })
+                .collect();
+            inner.children.retain(|_, record| record.ppid != parent);
+            targets
+        };
+        for (child, signal) in targets {
+            self.send_process_signal(
+                child,
+                signal,
+                crate::syscalls::signal::siginfo_parent_death(signal),
+            );
+        }
     }
 
     /// Whether `parent` has any child matching `filter`, zombie or not.
@@ -613,8 +770,9 @@ fn encode_wait_status(status: ExitStatus) -> i32 {
 /// Which children a `wait4` call is willing to reap.
 #[derive(Clone, Copy)]
 enum WaitFilter {
-    /// `pid < -1` and `pid == 0` (process-group waits) are not distinguished from `-1` here:
-    /// this shim has a single process group.
+    /// `pid < -1` and `pid == 0` are process-group filters on Linux. LiteBox now tracks
+    /// per-process groups, but `wait4` group filtering is not implemented yet, so both remain the
+    /// same conservative "any child" approximation as `pid == -1`.
     Any,
     Pid(i32),
 }
@@ -670,7 +828,7 @@ pub(crate) enum ExitStatus {
 
 impl<Platform: ShimPlatform> Process<Platform> {
     /// Creates a new process with the given initial thread.
-    fn new(pid: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
+    fn new(pid: i32, process_group_id: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         let fork_gate = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
@@ -678,20 +836,55 @@ impl<Platform: ShimPlatform> Process<Platform> {
         Self {
             nr_threads,
             fork_gate,
-            inner: Mutex::new(ProcessInner {
+            inner: Arc::new(Mutex::new(ProcessInner {
                 exit_status: ExitStatus::Exit(0),
                 group_exit: false,
                 is_killing_other_threads: false,
                 threads: BTreeMap::from_iter([(pid, remote)]),
-            }),
-            limits: ResourceLimits::default(),
+            })),
+            limits: Arc::new(ResourceLimits::default()),
             alarm_timer: Mutex::new(Alarm {
                 handle: None,
                 deadline: None,
             }),
             brk: core::sync::atomic::AtomicUsize::new(0),
             owned_ranges: Mutex::new(OwnedRanges::default()),
+            elf_patch_cache: Mutex::new(BTreeMap::new()),
             cpu_time_nanos: core::sync::atomic::AtomicU64::new(0),
+            session_id: AtomicI32::new(pid),
+            process_group_id: Arc::new(AtomicI32::new(process_group_id)),
+            controlling_pty: AtomicU32::new(NO_CONTROLLING_PTY),
+        }
+    }
+
+    /// Returns this process's process-group ID.
+    pub(crate) fn process_group_id(&self) -> i32 {
+        self.process_group_id.load(Ordering::Acquire)
+    }
+
+    /// Returns this process's controlling Unix98 PTY number, if one is assigned.
+    pub(crate) fn controlling_pty(&self) -> Option<u32> {
+        let number = self.controlling_pty.load(Ordering::Acquire);
+        (number != NO_CONTROLLING_PTY).then_some(number)
+    }
+
+    /// Assigns `number` as the controlling terminal when the caller is a session leader.
+    ///
+    /// Returns `true` when this call makes the assignment and `false` when the same terminal was
+    /// already assigned. Stealing a different terminal is rejected.
+    pub(crate) fn acquire_controlling_pty(&self, pid: i32, number: u32) -> Result<bool, Errno> {
+        if self.session_id.load(Ordering::Acquire) != pid {
+            return Err(Errno::EPERM);
+        }
+        match self.controlling_pty.compare_exchange(
+            NO_CONTROLLING_PTY,
+            number,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(true),
+            Err(current) if current == number => Ok(false),
+            Err(_) => Err(Errno::EPERM),
         }
     }
 
@@ -956,6 +1149,30 @@ enum ThreadInitState {
     },
 }
 
+#[derive(Clone, Default)]
+struct SupplementaryGroups(Box<[u32]>);
+
+impl SupplementaryGroups {
+    const MAX: usize = 65_536;
+
+    fn from_user<Platform: ShimPlatform>(size: usize, list: UserPtr<u32>) -> Result<Self, Errno> {
+        if size > Self::MAX {
+            return Err(Errno::EINVAL);
+        }
+        let mut groups = if size == 0 {
+            Box::default()
+        } else {
+            list.to_owned_slice::<Platform>(size).ok_or(Errno::EFAULT)?
+        };
+        groups.sort_unstable();
+        Ok(Self(groups))
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.0
+    }
+}
+
 /// Credentials of a process
 #[derive(Clone)]
 pub(crate) struct Credentials {
@@ -963,6 +1180,23 @@ pub(crate) struct Credentials {
     pub euid: u32,
     pub gid: u32,
     pub egid: u32,
+    supplementary_groups: SupplementaryGroups,
+}
+
+impl Credentials {
+    #[expect(
+        clippy::similar_names,
+        reason = "uid, euid, gid, and egid are the POSIX credential names"
+    )]
+    pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
+        Self {
+            uid,
+            euid,
+            gid,
+            egid,
+            supplementary_groups: SupplementaryGroups::default(),
+        }
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -1000,6 +1234,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `prctl`.
     pub(crate) fn sys_prctl(&self, arg: PrctlArg) -> Result<usize, Errno> {
         match arg {
+            PrctlArg::SetPDeathSig(signal) => {
+                self.thread.parent_death_signal.set(signal);
+                self.global
+                    .processes
+                    .set_parent_death_signal(self.pid, signal);
+                Ok(0)
+            }
+            PrctlArg::GetPDeathSig(signal_ptr) => {
+                let signal = self.thread.parent_death_signal.get();
+                signal_ptr
+                    .write_at_offset::<Platform>(0, signal.map_or(0, |signal| signal.as_i32()))
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
             PrctlArg::GetName(name) => name
                 .write_slice_at_offset::<Platform>(0, &self.comm.get())
                 .ok_or(Errno::EFAULT)
@@ -1032,9 +1280,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // Note we don't support capabilities in LiteBox, so we always return 0.
                 Ok(0)
             }
-            // `PrctlArg` is `#[non_exhaustive]` but only declares these three variants, all
-            // matched above; the syscall decoder rejects any other `prctl` option with `EINVAL`
-            // before a `PrctlArg` is ever constructed.
+            PrctlArg::GetDumpable => Ok(1),
+            PrctlArg::SetNoNewPrivs => Ok(0),
+            PrctlArg::GetNoNewPrivs => {
+                // LiteBox never permits an exec to gain guest privileges, so this property is
+                // effectively permanent even before the guest asks to set it.
+                Ok(1)
+            }
+            // `PrctlArg` is `#[non_exhaustive]`; the syscall decoder rejects every option not
+            // represented above with `EINVAL` before constructing one.
             _ => unreachable!(),
         }
     }
@@ -1241,7 +1495,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global
                 .processes
                 .record_exit(self.pid, status, cpu_time_nanos);
-            self.global.processes.discard_children_of(self.pid);
+            self.global
+                .processes
+                .signal_and_discard_children_of(self.pid);
         }
     }
 
@@ -1311,6 +1567,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         let args = args.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         self.do_clone(ctx, &args, true)
+    }
+
+    pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
+        if flags.is_empty() {
+            return Ok(0);
+        }
+        let namespace_flags = CloneFlags::NEWNS
+            | CloneFlags::NEWCGROUP
+            | CloneFlags::NEWUTS
+            | CloneFlags::NEWIPC
+            | CloneFlags::NEWUSER
+            | CloneFlags::NEWPID
+            | CloneFlags::NEWNET
+            | CloneFlags::NEWTIME;
+        if flags.intersects(namespace_flags) {
+            // LiteBox deliberately exposes no namespace-creation capability. `EPERM` matches a
+            // kernel where the caller lacks that capability and lets sandbox probes fail closed.
+            return Err(Errno::EPERM);
+        }
+        log_unsupported!("unshare with unsupported flags: {flags:?}");
+        Err(Errno::EINVAL)
     }
 
     /// Creates a new thread or process.
@@ -1578,7 +1855,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // itself as the current holder -- it is, after all, the thread running right now.
         let shared = self.join_address_space();
 
-        let thread = ThreadState::new_process(child_pid);
+        let thread = ThreadState::new_process(child_pid, self.process().process_group_id());
         thread.init_state.set(ThreadInitState::NewThread {
             // No stack of its own: it runs on the parent's, below the parent's `sp`.
             stack: None,
@@ -1607,6 +1884,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             })),
             guest_sp: Cell::new(guest_stack_pointer(ctx)),
         };
+        child.process().session_id.store(
+            self.process().session_id.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        child.process().controlling_pty.store(
+            self.process().controlling_pty.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         child.process().brk.store(
             self.process().brk.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -1614,13 +1899,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // The child is running on this memory, so it owns it in the same sense the parent does --
         // which matters if the child `fork`s again before it `exec`s.
         *child.process().owned_ranges.lock() = self.process().owned_ranges.lock().clone();
+        *child.process().elf_patch_cache.lock() = self.process().elf_patch_cache.lock().clone();
         self.global.processes.add_child(child_pid, self.pid);
         // Registered before the child can run, so a child that exits immediately still finds its
         // parent (this one) in the live set and can post it a `SIGCHLD`.
         self.register_for_remote_signals();
-        self.global
-            .processes
-            .register_process(child_pid, child.remote_signal_target());
+        self.global.processes.register_process(
+            child_pid,
+            child.remote_signal_target(),
+            child.process(),
+        );
 
         // Done last, so that the copy captures memory exactly as the child will find it.
         self.park_and_hand_off(guest_stack_pointer(ctx), child_pid);
@@ -1871,10 +2159,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Done at `fork` rather than at task construction because that is the first moment a process
     /// can acquire a child, and a process with no children has nothing to receive.
-    fn register_for_remote_signals(&self) {
-        self.global
-            .processes
-            .register_process(self.pid, self.remote_signal_target());
+    pub(crate) fn register_for_remote_signals(&self) {
+        self.global.processes.register_process(
+            self.pid,
+            self.remote_signal_target(),
+            self.process(),
+        );
     }
 
     /// Handle syscall `wait4`.
@@ -1913,8 +2203,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let filter = if pid > 0 {
             WaitFilter::Pid(pid)
         } else {
-            // `-1` (any child), `0` (any child in my process group) and `< -1` (a named process
-            // group) all mean the same thing in a shim with one process group.
+            // `-1` means any child. Linux applies process-group filters for `0` and `< -1`; that
+            // filtering is not implemented yet, so both currently use the same any-child path.
             WaitFilter::Any
         };
         let table = &self.global.processes;
@@ -2539,57 +2829,62 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.ppid
     }
 
-    /// Whether `pid`, as passed to `setpgid`/`getpgid`, names the calling process or one of its
-    /// recorded children -- the only targets this shim can meaningfully answer for (it has no
-    /// registry of unrelated processes; see [`Self::sys_getpgid`]).
-    fn pgid_target_is_self_or_child(&self, pid: i32) -> bool {
-        pid == 0
-            || pid == self.pid
-            || self
-                .global
-                .processes
-                .has_child(self.pid, WaitFilter::Pid(pid))
+    /// Resolves `pid`, as passed to `setpgid`/`getpgid`, to the process-group identity of the
+    /// calling process or one of its live children.
+    fn pgid_target(&self, pid: i32) -> Result<Arc<AtomicI32>, Errno> {
+        if pid == 0 || pid == self.pid {
+            return Ok(self.process().process_group_id.clone());
+        }
+        let Some(target) = self
+            .global
+            .processes
+            .live_child_process_group_id(self.pid, pid)
+        else {
+            log_unsupported!("setpgid/getpgid for a pid that is not a live child");
+            return Err(Errno::ESRCH);
+        };
+        Ok(target)
+    }
+
+    /// Handle syscall `setsid`.
+    ///
+    /// A process-group leader cannot create a new session. On success the caller becomes both the
+    /// session and process-group leader and loses any controlling terminal, matching Linux.
+    pub(crate) fn sys_setsid(&self) -> Result<i32, Errno> {
+        let process = self.process();
+        if process.process_group_id() == self.pid {
+            return Err(Errno::EPERM);
+        }
+        process.session_id.store(self.pid, Ordering::Release);
+        process
+            .controlling_pty
+            .store(NO_CONTROLLING_PTY, Ordering::Release);
+        process.process_group_id.store(self.pid, Ordering::Release);
+        Ok(self.pid)
     }
 
     /// Handle syscall `getpgid`.
     ///
-    /// `pid == 0` means "the calling process", matching `setpgid`/`getpgid`'s own convention
-    /// (distinct from the `sched_*` family's thread-granularity `pid == 0`; this one is
-    /// process-granularity, compared against `self.pid`).
-    ///
-    /// LiteBox's process group is a single shim-wide value (see [`crate::GlobalState::pgid`])
-    /// rather than a genuine per-process-group model, so any pid this shim can vouch for --
-    /// itself or a recorded child -- reports that same group. A pid it cannot vouch for is
-    /// `ESRCH`, matching what real Linux does for a genuinely nonexistent target (real Linux
-    /// additionally permits querying *any* live pid, not just self/children; we cannot, since we
-    /// keep no general pid registry to check existence against).
+    /// `pid == 0` means "the calling process". A parent may also query one of its live children.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
-        if !self.pgid_target_is_self_or_child(pid) {
-            log_unsupported!("getpgid for a pid that is not self or a known child");
-            return Err(Errno::ESRCH);
-        }
-        Ok(self.global.pgid.load(Ordering::Acquire))
+        Ok(self.pgid_target(pid)?.load(Ordering::Acquire))
     }
 
     /// Handle syscall `setpgid`.
     ///
     /// Real Linux additionally restricts this to processes in the same session and forbids
-    /// retargeting a child that has already called `execve` (`EACCES`); LiteBox tracks neither
-    /// sessions nor an exec-generation per child, so only the target-identity check in
-    /// [`Self::pgid_target_is_self_or_child`] is enforced. `pgid == 0` means "use the target's
-    /// own pid as its new group", matching real `setpgid`.
+    /// retargeting a child that has already called `execve` (`EACCES`). LiteBox does not yet track
+    /// an exec generation per child, so only the live self/child identity check is enforced.
+    /// `pgid == 0` means "use the target's own pid", matching Linux.
     #[allow(clippy::similar_names)]
     pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
         if pgid < 0 {
             return Err(Errno::EINVAL);
         }
-        if !self.pgid_target_is_self_or_child(pid) {
-            log_unsupported!("setpgid for a pid that is not self or a known child");
-            return Err(Errno::ESRCH);
-        }
         let target_pid = if pid == 0 { self.pid } else { pid };
+        let target = self.pgid_target(pid)?;
         let new_pgid = if pgid == 0 { target_pid } else { pgid };
-        self.global.pgid.store(new_pgid, Ordering::Release);
+        target.store(new_pgid, Ordering::Release);
         Ok(())
     }
 
@@ -2736,34 +3031,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    /// Handle syscall `getgroups`.
-    ///
-    /// The supplementary set is exactly the task's own gid. There is no group
-    /// database to consult, and this is what `initgroups` leaves a process with
-    /// when the only group it belongs to is its primary one -- so it is a
-    /// faithful state rather than a placeholder. Deriving it from `credentials`
-    /// instead of storing it also means the two cannot drift apart.
-    ///
-    /// # Errors
-    ///
-    /// `EINVAL` if `size` is negative, or positive but too small to hold the
-    /// set, both as Linux does. `EFAULT` if `list` is not writable. `size == 0`
-    /// is the "how many?" query and writes nothing.
     pub(crate) fn sys_getgroups(&self, size: i32, list: UserPtrMut<u32>) -> Result<usize, Errno> {
-        let groups = [self.credentials.borrow().gid];
         if size < 0 {
             return Err(Errno::EINVAL);
         }
         let size = usize::try_from(size).map_err(|_| Errno::EINVAL)?;
+        let credentials = self.credentials.borrow();
+        let groups = credentials.supplementary_groups.as_slice();
         if size == 0 {
             return Ok(groups.len());
         }
         if size < groups.len() {
             return Err(Errno::EINVAL);
         }
-        list.write_slice_at_offset::<Platform>(0, &groups)
+        list.write_slice_at_offset::<Platform>(0, groups)
             .ok_or(Errno::EFAULT)?;
         Ok(groups.len())
+    }
+
+    pub(crate) fn sys_setgroups(&self, size: usize, list: UserPtr<u32>) -> Result<(), Errno> {
+        if !self.is_privileged() {
+            return Err(Errno::EPERM);
+        }
+        let supplementary_groups = SupplementaryGroups::from_user::<Platform>(size, list)?;
+        let mut new = self.credentials.borrow().as_ref().clone();
+        new.supplementary_groups = supplementary_groups;
+        *self.credentials.borrow_mut() = Arc::new(new);
+        Ok(())
     }
 }
 
@@ -3237,6 +3531,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Either the old mappings are gone or (for a `fork`ed child) they were never this
         // process's to begin with. `load_program` re-populates this as it maps the new image.
         self.process().owned_ranges.lock().clear();
+        self.process().elf_patch_cache.lock().clear();
 
         self.global
             .platform
@@ -3802,6 +4097,8 @@ mod tests {
         assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
         assert_eq!(task.sys_getpgid(0), Ok(4242));
         assert_eq!(task.sys_getpgid(task.pid), Ok(4242));
+        assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
+        assert_eq!(task.sys_getpgid(0), Ok(4242));
     }
 
     /// `setpgid(pid, 0)` means "make `pid` its own group leader" -- real `setpgid`'s
@@ -3837,42 +4134,140 @@ mod tests {
         assert_eq!(task.sys_setpgid(unrelated_pid, 4242), Err(Errno::ESRCH));
     }
 
-    /// A recorded child (see `ProcessTable::add_child`, the same bookkeeping `wait4` reaps from)
-    /// is a permitted `setpgid`/`getpgid` target, matching real Linux allowing a parent to move
-    /// its own child into a group.
+    /// A live child (registered exactly as `do_fork` registers it) is a permitted
+    /// `setpgid`/`getpgid` target. Updating it must not alter the parent's own process group.
     #[test]
-    fn test_setpgid_getpgid_accept_a_known_child() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let child = task.pid.wrapping_add(1);
-        task.global.processes.add_child(child, task.pid);
+    fn test_setpgid_getpgid_accept_a_live_child() {
+        let parent = crate::syscalls::tests::init_platform(None);
+        let child = parent
+            .global
+            .clone()
+            .new_test_task(parent.files.borrow().fs.clone());
+        parent.global.processes.add_child(child.pid, parent.pid);
+        parent.global.processes.register_process(
+            child.pid,
+            child.remote_signal_target(),
+            child.process(),
+        );
 
-        assert_eq!(task.sys_setpgid(child, 4242), Ok(()));
-        assert_eq!(task.sys_getpgid(child), Ok(4242));
+        assert_eq!(parent.sys_setpgid(0, 3131), Ok(()));
+        assert_eq!(parent.sys_setpgid(child.pid, 4242), Ok(()));
+        assert_eq!(parent.sys_getpgid(child.pid), Ok(4242));
+        assert_eq!(child.sys_getpgid(0), Ok(4242));
+        assert_eq!(parent.sys_getpgid(0), Ok(3131));
     }
 
-    /// `setpgid`/`getpgid` and the `TIOCSPGRP`/`TIOCGPGRP` ioctls (`syscalls::file::Task::
-    /// stdio_ioctl`) read/write the exact same `global.pgid` field -- confirm each observes the
-    /// other's writes, without needing the ioctl's own fd plumbing (which has no existing unit
-    /// test harness in this codebase).
+    /// Threads of one process share one group identity. The channels impose an explicit
+    /// happens-before order between writes, so both threads and the original task must observe the
+    /// second write after first observing the first.
     #[test]
-    fn test_setpgid_getpgid_share_state_with_tiocspgrp_tiocgpgrp() {
+    fn test_setpgid_threads_share_happens_before_order() {
         let task = crate::syscalls::tests::init_platform(None);
+        let first = task.clone_for_test().expect("clone first test thread");
+        let second = task.clone_for_test().expect("clone second test thread");
+        let (first_done_tx, first_done_rx) = std::sync::mpsc::channel();
+        let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
 
-        assert_eq!(task.sys_setpgid(0, 4242), Ok(()));
-        assert_eq!(
-            task.global.pgid.load(core::sync::atomic::Ordering::Acquire),
-            4242,
-            "a setpgid write must be visible to a TIOCGPGRP read"
-        );
+        let first_handle = std::thread::spawn(move || {
+            let first_write = first.sys_setpgid(0, 3131);
+            first_done_tx.send(()).expect("publish first write");
+            second_done_rx.recv().expect("await second write");
+            (first_write, first.sys_getpgid(0))
+        });
+        let second_handle = std::thread::spawn(move || {
+            first_done_rx.recv().expect("await first write");
+            let after_first = second.sys_getpgid(0);
+            let second_write = second.sys_setpgid(0, 4242);
+            second_done_tx.send(()).expect("publish second write");
+            (after_first, second_write)
+        });
 
-        task.global
-            .pgid
-            .store(99, core::sync::atomic::Ordering::Release);
         assert_eq!(
-            task.sys_getpgid(0),
-            Ok(99),
-            "a TIOCSPGRP write must be visible to a getpgid read"
+            second_handle.join().expect("second test thread"),
+            (Ok(3131), Ok(()))
         );
+        assert_eq!(
+            first_handle.join().expect("first test thread"),
+            (Ok(()), Ok(4242))
+        );
+        assert_eq!(task.sys_getpgid(0), Ok(4242));
+    }
+
+    /// Process-group identity belongs to a process, not the shim. Each barrier round puts writes
+    /// from two independent processes in the same concurrency window, then makes both reads happen
+    /// only after both writes. A shim-global group would therefore deterministically make at least
+    /// one observation wrong in every round.
+    #[test]
+    fn test_setpgid_is_isolated_between_concurrent_independent_processes() {
+        const ROUNDS: i32 = 64;
+
+        let first = crate::syscalls::tests::init_platform(None);
+        let second = first
+            .global
+            .clone()
+            .new_test_task(first.files.borrow().fs.clone());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = barrier.clone();
+
+        let first_handle = std::thread::spawn(move || {
+            let mut observations = std::vec::Vec::new();
+            for round in 0..ROUNDS {
+                first_barrier.wait();
+                let expected = 10_000 + round;
+                let write = first.sys_setpgid(0, expected);
+                first_barrier.wait();
+                observations.push((expected, write, first.sys_getpgid(0)));
+                first_barrier.wait();
+            }
+            observations
+        });
+        let second_handle = std::thread::spawn(move || {
+            let mut observations = std::vec::Vec::new();
+            for round in 0..ROUNDS {
+                barrier.wait();
+                let expected = 20_000 + round;
+                let write = second.sys_setpgid(0, expected);
+                barrier.wait();
+                observations.push((expected, write, second.sys_getpgid(0)));
+                barrier.wait();
+            }
+            observations
+        });
+
+        for (expected, write, observed) in first_handle.join().expect("first test process") {
+            assert_eq!(write, Ok(()));
+            assert_eq!(observed, Ok(expected));
+        }
+        for (expected, write, observed) in second_handle.join().expect("second test process") {
+            assert_eq!(write, Ok(()));
+            assert_eq!(observed, Ok(expected));
+        }
+    }
+
+    #[test]
+    fn test_prctl_set_get_parent_death_signal() {
+        use litebox_common_linux::PrctlArg;
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let mut value = -1i32;
+        let value_ptr = UserPtrMut::from_ptr(&raw mut value);
+
+        task.sys_prctl(PrctlArg::GetPDeathSig(value_ptr))
+            .expect("initial PR_GET_PDEATHSIG failed");
+        assert_eq!(value, 0);
+
+        task.sys_prctl(PrctlArg::SetPDeathSig(Some(Signal::SIGKILL)))
+            .expect("PR_SET_PDEATHSIG failed");
+        task.sys_prctl(PrctlArg::GetPDeathSig(value_ptr))
+            .expect("PR_GET_PDEATHSIG failed");
+        assert_eq!(value, Signal::SIGKILL.as_i32());
+
+        task.sys_prctl(PrctlArg::SetPDeathSig(None))
+            .expect("clearing PR_SET_PDEATHSIG failed");
+        task.sys_prctl(PrctlArg::GetPDeathSig(value_ptr))
+            .expect("PR_GET_PDEATHSIG after clear failed");
+        assert_eq!(value, 0);
     }
 
     #[test]
@@ -4373,6 +4768,87 @@ mod tests {
 
         assert_eq!(task.sys_getuid(), 1000);
         assert_eq!(sibling.sys_getuid(), 0);
+    }
+
+    #[test]
+    fn test_setgroups_getgroups_round_trip_boundaries_and_copy_on_write() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let null_list = UserPtr::from_usize(0);
+        let null_out = UserPtrMut::from_usize(0);
+
+        assert_eq!(task.sys_getgroups(0, null_out), Ok(0));
+        assert_eq!(task.sys_getgroups(-1, null_out), Err(Errno::EINVAL));
+
+        let input = [41u32, 7, 41];
+        task.sys_setgroups(input.len(), UserPtr::from_ptr(input.as_ptr()))
+            .expect("root setgroups should succeed");
+        assert_eq!(task.sys_getgroups(0, null_out), Ok(input.len()));
+
+        let mut short = [u32::MAX; 2];
+        assert_eq!(
+            task.sys_getgroups(2, UserPtrMut::from_ptr(short.as_mut_ptr())),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(short, [u32::MAX; 2]);
+
+        let mut output = [0u32; 3];
+        assert_eq!(
+            task.sys_getgroups(3, UserPtrMut::from_ptr(output.as_mut_ptr())),
+            Ok(3)
+        );
+        assert_eq!(output, [7, 41, 41]);
+
+        let sibling = task
+            .clone_for_test()
+            .expect("clone_for_test should succeed");
+        let sibling_input = [9u32];
+        sibling
+            .sys_setgroups(
+                sibling_input.len(),
+                UserPtr::from_ptr(sibling_input.as_ptr()),
+            )
+            .expect("sibling setgroups should succeed");
+        let mut sibling_output = [0u32; 1];
+        assert_eq!(
+            sibling.sys_getgroups(1, UserPtrMut::from_ptr(sibling_output.as_mut_ptr()),),
+            Ok(1)
+        );
+        assert_eq!(sibling_output, sibling_input);
+        assert_eq!(
+            task.sys_getgroups(3, UserPtrMut::from_ptr(output.as_mut_ptr())),
+            Ok(3)
+        );
+        assert_eq!(output, [7, 41, 41]);
+
+        assert_eq!(task.sys_setgroups(1, null_list), Err(Errno::EFAULT));
+        assert_eq!(
+            task.sys_setgroups(super::SupplementaryGroups::MAX + 1, null_list),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            task.sys_getgroups(3, UserPtrMut::from_ptr(output.as_mut_ptr())),
+            Ok(3)
+        );
+        assert_eq!(output, [7, 41, 41]);
+
+        task.sys_setuid(1000).expect("setuid should succeed");
+        let denied_input = [11u32];
+        assert_eq!(
+            task.sys_setgroups(denied_input.len(), UserPtr::from_ptr(denied_input.as_ptr()),),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            task.sys_getgroups(3, UserPtrMut::from_ptr(output.as_mut_ptr())),
+            Ok(3)
+        );
+        assert_eq!(output, [7, 41, 41]);
+
+        sibling
+            .sys_setgroups(0, null_list)
+            .expect("setgroups with size zero should clear the set");
+        assert_eq!(sibling.sys_getgroups(0, null_out), Ok(0));
     }
 
     #[test]
@@ -5016,7 +5492,7 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
         let table = &task.global.processes;
         let child = task.pid + 1;
-        table.register_process(task.pid, task.remote_signal_target());
+        table.register_process(task.pid, task.remote_signal_target(), task.process());
         table.add_child(child, task.pid);
 
         // With the default disposition (ignore), the signal must not make blocking syscalls

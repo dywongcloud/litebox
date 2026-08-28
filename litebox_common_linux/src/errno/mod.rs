@@ -127,6 +127,7 @@ impl From<litebox::fs::errors::OpenError> for Errno {
     fn from(value: litebox::fs::errors::OpenError) -> Self {
         match value {
             litebox::fs::errors::OpenError::AccessNotAllowed => Errno::EACCES,
+            litebox::fs::errors::OpenError::OperationNotPermitted => Errno::EPERM,
             litebox::fs::errors::OpenError::NoWritePerms => Errno::EACCES,
             litebox::fs::errors::OpenError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,

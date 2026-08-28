@@ -6,6 +6,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use litebox::{
+    fd::EntryHandle,
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
         PageManagementProvider, RawConstPointer,
@@ -16,10 +17,7 @@ use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags, errno::Errno, loader::TRAMPOLINE_GUEST_TP_SLOT_OFFSET,
 };
 
-use crate::ShimFS;
-use crate::ShimPlatform;
-use crate::Task;
-use crate::UserPtrMut;
+use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
@@ -147,6 +145,7 @@ fn clear_icache_range(_start: usize, _len: usize) {}
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
 /// has executable segments mapped via `do_mmap_file()`.
+#[derive(Clone)]
 pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pre_patched: bool,
@@ -200,6 +199,26 @@ pub(crate) struct GuestImage {
     base: usize,
     /// The absolute guest path the image was opened with.
     path: alloc::string::String,
+}
+
+/// A writable shared memfd mapping whose contents must be copied back before
+/// the guest pages are unmapped.
+pub(crate) struct SharedFileMapping<Platform: ShimPlatform, FS: ShimFS> {
+    start: usize,
+    len: usize,
+    offset: usize,
+    file: EntryHandle<Platform, FS>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Clone for SharedFileMapping<Platform, FS> {
+    fn clone(&self) -> Self {
+        Self {
+            start: self.start,
+            len: self.len,
+            offset: self.offset,
+            file: self.file.clone(),
+        }
+    }
 }
 
 #[inline]
@@ -286,7 +305,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.init_elf_patch_state(fd, result.as_usize(), offset);
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
-            let mut cache = self.global.elf_patch_cache.lock();
+            let mut cache = self.process().elf_patch_cache.lock();
             if let Some(state) = cache.get_mut(&fd) {
                 let mapping_key = (result.as_usize(), len);
                 // Overlapping entries are safe here: file_mappings is only used
@@ -482,22 +501,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         //   flag actually controls is `Task::save_address_space` not private-copying that range
         //   out when its owner's turn ends, which is what keeps a `MAP_PRIVATE` region from
         //   leaking into the same sharing a `MAP_SHARED` one gets.
-        // - File-backed shared mappings are read-only: writable permission is rejected
-        //   upfront and cannot be added later via mprotect, because writes cannot be
-        //   propagated back to the underlying file.
-        // ...with one deliberate exception: `/dev/fb0`. Every real fbdev graphics client
-        // draws through a `MAP_SHARED | PROT_WRITE` mmap of the framebuffer, and because the
-        // shim and the guest share one host address space, that mapping can be genuinely
-        // coherent -- see `do_mmap_framebuffer`.
-        let fb0_shared_mapping = flags.contains(MapFlags::MAP_SHARED)
+        // - File-backed shared mappings are read-only unless they name a memfd. Writable memfd
+        //   mappings use the normal private host allocation but retain the open file description
+        //   and copy dirty bytes back before unmap. This is enough for APIs such as Glycin's
+        //   shared-memory handoff, which unmap the producer view before transferring the memfd.
+        // - `/dev/fb0` is a second deliberate exception. Every real fbdev graphics client draws
+        //   through a `MAP_SHARED | PROT_WRITE` mmap of the framebuffer, and because the shim and
+        //   the guest share one host address space, that mapping can be genuinely coherent -- see
+        //   `do_mmap_framebuffer`.
+        let writable_shared_file = flags.contains(MapFlags::MAP_SHARED)
             && prot.contains(ProtFlags::PROT_WRITE)
-            && !flags.contains(MapFlags::MAP_ANONYMOUS)
-            && self.raw_fd_is_fb0(fd);
-        if flags.contains(MapFlags::MAP_SHARED)
-            && prot.contains(ProtFlags::PROT_WRITE)
-            && !flags.contains(MapFlags::MAP_ANONYMOUS)
-            && !fb0_shared_mapping
-        {
+            && !flags.contains(MapFlags::MAP_ANONYMOUS);
+        let fb0_shared_mapping = writable_shared_file && self.raw_fd_is_fb0(fd);
+        let memfd_shared_mapping = if writable_shared_file && !fb0_shared_mapping {
+            self.raw_fd_memfd_handle(fd)
+        } else {
+            None
+        };
+        if writable_shared_file && !fb0_shared_mapping && memfd_shared_mapping.is_none() {
             log_unsupported!("MAP_SHARED with PROT_WRITE on file-backed mappings");
             return Err(Errno::EINVAL);
         }
@@ -525,15 +546,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        if flags.contains(MapFlags::MAP_ANONYMOUS) {
+        let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else if fb0_shared_mapping {
             self.do_mmap_framebuffer(suggested_addr, aligned_len, prot, flags, offset)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
-        .inspect(|ptr| self.record_mapped(ptr.as_usize(), aligned_len))
-        .map_err(Errno::from)
+        .map_err(Errno::from)?;
+
+        self.record_mapped(result.as_usize(), aligned_len);
+        if let Some(file) = memfd_shared_mapping {
+            self.files
+                .borrow()
+                .shared_file_mappings
+                .lock()
+                .push(SharedFileMapping {
+                    start: result.as_usize(),
+                    len,
+                    offset,
+                    file,
+                });
+        }
+        Ok(result)
     }
 
     /// Whether raw fd `fd` names `/dev/fb0` (see [`Self::is_fb0`]); `false` for anything that
@@ -554,6 +589,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_| false,
             )
             .unwrap_or(false)
+    }
+
+    fn raw_fd_memfd_handle(&self, fd: i32) -> Option<EntryHandle<Platform, FS>> {
+        let raw_fd = usize::try_from(fd).ok()?;
+        let files = self.files.borrow();
+        let typed = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<FS>(raw_fd)
+            .ok()?;
+        let descriptors = self.global.litebox.descriptor_table();
+        descriptors
+            .with_metadata(&typed, |_: &super::file::MemfdBacking| ())
+            .ok()?;
+        descriptors.entry_handle(&typed)
     }
 
     /// `mmap(MAP_SHARED | PROT_WRITE)` of `/dev/fb0`: allocate ordinary anonymous pages in the
@@ -600,19 +650,117 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(ptr)
     }
 
+    /// Copy every byte covered by `range` from a writable guest memfd mapping
+    /// back into its retained open file description.
+    fn flush_shared_file_mappings(
+        &self,
+        range_start: usize,
+        range_len: usize,
+    ) -> Result<(), Errno> {
+        let range_end = range_start.checked_add(range_len).ok_or(Errno::EINVAL)?;
+        let mappings = self.files.borrow().shared_file_mappings.lock().clone();
+
+        for mapping in mappings {
+            let mapping_end = mapping.start.saturating_add(mapping.len);
+            let overlap_start = mapping.start.max(range_start);
+            let overlap_end = mapping_end.min(range_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let len = overlap_end - overlap_start;
+            let bytes = UserPtr::<u8>::from_usize(overlap_start)
+                .to_owned_slice::<Platform>(len)
+                .ok_or(Errno::EFAULT)?;
+            let file_offset = mapping
+                .offset
+                .checked_add(overlap_start - mapping.start)
+                .ok_or(Errno::EOVERFLOW)?;
+            let temporary_fd = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .insert_handle(mapping.file.clone());
+            let write_result = (|| {
+                let files = self.files.borrow();
+                let mut written = 0;
+                while written < bytes.len() {
+                    let size = files
+                        .fs
+                        .write(
+                            &temporary_fd,
+                            &bytes[written..],
+                            Some(file_offset + written),
+                        )
+                        .map_err(Errno::from)?;
+                    if size == 0 || size > bytes.len() - written {
+                        return Err(Errno::EIO);
+                    }
+                    written += size;
+                }
+                Ok(())
+            })();
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&temporary_fd);
+            write_result?;
+        }
+        Ok(())
+    }
+
+    /// Forget the unmapped portions of writable memfd mappings while retaining
+    /// correctly-offset records for any pages on either side of a partial unmap.
+    fn clear_shared_file_mappings_for_range(&self, range_start: usize, range_len: usize) {
+        let range_end = range_start.saturating_add(range_len);
+        let files = self.files.borrow();
+        let mut mappings = files.shared_file_mappings.lock();
+        let old = core::mem::take(&mut *mappings);
+
+        for mapping in old {
+            let mapping_end = mapping.start.saturating_add(mapping.len);
+            if mapping_end <= range_start || mapping.start >= range_end {
+                mappings.push(mapping);
+                continue;
+            }
+            if mapping.start < range_start {
+                mappings.push(SharedFileMapping {
+                    start: mapping.start,
+                    len: range_start - mapping.start,
+                    offset: mapping.offset,
+                    file: mapping.file.clone(),
+                });
+            }
+            if mapping_end > range_end {
+                mappings.push(SharedFileMapping {
+                    start: range_end,
+                    len: mapping_end - range_end,
+                    offset: mapping.offset + (range_end - mapping.start),
+                    file: mapping.file,
+                });
+            }
+        }
+    }
+
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
+        let aligned_len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::EINVAL)?;
+        self.flush_shared_file_mappings(addr.as_usize(), aligned_len)?;
         if let Some(fb) = self.global.framebuffer.as_ref() {
             // Copy-back + deregister BEFORE the pages go away. On the (guest-bug) path where
             // the munmap itself then fails, this degrades the framebuffer to snapshot mode
             // spuriously, which is safe.
-            fb.clear_guest_mapping_overlapping(addr.as_usize(), align_up(len, PAGE_SIZE));
+            fb.clear_guest_mapping_overlapping(addr.as_usize(), aligned_len);
         }
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
+            self.clear_shared_file_mappings_for_range(addr.as_usize(), aligned_len);
             self.clear_file_mappings_for_range(addr.as_usize(), len);
-            self.record_unmapped(addr.as_usize(), align_up(len, PAGE_SIZE));
+            self.record_unmapped(addr.as_usize(), aligned_len);
         }
         result
     }
@@ -629,7 +777,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// re-patched instead of skipped.
     fn clear_file_mappings_for_range(&self, unmap_start: usize, unmap_len: usize) {
         let unmap_end = unmap_start.saturating_add(unmap_len);
-        let mut cache = self.global.elf_patch_cache.lock();
+        let mut cache = self.process().elf_patch_cache.lock();
         for state in cache.values_mut() {
             state.file_mappings.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
@@ -777,7 +925,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // We collect (fd, vaddr, seg_len, file_offset) to avoid holding
         // the lock while patching.
         let to_patch: alloc::vec::Vec<(i32, usize, usize)> = {
-            let cache = self.global.elf_patch_cache.lock();
+            let cache = self.process().elf_patch_cache.lock();
             let mut result = alloc::vec::Vec::new();
             for (&fd, state) in cache.iter() {
                 if state.pre_patched {
@@ -838,7 +986,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
     fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
         // Quick check: skip if already initialized.
-        if self.global.elf_patch_cache.lock().contains_key(&fd) {
+        if self.process().elf_patch_cache.lock().contains_key(&fd) {
             return;
         }
 
@@ -976,7 +1124,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         // Insert under lock (re-check for races).
-        let mut cache = self.global.elf_patch_cache.lock();
+        let mut cache = self.process().elf_patch_cache.lock();
         cache.entry(fd).or_insert(ElfPatchState {
             pre_patched,
             machine: e_machine,
@@ -1114,14 +1262,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
         // some loaders may map an executable segment at a non-zero offset first.
-        if !self.global.elf_patch_cache.lock().contains_key(&fd) {
+        if !self.process().elf_patch_cache.lock().contains_key(&fd) {
             self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset.unwrap_or(0));
         }
 
         // This lock guards the elf_patch_cache and is held for the entire
         // patching operation. In practice this is fine because the dynamic
         // linker loads shared libraries sequentially.
-        let mut cache = self.global.elf_patch_cache.lock();
+        let mut cache = self.process().elf_patch_cache.lock();
         let Some(state) = cache.get_mut(&fd) else {
             return true; // No patch state — not an ELF we're tracking
         };
@@ -1483,7 +1631,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Removes the cache entry (preventing stale state if the fd is reused)
     /// and unmaps any trampoline that was allocated but never used.
     pub(crate) fn finalize_elf_patch(&self, fd: i32) {
-        let state = self.global.elf_patch_cache.lock().remove(&fd);
+        let state = self.process().elf_patch_cache.lock().remove(&fd);
         if let Some(state) = state
             && state.trampoline_mapped
             && !state.pre_patched
@@ -1508,7 +1656,7 @@ mod tests {
     use litebox::platform::PageManagementProvider;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox_common_linux::MRemapFlags;
-    use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+    use litebox_common_linux::{FcntlArg, MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
@@ -1967,6 +2115,46 @@ mod tests {
 
         task.sys_munmap(addr, PAGE_SIZE).unwrap();
         task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn writable_shared_memfd_copies_back_before_descriptor_transfer() {
+        let _guard = crate::syscalls::tests::address_space_guard();
+        let task = init_platform(None);
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/tmp", 0o700)
+            .unwrap();
+        let len = 2304;
+        let fd = i32::try_from(task.sys_memfd_create(c"glycin-texture", 0x3).unwrap()).unwrap();
+        task.sys_ftruncate(fd, len).unwrap();
+
+        let addr = task
+            .sys_mmap(
+                0,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap();
+        let expected = (0..len)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<alloc::vec::Vec<_>>();
+        addr.copy_from_slice::<Platform>(0, &expected).unwrap();
+        task.sys_munmap(addr, len).unwrap();
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GET_SEALS).unwrap(), 0);
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::ADD_SEALS(0x0e)).unwrap(), 0);
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GET_SEALS).unwrap(), 0x0e);
+
+        let transferred = task.transfer_fd(fd).unwrap();
+        task.sys_close(fd).unwrap();
+        let received_fd =
+            i32::try_from(task.install_transferred_fd(transferred, false).unwrap()).unwrap();
+        let mut actual = alloc::vec![0; len + 1];
+        let size = task.sys_read(received_fd, &mut actual, Some(0)).unwrap();
+        assert_eq!(size, len, "copy-back must not extend to the page boundary");
+        assert_eq!(&actual[..size], expected);
+        task.sys_close(received_fd).unwrap();
     }
 
     #[test]

@@ -37,10 +37,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics impossible due to type invariants"
-    )]
     #[must_use]
     pub fn insert<Subsystem: FdEnabledSubsystem>(
         &mut self,
@@ -50,6 +46,24 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             entry: alloc::boxed::Box::new(entry.into()),
             metadata: AnyMap::new(),
         };
+        self.insert_handle(EntryHandle(Arc::new(RwLock::new(entry)), PhantomData))
+    }
+
+    /// Insert another descriptor for an existing open file description.
+    ///
+    /// Entry-scoped state and metadata remain shared with the descriptor from which
+    /// `handle` originated. Descriptor-scoped metadata is intentionally initialized
+    /// empty, matching `dup(2)` and `SCM_RIGHTS` semantics.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    #[must_use]
+    pub fn insert_handle<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        handle: EntryHandle<Platform, Subsystem>,
+    ) -> TypedFd<Subsystem> {
+        let EntryHandle(entry, PhantomData) = handle;
         let idx = self
             .entries
             .iter()
@@ -58,7 +72,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(RwLock::new(entry))));
+        let old = self.entries[idx].replace(IndividualEntry::new(entry));
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
@@ -520,8 +534,16 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 /// maintaining access to the descriptor table itself.
 pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
     Arc<RwLock<Platform, DescriptorEntry>>,
-    PhantomData<Subsystem>,
+    PhantomData<fn() -> Subsystem>,
 );
+
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
+    for EntryHandle<Platform, Subsystem>
+{
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0), PhantomData)
+    }
+}
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     EntryHandle<Platform, Subsystem>
 {

@@ -20,6 +20,8 @@ use thiserror::Error;
 pub enum OpenError {
     #[error("requested access to the file is not allowed")]
     AccessNotAllowed,
+    #[error("the requested operation is not permitted")]
+    OperationNotPermitted,
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
     #[error("write access requested for a file on a read-only filesystem")]

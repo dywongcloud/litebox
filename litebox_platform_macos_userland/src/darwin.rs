@@ -74,6 +74,14 @@ unsafe extern "C" {
     /// space.
     pub(crate) fn mach_vm_deallocate(target: MachPort, address: u64, size: u64) -> KernReturn;
 
+    fn mach_vm_read_overwrite(
+        target: MachPort,
+        address: u64,
+        size: u64,
+        data: u64,
+        out_size: *mut u64,
+    ) -> KernReturn;
+
     /// Moves or aliases an existing mapping to a new address, used here to
     /// relocate a `MAP_JIT` mapping created at a kernel-chosen address (see
     /// [`remap_to_fixed`] for why it cannot simply be `mmap(MAP_FIXED)`'d
@@ -140,6 +148,22 @@ unsafe extern "C" {
 pub(crate) fn mach_task_self() -> MachPort {
     // SAFETY: reading an immutable global libSystem publishes for this purpose.
     unsafe { mach_task_self_ }
+}
+
+pub(crate) fn read_task_u32s<const N: usize>(address: usize) -> Option<[u32; N]> {
+    let mut words = [0; N];
+    let bytes = u64::try_from(core::mem::size_of_val(&words)).ok()?;
+    let mut copied = 0;
+    let result = unsafe {
+        mach_vm_read_overwrite(
+            mach_task_self(),
+            address as u64,
+            bytes,
+            words.as_mut_ptr() as u64,
+            &raw mut copied,
+        )
+    };
+    (result == KERN_SUCCESS && copied == bytes).then_some(words)
 }
 
 /// The outcome of a failed [`reserve_fixed`] call.

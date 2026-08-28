@@ -159,6 +159,14 @@ pub(crate) struct RemoteSignalTarget<Platform: ShimPlatform> {
     shared_pending: Arc<Mutex<Platform, PendingSignals>>,
 }
 
+impl<Platform: ShimPlatform> Clone for RemoteSignalTarget<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            shared_pending: self.shared_pending.clone(),
+        }
+    }
+}
+
 impl<Platform: ShimPlatform> RemoteSignalTarget<Platform> {
     /// Queues a shim-generated `siginfo` on the target process.
     ///
@@ -172,6 +180,15 @@ impl<Platform: ShimPlatform> RemoteSignalTarget<Platform> {
     pub(crate) fn post(&self, signal: Signal, siginfo: Siginfo) {
         assert!(!signal.is_rt_signal() && siginfo.code >= 0);
         self.shared_pending.lock().push_from_kernel(signal, siginfo);
+    }
+
+    pub(crate) fn post_from_user(
+        &self,
+        limits: &super::process::ResourceLimits,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) {
+        self.shared_pending.lock().push(limits, signal, siginfo);
     }
 }
 
@@ -384,6 +401,18 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
+        #[cfg(target_pointer_width = "64")]
+        __pad: 0,
+        data: SiginfoData::new_zeroed(),
+    }
+}
+
+/// Creates the kernel-originated signal requested through `PR_SET_PDEATHSIG`.
+pub(crate) fn siginfo_parent_death(signal: Signal) -> Siginfo {
+    Siginfo {
+        signo: signal.as_i32(),
+        errno: 0,
+        code: SI_KERNEL,
         #[cfg(target_pointer_width = "64")]
         __pad: 0,
         data: SiginfoData::new_zeroed(),
@@ -702,7 +731,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
-        self.do_kill(Some(pid), None, signal)
+        if signal == 0 {
+            if pid == 0 || pid == self.pid || (pid > 0 && self.global.processes.is_live(pid)) {
+                return Ok(0);
+            }
+            return Err(Errno::ESRCH);
+        }
+        let signal = Signal::try_from(signal)?;
+        if pid == 0 {
+            let process_group_id = self.process().process_group_id();
+            self.send_shared_signal(signal, siginfo_kill(signal));
+            self.global.processes.send_process_group_signal(
+                process_group_id,
+                self.pid,
+                signal,
+                siginfo_kill(signal),
+            );
+            return Ok(0);
+        }
+        if pid > 0 && pid != self.pid {
+            return self
+                .global
+                .processes
+                .send_process_signal(pid, signal, siginfo_kill(signal))
+                .then_some(0)
+                .ok_or(Errno::ESRCH);
+        }
+        self.do_kill(Some(pid), None, signal.as_i32())
     }
 
     pub(crate) fn sys_tkill(&self, tid: i32, signal: i32) -> Result<usize, Errno> {
@@ -1002,5 +1057,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern crate std;
+
+    #[test]
+    fn kill_zero_signals_only_the_callers_process_group() {
+        let caller = crate::syscalls::tests::init_platform(None);
+        let peer = caller
+            .global
+            .clone()
+            .new_test_task(caller.files.borrow().fs.clone());
+        let outsider = caller
+            .global
+            .clone()
+            .new_test_task(caller.files.borrow().fs.clone());
+
+        caller.register_for_remote_signals();
+        peer.register_for_remote_signals();
+        outsider.register_for_remote_signals();
+        assert_eq!(caller.sys_setpgid(0, 3131), Ok(()));
+        assert_eq!(peer.sys_setpgid(0, 3131), Ok(()));
+        assert_eq!(outsider.sys_setpgid(0, 4242), Ok(()));
+        assert_eq!(caller.sys_kill(0, 0), Ok(0));
+        assert!(caller.pending_signal_set().is_empty());
+        assert!(peer.pending_signal_set().is_empty());
+        assert!(outsider.pending_signal_set().is_empty());
+
+        assert_eq!(caller.sys_kill(0, Signal::SIGUSR1.as_i32()), Ok(0));
+        assert!(caller.pending_signal_set().contains(Signal::SIGUSR1));
+        assert!(peer.pending_signal_set().contains(Signal::SIGUSR1));
+        assert!(!outsider.pending_signal_set().contains(Signal::SIGUSR1));
     }
 }

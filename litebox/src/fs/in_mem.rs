@@ -77,6 +77,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         self.current_user = UserInfo { user, group };
     }
 
+    /// Return the identity used for permission and ownership checks.
+    pub fn current_user(&self) -> UserInfo {
+        self.current_user
+    }
+
     /// Execute `f` with superuser/root privileges.
     ///
     /// This function primarily exists to initialize files. Most regular interaction with the file
@@ -200,8 +205,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
+            | OFlags::NOATIME
             | OFlags::NOFOLLOW
-            | OFlags::APPEND;
+            | OFlags::APPEND
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
             return Err(OpenError::UnsupportedFlags);
         }
@@ -257,23 +264,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             };
             (entry, false)
         };
+        if flags.contains(OFlags::NOATIME) {
+            let owner = entry.perms().userinfo.user;
+            if self.current_user.user != 0 && self.current_user.user != owner {
+                return Err(OpenError::OperationNotPermitted);
+            }
+        }
+        let path_only = flags.contains(OFlags::PATH);
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        let read_allowed = if access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR {
-            if !created && !self.current_user.can_read(&entry.perms()) {
-                return Err(OpenError::AccessNotAllowed);
-            }
-            true
-        } else {
-            false
-        };
-        let write_allowed = if access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR {
-            if !created && !self.current_user.can_write(&entry.perms()) {
-                return Err(OpenError::AccessNotAllowed);
-            }
-            true
-        } else {
-            false
-        };
+        let read_allowed =
+            if !path_only && (access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR) {
+                if !created && !self.current_user.can_read(&entry.perms()) {
+                    return Err(OpenError::AccessNotAllowed);
+                }
+                true
+            } else {
+                false
+            };
+        let write_allowed =
+            if !path_only && (access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR) {
+                if !created && !self.current_user.can_write(&entry.perms()) {
+                    return Err(OpenError::AccessNotAllowed);
+                }
+                true
+            } else {
+                false
+            };
         let append_mode = flags.contains(OFlags::APPEND);
         let fd = match entry {
             Entry::File(file) => {

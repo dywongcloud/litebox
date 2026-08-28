@@ -4,28 +4,35 @@
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
 use alloc::{
+    collections::BTreeMap,
     ffi::CString,
     string::{String, ToString as _},
+    sync::{Arc, Weak},
     vec,
 };
 use litebox::{
     event::{Events, wait::WaitError},
-    fd::{FdEnabledSubsystem, MetadataError, TypedFd},
+    fd::{EntryHandle, FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
+    net::Network,
     path,
+    pipes::Pipes,
     platform::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    FlockOperation, InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam,
-    errno::Errno, signal::Signal,
+    FlockOperation, InodeType, IoReadVec, IoWriteVec, IoctlArg, SockFlags, SockType, Statx,
+    StatxMask, TimeParam, errno::Errno, signal::Signal,
 };
 use thiserror::Error;
 
 use crate::{GlobalState, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    ffi::CStr,
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
+};
 
 #[derive(Clone, Copy)]
 struct AccessUserInfo {
@@ -41,6 +48,8 @@ impl From<litebox::fs::UserInfo> for AccessUserInfo {
         }
     }
 }
+
+static NEXT_MEMFD_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState<Platform: ShimPlatform> {
@@ -79,7 +88,24 @@ pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     pub(crate) fs: alloc::sync::Arc<FS>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
+    pub(crate) shared_file_mappings:
+        litebox::sync::Mutex<Platform, alloc::vec::Vec<super::mm::SharedFileMapping<Platform, FS>>>,
     max_fd: AtomicUsize,
+}
+
+/// A reference to an open file description carried in an `SCM_RIGHTS` message.
+///
+/// The sender's descriptor number and descriptor-local flags are intentionally absent.
+/// The strong entry handle keeps the description alive until it is installed by the
+/// receiver or discarded with the message.
+pub(crate) enum TransferredFd<Platform: ShimPlatform, FS: ShimFS> {
+    Fs(EntryHandle<Platform, FS>),
+    Network(EntryHandle<Platform, Network<Platform>>),
+    Pipe(EntryHandle<Platform, Pipes<Platform>>),
+    EventFd(EntryHandle<Platform, super::eventfd::EventfdSubsystem<Platform>>),
+    Epoll(EntryHandle<Platform, super::epoll::EpollSubsystem<Platform, FS>>),
+    Unix(EntryHandle<Platform, super::unix::UnixSocketSubsystem<Platform, FS>>),
+    Netlink(EntryHandle<Platform, super::netlink::NetlinkSubsystem<Platform>>),
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
@@ -89,6 +115,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
+            shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
             max_fd: AtomicUsize::new(usize::MAX),
         }
     }
@@ -133,6 +160,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
 
         let new = Self::new(self.fs.clone());
         new.set_max_fd(self.max_fd.load(Ordering::Relaxed));
+        (*new.shared_file_mappings.lock()).clone_from(&self.shared_file_mappings.lock());
         let alive_fds: alloc::vec::Vec<usize> =
             self.raw_descriptor_store.read().iter_alive().collect();
         for raw_fd in alive_fds {
@@ -191,6 +219,265 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             return Err(alloc::sync::Arc::into_inner(orig).unwrap());
         }
         Ok(raw_fd)
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Capture an open file description for an `SCM_RIGHTS` message without
+    /// allocating a descriptor in either process.
+    pub(crate) fn transfer_fd(&self, raw_fd: i32) -> Result<TransferredFd<Platform, FS>, Errno> {
+        let raw_fd = usize::try_from(raw_fd).map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        let result = files.run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .map(TransferredFd::Fs)
+                    .ok_or(Errno::EBADF)
+            },
+            |fd| {
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .map(TransferredFd::Network)
+                    .ok_or(Errno::EBADF)
+            },
+            |fd| {
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .map(TransferredFd::Pipe)
+                    .ok_or(Errno::EBADF)
+            },
+            |fd| {
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .map(TransferredFd::EventFd)
+                    .ok_or(Errno::EBADF)
+            },
+            |fd| {
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .map(TransferredFd::Epoll)
+                    .ok_or(Errno::EBADF)
+            },
+            |fd| {
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .map(TransferredFd::Unix)
+                    .ok_or(Errno::EBADF)
+            },
+        );
+        match result {
+            Ok(result) => result,
+            Err(Errno::EBADF) => {
+                let fd = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<super::netlink::NetlinkSubsystem<Platform>>(raw_fd)
+                    .map_err(|_| Errno::EBADF)?;
+                self.global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&fd)
+                    .map(TransferredFd::Netlink)
+                    .ok_or(Errno::EBADF)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Install an `SCM_RIGHTS` open file description at the receiver's lowest
+    /// available descriptor number.
+    pub(crate) fn install_transferred_fd(
+        &self,
+        transferred: TransferredFd<Platform, FS>,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        fn install<Platform, FS, Subsystem>(
+            task: &Task<Platform, FS>,
+            handle: EntryHandle<Platform, Subsystem>,
+            cloexec: bool,
+        ) -> Result<usize, Errno>
+        where
+            Platform: ShimPlatform,
+            FS: ShimFS,
+            Subsystem: FdEnabledSubsystem,
+        {
+            let typed = {
+                let mut descriptors = task.global.litebox.descriptor_table_mut();
+                let typed = descriptors.insert_handle(handle);
+                if cloexec {
+                    let old = descriptors.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
+                }
+                typed
+            };
+            task.files.borrow().insert_raw_fd(typed).map_err(|typed| {
+                let _ = task.global.litebox.descriptor_table_mut().remove(&typed);
+                Errno::EMFILE
+            })
+        }
+
+        match transferred {
+            TransferredFd::Fs(handle) => install(self, handle, cloexec),
+            TransferredFd::Network(handle) => install(self, handle, cloexec),
+            TransferredFd::Pipe(handle) => install(self, handle, cloexec),
+            TransferredFd::EventFd(handle) => install(self, handle, cloexec),
+            TransferredFd::Epoll(handle) => install(self, handle, cloexec),
+            TransferredFd::Unix(handle) => install(self, handle, cloexec),
+            TransferredFd::Netlink(handle) => install(self, handle, cloexec),
+        }
+    }
+}
+
+const F_SEAL_SEAL: u32 = 0x0001;
+const F_SEAL_SHRINK: u32 = 0x0002;
+const F_SEAL_GROW: u32 = 0x0004;
+const F_SEAL_WRITE: u32 = 0x0008;
+const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+const F_SEAL_ALL: u32 =
+    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+
+/// Entry metadata identifying an unlinked file created by `memfd_create(2)` and
+/// storing its inode-scoped seal set.
+#[derive(Debug)]
+pub(crate) struct MemfdBacking {
+    seals: AtomicU32,
+}
+
+impl Clone for MemfdBacking {
+    fn clone(&self) -> Self {
+        Self {
+            seals: AtomicU32::new(self.seals()),
+        }
+    }
+}
+
+impl MemfdBacking {
+    fn new(allow_sealing: bool) -> Self {
+        Self {
+            seals: AtomicU32::new(if allow_sealing { 0 } else { F_SEAL_SEAL }),
+        }
+    }
+
+    fn seals(&self) -> u32 {
+        self.seals.load(Ordering::Acquire)
+    }
+
+    fn add_seals(&self, seals: u32) -> Result<(), Errno> {
+        if seals & !F_SEAL_ALL != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut current = self.seals();
+        loop {
+            if current & F_SEAL_SEAL != 0 {
+                return Err(Errno::EPERM);
+            }
+            match self.seals.compare_exchange_weak(
+                current,
+                current | seals,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(updated) => current = updated,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtySide {
+    Master,
+    Slave,
+}
+
+struct PtyState<Platform: ShimPlatform> {
+    unlocked: AtomicBool,
+    termios: litebox::sync::Mutex<Platform, litebox_common_linux::Termios>,
+    winsize: litebox::sync::Mutex<Platform, litebox_common_linux::Winsize>,
+    foreground_pgid: AtomicI32,
+}
+
+impl<Platform: ShimPlatform> PtyState<Platform> {
+    fn new(foreground_pgid: i32) -> Self {
+        Self {
+            unlocked: AtomicBool::new(false),
+            termios: litebox::sync::Mutex::new(litebox_common_linux::Termios::default_cooked()),
+            winsize: litebox::sync::Mutex::new(litebox_common_linux::Winsize {
+                row: 24,
+                col: 80,
+                xpixel: 0,
+                ypixel: 0,
+            }),
+            foreground_pgid: AtomicI32::new(foreground_pgid),
+        }
+    }
+}
+
+struct PendingPtySlave<Platform: ShimPlatform, FS: ShimFS> {
+    handle: EntryHandle<Platform, super::unix::UnixSocketSubsystem<Platform, FS>>,
+    state: Arc<PtyState<Platform>>,
+}
+
+/// Unix98 pseudoterminals allocated by `/dev/ptmx`, shared by all guest tasks.
+pub(crate) struct PtyRegistry<Platform: ShimPlatform, FS: ShimFS> {
+    next_number: AtomicU32,
+    slaves: litebox::sync::Mutex<Platform, BTreeMap<u32, PendingPtySlave<Platform, FS>>>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> PtyRegistry<Platform, FS> {
+    pub(crate) fn new() -> Self {
+        Self {
+            next_number: AtomicU32::new(0),
+            slaves: litebox::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+struct PtyMasterLease<Platform: ShimPlatform, FS: ShimFS> {
+    number: u32,
+    registry: Weak<PtyRegistry<Platform, FS>>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for PtyMasterLease<Platform, FS> {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.slaves.lock().remove(&self.number);
+        }
+    }
+}
+
+/// Entry metadata that turns an AF_UNIX connected stream endpoint into one side
+/// of a pseudoterminal while retaining the socket subsystem's blocking I/O and
+/// poll behavior.
+struct PtyEndpoint<Platform: ShimPlatform, FS: ShimFS> {
+    number: u32,
+    side: PtySide,
+    state: Arc<PtyState<Platform>>,
+    master_lease: Option<Arc<PtyMasterLease<Platform, FS>>>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Clone for PtyEndpoint<Platform, FS> {
+    fn clone(&self) -> Self {
+        Self {
+            number: self.number,
+            side: self.side,
+            state: self.state.clone(),
+            master_lease: self.master_lease.clone(),
+        }
     }
 }
 
@@ -391,18 +678,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    fn do_open_raw(
+        &self,
+        path: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<FS>, litebox::fs::errors::OpenError> {
+        let mode = mode & !self.get_umask();
+        self.files
+            .borrow()
+            .fs
+            .open(path, flags - OFlags::CLOEXEC, mode)
+    }
+
     pub(crate) fn do_open(
         &self,
         path: impl path::Arg,
         flags: OFlags,
         mode: Mode,
     ) -> Result<TypedFd<FS>, Errno> {
-        let mode = mode & !self.get_umask();
-        self.files
-            .borrow()
-            .fs
-            .open(path, flags - OFlags::CLOEXEC, mode)
-            .map_err(Errno::from)
+        self.do_open_raw(path, flags, mode).map_err(Errno::from)
     }
 
     /// Linux caps a single path resolution at `MAXSYMLINKS` (40) followed links.
@@ -615,8 +910,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
-            files.fs.close(&file).unwrap();
-            Errno::EMFILE
+            if files.fs.close(&file).is_err() {
+                Errno::EIO
+            } else {
+                Errno::EMFILE
+            }
         })?;
         Ok(u32::try_from(raw_fd).unwrap())
     }
@@ -632,9 +930,173 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Mode::from_bits_retain(old_mask)
     }
 
+    /// Open `/dev/ptmx`, one allocated `/dev/pts/<n>` endpoint, or the calling process's
+    /// `/dev/tty` alias. Returning `None` means the path is not in the pseudoterminal namespace.
+    fn open_pty_path(&self, path: &CStr, flags: OFlags) -> Option<Result<u32, Errno>> {
+        let Ok(path) = path.to_str() else {
+            return Some(Err(Errno::EINVAL));
+        };
+        if path == "/dev/ptmx" {
+            return Some(self.open_ptmx(flags));
+        }
+        if path == "/dev/tty" {
+            return Some(self.open_controlling_tty(flags));
+        }
+        let number = path
+            .strip_prefix("/dev/pts/")
+            .and_then(|number| number.parse::<u32>().ok())?;
+        Some(self.open_pty_slave(number, flags))
+    }
+
+    fn open_ptmx(&self, flags: OFlags) -> Result<u32, Errno> {
+        let mut socket_flags = SockFlags::empty();
+        socket_flags.set(
+            SockFlags::NONBLOCK,
+            flags.intersects(OFlags::NONBLOCK | OFlags::NDELAY),
+        );
+        let (master, slave) =
+            super::unix::UnixSocket::new_connected_pair(SockType::Stream, socket_flags, self)
+                .ok_or(Errno::ENOSPC)?;
+        let number = self
+            .global
+            .pty_registry
+            .next_number
+            .fetch_add(1, Ordering::Relaxed);
+        let state = Arc::new(PtyState::new(self.process().process_group_id()));
+        let lease = Arc::new(PtyMasterLease {
+            number,
+            registry: Arc::downgrade(&self.global.pty_registry),
+        });
+
+        let (master_fd, slave_handle) = {
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            let master_fd =
+                descriptors.insert::<super::unix::UnixSocketSubsystem<Platform, FS>>(master);
+            let slave_fd =
+                descriptors.insert::<super::unix::UnixSocketSubsystem<Platform, FS>>(slave);
+            let old = descriptors.set_entry_metadata(
+                &master_fd,
+                PtyEndpoint {
+                    number,
+                    side: PtySide::Master,
+                    state: state.clone(),
+                    master_lease: Some(lease),
+                },
+            );
+            debug_assert!(old.is_none());
+            let old = descriptors.set_entry_metadata(
+                &slave_fd,
+                PtyEndpoint::<Platform, FS> {
+                    number,
+                    side: PtySide::Slave,
+                    state: state.clone(),
+                    master_lease: None,
+                },
+            );
+            debug_assert!(old.is_none());
+            if flags.contains(OFlags::CLOEXEC) {
+                let old = descriptors.set_fd_metadata(&master_fd, FileDescriptorFlags::FD_CLOEXEC);
+                debug_assert!(old.is_none());
+            }
+            let slave_handle = descriptors.entry_handle(&slave_fd).unwrap();
+            let removed = descriptors.remove(&slave_fd);
+            debug_assert!(removed.is_none());
+            (master_fd, slave_handle)
+        };
+        let old = self.global.pty_registry.slaves.lock().insert(
+            number,
+            PendingPtySlave {
+                handle: slave_handle,
+                state,
+            },
+        );
+        debug_assert!(old.is_none());
+
+        let files = self.files.borrow();
+        files
+            .insert_raw_fd(master_fd)
+            .map(u32::try_from)
+            .map_err(|master_fd| {
+                let _ = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .remove(&master_fd);
+                Errno::EMFILE
+            })
+            .and_then(|raw| raw.map_err(|_| Errno::EMFILE))
+    }
+
+    fn open_controlling_tty(&self, flags: OFlags) -> Result<u32, Errno> {
+        let number = self.process().controlling_pty().ok_or(Errno::ENXIO)?;
+        self.open_pty_slave(number, flags | OFlags::NOCTTY)
+            .map_err(|error| {
+                if error == Errno::ENOENT {
+                    Errno::ENXIO
+                } else {
+                    error
+                }
+            })
+    }
+
+    fn open_pty_slave(&self, number: u32, flags: OFlags) -> Result<u32, Errno> {
+        let (handle, state) = {
+            let slaves = self.global.pty_registry.slaves.lock();
+            let slave = slaves.get(&number).ok_or(Errno::ENOENT)?;
+            (slave.handle.clone(), slave.state.clone())
+        };
+        if !state.unlocked.load(Ordering::Acquire) {
+            return Err(Errno::EIO);
+        }
+        let slave_fd = {
+            let mut descriptors = self.global.litebox.descriptor_table_mut();
+            let slave_fd = descriptors.insert_handle(handle);
+            if flags.contains(OFlags::CLOEXEC) {
+                let old = descriptors.set_fd_metadata(&slave_fd, FileDescriptorFlags::FD_CLOEXEC);
+                debug_assert!(old.is_none());
+            }
+            slave_fd
+        };
+        let files = self.files.borrow();
+        let raw = files
+            .insert_raw_fd(slave_fd)
+            .map(u32::try_from)
+            .map_err(|slave_fd| {
+                let _ = self.global.litebox.descriptor_table_mut().remove(&slave_fd);
+                Errno::EMFILE
+            })
+            .and_then(|raw| raw.map_err(|_| Errno::EMFILE))?;
+        if !flags.contains(OFlags::NOCTTY) {
+            // Opening a slave without O_NOCTTY acquires it only for a session leader that has no
+            // controlling terminal. Failure to acquire never makes the open itself fail. Only a
+            // new acquisition makes the caller's process group the terminal's foreground group;
+            // reopening an existing controlling terminal must not reset a later TIOCSPGRP choice.
+            if self.process().acquire_controlling_pty(self.pid, number) == Ok(true) {
+                state
+                    .foreground_pgid
+                    .store(self.process().process_group_id(), Ordering::Release);
+            }
+        }
+        Ok(raw)
+    }
+
+    fn pty_endpoint(
+        &self,
+        fd: &TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>,
+    ) -> Option<PtyEndpoint<Platform, FS>> {
+        self.global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd, |endpoint: &PtyEndpoint<Platform, FS>| endpoint.clone())
+            .ok()
+    }
+
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
+        if let Some(result) = self.open_pty_path(&path, flags) {
+            return result;
+        }
         let file = self.do_open(path.clone(), flags, mode)?;
         self.insert_raw_file_fd(file, flags, Some(path))
     }
@@ -649,9 +1111,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<u32, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
         let path = self.follow_open_path(path, flags)?;
-        let result = self
-            .do_open(path.clone(), flags, mode)
-            .and_then(|file| self.insert_raw_file_fd(file, flags, Some(path.clone())));
+        let result = match self.open_pty_path(&path, flags) {
+            Some(result) => result,
+            None => self
+                .do_open(path.clone(), flags, mode)
+                .and_then(|file| self.insert_raw_file_fd(file, flags, Some(path.clone()))),
+        };
         // The `req=Openat` trace line above this only shows the user pointer; the resolved
         // path with the outcome is what a syscall-level diagnosis actually needs.
         litebox_util_log::trace!(path:? = path, result:? = result; "openat");
@@ -675,6 +1140,70 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::EINVAL),
             )
             .flatten()
+    }
+
+    /// Handle syscall `memfd_create`.
+    pub(crate) fn sys_memfd_create(&self, name: &CStr, flags: u32) -> Result<u32, Errno> {
+        const MFD_CLOEXEC: u32 = 0x0001;
+        const MFD_ALLOW_SEALING: u32 = 0x0002;
+        const MAX_NAME_LEN: usize = 249;
+
+        if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if name.to_bytes().len() > MAX_NAME_LEN {
+            return Err(Errno::ENAMETOOLONG);
+        }
+
+        let mut open_flags = OFlags::CREAT | OFlags::EXCL | OFlags::RDWR;
+        if flags & MFD_CLOEXEC != 0 {
+            open_flags |= OFlags::CLOEXEC;
+        }
+
+        // The generic filesystem interface has no anonymous-inode constructor. Create a private
+        // regular file and unlink it before publishing its descriptor; the open file description
+        // keeps the inode alive and supplies the read/write/truncate/mmap behavior memfds need.
+        for _ in 0..64 {
+            let id = NEXT_MEMFD_ID.fetch_add(1, Ordering::Relaxed);
+            let path = alloc::format!("/tmp/.litebox-memfd-{}-{id}", self.pid);
+            let file = match self.do_open_raw(path.as_str(), open_flags, Mode::RUSR | Mode::WUSR) {
+                Ok(file) => file,
+                Err(litebox::fs::errors::OpenError::AlreadyExists) => continue,
+                Err(error) => {
+                    litebox_util_log::error!(
+                        pid:? = self.pid,
+                        tid:? = self.tid,
+                        attempt_id = id,
+                        path:% = path,
+                        error:? = error;
+                        "memfd backing open failed"
+                    );
+                    return Err(Errno::from(error));
+                }
+            };
+            let unlink_result = {
+                let files = self.files.borrow();
+                files.fs.unlink(path.as_str())
+            };
+            if let Err(error) = unlink_result {
+                let close_failed = {
+                    let files = self.files.borrow();
+                    files.fs.close(&file).is_err()
+                };
+                if close_failed {
+                    return Err(Errno::EIO);
+                }
+                return Err(Errno::from(error));
+            }
+            let old = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, MemfdBacking::new(flags & MFD_ALLOW_SEALING != 0));
+            assert!(old.is_none());
+            return self.insert_raw_file_fd(file, open_flags, None);
+        }
+        Err(Errno::EAGAIN)
     }
 
     /// Handle syscall `mknodat` — create a filesystem node.
@@ -1222,9 +1751,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
-                    handle.with_entry(|file| {
-                        file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
-                    })
+                    let send = |payload: &[u8]| {
+                        handle.with_entry(|file| {
+                            file.sendto(
+                                self,
+                                payload,
+                                litebox_common_linux::SendFlags::empty(),
+                                None,
+                            )
+                        })
+                    };
+                    let Some(endpoint) = self.pty_endpoint(fd) else {
+                        return send(buf);
+                    };
+                    if endpoint.side != PtySide::Slave {
+                        return send(buf);
+                    }
+                    let output_flags = litebox_common_linux::OFlag::from_bits_truncate(
+                        endpoint.state.termios.lock().c_oflag,
+                    );
+                    if !output_flags.contains(
+                        litebox_common_linux::OFlag::OPOST | litebox_common_linux::OFlag::ONLCR,
+                    ) {
+                        return send(buf);
+                    }
+                    let newline_count = buf.iter().copied().filter(|byte| *byte == b'\n').count();
+                    if newline_count == 0 {
+                        return send(buf);
+                    }
+                    let output_len = buf
+                        .len()
+                        .checked_add(newline_count)
+                        .ok_or(Errno::EOVERFLOW)?;
+                    let mut output = alloc::vec::Vec::new();
+                    output
+                        .try_reserve_exact(output_len)
+                        .map_err(|_| Errno::ENOMEM)?;
+                    for &byte in buf {
+                        if byte == b'\n' {
+                            output.push(b'\r');
+                        }
+                        output.push(byte);
+                    }
+                    if send(&output)? != output.len() {
+                        return Err(Errno::EIO);
+                    }
+                    Ok(buf.len())
                 },
             )
             .flatten();
@@ -2106,7 +2678,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?);
         // Same rationale as `sys_openat`'s trace line: the raw request only carries a user
         // pointer, and readlink targets are load-bearing for sysfs-probing guests.
-        litebox_util_log::trace!(path:? = pathname, result:? = path; "readlinkat");
+        litebox_util_log::trace!(
+            pid:? = self.pid,
+            tid:? = self.tid,
+            path:? = pathname,
+            result:? = path;
+            "readlinkat"
+        );
         let path = path?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
@@ -2582,6 +3160,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )??;
                 Ok(0)
             }
+            FcntlArg::GET_SEALS => files
+                .run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        self.global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |memfd: &MemfdBacking| memfd.seals())
+                            .map_err(|error| match error {
+                                MetadataError::ClosedFd => Errno::EBADF,
+                                MetadataError::NoSuchMetadata => Errno::EINVAL,
+                            })
+                    },
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                )
+                .flatten(),
+            FcntlArg::ADD_SEALS(seals) => files
+                .run_on_raw_fd(
+                    desc,
+                    |fd| {
+                        self.global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |memfd: &MemfdBacking| memfd.add_seals(seals))
+                            .map_err(|error| match error {
+                                MetadataError::ClosedFd => Errno::EBADF,
+                                MetadataError::NoSuchMetadata => Errno::EINVAL,
+                            })?
+                            .map(|()| 0)
+                    },
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                    |_fd| Err(Errno::EINVAL),
+                )
+                .flatten(),
             FcntlArg::GETLK(lock) => {
                 self.files
                     .borrow()
@@ -2802,7 +3421,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
-                let pgid = self.global.pgid.load(Ordering::Acquire);
+                let pgid = self.global.stdio_foreground_pgid.load(Ordering::Acquire);
                 pgrp.write_at_offset::<Platform>(0, pgid)
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
@@ -2812,7 +3431,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if pgid <= 0 {
                     return Err(Errno::EINVAL);
                 }
-                self.global.pgid.store(pgid, Ordering::Release);
+                self.global
+                    .stdio_foreground_pgid
+                    .store(pgid, Ordering::Release);
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws) => {
@@ -2838,6 +3459,83 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             IoctlArg::TIOCGPTN(_) => Err(Errno::ENOTTY),
             _ => todo!(),
+        }
+    }
+
+    fn pty_ioctl(
+        &self,
+        endpoint: &PtyEndpoint<Platform, FS>,
+        arg: &IoctlArg,
+    ) -> Result<u32, Errno> {
+        match arg {
+            IoctlArg::TCGETS(termios) => {
+                let current = endpoint.state.termios.lock().clone();
+                termios
+                    .write_at_offset::<Platform>(0, current)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS(termios, _action) => {
+                let termios = termios.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                *endpoint.state.termios.lock() = termios;
+                Ok(0)
+            }
+            IoctlArg::TIOCSCTTY(_force) => {
+                if endpoint.side != PtySide::Slave {
+                    return Err(Errno::EINVAL);
+                }
+                self.process()
+                    .acquire_controlling_pty(self.pid, endpoint.number)?;
+                endpoint
+                    .state
+                    .foreground_pgid
+                    .store(self.process().process_group_id(), Ordering::Release);
+                Ok(0)
+            }
+            IoctlArg::TIOCGPGRP(pgrp) => {
+                let pgid = endpoint.state.foreground_pgid.load(Ordering::Acquire);
+                pgrp.write_at_offset::<Platform>(0, pgid)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp) => {
+                let pgid = pgrp.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                if pgid <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                endpoint
+                    .state
+                    .foreground_pgid
+                    .store(pgid, Ordering::Release);
+                Ok(0)
+            }
+            IoctlArg::TIOCGWINSZ(winsize) => {
+                let current = endpoint.state.winsize.lock().clone();
+                winsize
+                    .write_at_offset::<Platform>(0, current)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(winsize) => {
+                let winsize = winsize.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                *endpoint.state.winsize.lock() = winsize;
+                Ok(0)
+            }
+            IoctlArg::TIOCGPTN(number) if endpoint.side == PtySide::Master => {
+                number
+                    .write_at_offset::<Platform>(0, endpoint.number)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPTLCK(locked) if endpoint.side == PtySide::Master => {
+                let locked = locked.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+                endpoint
+                    .state
+                    .unlocked
+                    .store(locked == 0, Ordering::Release);
+                Ok(0)
+            }
+            _ => Err(Errno::ENOTTY),
         }
     }
 
@@ -3069,10 +3767,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )?,
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
+            | IoctlArg::TIOCSCTTY(..)
             | IoctlArg::TIOCGPGRP(..)
             | IoctlArg::TIOCSPGRP(..)
             | IoctlArg::TIOCGPTN(..)
-            | IoctlArg::TIOCGWINSZ(..) => files.run_on_raw_fd(
+            | IoctlArg::TIOCSPTLCK(..)
+            | IoctlArg::TIOCGWINSZ(..)
+            | IoctlArg::TIOCSWINSZ(..) => files.run_on_raw_fd(
                 desc,
                 |fd| {
                     if self.is_stdio(&files.fs, fd)? {
@@ -3104,7 +3805,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY),
+                |fd| {
+                    let endpoint = self.pty_endpoint(fd).ok_or(Errno::ENOTTY)?;
+                    self.pty_ioctl(&endpoint, &arg)
+                },
             )?,
             IoctlArg::FBIOGET_VSCREENINFO(..)
             | IoctlArg::FBIOPUT_VSCREENINFO(..)
@@ -4460,6 +5164,273 @@ mod tests {
 
         let _ = task.sys_close(rfd);
         let _ = task.sys_close(wfd);
+    }
+
+    #[test]
+    fn automatic_pty_acquisition_publishes_foreground_group_once() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let original_group = task.sys_getpgid(0).unwrap();
+        let allocate_pty = || {
+            let master = i32::try_from(
+                task.sys_open("/dev/ptmx", OFlags::RDWR | OFlags::NOCTTY, Mode::empty())
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut number = u32::MAX;
+            task.sys_ioctl(
+                master,
+                IoctlArg::TIOCGPTN(UserPtrMut::from_ptr(&raw mut number)),
+            )
+            .unwrap();
+            let unlocked = 0i32;
+            task.sys_ioctl(
+                master,
+                IoctlArg::TIOCSPTLCK(UserPtr::from_ptr(&raw const unlocked)),
+            )
+            .unwrap();
+            (master, number)
+        };
+        let (first_master, first_number) = allocate_pty();
+        let (second_master, second_number) = allocate_pty();
+
+        assert_eq!(task.sys_setsid(), Ok(task.pid));
+        let session_group = task.sys_getpgid(0).unwrap();
+        assert_ne!(session_group, original_group);
+        let first_slave = i32::try_from(
+            task.sys_open(
+                alloc::format!("/dev/pts/{first_number}"),
+                OFlags::RDWR,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let foreground_group = |fd| {
+            let mut group = -1;
+            task.sys_ioctl(
+                fd,
+                IoctlArg::TIOCGPGRP(UserPtrMut::from_ptr(&raw mut group)),
+            )
+            .unwrap();
+            group
+        };
+        assert_eq!(
+            foreground_group(first_slave),
+            session_group,
+            "automatic controlling-terminal acquisition must replace the group captured at ptmx open"
+        );
+
+        let selected_group = 6767;
+        task.sys_ioctl(
+            first_slave,
+            IoctlArg::TIOCSPGRP(UserPtr::from_ptr(&raw const selected_group)),
+        )
+        .unwrap();
+        let reopened_first = i32::try_from(
+            task.sys_open(
+                alloc::format!("/dev/pts/{first_number}"),
+                OFlags::RDWR,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            foreground_group(reopened_first),
+            selected_group,
+            "reopening an existing controlling terminal must preserve TIOCSPGRP state"
+        );
+
+        let second_slave = i32::try_from(
+            task.sys_open(
+                alloc::format!("/dev/pts/{second_number}"),
+                OFlags::RDWR,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            foreground_group(second_slave),
+            original_group,
+            "failed acquisition of a different controlling terminal must not publish a new foreground group"
+        );
+
+        task.sys_close(second_slave).unwrap();
+        task.sys_close(reopened_first).unwrap();
+        task.sys_close(first_slave).unwrap();
+        task.sys_close(second_master).unwrap();
+        task.sys_close(first_master).unwrap();
+    }
+
+    #[test]
+    fn unix98_pty_allocates_unlocks_and_transports_both_directions() {
+        let task = crate::syscalls::tests::init_platform(None);
+        assert_eq!(task.sys_setsid(), Ok(task.pid));
+        assert_eq!(
+            task.sys_open("/dev/tty", OFlags::RDWR, Mode::empty()),
+            Err(Errno::ENXIO),
+            "setsid must leave the process without a controlling terminal"
+        );
+        let master = i32::try_from(
+            task.sys_open("/dev/ptmx", OFlags::RDWR | OFlags::NOCTTY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mut number = u32::MAX;
+        assert_eq!(
+            task.sys_ioctl(
+                master,
+                IoctlArg::TIOCGPTN(UserPtrMut::from_ptr(&raw mut number)),
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            task.sys_open(
+                alloc::format!("/dev/pts/{number}"),
+                OFlags::RDWR | OFlags::NOCTTY,
+                Mode::empty(),
+            ),
+            Err(Errno::EIO),
+            "the slave must remain locked until TIOCSPTLCK"
+        );
+
+        let unlocked = 0i32;
+        assert_eq!(
+            task.sys_ioctl(
+                master,
+                IoctlArg::TIOCSPTLCK(UserPtr::from_ptr(&raw const unlocked)),
+            ),
+            Ok(0)
+        );
+        let slave = i32::try_from(
+            task.sys_open(
+                alloc::format!("/dev/pts/{number}"),
+                OFlags::RDWR | OFlags::NOCTTY,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            task.sys_open("/dev/tty", OFlags::RDWR, Mode::empty()),
+            Err(Errno::ENXIO),
+            "O_NOCTTY must suppress controlling-terminal acquisition"
+        );
+
+        assert_eq!(task.sys_write(master, b"input", None), Ok(5));
+        let mut input = [0; 5];
+        assert_eq!(task.sys_read(slave, &mut input, None), Ok(5));
+        assert_eq!(&input, b"input");
+
+        assert_eq!(task.sys_write(slave, b"output", None), Ok(6));
+        let mut output = [0; 6];
+        assert_eq!(task.sys_read(master, &mut output, None), Ok(6));
+        assert_eq!(&output, b"output");
+
+        let controlling = i32::try_from(
+            task.sys_open(
+                alloc::format!("/dev/pts/{number}"),
+                OFlags::RDWR,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task.sys_ioctl(controlling, IoctlArg::TIOCSCTTY(0)), Ok(0));
+        let mut foreground_pgid = -1;
+        assert_eq!(
+            task.sys_ioctl(
+                controlling,
+                IoctlArg::TIOCGPGRP(UserPtrMut::from_ptr(&raw mut foreground_pgid)),
+            ),
+            Ok(0)
+        );
+        let process_group_id = task.sys_getpgid(0).unwrap();
+        assert_eq!(
+            foreground_pgid, process_group_id,
+            "TIOCSCTTY must publish the caller's process-owned group as the PTY foreground group"
+        );
+
+        // Reproduce the desktop race exactly: another process mutates its own process group after
+        // this PTY has published its foreground group. Neither the first process's identity nor
+        // the PTY's foreground state may move, and replaying TIOCSCTTY must be idempotent.
+        let unrelated = task
+            .global
+            .clone()
+            .new_test_task(task.files.borrow().fs.clone());
+        assert_eq!(unrelated.sys_setpgid(0, 7777), Ok(()));
+        assert_eq!(task.sys_getpgid(0), Ok(process_group_id));
+        foreground_pgid = -1;
+        assert_eq!(
+            task.sys_ioctl(
+                controlling,
+                IoctlArg::TIOCGPGRP(UserPtrMut::from_ptr(&raw mut foreground_pgid)),
+            ),
+            Ok(0)
+        );
+        assert_eq!(foreground_pgid, process_group_id);
+        assert_eq!(task.sys_ioctl(controlling, IoctlArg::TIOCSCTTY(0)), Ok(0));
+        foreground_pgid = -1;
+        assert_eq!(
+            task.sys_ioctl(
+                controlling,
+                IoctlArg::TIOCGPGRP(UserPtrMut::from_ptr(&raw mut foreground_pgid)),
+            ),
+            Ok(0)
+        );
+        assert_eq!(foreground_pgid, process_group_id);
+        let tty = i32::try_from(
+            task.sys_open("/dev/tty", OFlags::RDWR, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task.sys_write(tty, b"alias", None), Ok(5));
+        let mut alias = [0; 5];
+        assert_eq!(task.sys_read(master, &mut alias, None), Ok(5));
+        assert_eq!(&alias, b"alias");
+
+        let requested = litebox_common_linux::Winsize {
+            row: 37,
+            col: 111,
+            xpixel: 777,
+            ypixel: 333,
+        };
+        task.sys_ioctl(
+            master,
+            IoctlArg::TIOCSWINSZ(UserPtr::from_ptr(&raw const requested)),
+        )
+        .unwrap();
+        let mut observed = litebox_common_linux::Winsize {
+            row: 0,
+            col: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        task.sys_ioctl(
+            slave,
+            IoctlArg::TIOCGWINSZ(UserPtrMut::from_ptr(&raw mut observed)),
+        )
+        .unwrap();
+        assert_eq!(
+            (observed.row, observed.col, observed.xpixel, observed.ypixel),
+            (37, 111, 777, 333)
+        );
+
+        task.sys_close(master).unwrap();
+        assert_eq!(
+            task.sys_open(
+                alloc::format!("/dev/pts/{number}"),
+                OFlags::RDWR,
+                Mode::empty(),
+            ),
+            Err(Errno::ENOENT),
+            "closing the master must retire the slave pathname"
+        );
+        task.sys_close(tty).unwrap();
+        task.sys_close(controlling).unwrap();
+        task.sys_close(slave).unwrap();
     }
 
     #[test]
