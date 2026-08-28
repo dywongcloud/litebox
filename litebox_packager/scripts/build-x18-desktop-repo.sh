@@ -245,6 +245,33 @@ EOF
                     sed -i "s/-flto=auto/-fno-lto/" "$dir/APKBUILD"
                 fi
                 ;;
+            gettext)
+                # The pkgver=1.0 "runtime-split" source tarball ships no
+                # build-aux/ directory (autopoint/autoreconf would normally
+                # regenerate it, but the stock APKBUILD has no prepare()
+                # step and this aports environment carries no autotools
+                # chain to run one). configure then fails looking for
+                # ../build-aux/*.sh.in. Fetch the matching full-distribution
+                # release, which does ship build-aux/, and copy it in before
+                # build() runs.
+                if ! grep -q "litebox-x18-gettext-build-aux" "$dir/APKBUILD"; then
+                    full_ver="0.23.1"
+                    cat >> "$dir/APKBUILD" <<EOF
+
+# litebox-x18-gettext-build-aux
+prepare() {
+	default_prepare
+	if [ ! -d build-aux ]; then
+		full_tar="\$SRCDEST/gettext-$full_ver.tar.xz"
+		[ -f "\$full_tar" ] || wget -q -O "\$full_tar" \\
+			"https://ftp.gnu.org/gnu/gettext/gettext-$full_ver.tar.xz"
+		tar xf "\$full_tar" -C "\$SRCDEST" "gettext-$full_ver/build-aux"
+		cp -r "\$SRCDEST/gettext-$full_ver/build-aux" build-aux
+	fi
+}
+EOF
+                fi
+                ;;
             pixman)
                 cat > "$dir/litebox-x18.patch" <<EOF
 --- a/pixman/pixman-arma64-neon-asm.h
