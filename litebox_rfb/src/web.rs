@@ -122,6 +122,10 @@ fn serve_connection<F: FramebufferSource>(
 ) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
+    // Bounds a stalled pre-upgrade client (never finishes sending its request head) to five
+    // seconds rather than pinning this thread forever; cleared before the WebSocket loop so a
+    // legitimately idle, already-upgraded connection isn't cut off for having no traffic.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -174,6 +178,9 @@ fn serve_connection<F: FramebufferSource>(
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
             );
             stream.write_all(resp.as_bytes())?;
+            // The five-second stall bound above is for the pre-upgrade HTTP head only; a real
+            // viewer's WebSocket connection is expected to sit idle between user input.
+            stream.set_read_timeout(None)?;
             serve_websocket(stream, framebuffer, on_input)
         }
         _ => {
