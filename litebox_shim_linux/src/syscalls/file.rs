@@ -3961,11 +3961,198 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                     |_fd| Err(Errno::ENOTTY),
                 )?,
+            // Legacy `SIOCGIF*`/`SIOCGIFCONF` socket ioctls ('S' = 0x89 in the ioctl type
+            // byte). `getifaddrs(3)` reaches interfaces through rtnetlink (see
+            // `crate::syscalls::netlink`) and never issues these, but tools built directly
+            // against BSD-style `ifreq`/`ifconf` -- busybox `ifconfig`, `route` -- still do.
+            // Answered from the same fixed two-interface table netlink synthesises: `lo`
+            // (127.0.0.1/8) and `eth0` (this guest's real address, from `self.global.net`).
+            IoctlArg::Raw { cmd, arg: raw_arg } if (cmd >> 8) & 0xff == 0x89 => files
+                .run_on_raw_fd(
+                    desc,
+                    |_fd| -> Result<u32, Errno> { Err(Errno::ENOTTY) },
+                    |_fd| -> Result<u32, Errno> {
+                        self.sys_ioctl_siocgif(cmd, raw_arg)
+                    },
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| Err(Errno::ENOTTY),
+                    |_fd| -> Result<u32, Errno> {
+                        // AF_UNIX sockets answer the same fixed table: real programs only
+                        // ever issue these against an AF_INET socket, but the kernel itself
+                        // does not check the socket's domain for `SIOCGIF*` (it is a global
+                        // ioctl number, not protocol-specific), so neither does this shim.
+                        self.sys_ioctl_siocgif(cmd, raw_arg)
+                    },
+                )?,
             _ => {
                 log_unsupported!("ioctl with arg {:?}", arg);
                 Err(Errno::EINVAL)
             }
         }
+    }
+
+    /// The `SIOCGIFCONF`/`SIOCGIFFLAGS`/`SIOCGIFADDR`/`SIOCGIFNETMASK`/`SIOCGIFBRDADDR`/
+    /// `SIOCGIFHWADDR`/`SIOCGIFMTU` family, against the fixed `lo` + `eth0` interface table
+    /// (see the call site's doc comment). `raw_arg` points at a `struct ifconf` for
+    /// `SIOCGIFCONF`, a `struct ifreq` for everything else.
+    fn sys_ioctl_siocgif(&self, cmd: u32, raw_arg: UserPtrMut<u8>) -> Result<u32, Errno> {
+        use litebox_common_linux::{
+            IFNAMSIZ, IfrFlags, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF, SIOCGIFFLAGS,
+            SIOCGIFHWADDR, SIOCGIFMTU, SIOCGIFNETMASK,
+        };
+
+        // `sockaddr_in { sa_family: u16, sin_port: u16, sin_addr: [u8;4], sin_zero: [u8;8] }`,
+        // padded to `sockaddr`'s 16 bytes -- the shape every `SIOCGIF*` address getter writes
+        // into `ifr_ifru.ifru_addr`.
+        const AF_INET: u16 = 2;
+        fn sockaddr_in(addr: [u8; 4]) -> [u8; 16] {
+            let mut b = [0u8; 16];
+            b[0..2].copy_from_slice(&AF_INET.to_ne_bytes());
+            b[4..8].copy_from_slice(&addr);
+            b
+        }
+        const ARPHRD_ETHER: u16 = 1;
+        const ARPHRD_LOOPBACK: u16 = 772;
+        const LO_ADDR: [u8; 4] = [127, 0, 0, 1];
+        const LO_MASK: [u8; 4] = [255, 0, 0, 0];
+        const ETH_MASK: [u8; 4] = [255, 255, 255, 0];
+        const ETH_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        const MTU: i32 = 1500;
+
+        struct Iface {
+            name: &'static [u8],
+            addr: [u8; 4],
+            netmask: [u8; 4],
+            flags: IfrFlags,
+            hw_type: u16,
+        }
+        let eth_addr = self.global.net.lock().interface_ip().octets();
+        let ifaces = [
+            Iface {
+                name: b"lo",
+                addr: LO_ADDR,
+                netmask: LO_MASK,
+                flags: IfrFlags::IFF_UP | IfrFlags::IFF_LOOPBACK | IfrFlags::IFF_RUNNING,
+                hw_type: ARPHRD_LOOPBACK,
+            },
+            Iface {
+                name: b"eth0",
+                addr: eth_addr,
+                netmask: ETH_MASK,
+                flags: IfrFlags::IFF_UP
+                    | IfrFlags::IFF_BROADCAST
+                    | IfrFlags::IFF_RUNNING
+                    | IfrFlags::IFF_MULTICAST,
+                hw_type: ARPHRD_ETHER,
+            },
+        ];
+
+        fn write_ifreq_name<P: litebox::platform::RawPointerProvider>(
+            dst: UserPtrMut<u8>,
+            name: &[u8],
+        ) -> Option<()> {
+            let mut buf = [0u8; IFNAMSIZ];
+            buf[..name.len()].copy_from_slice(name);
+            dst.copy_from_slice::<P>(0, &buf)
+        }
+
+        if cmd == SIOCGIFCONF {
+            // `struct ifconf { int ifc_len; union { char *ifc_buf; struct ifreq *ifc_req; }; }`.
+            // LP64 pads `ifc_len` to 8 bytes before the pointer.
+            let header = raw_arg
+                .to_owned_slice::<Platform>(16)
+                .ok_or(Errno::EFAULT)?;
+            let ifc_len = i32::from_ne_bytes(
+                <[u8; 4]>::try_from(&header[0..4]).unwrap_or_else(|_| unreachable!()),
+            );
+            let buf_addr = usize::from_ne_bytes(
+                <[u8; 8]>::try_from(&header[8..16]).unwrap_or_else(|_| unreachable!()),
+            );
+            let dst = UserPtrMut::<u8>::from_usize(buf_addr);
+
+            const IFREQ_SIZE: usize = IFNAMSIZ + 16;
+            let capacity = usize::try_from(ifc_len.max(0)).unwrap_or(0) / IFREQ_SIZE;
+            let n = ifaces.len().min(capacity);
+            for (i, iface) in ifaces.iter().take(n).enumerate() {
+                let entry = UserPtrMut::<u8>::from_usize(dst.as_usize() + i * IFREQ_SIZE);
+                write_ifreq_name::<Platform>(entry, iface.name).ok_or(Errno::EFAULT)?;
+                let addr_entry = UserPtrMut::<u8>::from_usize(entry.as_usize() + IFNAMSIZ);
+                addr_entry
+                    .copy_from_slice::<Platform>(0, &sockaddr_in(iface.addr))
+                    .ok_or(Errno::EFAULT)?;
+            }
+            let written_len = i32::try_from(n * IFREQ_SIZE).unwrap_or(0);
+            raw_arg
+                .copy_from_slice::<Platform>(0, &written_len.to_ne_bytes())
+                .ok_or(Errno::EFAULT)?;
+            return Ok(0);
+        }
+
+        // Every other command names one interface in `ifr_name` and gets a reply written
+        // into the same union slot the name doesn't occupy.
+        let name_bytes = raw_arg
+            .to_owned_slice::<Platform>(IFNAMSIZ)
+            .ok_or(Errno::EFAULT)?;
+        let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(IFNAMSIZ);
+        let name = &name_bytes[..name_len];
+        let Some(iface) = ifaces.iter().find(|i| i.name == name) else {
+            return Err(Errno::ENODEV);
+        };
+        let payload = UserPtrMut::<u8>::from_usize(raw_arg.as_usize() + IFNAMSIZ);
+        match cmd {
+            SIOCGIFFLAGS => {
+                let mut b = [0u8; 16];
+                b[0..2].copy_from_slice(&iface.flags.bits().to_ne_bytes());
+                payload
+                    .copy_from_slice::<Platform>(0, &b)
+                    .ok_or(Errno::EFAULT)?;
+            }
+            SIOCGIFADDR => {
+                payload
+                    .copy_from_slice::<Platform>(0, &sockaddr_in(iface.addr))
+                    .ok_or(Errno::EFAULT)?;
+            }
+            SIOCGIFNETMASK => {
+                payload
+                    .copy_from_slice::<Platform>(0, &sockaddr_in(iface.netmask))
+                    .ok_or(Errno::EFAULT)?;
+            }
+            SIOCGIFBRDADDR => {
+                let broadcast = [
+                    iface.addr[0] | !iface.netmask[0],
+                    iface.addr[1] | !iface.netmask[1],
+                    iface.addr[2] | !iface.netmask[2],
+                    iface.addr[3] | !iface.netmask[3],
+                ];
+                payload
+                    .copy_from_slice::<Platform>(0, &sockaddr_in(broadcast))
+                    .ok_or(Errno::EFAULT)?;
+            }
+            SIOCGIFHWADDR => {
+                let mut b = [0u8; 16];
+                b[0..2].copy_from_slice(&iface.hw_type.to_ne_bytes());
+                let mac = if iface.hw_type == ARPHRD_LOOPBACK {
+                    [0u8; 6]
+                } else {
+                    ETH_MAC
+                };
+                b[2..8].copy_from_slice(&mac);
+                payload
+                    .copy_from_slice::<Platform>(0, &b)
+                    .ok_or(Errno::EFAULT)?;
+            }
+            SIOCGIFMTU => {
+                payload
+                    .copy_from_slice::<Platform>(0, &MTU.to_ne_bytes())
+                    .ok_or(Errno::EFAULT)?;
+            }
+            _ => {
+                log_unsupported!("SIOCGIF ioctl {cmd:#x}");
+                return Err(Errno::EINVAL);
+            }
+        }
+        Ok(0)
     }
 
     /// Handle syscall `epoll_create` and `epoll_create1`

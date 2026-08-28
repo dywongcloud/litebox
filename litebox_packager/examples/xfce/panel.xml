@@ -70,7 +70,13 @@
     <property name="plugin-12" type="string" value="separator"/>
     <property name="plugin-13" type="string" value="launcher">
       <property name="items" type="array">
-        <value type="string" value="xfce4-terminal-emulator.desktop"/>
+        <!-- xfce4-terminal is installed but segfaults on launch under this
+             platform's x18 constraint (its GTK/VTE code sits outside the
+             x18-fixed package closure -- see build-x18-desktop-repo.sh's
+             DEFAULT_PACKAGES comment). xterm is in that closure and is the
+             terminal start-desktop.sh actually launches and verifies, so
+             the taskbar launcher points at it directly instead. -->
+        <value type="string" value="xterm.desktop"/>
       </property>
     </property>
     <property name="plugin-14" type="string" value="launcher">

@@ -927,6 +927,34 @@ pub const FBIOGET_FSCREENINFO: u32 = 0x4602;
 pub const FBIOPAN_DISPLAY: u32 = 0x4606;
 pub const FBIOBLANK: u32 = 0x4611;
 
+/// `IFNAMSIZ` (`linux/if.h`): the fixed size of `ifr_name`/`ifc_ifcu.ifcu_req[].ifr_name`.
+pub const IFNAMSIZ: usize = 16;
+
+// Legacy socket ioctls (`linux/sockios.h`), the interface-enumeration path
+// `getifaddrs(3)`/rtnetlink bypasses but tools built directly against BSD-style
+// `ifreq`/`ifconf` (busybox `ifconfig`, `route`, ...) still use.
+pub const SIOCGIFCONF: u32 = 0x8912;
+pub const SIOCGIFFLAGS: u32 = 0x8913;
+pub const SIOCGIFADDR: u32 = 0x8915;
+pub const SIOCGIFNETMASK: u32 = 0x891b;
+pub const SIOCGIFBRDADDR: u32 = 0x8919;
+pub const SIOCGIFHWADDR: u32 = 0x8927;
+pub const SIOCGIFMTU: u32 = 0x8921;
+
+bitflags::bitflags! {
+    /// `ifr_flags` bits this shim reports (`linux/if.h`).
+    #[derive(Debug, Clone, Copy)]
+    pub struct IfrFlags: u16 {
+        const IFF_UP = 0x1;
+        const IFF_BROADCAST = 0x2;
+        const IFF_LOOPBACK = 0x8;
+        const IFF_RUNNING = 0x40;
+        const IFF_MULTICAST = 0x1000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 /// When a new terminal attribute value takes effect, per `tcsetattr(3)`'s
 /// `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` distinction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

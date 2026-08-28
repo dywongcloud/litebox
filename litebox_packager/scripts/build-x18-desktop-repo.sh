@@ -121,8 +121,8 @@ if [ "$contains_gcc" != true ]; then
 fi
 
 GCC_JOBS="${LITEBOX_X18_GCC_JOBS:-3}"
-[[ "$GCC_JOBS" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || \
-    fatal "invalid GCC job count (expected 1..64): $GCC_JOBS"
+[[ "$GCC_JOBS" =~ ^[1-9][0-9]{0,2}$ && "$GCC_JOBS" -le 512 ]] || \
+    fatal "invalid GCC job count (expected 1..512): $GCC_JOBS"
 
 CONTAINER_ENGINE=""
 for candidate in podman docker; do
