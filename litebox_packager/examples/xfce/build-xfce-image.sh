@@ -47,23 +47,49 @@ cp -R "$X18_REPO" "$WORKDIR/x18repo"
 
 "$CONTAINER_ENGINE" build --platform linux/arm64 -t "$IMAGE_TAG" "$WORKDIR"
 
-# Verify every ELF the live smoke test actually loads is x18-clean: the
-# entry binaries start-desktop.sh execs, plus their full recursive NEEDED
-# closure. Scanning the whole image's 348 installed packages (measured
-# live: the xfce4 metapackage pulls in a stock closure roughly 4x
-# DEFAULT_PACKAGES's ~80 rebuilt origins -- webkit2gtk, ffmpeg's codec
-# stack, poppler -- none of it reachable from the desktop/terminal/VNC path)
-# would fail on hundreds of thousands of residual x18 refs in code nothing
-# here ever executes. This mirrors the roadmap's own accepted precedent:
-# partial x18 coverage shrinks the corruption surface rather than
-# eliminating it: everything actually on the smoke-test's live call path is
-# held to the zero-residual bar; unreached stock libraries are not.
+CONTAINER_ID="$($CONTAINER_ENGINE create "$IMAGE_TAG")"
+"$CONTAINER_ENGINE" export "$CONTAINER_ID" > "$WORKDIR/rootfs.tar"
+"$CONTAINER_ENGINE" rm "$CONTAINER_ID" >/dev/null
+CONTAINER_ID=""
+
+cargo run --release --manifest-path "$REPO_ROOT/Cargo.toml" \
+    -p litebox_packager -- \
+    --oci-rootfs-tar "$WORKDIR/rootfs.tar" -o "$OUTPUT"
+
+# Verify every ELF the live smoke test actually loads is x18-clean, scanned
+# from the PACKAGED tar (post litebox_packager, which substitutes a
+# -ffixed-x18 musl from its content-addressed cache when available -- see
+# litebox_packager/src/musl_x18.rs), not the pre-packaging podman image:
+# scanning the podman image would report musl's original x18 count even
+# after the packager has already replaced it, since substitution happens
+# during packaging, not before. binutils' readelf/objdump aren't reliably
+# present on a macOS host, so the scan runs inside a scratch Alpine
+# container fed the packaged tar directly, mirroring the closure walk
+# already used above for the pre-packaging gate. The entry binaries
+# start-desktop.sh execs, plus their full recursive NEEDED closure.
+# Scanning the whole image's 348 installed packages (measured live: the
+# xfce4 metapackage pulls in a stock closure roughly 4x DEFAULT_PACKAGES's
+# ~80 rebuilt origins -- webkit2gtk, ffmpeg's codec stack, poppler -- none
+# of it reachable from the desktop/terminal/VNC path) would fail on
+# hundreds of thousands of residual x18 refs in code nothing here ever
+# executes. This mirrors the roadmap's own accepted precedent: partial x18
+# coverage shrinks the corruption surface rather than eliminating it:
+# everything actually on the smoke-test's live call path is held to the
+# zero-residual bar; unreached stock libraries are not.
+SCAN_CONTAINER="litebox-x18-scan-$$"
+"$CONTAINER_ENGINE" run -d --name "$SCAN_CONTAINER" --platform linux/arm64 \
+    "public.ecr.aws/docker/library/alpine:${ALPINE_BRANCH%-stable}" sleep 300 >/dev/null
+scan_cleanup() { "$CONTAINER_ENGINE" rm -f "$SCAN_CONTAINER" >/dev/null 2>&1 || true; }
+trap 'scan_cleanup; cleanup' EXIT
+"$CONTAINER_ENGINE" exec "$SCAN_CONTAINER" mkdir -p /scan
+"$CONTAINER_ENGINE" cp "$OUTPUT" "$SCAN_CONTAINER:/scan.tar"
 # shellcheck disable=SC2016
-if ! "$CONTAINER_ENGINE" run --rm --platform linux/arm64 "$IMAGE_TAG" sh -c '
+if ! "$CONTAINER_ENGINE" exec "$SCAN_CONTAINER" sh -c '
     set -e
-    apk add --no-cache binutils > /dev/null 2>&1
+    apk add --no-cache binutils tar > /dev/null 2>&1
+    tar -xf /scan.tar -C /scan
     seen=""
-    queue="/usr/libexec/Xorg /usr/bin/dbus-daemon /usr/bin/xfwm4 /usr/bin/xfdesktop /usr/bin/xfce4-panel /usr/bin/xfce4-terminal /usr/bin/xterm"
+    queue="/scan/usr/libexec/Xorg /scan/usr/bin/dbus-daemon /scan/usr/bin/xfwm4 /scan/usr/bin/xfdesktop /scan/usr/bin/xfce4-panel /scan/usr/bin/xfce4-terminal /scan/usr/bin/xterm"
     while [ -n "$queue" ]; do
         next=""
         for f in $queue; do
@@ -71,7 +97,7 @@ if ! "$CONTAINER_ENGINE" run --rm --platform linux/arm64 "$IMAGE_TAG" sh -c '
             seen="$seen $f"
             [ -f "$f" ] || continue
             for d in $(readelf -d "$f" 2>/dev/null | grep NEEDED | sed "s/.*\[\(.*\)\]/\1/"); do
-                found=$(find /usr/lib /lib -name "$d" 2>/dev/null | head -1)
+                found=$(find /scan/usr/lib /scan/lib -name "$d" 2>/dev/null | head -1)
                 [ -n "$found" ] || continue
                 case " $seen " in *" $found "*) ;; *) next="$next $found";; esac
             done
@@ -83,7 +109,7 @@ if ! "$CONTAINER_ENGINE" run --rm --platform linux/arm64 "$IMAGE_TAG" sh -c '
         readelf -h "$file" > /dev/null 2>&1 || continue
         n=$(objdump -d "$file" 2>/dev/null | grep -oE "\b[wx]18\b" | wc -l)
         if [ "$n" -gt 0 ]; then
-            echo "  residual x18 refs: $file ($n)"
+            echo "  residual x18 refs: ${file#/scan/} ($n)"
             total=$((total + n))
         fi
     done
@@ -93,15 +119,8 @@ if ! "$CONTAINER_ENGINE" run --rm --platform linux/arm64 "$IMAGE_TAG" sh -c '
     echo "the desktop/terminal smoke-test closure still contains x18 instructions; patch the named assembly/build path" >&2
     exit 1
 fi
-
-CONTAINER_ID="$($CONTAINER_ENGINE create "$IMAGE_TAG")"
-"$CONTAINER_ENGINE" export "$CONTAINER_ID" > "$WORKDIR/rootfs.tar"
-"$CONTAINER_ENGINE" rm "$CONTAINER_ID" >/dev/null
-CONTAINER_ID=""
-
-cargo run --release --manifest-path "$REPO_ROOT/Cargo.toml" \
-    -p litebox_packager -- \
-    --oci-rootfs-tar "$WORKDIR/rootfs.tar" -o "$OUTPUT"
+scan_cleanup
+trap cleanup EXIT
 
 python3 - "$OUTPUT" <<'PY'
 import sys
