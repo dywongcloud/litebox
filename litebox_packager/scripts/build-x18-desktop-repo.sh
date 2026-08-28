@@ -71,16 +71,24 @@ DEFAULT_PACKAGES=(
     # core/runtime plumbing
     busybox zlib bzip2 xz brotli libffi pcre2 libxml2 yaml libeconf
     libbsd libmd libcap libseccomp util-linux eudev bubblewrap gcc
-    dbus gettext json-glib expat nettle
+    dbus gettext json-glib expat nettle gnutls icu lz4 libidn2
+    libunistring gmp zstd
     # graphics, image, font, and text stack
     libpng libjpeg-turbo lcms2 dav1d fribidi graphite2 freetype fontconfig
-    harfbuzz pixman cairo pango gdk-pixbuf glycin libglycin librsvg
+    harfbuzz pixman cairo pango gdk-pixbuf glycin libglycin librsvg libxpm
     # input/display protocols and client libraries
     mtdev libevdev wayland libdrm libpciaccess libdisplay-info libepoxy
     libxau libxdmcp libxcb xcb-util libx11 libxext libxrender libxft libxi
     libxrandr libxcursor libxfixes libxdamage libxcomposite libxinerama
     libxtst libice libsm libxt libxmu libxaw libxkbfile libfontenc
     libxfont2 libxkbcommon libxpresent libxres libxshmfence libxcvt
+    # ncurses is deliberately absent: Alpine 3.24-stable's aport pins
+    # https://invisible-mirror.net/archives/ncurses/current/ncurses-6.6-
+    # 20260516.tgz by checksum, and that exact dated snapshot has aged out
+    # of the mirror's current/ directory (404s as of 2026-08-28). See
+    # docs/roadmap.md and the xfce-x18-ncurses-source-vanished tracking
+    # item: libncursesw.so.6 remains a known residual-x18 gap until a
+    # source is found or Alpine's aport moves to a live snapshot.
     # GTK stack
     simdutf glib at-spi2-core gtk+3.0 gtk-layer-shell libnotify libdbusmenu-glib
     # X server, drivers, and keymap compiler
