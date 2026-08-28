@@ -241,7 +241,7 @@ impl<Platform: ShimPlatform> Clone for SignalHandlers<Platform> {
     }
 }
 
-struct PendingSignals {
+pub(crate) struct PendingSignals {
     /// The set of pending signals.
     pending: SigSet,
     /// The queue of pending siginfo structures.
@@ -249,7 +249,7 @@ struct PendingSignals {
 }
 
 impl PendingSignals {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: SigSet::empty(),
             queue: VecDeque::new(),
@@ -312,7 +312,12 @@ impl PendingSignals {
         self.pending.add(signal);
     }
 
-    fn push(&mut self, rlimits: &super::process::ResourceLimits, signal: Signal, siginfo: Siginfo) {
+    pub(crate) fn push(
+        &mut self,
+        rlimits: &super::process::ResourceLimits,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) {
         assert_eq!(signal.as_i32(), siginfo.signo);
 
         // Don't queue duplicates for standard signals.
@@ -330,6 +335,23 @@ impl PendingSignals {
         }
         self.queue.push_back(siginfo);
         self.pending.add(signal);
+    }
+
+    /// Moves every entry queued here into `dest`, preserving standard-signal dedup (an entry
+    /// whose signal is already pending in `dest` is dropped, matching `push`'s own dedup rule --
+    /// this can only apply to standard signals, since `push`'s realtime-signal branch never
+    /// hits `pending.contains` at all). Does not re-apply an `RLIMIT_SIGPENDING` check: the
+    /// limit was already enforced when each entry was queued here.
+    pub(crate) fn drain_into(&mut self, dest: &mut Self) {
+        for siginfo in self.queue.drain(..) {
+            let signal = Signal::try_from(siginfo.signo).expect("queued an invalid signal");
+            if !signal.is_rt_signal() && dest.pending.contains(signal) {
+                continue;
+            }
+            dest.queue.push_back(siginfo);
+            dest.pending.add(signal);
+        }
+        self.pending = SigSet::empty();
     }
 }
 
@@ -693,13 +715,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
-        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
-            self.send_signal(signal, siginfo_kill(signal));
-            Ok(0)
-        } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
-            Err(Errno::ESRCH)
+        if pid.is_some_and(|pid| pid != self.pid) {
+            log_unsupported!("sys_{{t|tg}}kill with remote pid");
+            return Err(Errno::ESRCH);
         }
+        let Some(tid) = tid else {
+            self.send_signal(signal, siginfo_kill(signal));
+            return Ok(0);
+        };
+        if tid == self.tid {
+            self.send_signal(signal, siginfo_kill(signal));
+            return Ok(0);
+        }
+        // A sibling thread's `SignalState.pending` is a bare `RefCell`, not `Send`/`Sync` --
+        // only reachable from the thread it belongs to -- so delivery goes through
+        // `ThreadRemote::remote_pending`, the one piece of a thread's signal state built to be
+        // touched remotely. `thread_remote` returns `None` once the target has detached
+        // (exited), which is exactly when a real `tkill` would also report ESRCH: Linux never
+        // resurrects a reaped tid.
+        let Some(remote) = self.process().thread_remote(tid) else {
+            return Err(Errno::ESRCH);
+        };
+        remote.deliver_remote_signal(&self.process().limits, signal, siginfo_kill(signal));
+        Ok(0)
     }
 
     /// Returns whether there are any pending signals that can be delivered.
@@ -711,6 +749,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// a signal in the first place; this is where that is enforced, rather than at the sending
     /// end, because a sender in another guest process cannot see the target's live handler table.
     pub(crate) fn has_pending_signals(&self) -> bool {
+        self.thread_remote()
+            .drain_remote_signals_into(&mut self.signals.pending.borrow_mut());
         let blocked = self.signals.blocked.get();
         let thread_pending = self.signals.pending.borrow().pending & !blocked;
         let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
@@ -740,6 +780,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+        self.thread_remote()
+            .drain_remote_signals_into(&mut self.signals.pending.borrow_mut());
         loop {
             let blocked = self.signals.blocked.get();
             let (signal, siginfo) = {

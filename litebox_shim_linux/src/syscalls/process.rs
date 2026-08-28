@@ -120,12 +120,20 @@ impl<Platform: ShimPlatform> Drop for ForkGateGuard<'_, Platform> {
     }
 }
 
-struct ThreadRemote<Platform: ShimPlatform> {
+pub(crate) struct ThreadRemote<Platform: ShimPlatform> {
     /// Always set under the process `inner` lock, but can be read without
     /// locking.
     is_exiting: AtomicBool,
     /// Handle to interrupt waits on this thread.
     handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+    /// Signals directed at this specific thread by a remote `tkill`/`tgkill` (as opposed to a
+    /// process-directed `kill`, which uses [`Process`]-wide `shared_pending` instead). The
+    /// owning task's own `signals.pending` is a bare `RefCell` and therefore neither `Send` nor
+    /// `Sync` -- it can only ever be touched by the thread it belongs to -- so a sender on a
+    /// different thread has nowhere else to hand off a specifically-targeted signal. Drained
+    /// into that `RefCell` by the owning thread itself in `Task::process_signals`/
+    /// `Task::has_pending_signals`, the same way `Process::shared_pending` already is.
+    remote_pending: Mutex<Platform, super::signal::PendingSignals>,
 }
 
 impl<Platform: ShimPlatform> ThreadRemote<Platform> {
@@ -133,6 +141,7 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
         Self {
             is_exiting: AtomicBool::new(false),
             handle: once_cell::race::OnceBox::new(),
+            remote_pending: Mutex::new(super::signal::PendingSignals::new()),
         }
     }
 
@@ -140,6 +149,29 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
         if let Some(handle) = self.handle.get() {
             handle.interrupt();
         }
+    }
+
+    /// Queues `signal` for specifically this thread (a `tkill`/`tgkill` target) and wakes it out
+    /// of any interruptible wait so it notices next time it checks for pending signals. Safe to
+    /// call from any thread: `remote_pending` is the one piece of this thread's signal state
+    /// that is `Send`/`Sync`, precisely so a sender elsewhere never has to touch the owning
+    /// thread's local, non-`Send` `SignalState`.
+    pub(crate) fn deliver_remote_signal(
+        &self,
+        rlimits: &ResourceLimits,
+        signal: litebox_common_linux::signal::Signal,
+        siginfo: litebox_common_linux::signal::Siginfo,
+    ) {
+        self.remote_pending.lock().push(rlimits, signal, siginfo);
+        self.interrupt();
+    }
+
+    /// Drains any signals queued for specifically this thread (see `remote_pending`) into
+    /// `local`, the owning task's own thread-local pending set. Called only by the thread this
+    /// `ThreadRemote` belongs to.
+    pub(crate) fn drain_remote_signals_into(&self, local: &mut super::signal::PendingSignals) {
+        let mut remote = self.remote_pending.lock();
+        remote.drain_into(local);
     }
 }
 
@@ -668,6 +700,14 @@ impl<Platform: ShimPlatform> Process<Platform> {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
     }
 
+    /// Returns the remote handle for thread `tid` of this process, if it is currently attached
+    /// (i.e. running or blocked, not yet exited). Used by `tkill`/`tgkill` to deliver a
+    /// specifically-targeted signal without reaching into another thread's non-`Send` local
+    /// state -- see [`ThreadRemote::remote_pending`].
+    pub(crate) fn thread_remote(&self, tid: i32) -> Option<Arc<ThreadRemote<Platform>>> {
+        self.inner.lock().threads.get(&tid).cloned()
+    }
+
     /// Parks the calling thread while this process's fork gate is closed.
     ///
     /// The fast path -- gate open, the only case any thread sees outside a
@@ -928,6 +968,12 @@ pub(crate) struct Credentials {
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn process(&self) -> &Arc<Process<Platform>> {
         &self.thread.process
+    }
+
+    /// This task's own remote handle -- the piece of its signal/wait state a `tkill`/`tgkill`
+    /// from another thread can safely touch. See [`ThreadRemote::remote_pending`].
+    pub(crate) fn thread_remote(&self) -> &Arc<ThreadRemote<Platform>> {
+        &self.thread.remote
     }
 
     /// Set the current task's command name.
