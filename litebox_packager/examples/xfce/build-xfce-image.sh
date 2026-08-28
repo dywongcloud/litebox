@@ -46,6 +46,36 @@ cp "$SCRIPT_DIR/Containerfile" "$SCRIPT_DIR/xorg.conf" \
 cp -R "$X18_REPO" "$WORKDIR/x18repo"
 
 "$CONTAINER_ENGINE" build --platform linux/arm64 -t "$IMAGE_TAG" "$WORKDIR"
+
+# Verify every executable ELF actually shipped in the built image is
+# x18-clean. Scanning here (the built image's real filesystem), not the raw
+# x18-repo build's REPODEST, is required: rebuilding an origin can emit far
+# more than what Containerfile's overlay step ends up installing (gcc also
+# produces gcc-gnat/gcc-go/gcc-gdc and their runtime libs as side products,
+# none of which this image installs), and scanning unshipped byproducts
+# produces irrelevant failures unrelated to what actually runs as this guest.
+# shellcheck disable=SC2016
+if ! "$CONTAINER_ENGINE" run --rm --platform linux/arm64 "$IMAGE_TAG" sh -c '
+    set -e
+    apk add --no-cache binutils > /dev/null 2>&1
+    total=0
+    while IFS= read -r file; do
+        readelf -h "$file" > /dev/null 2>&1 || continue
+        n=$(objdump -d "$file" 2>/dev/null | grep -oE "\b[wx]18\b" | wc -l)
+        if [ "$n" -gt 0 ]; then
+            echo "  residual x18 refs: $file ($n)"
+            total=$((total + n))
+        fi
+    done <<EOF
+$(find / -xdev -type f -perm -u+x 2>/dev/null)
+EOF
+    echo "total residual x18 register references across shipped ELFs: $total"
+    [ "$total" -eq 0 ]
+'; then
+    echo "shipped image still contains x18 instructions; patch the named assembly/build path" >&2
+    exit 1
+fi
+
 CONTAINER_ID="$($CONTAINER_ENGINE create "$IMAGE_TAG")"
 "$CONTAINER_ENGINE" export "$CONTAINER_ID" > "$WORKDIR/rootfs.tar"
 "$CONTAINER_ENGINE" rm "$CONTAINER_ID" >/dev/null

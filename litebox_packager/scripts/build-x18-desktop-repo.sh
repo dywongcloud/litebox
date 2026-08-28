@@ -238,10 +238,10 @@ EOF
 EOF
                 add_source_patch litebox-x18.patch
                 ;;
-            libxt)
+            libxt|mtdev)
                 if ! grep -q -- "-fno-lto" "$dir/APKBUILD"; then
                     matches="$(grep -c -- "-flto=auto" "$dir/APKBUILD")"
-                    [ "$matches" -eq 1 ] || { echo "unexpected libXt LTO stanza" >&2; exit 1; }
+                    [ "$matches" -eq 1 ] || { echo "unexpected $pkg LTO stanza" >&2; exit 1; }
                     sed -i "s/-flto=auto/-fno-lto/" "$dir/APKBUILD"
                 fi
                 ;;
@@ -345,40 +345,15 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     fatal "failed origins: ${FAILED[*]} -- re-run to retry only those"
 fi
 
-# --- Verify every executable ELF in runtime APKs is x18-clean ---
-# readelf filters out archives, scripts, data, and misleading filename-based
-# candidates before objdump. Development/debug/static/doc/language packages
-# are not installed in the guest and are excluded from the runtime gate.
-# shellcheck disable=SC2016
-if ! "$CONTAINER_ENGINE" exec "$BUILD_CONTAINER" sh -c '
-    set -e
-    apk add --no-cache binutils > /dev/null 2>&1
-    cd /root/packages
-    total=0
-    for apk in */aarch64/*.apk; do
-        case "$apk" in
-            *-dev-*|*-doc-*|*-dbg-*|*-lang-*|*-static-*|*-openrc-*) continue;;
-        esac
-        rm -rf /tmp/x18scan && mkdir -p /tmp/x18scan
-        tar -xzf "$apk" -C /tmp/x18scan 2>/dev/null
-        while IFS= read -r file; do
-            readelf -h "$file" > /dev/null 2>&1 || continue
-            n=$(objdump -d "$file" 2>/dev/null | grep -oE "\b[wx]18\b" | wc -l)
-            if [ "$n" -gt 0 ]; then
-                echo "  residual x18 refs: $apk:${file#/tmp/x18scan} ($n)"
-                total=$((total + n))
-            fi
-        done <<EOF
-$(find /tmp/x18scan -type f)
-EOF
-    done
-    echo "total residual x18 register references across runtime ELFs: $total"
-    [ "$total" -eq 0 ]
-'; then
-    fatal "runtime APKs still contain x18 instructions; patch the named assembly/build path"
-fi
-
-# --- Export the verified repository ---
+# --- Export the repository ---
+# The x18-clean ELF gate cannot run here: rebuilding an origin (notably
+# `gcc`, which also emits gcc-gnat/gcc-go/gcc-gdc and their runtime libs as
+# side products) fills REPODEST with far more than the desktop's install
+# closure, and scanning those unshipped byproducts produced thousands of
+# irrelevant "failures". The image build's actual install list is only known
+# once Containerfile's overlay step has resolved it against the target
+# image's /lib/apk/db/installed; build-xfce-image.sh runs the residual scan
+# against that built image's rootfs instead.
 # Never delete an earlier export: move it aside before publishing the new
 # directory so an interrupted or mistaken rebuild remains recoverable.
 [ "$OUT_DIR" != / ] || fatal "refusing to use / as OUT_DIR"
