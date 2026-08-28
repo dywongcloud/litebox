@@ -246,11 +246,18 @@ EOF
 EOF
                 add_source_patch litebox-x18.patch
                 ;;
-            libxt|mtdev)
+            libxt|mtdev|gmp)
                 if ! grep -q -- "-fno-lto" "$dir/APKBUILD"; then
                     matches="$(grep -c -- "-flto=auto" "$dir/APKBUILD")"
                     [ "$matches" -eq 1 ] || { echo "unexpected $pkg LTO stanza" >&2; exit 1; }
                     sed -i "s/-flto=auto/-fno-lto/" "$dir/APKBUILD"
+                fi
+                ;;
+            util-linux)
+                if ! grep -q -- "-fno-lto" "$dir/APKBUILD"; then
+                    matches="$(grep -c -- "-ffat-lto-objects -flto=auto" "$dir/APKBUILD")"
+                    [ "$matches" -eq 1 ] || { echo "unexpected util-linux LTO stanza" >&2; exit 1; }
+                    sed -i "s/-ffat-lto-objects -flto=auto/-fno-lto/" "$dir/APKBUILD"
                 fi
                 ;;
             gettext)
