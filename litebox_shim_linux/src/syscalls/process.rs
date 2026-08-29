@@ -862,10 +862,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             set_child_tid: None,
         });
 
+        // Prepare the child's execution context: same as parent but with return value = 0.
+        // The child process resumes at the syscall return point but gets 0 as fork() result.
+        let mut child_ctx = ctx.clone();
+        #[cfg(target_arch = "x86_64")]
+        {
+            child_ctx.rax = 0;  // fork() returns 0 in child process
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            child_ctx.regs[0] = 0;  // fork() returns 0 in child process
+        }
+
         // Spawn the child process as a new task.
         let r = unsafe {
             self.global.platform.spawn_thread(
-                ctx,
+                &child_ctx,
                 Box::new(NewThreadArgs {
                     task: crate::Task {
                         global: self.global.clone(),
@@ -895,8 +907,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         // Return child PID to parent.
-        // The child will return 0 from this same syscall (handled by the platform's
-        // return-value setup for the new thread).
         Ok(usize::try_from(child_pid).unwrap())
     }
 }
