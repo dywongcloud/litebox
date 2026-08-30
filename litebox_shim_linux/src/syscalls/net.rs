@@ -1040,11 +1040,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                         litebox::net::Protocol::Udp
                     }
-                    SockType::Raw => todo!(),
+                    // No raw IP networking of any kind is available: the host has no `tun`
+                    // device without root (see `net_proxy`'s module doc), so there is no path
+                    // to actually emit an ICMP echo or any other raw packet. `EPERM` matches
+                    // what an unprivileged Linux process making this same call without
+                    // `CAP_NET_RAW` sees, so `ping`'s own "Operation not permitted" is exactly
+                    // what a caller would expect in a sandboxed environment -- a clean syscall
+                    // failure instead of a guest-crashing panic.
+                    SockType::Raw => return Err(Errno::EPERM),
                     SockType::SeqPacket => return Err(Errno::ESOCKTNOSUPPORT),
                     // `SockType` is `#[non_exhaustive]`; all currently declared variants are
-                    // matched above (`Raw`'s own handling is a separate, real gap -- see the
-                    // `todo!()` above -- not exhaustiveness padding).
+                    // matched above.
                     _ => unreachable!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;

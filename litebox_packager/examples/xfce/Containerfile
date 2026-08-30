@@ -159,7 +159,7 @@ RUN set -eux; \
                 exit 1 ;; \
         esac; \
     done; \
-    [ "$required_count" -eq 64 ]; \
+    [ "$required_count" -eq 66 ]; \
     rm -f /tmp/apk-world.before-x18-overlay \
         /tmp/apk-world.for-x18-overlay \
         /tmp/installed.before-x18-overlay \
@@ -173,5 +173,6 @@ RUN set -eux; \
 
 COPY xorg.conf /etc/X11/xorg.conf
 COPY panel.xml /etc/xdg/litebox/xfce4-panel.xml
+COPY resolv.conf /etc/resolv.conf
 COPY start-desktop.sh /usr/bin/start-desktop.sh
 RUN chmod 0755 /usr/bin/start-desktop.sh

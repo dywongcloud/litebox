@@ -220,7 +220,7 @@ LITEBOX_APORTS_COMMIT="$APORTS_COMMIT" \
 
 WORKDIR="$(mktemp -d)"
 cp "$SCRIPT_DIR/Containerfile" "$SCRIPT_DIR/panel.xml" "$SCRIPT_DIR/xorg.conf" \
-    "$SCRIPT_DIR/start-desktop.sh" "$WORKDIR/"
+    "$SCRIPT_DIR/resolv.conf" "$SCRIPT_DIR/start-desktop.sh" "$WORKDIR/"
 mkdir -p "$WORKDIR/x18repo"
 cp -R "$X18_REPO/." "$WORKDIR/x18repo"
 

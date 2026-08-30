@@ -4012,6 +4012,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             b[4..8].copy_from_slice(&addr);
             b
         }
+        fn write_ifreq_name<P: litebox::platform::RawPointerProvider>(
+            dst: UserPtrMut<u8>,
+            name: &[u8],
+        ) -> Option<()> {
+            let mut buf = [0u8; IFNAMSIZ];
+            buf[..name.len()].copy_from_slice(name);
+            dst.copy_from_slice::<P>(0, &buf)
+        }
         const ARPHRD_ETHER: u16 = 1;
         const ARPHRD_LOOPBACK: u16 = 772;
         const LO_ADDR: [u8; 4] = [127, 0, 0, 1];
@@ -4019,6 +4027,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         const ETH_MASK: [u8; 4] = [255, 255, 255, 0];
         const ETH_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
         const MTU: i32 = 1500;
+        // `struct ifreq` on musl/aarch64 is 40 bytes total, not the 32 a bare
+        // `ifr_name[IFNAMSIZ] + sockaddr` sum would suggest: the `ifr_ifru`
+        // union member at offset 16 is sized 24 bytes (verified live via
+        // `sizeof(struct ifreq)`/`offsetof` on this target), not 16, to leave
+        // room for union members not used here (e.g. `sockaddr_in6`-shaped
+        // ones). `SIOCGIFCONF`'s stride through the caller-provided buffer
+        // must match this exactly: a 32-byte stride left every entry past
+        // the first pointing 8 bytes into the *next* real entry's payload,
+        // so a caller (confirmed live: busybox `ifconfig`, whose own
+        // `if_readconf` walks `ifc.ifc_req` in `sizeof(struct ifreq)`
+        // strides) reading the second entry read zeroed padding instead of
+        // "eth0", producing an empty-named phantom interface and a fatal
+        // `SIOCGIFFLAGS` probe against it ("error fetching interface
+        // information: Device not found").
+        const IFREQ_SIZE: usize = IFNAMSIZ + 24;
 
         struct Iface {
             name: &'static [u8],
@@ -4048,15 +4071,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             },
         ];
 
-        fn write_ifreq_name<P: litebox::platform::RawPointerProvider>(
-            dst: UserPtrMut<u8>,
-            name: &[u8],
-        ) -> Option<()> {
-            let mut buf = [0u8; IFNAMSIZ];
-            buf[..name.len()].copy_from_slice(name);
-            dst.copy_from_slice::<P>(0, &buf)
-        }
-
         if cmd == SIOCGIFCONF {
             // `struct ifconf { int ifc_len; union { char *ifc_buf; struct ifreq *ifc_req; }; }`.
             // LP64 pads `ifc_len` to 8 bytes before the pointer.
@@ -4071,7 +4085,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             let dst = UserPtrMut::<u8>::from_usize(buf_addr);
 
-            const IFREQ_SIZE: usize = IFNAMSIZ + 16;
             let capacity = usize::try_from(ifc_len.max(0)).unwrap_or(0) / IFREQ_SIZE;
             let n = ifaces.len().min(capacity);
             for (i, iface) in ifaces.iter().take(n).enumerate() {

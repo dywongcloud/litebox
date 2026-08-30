@@ -504,6 +504,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         host_service::listen_in_guest(&self.0, addr, backlog)
     }
 
+    /// Create a host-owned UDP socket bound inside the guest's network stack (typically on the
+    /// guest's loopback) -- the datagram counterpart of [`Self::listen_in_guest`]. The guest
+    /// never sees an fd for it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the socket cannot be created or bound (e.g. the guest already owns the port).
+    pub fn bind_udp_in_guest(
+        &self,
+        addr: core::net::SocketAddr,
+    ) -> Result<host_service::GuestDatagramSocket<Platform>, Errno> {
+        host_service::bind_udp_in_guest(&self.0, addr)
+    }
+
     /// Returns the platform this shim was built with.
     pub fn platform(&self) -> &'static Platform {
         self.0.platform

@@ -359,9 +359,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 "/tmp",
                 litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
             )
-            .unwrap_or_else(|e| panic!("/tmp creation cannot fail on a fresh in-memory file system: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("/tmp creation cannot fail on a fresh in-memory file system: {e}")
+            });
             fs.chown("/tmp", Some(1000), Some(1000))
-                .unwrap_or_else(|e| panic!("/tmp chown cannot fail on a fresh in-memory file system: {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("/tmp chown cannot fail on a fresh in-memory file system: {e}")
+                });
 
             // Standard FHS directories that guest tools expect to already exist (e.g. `apk`
             // opens a log file under `/var/log`) but that don't survive as empty-directory
@@ -491,6 +495,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             addr:? = net_proxy::PROXY_ADDR, resolvers:? = resolvers;
             "guest http proxy listening"
         );
+        let dns_socket = shim
+            .bind_udp_in_guest(std::net::SocketAddr::from(net_proxy::DNS_ADDR))
+            .map_err(|e| anyhow!("failed to start the in-guest DNS responder: {e:?}"))?;
+        litebox_util_log::info!(
+            addr:? = net_proxy::DNS_ADDR;
+            "guest dns responder listening"
+        );
+        let dns_resolvers = resolvers.clone();
+        std::thread::spawn(move || net_proxy::serve_dns(&dns_socket, dns_resolvers));
         std::thread::spawn(move || net_proxy::serve(&listener, resolvers));
     }
 
@@ -506,8 +519,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .environment_variables
         .iter()
         .map(|x| {
-            std::ffi::CString::new(x.bytes().collect::<Vec<u8>>())
-                .map_err(|e| anyhow!("environment variable {x:?} contains an embedded NUL byte: {e}"))
+            std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).map_err(|e| {
+                anyhow!("environment variable {x:?} contains an embedded NUL byte: {e}")
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     let envp = if cli_args.forward_environment_variables {
@@ -515,7 +529,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .map(|(k, v)| {
                 std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
                     .map_err(|e| {
-                        anyhow!("host environment variable {k:?} contains an embedded NUL byte: {e}")
+                        anyhow!(
+                            "host environment variable {k:?} contains an embedded NUL byte: {e}"
+                        )
                     })
             })
             .collect::<Result<Vec<_>>>()?;

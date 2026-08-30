@@ -100,6 +100,15 @@ DEFAULT_PACKAGES=(
     fontconfig cairo harfbuzz pango libdrm libglycin gdk-pixbuf librsvg glycin
     # direct framebuffer desktop and standard UI paths
     gtk+3.0 libwnck3 xorg-server xfwm4 xfce4-settings vte3 thunar
+    # taskbar/panel and desktop-icon components -- previously missing from
+    # this closure, which left them on stock (non-x18-fixed) code and
+    # exposed to the corruption docs/roadmap.md documents as "GTK components
+    # ... running but never painting, and an X client wedged awaiting a
+    # reply the server never sent". Confirmed live: the guest wedges
+    # (framebuffer and clock both frozen, runner process alive and pegged
+    # near 100% CPU) after sustained interaction with xfce4-panel's
+    # Applications menu.
+    xfce4-panel xfdesktop
     # Xt smoke clients
     libxt libxaw libxfont2 libxft libxmu libxpm xterm
 )
@@ -383,19 +392,40 @@ if [ "$container_version" != "$BUILD_STATE" ]; then
             "edition = \"2024\"" \
             > "$rust_build/Cargo.toml"
         printf "%s\n" "fn main() {}" > "$rust_build/src/main.rs"
+        # profiler_builtins/build.rs otherwise compiles real LLVM compiler-rt C
+        # sources (GCDAProfiling.c, InstrProfiling*.c, ...) it expects at
+        # ../../src/llvm-project/compiler-rt/lib/profile -- a tree this
+        # from-scratch bootstrap never checks out. Its own escape hatch
+        # (LLVM_PROFILER_RT_LIB, read at the very top of build.rs) skips that
+        # native compile entirely and links whatever static archive it is
+        # pointed at instead. Chromiums release build graph never actually
+        # calls the __llvm_profile_* symbols that archive would normally
+        # provide (no PGO/coverage GN args are set anywhere in this closure),
+        # so an empty archive is enough to satisfy both this crates own build
+        # and every later linker invocation that pulls it in transitively.
+        empty_profiler_rt="$rust_build/libempty-profiler-rt.a"
+        /usr/bin/ar rcs "$empty_profiler_rt"
         (
             cd "$rust_build"
             /usr/bin/cargo generate-lockfile --offline
             RUSTC_BOOTSTRAP=1 \
             RUSTFLAGS="-Zfixed-x18 -Cembed-bitcode=yes" \
-                /usr/bin/cargo -Zbuild-std=std,panic_abort,test \
+            LLVM_PROFILER_RT_LIB="$empty_profiler_rt" \
+                /usr/bin/cargo -Zbuild-std=std,panic_abort,test,profiler_builtins \
                 build --locked --release --target "$rust_target"
         )
         fixed_rust="$rust_build/target/$rust_target/release/deps"
+        # profiler_builtins: Chromiums own Rust build (build/rust/std/BUILD.gn,
+        # invoked via find_std_rlibs.py) always copies libprofiler_builtins.rlib
+        # out of the sysroot unconditionally -- not gated behind a coverage or
+        # profiling GN arg -- so its absence here is a hard ninja failure
+        # ("cp: cant stat obj/build/rust/std/libprofiler_builtins.rlib") the
+        # first time any Rust target in the Chromium build graph links,
+        # confirmed live against chromium 151.0.7922.173.
         expected_rust_crates="
             addr2line adler2 alloc cfg_if compiler_builtins core getopts gimli
             hashbrown libc memchr miniz_oxide object panic_abort panic_unwind
-            proc_macro rustc_demangle rustc_literal_escaper
+            proc_macro profiler_builtins rustc_demangle rustc_literal_escaper
             rustc_std_workspace_alloc rustc_std_workspace_core
             rustc_std_workspace_std std std_detect test unwind
         "
@@ -453,19 +483,40 @@ if [ "$container_version" != "$BUILD_STATE" ]; then
             -Zforce-unstable-if-unmarked \
             --extern core="$rust_core" \
             -L dependency="$rust_sysroot" \
-            -o "$rust_build/libpanic_abort-litebox.rlib"
+            -o "$rust_build/libpanic_abort-deadbeef.rlib"
+        # Real rustc-built rlibs carry a hex metadata hash after the crate
+        # name (e.g. libcore-2ce4ae595641ff84.rlib); some downstream build
+        # systems -- Chromiums build/rust/std/find_std_rlibs.py among them --
+        # parse the sysroot directory with a regex that requires it
+        # (lib([0-9a-z_]+)-([0-9a-f]+).rlib -- [0-9a-f] only) and crash
+        # (AttributeError: NoneType object has no attribute group) on any
+        # filename that does not match. The previous literal "-litebox" --
+        # l, i, x are not hex digits -- failed that pattern; "deadbeef" is
+        # entirely within [0-9a-f] and matches, while still being an obvious
+        # placeholder rather than a real content hash.
         rm -f "$rust_sysroot"/libpanic_abort-*.rlib
-        cp "$rust_build/libpanic_abort-litebox.rlib" "$rust_sysroot"/
+        cp "$rust_build/libpanic_abort-deadbeef.rlib" "$rust_sysroot"/
 
-        # Cargo honors RUSTC and Meson discovers the PATH leaf. The wrapper also
-        # covers direct rustc invocations and enables only the required unstable
-        # compiler policy on Alpine stable Rust.
+        # Cargo honors RUSTC and Meson discovers the PATH leaf, but some build
+        # systems (Chromiums own build/rust/gni_impl, confirmed live) resolve
+        # `rustc` to an absolute /usr/bin/rustc path baked into their own
+        # generated ninja commands, bypassing $PATH, $RUSTC, and
+        # /usr/local/bin/rustc entirely -- their crates then compile without
+        # -Zfixed-x18 while linking against this containers x18-fixed
+        # std/alloc/core, which rustcs own ABI-mismatch detection correctly
+        # refuses ("mixing -Zfixed-x18 will cause an ABI mismatch"). Moving
+        # the real binary aside and replacing /usr/bin/rustc itself with the
+        # wrapper closes that gap: every caller that hardcodes the absolute
+        # path still reaches a binary, and that binary always adds the flag.
+        real_rustc=/usr/bin/rustc.real
+        [ -e "$real_rustc" ] || mv /usr/bin/rustc "$real_rustc"
         printf "%s\n" \
             "#!/bin/sh" \
             "export RUSTC_BOOTSTRAP=1" \
-            "exec /usr/bin/rustc -Zfixed-x18 \"\$@\"" \
-            > /usr/local/bin/rustc
-        chmod 0755 /usr/local/bin/rustc
+            "exec $real_rustc -Zfixed-x18 \"\$@\"" \
+            > /usr/bin/rustc
+        chmod 0755 /usr/bin/rustc
+        cp /usr/bin/rustc /usr/local/bin/rustc
         printf "export RUSTC=\"/usr/local/bin/rustc\"\n" >> /etc/abuild.conf
         printf "export RUSTC_BOOTSTRAP=1\n" >> /etc/abuild.conf
         [ "$(command -v rustc)" = /usr/local/bin/rustc ]
@@ -493,6 +544,12 @@ if [ "$container_version" != "$BUILD_STATE" ]; then
         grep -q fixed-x18 /usr/local/bin/rustc || exit 1
         grep -q DISTFILES_MIRROR /etc/abuild.conf || exit 1
         git config --global --add safe.directory /root/aports
+        # Some networks front gitlab.alpinelinux.org with a proxy that returns a
+        # bare 403 to every request (observed live, not a transient outage --
+        # the mirror below answers normally from the same host). Rewrite to
+        # the GitHub read-only mirror rather than retrying the same blocked host.
+        git config --global url."https://github.com/alpinelinux/aports.git".insteadOf \
+            https://gitlab.alpinelinux.org/alpine/aports.git
         for attempt in 1 2 3; do
             rm -rf /root/aports
             git init -q /root/aports

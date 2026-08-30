@@ -197,3 +197,120 @@ pub(crate) fn listen_in_guest<Platform: ShimPlatform, FS: ShimFS>(
         }),
     })
 }
+
+/// Erases the `FS` generic the same way [`ListenerOps`] does, so [`GuestDatagramSocket`] is
+/// generic over `Platform` only.
+trait DatagramOps<Platform: ShimPlatform>: Send + Sync {
+    fn try_recv_from(&self, buf: &mut [u8]) -> DatagramRead;
+    fn try_send_to(&self, buf: &[u8], to: core::net::SocketAddr) -> bool;
+}
+
+struct DatagramImpl<Platform: ShimPlatform, FS: ShimFS> {
+    global: Arc<GlobalState<Platform, FS>>,
+    sockfd: Option<SocketFd<Platform>>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> DatagramOps<Platform> for DatagramImpl<Platform, FS> {
+    fn try_recv_from(&self, buf: &mut [u8]) -> DatagramRead {
+        let Some(sockfd) = self.sockfd.as_ref() else {
+            return DatagramRead::Empty;
+        };
+        let mut source_addr = None;
+        match self.global.net.lock().receive(
+            sockfd,
+            buf,
+            litebox::net::ReceiveFlags::empty(),
+            Some(&mut source_addr),
+        ) {
+            Ok(len) => match source_addr {
+                Some(from) => DatagramRead::Data { len, from },
+                // A source-less success never happens for UDP in practice, but there is no
+                // address to reply to, so treat it the same as nothing arrived.
+                None => DatagramRead::Empty,
+            },
+            Err(_) => DatagramRead::Empty,
+        }
+    }
+
+    fn try_send_to(&self, buf: &[u8], to: core::net::SocketAddr) -> bool {
+        let Some(sockfd) = self.sockfd.as_ref() else {
+            return false;
+        };
+        self.global
+            .net
+            .lock()
+            .send(sockfd, buf, litebox::net::SendFlags::empty(), Some(to))
+            .is_ok()
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for DatagramImpl<Platform, FS> {
+    fn drop(&mut self) {
+        if let Some(sockfd) = self.sockfd.take() {
+            let _ = self
+                .global
+                .net
+                .lock()
+                .close(&sockfd, litebox::net::CloseBehavior::Immediate);
+        }
+    }
+}
+
+/// A host-owned UDP socket bound inside the guest network stack -- the datagram counterpart of
+/// [`GuestListener`]/[`GuestStream`]. Unlike the TCP path this needs no descriptor-table proxy:
+/// [`litebox::net::Network::send`]/[`receive`](litebox::net::Network::receive) already carry a
+/// per-call destination/source [`core::net::SocketAddr`], which is all a request/response
+/// protocol like DNS needs.
+pub struct GuestDatagramSocket<Platform: ShimPlatform> {
+    ops: Box<dyn DatagramOps<Platform>>,
+}
+
+/// What [`GuestDatagramSocket::try_recv_from`] observed.
+pub enum DatagramRead {
+    /// A datagram of `n` bytes arrived from `from`.
+    Data {
+        len: usize,
+        from: core::net::SocketAddr,
+    },
+    /// Nothing available right now; poll again after the next stack tick.
+    Empty,
+}
+
+impl<Platform: ShimPlatform> GuestDatagramSocket<Platform> {
+    /// Non-blocking receive of one datagram, with its source address.
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> DatagramRead {
+        self.ops.try_recv_from(buf)
+    }
+
+    /// Non-blocking send of one datagram to `to`. `true` if it was queued.
+    pub fn try_send_to(&self, buf: &[u8], to: core::net::SocketAddr) -> bool {
+        self.ops.try_send_to(buf, to)
+    }
+}
+
+/// Create a host-owned UDP socket bound to `addr` inside the guest network stack.
+///
+/// # Errors
+///
+/// Fails if the socket cannot be created or bound (e.g. the guest already owns the port).
+pub(crate) fn bind_udp_in_guest<Platform: ShimPlatform, FS: ShimFS>(
+    global: &Arc<GlobalState<Platform, FS>>,
+    addr: core::net::SocketAddr,
+) -> Result<GuestDatagramSocket<Platform>, Errno> {
+    let sockfd = global
+        .net
+        .lock()
+        .socket(litebox::net::Protocol::Udp)
+        .map_err(Errno::from)?;
+    global
+        .net
+        .lock()
+        .bind(&sockfd, &addr)
+        .map_err(Errno::from)?;
+    Ok(GuestDatagramSocket {
+        ops: Box::new(DatagramImpl {
+            global: global.clone(),
+            sockfd: Some(sockfd),
+        }),
+    })
+}
