@@ -178,12 +178,14 @@ require_alive Xorg "$xorg_pid" "$XORG_LOG"
 THUNAR_LOG="$LOG_DIR/thunar.log"
 thunar "$HOME" >"$THUNAR_LOG" 2>&1 &
 thunar_pid=$!
+sleep 2
+require_alive Thunar "$thunar_pid" "$THUNAR_LOG"
+
 XTERM_LOG="$LOG_DIR/xterm.log"
 xterm -geometry 80x24+360+320 -title "LiteBox Terminal" -e /bin/sh \
     >"$XTERM_LOG" 2>&1 &
 xterm_pid=$!
 sleep 2
-require_alive Thunar "$thunar_pid" "$THUNAR_LOG"
 require_alive xterm "$xterm_pid" "$XTERM_LOG"
 
 print_log xorg.err "$XORG_ERR"
