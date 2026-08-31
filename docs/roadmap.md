@@ -975,6 +975,37 @@ fault (this pass did not have one available) or a targeted sentinel-register
 experiment analogous to `guest::tests::xnu_zeroes_guest_x18_on_every_return_to_el0`,
 extended to `x16`.
 
+**Update, a later pass: the targeted sentinel-register experiment now exists
+(`guest::tests::sigalrm_delivery_x16_probe`) and directly refutes the
+"same mechanism as `x18`" half of this hypothesis.** It holds a sentinel
+live in `X16` on a spinning thread (immediates only, no memory operand
+ever touches `X16` again) with no `SVC` in flight, interrupts it with a
+real cross-thread `SIGALRM` -- the exact signal `install_async_signal_handlers`
+uses for guest preemption -- and inspects the delivered `mcontext`'s
+`X16` directly, entirely outside any litebox rewriter/gate machinery.
+Run 5/5 clean plus every ordinary `cargo test` invocation since: `X16`
+always survives real signal delivery intact. So XNU's `X18`-zeroing does
+**not** generalize to `X16` the way this hypothesis proposed -- unlike
+`X18`, `X16` is not a register the Darwin ABI reserves and zeroes on
+every EL0 return. A parallel review of both places litebox's own code
+touches `X16` (the SVC-gate codegen in
+`litebox_syscall_rewriter::arm64`'s `hook_svc`, and `guest.rs`'s
+`syscall_entry_stubs`/`prepare_interrupt_delivery`) found both correctly
+save the guest's real `X16` before clobbering it and restore it into the
+captured `PtRegs` -- no obvious clobber bug either. `concurrent_guest_
+threads_each_keep_their_own_context` (8 concurrent guest threads) also
+ran clean 20/20 under repeated stress. The freeze this was chasing (see
+XFCE desktop notes) still reproduces only under the *real* GTK/X11 stack's
+full thread count (~90) and genuine event-loop scheduling pressure --
+none of litebox's own controlled tests, even under concurrency, reproduce
+it, so the remaining leads are either a genuinely load-dependent race this
+pass's tests are still too small to trigger, or a mechanism outside `X16`
+correctness entirely (e.g. a different register, a memory-ordering bug, or
+something specific to the GTK/X11 code paths themselves). Confirming
+further still needs the kernel-level trace across an actual in-the-wild
+fault, ideally captured directly from a frozen XFCE guest rather than a
+synthetic repro.
+
 Reproduced fresh this pass, 8/8 runs, with the exact repro command:
 `LITEBOX_LOG=litebox_shim_linux=trace,litebox_platform_macos_userland=trace
 litebox_runner_linux_on_macos_userland --initial-files <node:alpine tar with

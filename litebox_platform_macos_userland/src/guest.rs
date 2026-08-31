@@ -2669,6 +2669,119 @@ pub(crate) mod tests {
         );
     }
 
+    /// DIAGNOSTIC (not a permanent regression pin): tests `docs/roadmap.md`'s
+    /// "A further, distinct crash" leading hypothesis -- that `X16` (the
+    /// AArch64 ELF ABI's canonical PLT/lazy-binding scratch register) is
+    /// corrupted the same way XNU's own ABI reserves and zeroes `x18`, but
+    /// for a *real async signal* landing mid-execution rather than an `SVC`.
+    /// Unlike the `x18`/`x17` probes above (both raw `SVC`s, which XNU's own
+    /// ABI has a documented opinion about for `x16`/`x18` specifically as the
+    /// syscall-number and platform registers), this probe holds a sentinel
+    /// live in `x16` on a spinning thread with no `SVC` in flight at all, and
+    /// interrupts it with a real cross-thread `SIGALRM` -- the exact
+    /// mechanism `install_async_signal_handlers` installs for real guest
+    /// preemption -- to see whether the delivered `mcontext.thread_state.x[16]`
+    /// still holds the sentinel or reads corrupted, isolating XNU's own
+    /// signal-delivery behavior from any litebox rewriter/gate machinery
+    /// (neither the syscall rewriter nor `enter_guest_asm`'s own `X16` usage
+    /// is anywhere in this test's call path).
+    #[test]
+    fn sigalrm_delivery_x16_probe() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        static CAPTURED_X16: AtomicU64 = AtomicU64::new(0);
+        static CAPTURED: AtomicBool = AtomicBool::new(false);
+        static SPIN: AtomicBool = AtomicBool::new(true);
+        const SENTINEL: u64 = 0xABCD_1234_5678_EF16;
+
+        extern "C" fn handler(
+            _signum: libc::c_int,
+            _info: *mut libc::siginfo_t,
+            ucontext: *mut libc::c_void,
+        ) {
+            // SAFETY: the kernel hands a real `ucontext_t` to an
+            // `SA_SIGINFO` handler; `uc_mcontext` points at a
+            // `_STRUCT_MCONTEXT64` on this architecture, exactly as
+            // `interrupt_signal_handler`/`fault_handler` assume.
+            unsafe {
+                let uc = ucontext.cast::<libc::ucontext_t>();
+                if uc.is_null() {
+                    return;
+                }
+                let mc = (*uc).uc_mcontext.cast::<crate::darwin::McontextPrefix64>();
+                if mc.is_null() {
+                    return;
+                }
+                let x16 = (*mc).thread_state.x[16];
+                CAPTURED_X16.store(x16, Ordering::SeqCst);
+                CAPTURED.store(true, Ordering::SeqCst);
+                SPIN.store(false, Ordering::SeqCst);
+            }
+        }
+
+        // Reset shared statics: this test may run alongside others in the
+        // same process, but SIGALRM/this test's own statics are not touched
+        // by anything else, so no serialization beyond the usual TEST_SERIAL
+        // discipline (installing a process-wide signal handler) is needed
+        // for correctness, only politeness -- take it anyway.
+        let _guard = TEST_SERIAL.lock().unwrap();
+        CAPTURED.store(false, Ordering::SeqCst);
+        SPIN.store(true, Ordering::SeqCst);
+
+        crate::darwin::install_handler(libc::SIGALRM, handler as *const () as usize, true, &[]);
+
+        let tid = unsafe { libc::pthread_self() };
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: `tid` is a live pthread_t for the still-running spinner
+            // below; pthread_kill with a signal this process has a handler
+            // for is always safe to call.
+            unsafe { libc::pthread_kill(tid, libc::SIGALRM) };
+        });
+
+        // Single asm block: load SENTINEL into x16 via immediates only (no
+        // memory operand touches x16), then spin purely in asm on the flag's
+        // address (staged in a different register) so x16 is never written
+        // again by this thread's own code until read back at the very end --
+        // the compiler cannot reallocate x16 mid-block since the whole
+        // sequence is one inline-asm block, not separate Rust statements.
+        let self_seen: u64;
+        unsafe {
+            core::arch::asm!(
+                "movz x16, #0xef16",
+                "movk x16, #0x5678, lsl #16",
+                "movk x16, #0x1234, lsl #32",
+                "movk x16, #0xabcd, lsl #48",
+                "2:",
+                "ldrb w9, [{flag}]",
+                "cbnz w9, 2b",
+                "mov {out}, x16",
+                flag = in(reg) &raw const SPIN,
+                out = out(reg) self_seen,
+                out("x9") _,
+                out("x16") _,
+                options(nostack),
+            );
+        }
+
+        sender.join().unwrap();
+        crate::darwin::reraise_fatally(libc::SIGALRM);
+
+        assert!(
+            CAPTURED.load(Ordering::SeqCst),
+            "SIGALRM handler never ran (test infrastructure issue, not a \
+             finding about x16)"
+        );
+        let got = CAPTURED_X16.load(Ordering::SeqCst);
+        assert_eq!(
+            got, SENTINEL,
+            "x16 corrupted by real SIGALRM delivery: mcontext held {got:#x}, \
+             expected sentinel {SENTINEL:#x} (self-observed post-spin value \
+             was {self_seen:#x}) -- this would confirm docs/roadmap.md's \
+             leading hypothesis for the further, distinct crash"
+        );
+    }
+
     /// A shim that captures [`guest_fp_state`] the instant a fault is
     /// delivered -- the same accessor `lib.rs`'s `ThreadProvider::get_fp_state`
     /// exposes to the shim, so this is exactly what a real signal-frame build
