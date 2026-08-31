@@ -199,6 +199,30 @@ print_log thunar.log "$THUNAR_LOG"
 print_log xterm.log "$XTERM_LOG"
 printf '%s\n' "DESKTOP UP"
 
+# Diagnostic-only heartbeat (never calls fail -- purely observational): a
+# host-visible timestamped record of whether Xorg's own core protocol round
+# trip (the same xset q the health-check loop below already gates on) keeps
+# succeeding through a freeze. CONFIRMED LIVE (2026-08-30/31): during an
+# actual panel-click freeze (clock static, Applications menu and taskbar
+# buttons both dead), this heartbeat kept logging "xset q: OK" every 5s for
+# 3.5+ minutes straight, and a titlebar drag (an xfwm4-owned operation) still
+# worked during the same freeze -- Xorg and xfwm4 are NOT the wedged party.
+# Only xfce4-panel-owned widgets (Applications menu, Show Desktop, taskbar
+# icons) stopped responding. Kept as a standing diagnostic so any future
+# freeze investigation gets this confirmation for free from the ordinary
+# runner log, instead of needing a bespoke instrumented rebuild each time.
+(
+    while :; do
+        sleep 5
+        if xset q >/dev/null 2>&1; then
+            printf '%s heartbeat: xset q OK\n' "$(date -u +%H:%M:%S)"
+        else
+            printf '%s heartbeat: xset q FAILED\n' "$(date -u +%H:%M:%S)"
+        fi
+    done
+) &
+heartbeat_pid=$!
+
 while :; do
     sleep 5
     require_alive Xorg "$xorg_pid" "$XORG_LOG"
