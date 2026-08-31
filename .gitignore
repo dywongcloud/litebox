@@ -210,3 +210,6 @@ dev_bench/unixbench/*.zip
 
 # Claude Code local worktrees (Workflow tool isolation:'worktree' agents)
 /.claude/
+
+# XFCE demo watchdog's runtime logs (watch-desktop.sh)
+litebox_packager/examples/xfce/watchdog-logs/
