@@ -28,7 +28,6 @@ use litebox::{
     pipes::Pipes,
     platform::TimeProvider,
     shim::ContinueOperation,
-    sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox_common_linux::{
@@ -341,7 +340,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let global = Arc::new(GlobalState {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
-            futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
@@ -351,12 +349,11 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             input_registry: self.input_registry.take(),
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
-            elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            pty_registry: Arc::new(syscalls::file::PtyRegistry::new()),
             guest_images: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
-            // Overwritten with the initial task's pid in `load_program`; `0` is not a valid pid
-            // so it's an obviously-uninitialized placeholder if ever observed.
-            pgid: 0.into(),
+            shared_file_backings: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             termios: litebox::sync::Mutex::new(litebox_common_linux::Termios::default_cooked()),
+            stdio_foreground_pgid: core::sync::atomic::AtomicI32::new(0),
             processes: syscalls::process::ProcessTable::new(),
             brk_lock: litebox::sync::Mutex::new(()),
         });
@@ -418,31 +415,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         self.0
             .next_thread_id
             .fetch_max(pid.saturating_add(1), core::sync::atomic::Ordering::Relaxed);
-
-        // A freshly started process becomes its own process-group (and session) leader, absent
-        // some other mechanism (e.g. a shell explicitly calling `setpgid`) putting it into an
-        // existing group -- matching real Linux's default for the first process in a new job.
         self.0
-            .pgid
-            .store(pid, core::sync::atomic::Ordering::Relaxed);
+            .stdio_foreground_pgid
+            .store(pid, core::sync::atomic::Ordering::Release);
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                thread: syscalls::process::ThreadState::new_process(pid, pid),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
                 ppid,
                 tid: pid,
                 credentials: RefCell::new(
-                    syscalls::process::Credentials {
-                        uid,
-                        euid,
-                        gid,
-                        egid,
-                    }
-                    .into(),
+                    syscalls::process::Credentials::new(uid, euid, gid, egid).into(),
                 ),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
@@ -516,6 +503,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         host_service::listen_in_guest(&self.0, addr, backlog)
     }
 
+    /// Create a host-owned UDP socket bound inside the guest's network stack (typically on the
+    /// guest's loopback) -- the datagram counterpart of [`Self::listen_in_guest`]. The guest
+    /// never sees an fd for it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the socket cannot be created or bound (e.g. the guest already owns the port).
+    pub fn bind_udp_in_guest(
+        &self,
+        addr: core::net::SocketAddr,
+    ) -> Result<host_service::GuestDatagramSocket<Platform>, Errno> {
+        host_service::bind_udp_in_guest(&self.0, addr)
+    }
+
     /// Returns the platform this shim was built with.
     pub fn platform(&self) -> &'static Platform {
         self.0.platform
@@ -565,7 +566,8 @@ fn default_fs<Platform: ShimPlatform>(
     let mut framebuffer = None;
     let input_registry = litebox::fs::devices::InputRegistry::new();
     let input_registry_for_mount = input_registry.clone();
-    let dev_stdio = litebox::fs::resolver::Resolver::new(
+    let current_user = in_mem_fs.current_user();
+    let dev_stdio = litebox::fs::resolver::Resolver::new_with_user(
         litebox,
         litebox::fs::composer::Composer::builder()
             .mount("/dev", |allocator| {
@@ -583,6 +585,7 @@ fn default_fs<Platform: ShimPlatform>(
             })
             .build()
             .unwrap(),
+        current_user,
     );
     let proc_handle = proc_handle.expect("mounted immediately above");
     // `Composer::builder().mount("/dev", ..)`'s closure runs synchronously inside `.build()`
@@ -590,7 +593,7 @@ fn default_fs<Platform: ShimPlatform>(
     // unmounted `Framebuffer` rather than panicking keeps this path total even if that
     // invariant is ever violated by a future refactor.
     let framebuffer = framebuffer.unwrap_or_else(litebox::fs::devices::Framebuffer::new);
-    let tar_ro = litebox::fs::resolver::Resolver::new(
+    let tar_ro = litebox::fs::resolver::Resolver::new_with_user(
         litebox,
         litebox::fs::composer::Composer::builder()
             .mount("/", |allocator| {
@@ -598,17 +601,20 @@ fn default_fs<Platform: ShimPlatform>(
             })
             .build()
             .unwrap(),
+        current_user,
     );
-    let fs = litebox::fs::layered::FileSystem::new(
+    let fs = litebox::fs::layered::FileSystem::new_with_user(
         litebox,
         in_mem_fs,
-        litebox::fs::layered::FileSystem::new(
+        litebox::fs::layered::FileSystem::new_with_user(
             litebox,
             dev_stdio,
             tar_ro,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+            current_user,
         ),
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+        current_user,
     );
     (fs, proc_handle, framebuffer, input_registry)
 }
@@ -688,6 +694,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<Platform, FS>>) -> R,
         unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform, FS>>) -> R,
+        netlink: impl FnOnce(&TypedFd<syscalls::netlink::NetlinkSubsystem<Platform>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -713,6 +720,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(unix(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(netlink(&fd));
         }
         Err(Errno::EBADF)
     }
@@ -970,6 +981,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -1278,6 +1290,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     syscall!(sys_openat(dirfd, path, flags, mode))
                 }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
+            SyscallRequest::MemfdCreate { name, flags } => name
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |name| {
+                    syscall!(sys_memfd_create(&name, flags))
+                }),
             SyscallRequest::Mknodat {
                 dirfd,
                 pathname,
@@ -1475,6 +1492,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
+            SyscallRequest::Unshare { flags } => self.sys_unshare(flags),
             SyscallRequest::SetThreadArea { user_desc } => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -1529,6 +1547,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .sys_getpgid(pid)
                 .map(|pgid| pgid.reinterpret_as_unsigned() as usize),
             SyscallRequest::Setpgid { pid, pgid } => syscall!(sys_setpgid(pid, pgid)),
+            SyscallRequest::Setsid => self
+                .sys_setsid()
+                .map(|sid| sid.reinterpret_as_unsigned() as usize),
             SyscallRequest::Wait4 {
                 pid,
                 wstatus,
@@ -1542,6 +1563,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
             SyscallRequest::Getgroups { size, list } => syscall!(sys_getgroups(size, list)),
+            SyscallRequest::Setgroups { size, list } => syscall!(sys_setgroups(size, list)),
             SyscallRequest::Setuid { uid } => syscall!(sys_setuid(uid)),
             SyscallRequest::Setgid { gid } => syscall!(sys_setgid(gid)),
             SyscallRequest::Setresuid { ruid, euid, suid } => {
@@ -1631,8 +1653,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     litebox: litebox::LiteBox<Platform>,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
-    /// The futex manager for handling futex operations.
-    futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
     /// The network subsystem.
@@ -1644,12 +1664,18 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
-    /// Per-process collection of ELF patching state for runtime syscall rewriting.
-    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Unix98 pseudoterminal namespace shared by every guest task.
+    pty_registry: Arc<syscalls::file::PtyRegistry<Platform, FS>>,
     /// Guest ELF images recorded at map time, for fault symbolization. Grows
     /// monotonically (never pruned on unmap) and survives the mapping fd's
     /// close, unlike [`Self::elf_patch_cache`]. See `Task::find_guest_image`.
     guest_images: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::mm::GuestImage>>,
+    /// Stable shared-page identities keyed by filesystem device/inode, so aliases opened through
+    /// different file descriptions still converge on one backing object.
+    shared_file_backings: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<(usize, usize), litebox::mm::linux::SharedFutexBacking>,
+    >,
     /// Handle to the `/proc` backend mounted by [`LinuxShimBuilder::default_fs`], if any --
     /// `None` when the shim was built with a filesystem that doesn't mount one.
     /// `Task::set_task_comm` publishes the guest task's identity here as it becomes known.
@@ -1667,23 +1693,12 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// filesystem that doesn't mount one. `sys_read`/`sys_ioctl`/poll intercept evdev fds
     /// through this, and the runner injects input events into it.
     input_registry: Option<litebox::fs::devices::InputRegistry<Platform>>,
-    /// The process group ID both of the controlling terminal's foreground group (as set by
-    /// `TIOCSPGRP` / read by `TIOCGPGRP`) and of every guest process (as set by `setpgid` / read
-    /// by `getpgid` -- see `syscalls::process::Task::sys_setpgid`/`sys_getpgid`). All four
-    /// syscalls share this one field.
-    ///
-    /// This is a single shim-wide value rather than a per-process-group one: `fork` (see
-    /// `syscalls::process::Task::do_fork`) does now produce tasks with distinct pids, but they
-    /// all inherit the one process group, so `setpgid` can only ever move a task into *the*
-    /// group, never a second, distinct one -- matching `WaitFilter::Any`'s existing "this shim
-    /// has a single process group" simplification for `wait4`. [`LinuxShim::load_program`]
-    /// initializes this to the initial task's `pid`, matching real Linux's convention that a
-    /// freshly started process (as opposed to one that inherited an existing group via `fork`)
-    /// becomes its own process-group leader.
-    pgid: core::sync::atomic::AtomicI32,
     /// Real termios state for the process's controlling terminal (shared by stdin/stdout/stderr,
     /// like a real Linux `tty_struct`), as read by `TCGETS` and written by `TCSETS`.
     termios: litebox::sync::Mutex<Platform, litebox_common_linux::Termios>,
+    /// Foreground process group of the host-backed stdin/stdout/stderr terminal. This belongs to
+    /// the terminal, not to any guest process; pseudoterminals keep the same state in `PtyState`.
+    stdio_foreground_pgid: core::sync::atomic::AtomicI32,
     /// Parent/child relationships and exit statuses for every guest process, so that `fork`ed
     /// children can be reaped by `wait4`.
     processes: syscalls::process::ProcessTable<Platform>,
@@ -1756,16 +1771,13 @@ mod test_utils {
             files.initialize_stdio_in_shared_descriptors_table(&self);
             Task {
                 wait_state: wait::WaitState::new(self.platform),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                thread: syscalls::process::ThreadState::new_process(pid, 0),
                 pid,
                 ppid: 0,
                 tid: pid,
-                credentials: RefCell::new(Arc::new(syscalls::process::Credentials {
-                    uid: 0,
-                    euid: 0,
-                    gid: 0,
-                    egid: 0,
-                })),
+                credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(
+                    0, 0, 0, 0,
+                ))),
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),

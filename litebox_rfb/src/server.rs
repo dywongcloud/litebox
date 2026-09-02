@@ -4,12 +4,14 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::proto::{self, PixelFormat};
 
-/// A boxed input-event handler, shared across every connected client's serving thread.
-type InputHandler = dyn Fn(InputEvent) + Send + Sync;
+/// A boxed input-message handler, shared across every connected client's serving thread.
+pub(crate) type InputHandler = dyn Fn(InputMessage) + Send + Sync;
+
+static NEXT_INPUT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A pointer (mouse) event received from a connected client (RFC 6143 §7.5.5).
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +38,62 @@ pub struct KeyEvent {
 pub enum InputEvent {
     Pointer(PointerEvent),
     Key(KeyEvent),
+}
+
+/// Process-unique identity of one input-capable RFB or browser connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InputClientId(u64);
+
+/// Input connection lifecycle and event stream delivered to the runner.
+#[derive(Debug, Clone, Copy)]
+pub enum InputMessage {
+    Connected(InputClientId),
+    Event {
+        client: InputClientId,
+        event: InputEvent,
+    },
+    Disconnected(InputClientId),
+}
+
+/// Emits a balanced connection lifecycle even when a read loop returns through an error path.
+pub(crate) struct InputClient<'a> {
+    id: Option<InputClientId>,
+    on_input: &'a InputHandler,
+}
+
+impl<'a> InputClient<'a> {
+    pub(crate) fn connect(on_input: &'a InputHandler) -> Self {
+        let raw = NEXT_INPUT_CLIENT_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("RFB input client ID space exhausted");
+        let client = Self {
+            id: Some(InputClientId(raw)),
+            on_input,
+        };
+        (client.on_input)(InputMessage::Connected(
+            client.id.expect("new input client must be connected"),
+        ));
+        client
+    }
+
+    pub(crate) fn send(&self, event: InputEvent) {
+        let Some(client) = self.id else {
+            return;
+        };
+        (self.on_input)(InputMessage::Event { client, event });
+    }
+
+    pub(crate) fn disconnect(&mut self) {
+        if let Some(client) = self.id.take() {
+            (self.on_input)(InputMessage::Disconnected(client));
+        }
+    }
+}
+
+impl Drop for InputClient<'_> {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
 }
 
 /// What this server needs from a caller-owned framebuffer: current dimensions and a snapshot of
@@ -102,7 +160,7 @@ impl<F: FramebufferSource> RfbServer<F> {
     /// 500ms read timeout via a raw socket option so a call to [`ShutdownHandle::signal`] is
     /// noticed within that bound rather than blocking forever on a `TcpListener` with no pending
     /// connection.
-    pub fn run(&self, on_input: impl Fn(InputEvent) + Send + Sync + 'static) -> io::Result<()> {
+    pub fn run(&self, on_input: impl Fn(InputMessage) + Send + Sync + 'static) -> io::Result<()> {
         self.listener.set_nonblocking(true)?;
         let on_input: Arc<InputHandler> = Arc::new(on_input);
         while !self.shutdown.load(Ordering::Relaxed) {
@@ -167,6 +225,7 @@ fn serve_client<F: FramebufferSource>(
     let mut write_stream = stream.try_clone()?;
     let (width, height) = framebuffer.dimensions();
     write_server_init(&mut stream, width, height)?;
+    let input_client = InputClient::connect(&**on_input);
 
     let pusher_shutdown_flag = Arc::new(AtomicBool::new(false));
     let pusher_stop = Arc::clone(&pusher_shutdown_flag);
@@ -193,7 +252,10 @@ fn serve_client<F: FramebufferSource>(
         })
     };
 
-    let result = read_client_loop(&mut stream, &**on_input, shutdown);
+    let result = read_client_loop(&mut stream, &input_client, shutdown);
+    // Release this client's held input before waiting for the framebuffer pusher. Its socket write
+    // may still be blocked or timing out after the reader observed disconnect.
+    drop(input_client);
 
     pusher_shutdown_flag.store(true, Ordering::Relaxed);
     let _ = pusher.join();
@@ -267,7 +329,7 @@ fn write_framebuffer_update(
 /// error occurs. RFC 6143 §7.5.
 fn read_client_loop(
     stream: &mut impl io::Read,
-    on_input: &InputHandler,
+    input_client: &InputClient<'_>,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let mut msg_type = [0u8; 1];
@@ -302,7 +364,7 @@ fn read_client_loop(
                 stream.read_exact(&mut down_byte)?;
                 proto::skip(stream, 2)?; // padding
                 let key = proto::read_u32(stream)?;
-                on_input(InputEvent::Key(KeyEvent {
+                input_client.send(InputEvent::Key(KeyEvent {
                     down: down_byte[0] != 0,
                     key,
                 }));
@@ -312,7 +374,7 @@ fn read_client_loop(
                 stream.read_exact(&mut mask)?;
                 let x = proto::read_u16(stream)?;
                 let y = proto::read_u16(stream)?;
-                on_input(InputEvent::Pointer(PointerEvent {
+                input_client.send(InputEvent::Pointer(PointerEvent {
                     button_mask: mask[0],
                     x,
                     y,

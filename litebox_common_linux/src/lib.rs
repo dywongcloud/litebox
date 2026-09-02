@@ -614,6 +614,10 @@ pub enum FcntlArg {
     SETLK(UserPtr<Flock>),
     /// Set a file lock and wait if blocked
     SETLKW(UserPtr<Flock>),
+    /// Add seals to a memfd
+    ADD_SEALS(u32),
+    /// Get seals from a memfd
+    GET_SEALS,
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
 }
@@ -675,6 +679,8 @@ const F_SETFL: i32 = 4;
 const F_GETLK: i32 = 5;
 const F_SETLK: i32 = 6;
 const F_SETLKW: i32 = 7;
+const F_ADD_SEALS: i32 = 1033;
+const F_GET_SEALS: i32 = 1034;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -696,6 +702,8 @@ impl FcntlArg {
             F_GETLK => Self::GETLK(UserPtrMut::from_usize(arg)),
             F_SETLK => Self::SETLK(UserPtr::from_usize(arg)),
             F_SETLKW => Self::SETLKW(UserPtr::from_usize(arg)),
+            F_ADD_SEALS => Self::ADD_SEALS(arg.trunc()),
+            F_GET_SEALS => Self::GET_SEALS,
             F_DUPFD => Self::DUPFD {
                 cloexec: false,
                 min_fd: arg.trunc(),
@@ -904,17 +912,48 @@ pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
+pub const TIOCSCTTY: u32 = 0x540E;
 pub const TIOCGPGRP: u32 = 0x540F;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
+pub const TIOCSPTLCK: u32 = 0x40045431;
 pub const FBIOGET_VSCREENINFO: u32 = 0x4600;
 pub const FBIOPUT_VSCREENINFO: u32 = 0x4601;
 pub const FBIOGET_FSCREENINFO: u32 = 0x4602;
 pub const FBIOPAN_DISPLAY: u32 = 0x4606;
 pub const FBIOBLANK: u32 = 0x4611;
+
+/// `IFNAMSIZ` (`linux/if.h`): the fixed size of `ifr_name`/`ifc_ifcu.ifcu_req[].ifr_name`.
+pub const IFNAMSIZ: usize = 16;
+
+// Legacy socket ioctls (`linux/sockios.h`), the interface-enumeration path
+// `getifaddrs(3)`/rtnetlink bypasses but tools built directly against BSD-style
+// `ifreq`/`ifconf` (busybox `ifconfig`, `route`, ...) still use.
+pub const SIOCGIFCONF: u32 = 0x8912;
+pub const SIOCGIFFLAGS: u32 = 0x8913;
+pub const SIOCGIFADDR: u32 = 0x8915;
+pub const SIOCGIFNETMASK: u32 = 0x891b;
+pub const SIOCGIFBRDADDR: u32 = 0x8919;
+pub const SIOCGIFHWADDR: u32 = 0x8927;
+pub const SIOCGIFMTU: u32 = 0x8921;
+
+bitflags::bitflags! {
+    /// `ifr_flags` bits this shim reports (`linux/if.h`).
+    #[derive(Debug, Clone, Copy)]
+    pub struct IfrFlags: u16 {
+        const IFF_UP = 0x1;
+        const IFF_BROADCAST = 0x2;
+        const IFF_LOOPBACK = 0x8;
+        const IFF_RUNNING = 0x40;
+        const IFF_MULTICAST = 0x1000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
 
 /// When a new terminal attribute value takes effect, per `tcsetattr(3)`'s
 /// `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` distinction.
@@ -937,15 +976,21 @@ pub enum IoctlArg {
     TCGETS(UserPtrMut<Termios>),
     /// Set the current serial port settings.
     TCSETS(UserPtr<Termios>, TerminalSetAction),
+    /// Set this terminal as the calling session's controlling terminal.
+    TIOCSCTTY(u32),
     /// Get the foreground process group ID of the controlling terminal.
     TIOCGPGRP(UserPtrMut<i32>),
     /// Set the foreground process group ID of the controlling terminal.
     TIOCSPGRP(UserPtr<i32>),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
+    /// Set window size.
+    TIOCSWINSZ(UserPtr<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
+    /// Lock or unlock a Unix98 pseudo-terminal slave device.
+    TIOCSPTLCK(UserPtr<i32>),
     /// Enables or disables non-blocking mode
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
@@ -1002,6 +1047,7 @@ pub enum SockType {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
+    SeqPacket = 5,
 }
 
 bitflags::bitflags! {
@@ -1045,6 +1091,8 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    RETOPTS = 7,
+    RECVTTL = 12,
 }
 
 #[repr(u32)]
@@ -1682,7 +1730,7 @@ pub struct RobustListHead {
     /// the relative position of the futex field to examine. This way
     /// we keep userspace flexible, to freely shape its data-structure,
     /// without hardcoding any particular offset into the kernel.
-    pub futex_offset: usize,
+    pub futex_offset: isize,
     /// The death of the thread may race with userspace setting
     /// up a lock's links. So to handle this race, userspace first
     /// sets this field to the address of the to-be-taken lock,
@@ -2093,6 +2141,7 @@ pub enum FutexOperation {
     Requeue = 3,
     CmpRequeue = 4,
     WaitBitset = 9,
+    WakeBitset = 10,
 }
 
 bitflags::bitflags! {
@@ -2130,6 +2179,12 @@ pub enum FutexArgs {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
         count: u32,
+    },
+    WakeBitset {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        count: u32,
+        bitmask: u32,
     },
     /// `FUTEX_REQUEUE`: wake up to `num_to_wake` waiters on `addr`, then move up to
     /// `num_to_requeue` of the *remaining* waiters on `addr` onto `addr2`'s wait queue, without
@@ -2215,9 +2270,14 @@ pub enum PrctlOption {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum PrctlArg {
+    SetPDeathSig(Option<signal::Signal>),
+    GetPDeathSig(UserPtrMut<i32>),
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
+    GetDumpable,
     CapBSetRead(usize),
+    SetNoNewPrivs,
+    GetNoNewPrivs,
 }
 
 #[repr(i32)]
@@ -2240,6 +2300,8 @@ pub struct ReceiveFlags(u32);
 
 bitflags::bitflags! {
     impl ReceiveFlags: u32 {
+        /// `MSG_CTRUNC`: ancillary data was truncated
+        const CTRUNC = 0x8;
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
         /// `MSG_DONTWAIT`: non-blocking operation
@@ -2386,6 +2448,66 @@ impl ShutdownHow {
     }
 }
 
+/// Flags accepted by `inotify_init1(2)`.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct InotifyInitFlags(u32);
+
+bitflags::bitflags! {
+    impl InotifyInitFlags: u32 {
+        const NONBLOCK = 0x0000_0800;
+        const CLOEXEC = 0x0008_0000;
+    }
+}
+
+/// Event-selection and behavior flags accepted by `inotify_add_watch(2)`.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct InotifyMask(u32);
+
+bitflags::bitflags! {
+    impl InotifyMask: u32 {
+        const ACCESS = 0x0000_0001;
+        const MODIFY = 0x0000_0002;
+        const ATTRIB = 0x0000_0004;
+        const CLOSE_WRITE = 0x0000_0008;
+        const CLOSE_NOWRITE = 0x0000_0010;
+        const OPEN = 0x0000_0020;
+        const MOVED_FROM = 0x0000_0040;
+        const MOVED_TO = 0x0000_0080;
+        const CREATE = 0x0000_0100;
+        const DELETE = 0x0000_0200;
+        const DELETE_SELF = 0x0000_0400;
+        const MOVE_SELF = 0x0000_0800;
+        const UNMOUNT = 0x0000_2000;
+        const Q_OVERFLOW = 0x0000_4000;
+        const IGNORED = 0x0000_8000;
+        const ONLYDIR = 0x0100_0000;
+        const DONT_FOLLOW = 0x0200_0000;
+        const EXCL_UNLINK = 0x0400_0000;
+        const MASK_CREATE = 0x1000_0000;
+        const MASK_ADD = 0x2000_0000;
+        const ISDIR = 0x4000_0000;
+        const ONESHOT = 0x8000_0000;
+    }
+}
+
+impl InotifyMask {
+    pub const CLOSE: Self = Self::CLOSE_WRITE.union(Self::CLOSE_NOWRITE);
+    pub const MOVE: Self = Self::MOVED_FROM.union(Self::MOVED_TO);
+    pub const ALL_EVENTS: Self = Self::from_bits_retain(0x0000_0fff);
+}
+
+/// Fixed header of one variable-length inotify queue record.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct InotifyEvent {
+    pub wd: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    pub len: u32,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -2433,6 +2555,9 @@ pub enum SyscallRequest {
     },
     Chdir {
         pathname: UserPtr<c_char>,
+    },
+    Fchdir {
+        fd: i32,
     },
     Mmap {
         addr: usize,
@@ -2727,6 +2852,10 @@ pub enum SyscallRequest {
         fd: i32,
         length: usize,
     },
+    MemfdCreate {
+        name: UserPtr<c_char>,
+        flags: u32,
+    },
     Mknodat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -2828,6 +2957,9 @@ pub enum SyscallRequest {
     Clone3 {
         args: UserPtr<CloneArgs>,
     },
+    Unshare {
+        flags: CloneFlags,
+    },
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on x86_64.
     SetThreadArea {
@@ -2902,6 +3034,8 @@ pub enum SyscallRequest {
         pid: i32,
         pgid: i32,
     },
+    /// `setsid()`: create a new session with the caller as its leader.
+    Setsid,
     /// `wait4(pid, wstatus, options, rusage)`.
     ///
     /// This is the only wait syscall aarch64 offers besides `waitid`; libc's
@@ -2921,6 +3055,10 @@ pub enum SyscallRequest {
     Getgroups {
         size: i32,
         list: UserPtrMut<u32>,
+    },
+    Setgroups {
+        size: usize,
+        list: UserPtr<u32>,
     },
     Setuid {
         uid: u32,
@@ -3163,6 +3301,7 @@ impl SyscallRequest {
             },
             Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
                 length,
@@ -3202,10 +3341,13 @@ impl SyscallRequest {
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Now),
                         TCSETSW => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Drain),
                         TCSETSF => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Flush),
+                        TIOCSCTTY => IoctlArg::TIOCSCTTY(ctx.sys_req_arg(2)),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
+                        TIOCSPTLCK => IoctlArg::TIOCSPTLCK(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
                         FBIOGET_VSCREENINFO => IoctlArg::FBIOGET_VSCREENINFO(ctx.sys_req_ptr(2)),
@@ -3377,6 +3519,7 @@ impl SyscallRequest {
             Sysno::getppid => SyscallRequest::Getppid,
             Sysno::getpgid => sys_req!(Getpgid { pid }),
             Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
+            Sysno::setsid => SyscallRequest::Setsid,
             Sysno::wait4 => sys_req!(Wait4 {
                 pid,
                 wstatus:*,
@@ -3388,6 +3531,7 @@ impl SyscallRequest {
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
             Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
+            Sysno::setgroups => sys_req!(Setgroups { size, list:* }),
             Sysno::setuid => sys_req!(Setuid { uid }),
             Sysno::setgid => sys_req!(Setgid { gid }),
             Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
@@ -3438,15 +3582,51 @@ impl SyscallRequest {
                 let op: u32 = ctx.sys_req_arg(0);
                 if let Ok(op) = PrctlOption::try_from(op) {
                     match op {
+                        PrctlOption::SetPDeathSig => {
+                            let signal: i32 = ctx.sys_req_arg(1);
+                            let signal = if signal == 0 {
+                                None
+                            } else {
+                                Some(signal::Signal::try_from(signal)?)
+                            };
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetPDeathSig(signal),
+                            }
+                        }
+                        PrctlOption::GetPDeathSig => SyscallRequest::Prctl {
+                            args: PrctlArg::GetPDeathSig(ctx.sys_req_ptr(1)),
+                        },
                         PrctlOption::SetName => SyscallRequest::Prctl {
                             args: PrctlArg::SetName(ctx.sys_req_ptr(1)),
                         },
                         PrctlOption::GetName => SyscallRequest::Prctl {
                             args: PrctlArg::GetName(ctx.sys_req_ptr(1)),
                         },
+                        PrctlOption::GetDumpable
+                            if (1..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::GetDumpable,
+                            }
+                        }
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
                         },
+                        PrctlOption::SetNoNewPrivs
+                            if ctx.sys_req_arg::<usize>(1) == 1
+                                && (2..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetNoNewPrivs,
+                            }
+                        }
+                        PrctlOption::GetNoNewPrivs
+                            if (1..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::GetNoNewPrivs,
+                            }
+                        }
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
@@ -3559,6 +3739,7 @@ impl SyscallRequest {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "aarch64")]
@@ -3603,6 +3784,9 @@ impl SyscallRequest {
                     args: ctx.sys_req_ptr(0),
                 }
             }
+            Sysno::unshare => SyscallRequest::Unshare {
+                flags: CloneFlags::from_bits_retain(ctx.sys_req_arg(0)),
+            },
             Sysno::set_robust_list => {
                 if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead>() {
                     sys_req!(SetRobustList { head })
@@ -3723,26 +3907,46 @@ impl SyscallRequest {
                 flags,
                 count: val,
             },
-            FutexOperation::Requeue => FutexArgs::Requeue {
+            FutexOperation::WakeBitset => FutexArgs::WakeBitset {
                 addr,
                 flags,
-                num_to_wake: val,
-                // ABI quirk: for `FUTEX_REQUEUE`, argument slot 3 (`WAIT`'s `timeout` pointer)
-                // is instead a plain integer, `num_to_requeue` -- not read via `time_param`/
-                // `sys_req_ptr` at all. See `man 2 futex`.
-                num_to_requeue: ctx.sys_req_arg(3),
-                addr2: ctx.sys_req_ptr(4),
+                count: val,
+                bitmask: ctx.sys_req_arg(5),
             },
-            FutexOperation::CmpRequeue => FutexArgs::CmpRequeue {
-                addr,
-                flags,
-                num_to_wake: val,
-                // Same ABI quirk as `FUTEX_REQUEUE`: argument slot 3 is the plain integer
-                // `num_to_requeue`, not a `timeout` pointer. See `man 2 futex`.
-                num_to_requeue: ctx.sys_req_arg(3),
-                addr2: ctx.sys_req_ptr(4),
-                expected_value: ctx.sys_req_arg(5),
-            },
+            FutexOperation::Requeue => {
+                let num_to_requeue: u32 = ctx.sys_req_arg(3);
+                // Linux's requeue quotas are `int`, despite occupying raw register-sized syscall
+                // slots. Negative values are rejected before comparing or mutating either queue.
+                if val > i32::MAX as u32 || num_to_requeue > i32::MAX as u32 {
+                    return Err(errno::Errno::EINVAL);
+                }
+                FutexArgs::Requeue {
+                    addr,
+                    flags,
+                    num_to_wake: val,
+                    // ABI quirk: for `FUTEX_REQUEUE`, argument slot 3 (`WAIT`'s `timeout` pointer)
+                    // is instead a plain integer, `num_to_requeue` -- not read via `time_param`/
+                    // `sys_req_ptr` at all. See `man 2 futex`.
+                    num_to_requeue,
+                    addr2: ctx.sys_req_ptr(4),
+                }
+            }
+            FutexOperation::CmpRequeue => {
+                let num_to_requeue: u32 = ctx.sys_req_arg(3);
+                if val > i32::MAX as u32 || num_to_requeue > i32::MAX as u32 {
+                    return Err(errno::Errno::EINVAL);
+                }
+                FutexArgs::CmpRequeue {
+                    addr,
+                    flags,
+                    num_to_wake: val,
+                    // Same ABI quirk as `FUTEX_REQUEUE`: argument slot 3 is the plain integer
+                    // `num_to_requeue`, not a `timeout` pointer. See `man 2 futex`.
+                    num_to_requeue,
+                    addr2: ctx.sys_req_ptr(4),
+                    expected_value: ctx.sys_req_arg(5),
+                }
+            }
         };
         Ok(SyscallRequest::Futex { args })
     }

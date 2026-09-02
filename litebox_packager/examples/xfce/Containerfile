@@ -1,35 +1,208 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Keep this release synchronized with build-xfce-image.sh's aports branch.
-FROM alpine:3.24
+ARG LITEBOX_ALPINE_BASE_IMAGE=alpine:3.24
+FROM ${LITEBOX_ALPINE_BASE_IMAGE} AS x18-verifier
 
-RUN apk add --no-cache \
-        dbus dbus-x11 font-cursor-misc font-dejavu font-misc-misc \
-        xf86-input-evdev xf86-video-fbdev xfce4 xfce4-terminal \
-        xclock xeyes xmessage xorg-server xrandr xset xterm \
-    && fc-cache -f \
-    && mkdir -p /etc/X11 /home/user \
-    && chmod 700 /home/user
+ARG LITEBOX_ALPINE_BASE_IMAGE
+ARG LITEBOX_ALPINE_BRANCH
+ARG LITEBOX_APORTS_COMMIT
+ARG LITEBOX_X18_RECIPE_SHA256
 
-# Overlay only rebuilt packages already installed at the exact same version.
-# Naming paths explicitly is required: repository add/upgrade is a no-op for
-# same-version packages, while a local path is applied as "Replacing x -> x".
+RUN apk add --no-cache openssl
 COPY x18repo /x18repo
 RUN set -eux; \
-    overlay=""; \
-    for installed in $(awk -F: '$1 == "P" { name=$2 } $1 == "V" { print name "-" $2 ".apk" }' /lib/apk/db/installed); do \
-        candidate=$(find /x18repo -type f -name "$installed" -print -quit); \
-        [ -z "$candidate" ] || overlay="$overlay $candidate"; \
+    cp /x18repo/litebox-x18.rsa.pub /etc/apk/keys/; \
+    { \
+        printf '[completion]\n'; \
+        cat /x18repo/litebox-x18-completion.env; \
+        printf '[required-origins]\n'; \
+        cat /x18repo/litebox-x18-required-origins.txt; \
+        printf '[packages]\n'; \
+        cat /x18repo/litebox-x18-packages.tsv; \
+    } > /tmp/litebox-x18-completion.bundle; \
+    cmp /tmp/litebox-x18-completion.bundle /x18repo/litebox-x18-completion.bundle; \
+    openssl dgst -sha256 \
+        -verify /etc/apk/keys/litebox-x18.rsa.pub \
+        -signature /x18repo/litebox-x18-completion.sig \
+        /x18repo/litebox-x18-completion.bundle; \
+    completion=/x18repo/litebox-x18-completion.env; \
+    expected_keys='alpine_branch aports_commit base_digest base_image build_state format origin_count recipe_sha256 '; \
+    actual_keys=$(cut -d= -f1 "$completion" | LC_ALL=C sort | tr '\n' ' '); \
+    [ "$actual_keys" = "$expected_keys" ]; \
+    completion_value() { sed -n "s/^$1=//p" "$completion"; }; \
+    [ "$(completion_value format)" = 1 ]; \
+    [ "$(completion_value base_image)" = "$LITEBOX_ALPINE_BASE_IMAGE" ]; \
+    base_digest=${LITEBOX_ALPINE_BASE_IMAGE##*@}; \
+    [ "$base_digest" != "$LITEBOX_ALPINE_BASE_IMAGE" ]; \
+    [ "$(completion_value base_digest)" = "$base_digest" ]; \
+    [ "$(completion_value alpine_branch)" = "$LITEBOX_ALPINE_BRANCH" ]; \
+    [ "$(completion_value aports_commit)" = "$LITEBOX_APORTS_COMMIT" ]; \
+    [ "$(completion_value recipe_sha256)" = "$LITEBOX_X18_RECIPE_SHA256" ]; \
+    required=/x18repo/litebox-x18-required-origins.txt; \
+    manifest=/x18repo/litebox-x18-packages.tsv; \
+    [ -s "$required" ]; \
+    [ -s "$manifest" ]; \
+    required_count=$(wc -l < "$required" | tr -d '[:space:]'); \
+    [ "$(completion_value origin_count)" = "$required_count" ]; \
+    LC_ALL=C sort -u "$required" > /tmp/required-origins; \
+    [ "$(wc -l < /tmp/required-origins | tr -d '[:space:]')" = "$required_count" ]; \
+    mv /x18repo /verified-x18repo
+
+FROM ${LITEBOX_ALPINE_BASE_IMAGE}
+
+RUN apk add --no-cache --upgrade \
+        apk-tools \
+        adwaita-xfce-icon-theme dbus dbus-x11 duktape-libs \
+        font-cursor-misc font-dejavu font-misc-misc setpriv \
+        thunar xf86-input-evdev xf86-video-fbdev \
+        xfce4-panel xfce4-settings xfce4-terminal xfdesktop xfwm4 \
+        xclock xeyes xmessage xorg-server xrandr xset xterm \
+    && fc-cache -f \
+    && mkdir -p /etc/X11
+
+COPY --from=x18-verifier /verified-x18repo /x18repo
+RUN set -eux; \
+    cp /x18repo/litebox-x18.rsa.pub /etc/apk/keys/; \
+    manifest=/x18repo/litebox-x18-packages.tsv; \
+    chromium_apks=''; \
+    for name in chromium chromium-common chromium-angle; do \
+        entry=$(awk -F'|' -v name="$name" '$1 == name { print $3 "|" $4 }' "$manifest"); \
+        [ -n "$entry" ] && [ "${entry%%|*}" = chromium ]; \
+        relative_path=${entry#*|}; \
+        case "$relative_path" in \
+            */aarch64/*.apk) ;; \
+            *) printf 'invalid Chromium APK path: %s\n' "$relative_path" >&2; exit 1 ;; \
+        esac; \
+        candidate=/x18repo/$relative_path; \
+        [ -f "$candidate" ]; \
+        chromium_apks="$chromium_apks $candidate"; \
     done; \
-    [ -n "$overlay" ]; \
+    apk add --no-cache $chromium_apks; \
+    cp /etc/apk/world /tmp/apk-world.before-x18-overlay; \
+    cp /etc/apk/world /tmp/apk-world.for-x18-overlay; \
+    removal_targets='mesa-egl mesa-gles mesa-gl mesa-gbm mesa libelf libxshmfence libxxf86vm llvm22-libs spirv-tools'; \
+    printf '%s\n' $removal_targets | LC_ALL=C sort \
+        > /tmp/removal-target-packages; \
+    [ "$(wc -l < /tmp/removal-target-packages | tr -d '[:space:]')" -eq 10 ]; \
+    printf '%s\n' mesa-gl libxxf86vm | LC_ALL=C sort \
+        > /tmp/expected-removed-packages; \
+    [ "$(wc -l < /tmp/expected-removed-packages | tr -d '[:space:]')" -eq 2 ]; \
+    for retained in $removal_targets; do \
+        if grep -Fx "$retained" /tmp/apk-world.before-x18-overlay > /dev/null; then \
+            printf 'forbidden dependency unexpectedly belongs to the final image world: %s\n' \
+                "$retained" >&2; \
+            exit 1; \
+        fi; \
+        printf '%s\n' "$retained" >> /tmp/apk-world.for-x18-overlay; \
+    done; \
+    cp /tmp/apk-world.for-x18-overlay /etc/apk/world; \
+    required=/x18repo/litebox-x18-required-origins.txt; \
+    manifest=/x18repo/litebox-x18-packages.tsv; \
+    LC_ALL=C sort -u "$required" > /tmp/required-origins; \
+    required_count=$(wc -l < /tmp/required-origins | tr -d '[:space:]'); \
+    : > /tmp/selected-origins; \
+    overlay=""; \
+    selected=0; \
+    for installed in $(awk -F: '$1 == "P" { name=$2 } $1 == "V" { print name "|" $2 }' /lib/apk/db/installed); do \
+        name=${installed%%|*}; \
+        version=${installed#*|}; \
+        entry=$(awk -F'|' -v name="$name" '$1 == name { print $2 "|" $3 "|" $4 }' "$manifest"); \
+        [ -z "$entry" ] && continue; \
+        expected_version=${entry%%|*}; \
+        origin_and_path=${entry#*|}; \
+        origin=${origin_and_path%%|*}; \
+        relative_path=${origin_and_path#*|}; \
+        [ "$version" = "$expected_version" ] || { \
+            printf 'x18 APK version mismatch for %s: image=%s repo=%s\n' \
+                "$name" "$version" "$expected_version" >&2; \
+            exit 1; \
+        }; \
+        grep -Fx "$origin" "$required" > /dev/null; \
+        case "$relative_path" in \
+            */aarch64/*.apk) ;; \
+            *) printf 'invalid x18 APK path: %s\n' "$relative_path" >&2; exit 1 ;; \
+        esac; \
+        candidate=/x18repo/$relative_path; \
+        [ -f "$candidate" ]; \
+        printf '%s\n' "$origin" >> /tmp/selected-origins; \
+        if [ "$origin" = chromium ]; then \
+            continue; \
+        fi; \
+        overlay="$overlay $candidate"; \
+        selected=$((selected + 1)); \
+    done; \
+    [ "$selected" -gt 0 ]; \
+    LC_ALL=C sort -u /tmp/selected-origins > /tmp/selected-origins.unique; \
+    cmp /tmp/required-origins /tmp/selected-origins.unique; \
+    LC_ALL=C awk -F: '$1 == "P" { print $2 }' /lib/apk/db/installed | \
+        sort > /tmp/installed.before-x18-overlay; \
     plan=$(apk add --simulate --no-network --repositories-file /dev/null \
-        --allow-untrusted $overlay 2>&1); \
+        $overlay 2>&1); \
     printf '%s\n' "$plan"; \
-    printf '%s\n' "$plan" | grep 'Replacing '; \
-    ! printf '%s\n' "$plan" | grep -E 'unavailable|(^| )(Installing|Upgrading|Downgrading|Purging) '; \
-    apk add --no-network --repositories-file /dev/null --allow-untrusted $overlay; \
+    replacement_count=$(printf '%s\n' "$plan" | grep -c 'Replacing ' || true); \
+    [ "$replacement_count" -eq "$selected" ]; \
+    if printf '%s\n' "$plan" | \
+        grep -E 'unavailable|(^| )(Installing|Upgrading|Downgrading|Purging) ' \
+            > /dev/null; then \
+        printf '%s\n' 'unexpected non-replacement action in x18 overlay plan' >&2; \
+        exit 1; \
+    fi; \
+    apk add --no-network --repositories-file /dev/null $overlay; \
+    cp /tmp/apk-world.for-x18-overlay /etc/apk/world; \
+    removal_plan=$(apk del --simulate --no-network $removal_targets 2>&1); \
+    printf '%s\n' "$removal_plan"; \
+    if printf '%s\n' "$removal_plan" | \
+        grep -E 'unavailable|(^| )(Installing|Upgrading|Downgrading|Replacing) ' \
+            > /dev/null; then \
+        printf '%s\n' 'unexpected non-purge action in Mesa removal plan' >&2; \
+        exit 1; \
+    fi; \
+    printf '%s\n' "$removal_plan" | \
+        sed -n 's/^([^)]*) Purging \([^ ]*\) .*/\1/p' | \
+        LC_ALL=C sort > /tmp/removal-plan-packages; \
+    cmp /tmp/expected-removed-packages /tmp/removal-plan-packages; \
+    apk del --no-network $removal_targets; \
+    LC_ALL=C awk -F: '$1 == "P" { print $2 }' /lib/apk/db/installed | \
+        sort > /tmp/installed.after-mesa-removal; \
+    LC_ALL=C comm -23 /tmp/installed.before-x18-overlay \
+        /tmp/installed.after-mesa-removal > /tmp/removed-packages; \
+    LC_ALL=C comm -13 /tmp/installed.before-x18-overlay \
+        /tmp/installed.after-mesa-removal > /tmp/added-packages; \
+    cmp /tmp/expected-removed-packages /tmp/removed-packages; \
+    [ ! -s /tmp/added-packages ]; \
+    cp /tmp/apk-world.before-x18-overlay /etc/apk/world; \
+    cmp /tmp/apk-world.before-x18-overlay /etc/apk/world; \
+    for installed in $(awk -F: '$1 == "P" { print $2 }' /lib/apk/db/installed); do \
+        case "$installed" in \
+            ffmpeg|gstreamer*|gst-*|libxxf86vm|mesa-gl|tumbler|webkit2gtk*) \
+                printf 'forbidden desktop package remained installed: %s\n' "$installed" >&2; \
+                exit 1 ;; \
+        esac; \
+    done; \
+    [ "$required_count" -eq 70 ]; \
+    sandbox=/usr/lib/chromium/chrome-sandbox; \
+    [ -f "$sandbox" ] && [ ! -L "$sandbox" ]; \
+    [ "$(stat -c '%u:%g' "$sandbox")" = 0:0 ]; \
+    [ "$(stat -c '%a' "$sandbox")" = 4755 ]; \
+    addgroup -S -g 1000 litebox; \
+    adduser -S -D -H -u 1000 -G litebox -s /bin/sh litebox; \
+    [ "$(id -u litebox)" = 1000 ]; \
+    [ "$(id -g litebox)" = 1000 ]; \
+    rm -f /tmp/apk-world.before-x18-overlay \
+        /tmp/apk-world.for-x18-overlay \
+        /tmp/installed.before-x18-overlay \
+        /tmp/installed.after-mesa-removal \
+        /tmp/removal-plan-packages /tmp/removal-target-packages \
+        /tmp/expected-removed-packages \
+        /tmp/removed-packages /tmp/added-packages \
+        /tmp/required-origins /tmp/selected-origins \
+        /tmp/selected-origins.unique \
+        /etc/apk/keys/litebox-x18.rsa.pub; \
     rm -rf /x18repo
 
 COPY xorg.conf /etc/X11/xorg.conf
+COPY panel.xml /etc/xdg/litebox/xfce4-panel.xml
+COPY resolv.conf /etc/resolv.conf
 COPY start-desktop.sh /usr/bin/start-desktop.sh
+RUN chmod 0755 /usr/bin/start-desktop.sh

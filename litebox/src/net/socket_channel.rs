@@ -271,6 +271,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkP
         }
     }
 
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.unregister_observer(observer),
+            NetworkProxy::Datagram(channel) => channel.unregister_observer(observer),
+            NetworkProxy::Raw => {}
+        }
+    }
+
     fn check_io_events(&self) -> Events {
         match self {
             NetworkProxy::Stream(channel) => channel.check_io_events(),
@@ -501,6 +509,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
         self.inner.pollee.register_observer(observer, mask);
+    }
+
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        self.inner.pollee.unregister_observer(observer);
     }
 
     fn check_io_events(&self) -> Events {
@@ -912,6 +924,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
         self.inner.pollee.register_observer(observer, mask);
+    }
+
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        self.inner.pollee.unregister_observer(observer);
     }
 
     fn check_io_events(&self) -> Events {

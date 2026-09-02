@@ -447,6 +447,15 @@ where
     #[must_use]
     fn write_at_offset(self, count: isize, value: T) -> Option<()>;
 
+    /// Atomically replaces a `u32` when its current value equals `current`.
+    ///
+    /// `None` reports an invalid, faulting, or misaligned pointer. The inner result is `Ok` with
+    /// the previous value when the exchange succeeds and `Err` with the observed value when the
+    /// comparison fails. The operation has sequentially consistent ordering.
+    fn compare_exchange_u32(self, current: u32, new: u32) -> Option<Result<u32, u32>>
+    where
+        Self: RawMutPointer<u32>;
+
     /// Write a slice of values at the given offset.
     ///
     /// Returns `None` if the provided pointer is invalid, or if the specified offset is known (in

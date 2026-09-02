@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::fs::UserInfo;
+use crate::fs::{AccessCredentials, DacAccessKind, UserInfo};
 use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
 
@@ -38,44 +38,69 @@ pub struct Resolver<
 > {
     litebox: LiteBox<Platform>,
     backend: Backend,
+    user_info: UserInfo,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
-    /// Construct a new resolver over a `backend`.
+    /// Construct a new resolver over a `backend` for the default 1000/1000 identity.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, backend: Backend) -> Self {
+        Self::new_with_user(
+            litebox,
+            backend,
+            UserInfo {
+                user: 1000,
+                group: 1000,
+            },
+        )
+    }
+
+    /// Construct a new resolver over a `backend` for `user_info`.
+    #[must_use]
+    pub fn new_with_user(
+        litebox: &LiteBox<Platform>,
+        backend: Backend,
+        user_info: UserInfo,
+    ) -> Self {
         Self {
             litebox: litebox.clone(),
             backend,
+            user_info,
+        }
+    }
+
+    fn context_as<'a>(&self, credentials: AccessCredentials<'a>) -> Context<'a> {
+        Context {
+            cwd: vec![],
+            credentials,
         }
     }
 }
 
 /// Per-call resolution context.  The user may hold and mutate this as they wish.
 #[derive(Clone, Debug)]
-pub struct Context {
+pub struct Context<'a> {
     /// Current working directory.
     ///
     /// An empty list is equivalent to `/`. Guaranteed to never have `.` or `..`.
     cwd: Vec<String>,
     /// Effective user for permission checks.
-    user_info: UserInfo,
+    credentials: AccessCredentials<'a>,
 }
 
-impl Context {
+impl Context<'static> {
     /// A new default context, anchored at `/` for a non-root user.
-    pub fn new() -> Context {
+    pub fn new() -> Context<'static> {
         Self {
             cwd: vec![],
-            user_info: UserInfo {
-                user: 1000,
-                group: 1000,
-            },
+            credentials: AccessCredentials::new(1000, 1000, &[]),
         }
     }
+}
 
+impl Context<'_> {
     /// Resolve `path` against the current context.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
@@ -101,38 +126,12 @@ impl Context {
         Ok(ResolvedPath { components })
     }
 
-    fn can_execute(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
-            permissions.mode.contains(Mode::XUSR)
-        } else if self.user_info.group == permissions.owner.group {
-            permissions.mode.contains(Mode::XGRP)
-        } else {
-            permissions.mode.contains(Mode::XOTH)
-        }
-    }
-
-    fn can_read(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
-            permissions.mode.contains(Mode::RUSR)
-        } else if self.user_info.group == permissions.owner.group {
-            permissions.mode.contains(Mode::RGRP)
-        } else {
-            permissions.mode.contains(Mode::ROTH)
-        }
-    }
-
-    fn can_write(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
-            permissions.mode.contains(Mode::WUSR)
-        } else if self.user_info.group == permissions.owner.group {
-            permissions.mode.contains(Mode::WGRP)
-        } else {
-            permissions.mode.contains(Mode::WOTH)
-        }
+    fn can_use_noatime(&self, permissions: &PermissionInfo) -> bool {
+        self.credentials.user() == 0 || self.credentials.owns(permissions.owner)
     }
 }
 
-impl Default for Context {
+impl Default for Context<'static> {
     fn default() -> Self {
         Self::new()
     }
@@ -160,7 +159,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 {
     fn parent_dir_and_name<'a>(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         path: &'a ResolvedPath,
     ) -> Result<Option<(WalkingDirHandle<'_>, &'a str)>, WalkError> {
         // Return the walking handle rather than an owned directory handle so backends can keep any
@@ -193,7 +192,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     fn walk_to_directory<'a>(
         &'a self,
-        context: &Context,
+        context: &Context<'_>,
         from: WalkingDirHandle<'a>,
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
@@ -217,6 +216,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             #[cfg(debug_assertions)]
             absolute_components,
             &outcome,
+            outcome.components.len(),
         )?;
 
         match outcome.stop_reason {
@@ -237,18 +237,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     fn walk_path<'a>(
         &'a self,
-        context: &Context,
+        context: &Context<'_>,
         from: WalkingDirHandle<'a>,
         components: &[&str],
+        skip_terminal_directory_permission: bool,
         #[cfg(debug_assertions)] absolute_components: &[&str],
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
         assert!(!components.is_empty());
         let outcome = self.backend.walk_directories(from, components)?;
+        let checked_components = if skip_terminal_directory_permission
+            && outcome.stop_reason == WalkStopReason::CompleteDirectory
+        {
+            outcome.components.len().saturating_sub(1)
+        } else {
+            outcome.components.len()
+        };
         Self::check_walk_permissions(
             context,
             #[cfg(debug_assertions)]
             absolute_components,
             &outcome,
+            checked_components,
         )?;
 
         let walked = outcome.components.len();
@@ -272,15 +281,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn check_walk_permissions(
-        context: &Context,
+        context: &Context<'_>,
         #[cfg(debug_assertions)] absolute_components: &[&str],
         outcome: &WalkOutcome<WalkingDirHandle<'_>>,
+        checked_components: usize,
     ) -> Result<(), PathError> {
-        for (idx, walked) in outcome.components.iter().enumerate() {
+        for (idx, walked) in outcome
+            .components
+            .iter()
+            .take(checked_components)
+            .enumerate()
+        {
+            #[cfg(not(debug_assertions))]
+            let _ = idx;
             match &walked.permissions {
                 PermissionCheck::ByBackend => {}
                 PermissionCheck::ByResolver(permissions) => {
-                    if !context.can_execute(permissions) {
+                    if !super::dac_allows_as(
+                        context.credentials,
+                        permissions.owner,
+                        permissions.mode,
+                        DacAccessKind::DirectorySearch,
+                    ) {
                         return Err(PathError::NoSearchPerms {
                             #[cfg(debug_assertions)]
                             dir: {
@@ -302,16 +324,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 }
 
-/// This exists purely as a migration feature, until we have completely separated contexts. See
-/// comment on `Resolver`.
-fn default_context_pre_context_management_changes() -> Context {
-    Context::new()
-}
-
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     super::FileSystem for Resolver<Platform, Backend>
 {
     fn open(&self, path: impl Arg, flags: OFlags, mode: Mode) -> Result<TypedFd<Self>, OpenError> {
+        self.open_as(self.user_info.into(), path, flags, mode)
+    }
+
+    fn open_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, OpenError> {
+        let flags = flags.normalized_for_open();
         const CURRENTLY_SUPPORTED_OFLAGS: OFlags = OFlags::CREAT
             .union(OFlags::RDONLY)
             .union(OFlags::WRONLY)
@@ -322,20 +349,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .union(OFlags::DIRECTORY)
             .union(OFlags::NONBLOCK)
             .union(OFlags::LARGEFILE)
+            .union(OFlags::NOATIME)
             .union(OFlags::NOFOLLOW)
             .union(OFlags::APPEND)
             .union(OFlags::PATH);
 
         if flags.intersects(CURRENTLY_SUPPORTED_OFLAGS.complement()) {
-            unimplemented!("{flags:?}")
+            return Err(OpenError::UnsupportedFlags);
         }
         let path_only = flags.contains(OFlags::PATH);
 
-        let context = default_context_pre_context_management_changes();
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
-        let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
+        let read_allowed =
+            !path_only && (access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR);
+        let write_allowed =
+            !path_only && (access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR);
         let append_mode = flags.contains(OFlags::APPEND);
         let insert = |handle, seek_behavior| {
             self.litebox.descriptor_table_mut().insert(ResolverEntry {
@@ -365,6 +395,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             &context,
             self.backend.root(),
             &components,
+            path_only,
             #[cfg(debug_assertions)]
             &components,
         );
@@ -389,9 +420,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(OpenError::AlreadyExists);
                 }
                 if !path_only
+                    && flags.contains(OFlags::NOATIME)
                     && let PermissionCheck::ByResolver(permissions) = &file.permissions
-                    && ((read_allowed && !context.can_read(permissions))
-                        || (write_allowed && !context.can_write(permissions)))
+                    && !context.can_use_noatime(permissions)
+                {
+                    return Err(OpenError::OperationNotPermitted);
+                }
+                if !path_only
+                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                    && ((read_allowed
+                        && !super::dac_allows_as(
+                            context.credentials,
+                            permissions.owner,
+                            permissions.mode,
+                            DacAccessKind::Read,
+                        ))
+                        || (write_allowed
+                            && !super::dac_allows_as(
+                                context.credentials,
+                                permissions.owner,
+                                permissions.mode,
+                                DacAccessKind::Write,
+                            )))
                 {
                     return Err(OpenError::AccessNotAllowed);
                 }
@@ -455,18 +505,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
+        if !entry.entry.read_allowed {
+            return Err(ReadError::NotForReading);
+        }
         let file = match &entry.entry.handle {
             OwnedHandle::File(file) => file,
             OwnedHandle::Dir(_) => return Err(ReadError::NotAFile),
         };
         let seek_behavior = entry.entry.seek_behavior;
-        if !entry.entry.read_allowed {
-            return Err(ReadError::NotForReading);
-        }
-        if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read from O_PATH fd")
-        }
 
         let read_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
@@ -494,18 +540,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
+        if !entry.entry.write_allowed {
+            return Err(WriteError::NotForWriting);
+        }
         let file = match &entry.entry.handle {
             OwnedHandle::File(file) => file,
             OwnedHandle::Dir(_) => return Err(WriteError::NotAFile),
         };
         let seek_behavior = entry.entry.seek_behavior;
-        if !entry.entry.write_allowed {
-            return Err(WriteError::NotForWriting);
-        }
-        if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("write to O_PATH fd")
-        }
 
         let write_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
@@ -536,14 +578,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(SeekError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
-        let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(SeekError::NotAFile),
-        };
         if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("seek on O_PATH fd")
+            return Err(SeekError::NotAFile);
         }
+        if matches!(&entry.entry.handle, OwnedHandle::Dir(_)) {
+            let base = match whence {
+                super::SeekWhence::RelativeToBeginning => 0,
+                super::SeekWhence::RelativeToCurrentOffset => entry.entry.position,
+                super::SeekWhence::RelativeToEnd => return Err(SeekError::InvalidOffset),
+            };
+            let new_position = base
+                .checked_add_signed(offset)
+                .ok_or(SeekError::InvalidOffset)?;
+            if isize::try_from(new_position).is_err() {
+                return Err(SeekError::InvalidOffset);
+            }
+            entry.entry.position = new_position;
+            return Ok(new_position);
+        }
+        let OwnedHandle::File(file) = &entry.entry.handle else {
+            unreachable!()
+        };
 
         match entry.entry.seek_behavior {
             SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
@@ -562,6 +617,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 let new_position = base
                     .checked_add_signed(offset)
                     .ok_or(SeekError::InvalidOffset)?;
+                if isize::try_from(new_position).is_err() {
+                    return Err(SeekError::InvalidOffset);
+                }
                 // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
                 // file types may not. Model that distinction instead of using one resolver rule.
                 if new_position > file_len {
@@ -585,16 +643,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(TruncateError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
+        if entry.entry.path_only {
+            return Err(TruncateError::PathOnlyFd);
+        }
         let file = match &entry.entry.handle {
             OwnedHandle::File(file) => file,
             OwnedHandle::Dir(_) => return Err(TruncateError::IsDirectory),
         };
         if !entry.entry.write_allowed {
             return Err(TruncateError::NotForWriting);
-        }
-        if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("truncate O_PATH fd")
         }
 
         self.backend.truncate(file, length)?;
@@ -605,7 +662,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let context = default_context_pre_context_management_changes();
+        self.chmod_as(self.user_info.into(), path, mode)
+    }
+
+    fn chmod_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -646,7 +712,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let context = default_context_pre_context_management_changes();
+        self.chown_as(self.user_info.into(), path, user, group)
+    }
+
+    fn chown_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -693,7 +769,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         atime: Option<Timestamp>,
         mtime: Option<Timestamp>,
     ) -> Result<(), UtimeError> {
-        let context = default_context_pre_context_management_changes();
+        self.utimensat_as(self.user_info.into(), path, atime, mtime)
+    }
+
+    fn utimensat_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -734,7 +820,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
-        let context = default_context_pre_context_management_changes();
+        self.unlink_as(self.user_info.into(), path)
+    }
+
+    fn unlink_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+    ) -> Result<(), UnlinkError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -753,7 +847,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let context = default_context_pre_context_management_changes();
+        self.mkdir_as(self.user_info.into(), path, mode)
+    }
+
+    fn mkdir_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -772,7 +875,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
-        let context = default_context_pre_context_management_changes();
+        self.rmdir_as(self.user_info.into(), path)
+    }
+
+    fn rmdir_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+    ) -> Result<(), RmdirError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
@@ -798,8 +909,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(ReadDirError::ClosedFd)?;
         let entry = entry.get_entry();
         if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read_dir on O_PATH fd")
+            return Err(ReadDirError::PathOnlyFd);
         }
         let dir = match &entry.entry.handle {
             OwnedHandle::File(_) => return Err(ReadDirError::NotADirectory),
@@ -822,18 +932,50 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(entries)
     }
 
+    fn with_dir_position<T>(
+        &self,
+        fd: &TypedFd<Self>,
+        f: impl FnOnce(&mut usize) -> T,
+    ) -> Result<T, ReadDirError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ReadDirError::ClosedFd)?;
+        let mut entry = entry.get_entry_mut();
+        if entry.entry.path_only {
+            return Err(ReadDirError::PathOnlyFd);
+        }
+        if !matches!(&entry.entry.handle, OwnedHandle::Dir(_)) {
+            return Err(ReadDirError::NotADirectory);
+        }
+        Ok(f(&mut entry.entry.position))
+    }
+
     fn file_status(&self, path: impl Arg) -> Result<super::FileStatus, FileStatusError> {
+        self.file_status_as(self.user_info.into(), path)
+    }
+
+    fn file_status_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+    ) -> Result<super::FileStatus, FileStatusError> {
         let fd = self
-            .open(path, OFlags::PATH, Mode::empty())
+            .open_as(credentials, path, OFlags::PATH, Mode::empty())
             .map_err(|error| match error {
                 OpenError::PathError(error) => error.into(),
                 OpenError::Io
                 | OpenError::AccessNotAllowed
+                | OpenError::OperationNotPermitted
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
                 | OpenError::TooManySymbolicLinks
-                | OpenError::TruncateError(_) => FileStatusError::Io,
+                | OpenError::TruncateError(_)
+                // Called above with OFlags::PATH only, always within Resolver::open's
+                // supported set.
+                | OpenError::UnsupportedFlags => FileStatusError::Io,
             })?;
         let status = self.fd_file_status(&fd);
         self.close(&fd).unwrap();
@@ -854,12 +996,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn readlink(&self, path: impl Arg) -> Result<alloc::string::String, ReadlinkError> {
+        self.readlink_as(self.user_info.into(), path)
+    }
+
+    fn readlink_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+    ) -> Result<alloc::string::String, ReadlinkError> {
         // Open the link itself (`O_PATH` never follows a symlink), then read its
-        // target from the backend. `open` does not follow symlinks here -- the
+        // target from the backend. `open_as` does not follow symlinks here -- the
         // shim's leaf-following runs above this layer -- so a symlink resolves to
         // its own handle.
         let fd = self
-            .open(path, OFlags::PATH, Mode::empty())
+            .open_as(credentials, path, OFlags::PATH, Mode::empty())
             .map_err(|error| match error {
                 OpenError::PathError(error) => error.into(),
                 _ => ReadlinkError::Io,
@@ -883,6 +1033,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         let entry = self.litebox.descriptor_table().entry_handle(fd)?;
         let entry = entry.get_entry();
+        if !entry.entry.read_allowed {
+            return None;
+        }
         match &entry.entry.handle {
             OwnedHandle::File(file) => self.backend.get_static_backing_data(file),
             OwnedHandle::Dir(_) => None,

@@ -304,6 +304,107 @@ write_fn!(
     core::convert::identity
 );
 
+/// Atomically compares and conditionally exchanges a `u32` in fallible guest memory.
+///
+/// The outer `Result` reports a memory fault. The inner result matches
+/// [`core::sync::atomic::AtomicU32::compare_exchange`]: `Ok(previous)` on exchange and
+/// `Err(actual)` on comparison failure.
+///
+/// # Safety
+/// `dest` must be aligned and valid for a `u32` atomic access, or point into non-Rust memory whose
+/// faults are handled through this module's exception table.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn compare_exchange_u32_fallible(
+    dest: *mut u32,
+    current: u32,
+    new: u32,
+) -> Result<Result<u32, u32>, Fault> {
+    let mut observed = current;
+    let mut exchanged = 0u8;
+    let mut faulted = 0u8;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "lock cmpxchg dword ptr [{dest}], {new:e}",
+            "sete {exchanged}",
+            "jmp 4f",
+            "3:",
+            "mov {faulted}, 1",
+            "4:",
+            ex_table_entry!("2b", "3b", "3b"),
+            dest = in(reg) dest,
+            new = in(reg) new,
+            inout("eax") observed,
+            exchanged = inout(reg_byte) exchanged,
+            faulted = inout(reg_byte) faulted,
+        }
+    }
+    if faulted != 0 {
+        return Err(Fault);
+    }
+    Ok(if exchanged != 0 {
+        Ok(observed)
+    } else {
+        Err(observed)
+    })
+}
+
+/// Atomically compares and conditionally exchanges a `u32` in fallible guest memory.
+///
+/// See the x86-64 implementation for the contract.
+///
+/// # Safety
+/// Same requirements as the x86-64 implementation.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn compare_exchange_u32_fallible(
+    dest: *mut u32,
+    current: u32,
+    new: u32,
+) -> Result<Result<u32, u32>, Fault> {
+    let mut observed = current;
+    let mut exchanged = 0u32;
+    let mut status = 0u32;
+    let mut faulted = 0u32;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "ldaxr {observed:w}, [{dest}]",
+            "cmp {observed:w}, {current:w}",
+            "b.ne 4f",
+            "stlxr {status:w}, {new:w}, [{dest}]",
+            "cbnz {status:w}, 2b",
+            "mov {exchanged:w}, #1",
+            "b 3f",
+            "4:",
+            "clrex",
+            "mov {exchanged:w}, wzr",
+            "3:",
+            "b 6f",
+            "5:",
+            "clrex",
+            "mov {faulted:w}, #1",
+            "6:",
+            ex_table_entry!("2b", "3b", "5b"),
+            dest = in(reg) dest,
+            current = in(reg) current,
+            new = in(reg) new,
+            observed = inout(reg) observed,
+            exchanged = inout(reg) exchanged,
+            status = inout(reg) status,
+            faulted = inout(reg) faulted,
+        }
+    }
+    let _ = status;
+    if faulted != 0 {
+        return Err(Fault);
+    }
+    Ok(if exchanged != 0 {
+        Ok(observed)
+    } else {
+        Err(observed)
+    })
+}
+
 /// Exception table entry with relative offsets
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

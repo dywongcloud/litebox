@@ -1,0 +1,1 @@
+{"dispatch_id":"1788302924053-500-4b48179a0f6118ca","error":"transition rejected: no edge from `SPECIFY` to `STATE` in the active FSM graph -- there is no legal direct path between these phases.","error_code":"failed","exitCode":1,"next_dispatch_hint":"instruction","ok":false,"request_fingerprint":"7f613cef0c9516f5","stdout":"","verb":"transition"}

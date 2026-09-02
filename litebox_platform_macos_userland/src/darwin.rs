@@ -12,7 +12,7 @@
 //! public `os_sync_wait_on_address` alternative only exists from macOS 14.4,
 //! which would leave earlier M-series machines with no implementation at all.
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 
 /// `MAP_JIT` from `<sys/mman.h>`: an anonymous mapping that may hold executable
@@ -73,6 +73,14 @@ unsafe extern "C" {
     /// it fails, so a failed allocation never permanently reserves address
     /// space.
     pub(crate) fn mach_vm_deallocate(target: MachPort, address: u64, size: u64) -> KernReturn;
+
+    fn mach_vm_read_overwrite(
+        target: MachPort,
+        address: u64,
+        size: u64,
+        data: u64,
+        out_size: *mut u64,
+    ) -> KernReturn;
 
     /// Moves or aliases an existing mapping to a new address, used here to
     /// relocate a `MAP_JIT` mapping created at a kernel-chosen address (see
@@ -140,6 +148,22 @@ unsafe extern "C" {
 pub(crate) fn mach_task_self() -> MachPort {
     // SAFETY: reading an immutable global libSystem publishes for this purpose.
     unsafe { mach_task_self_ }
+}
+
+pub(crate) fn read_task_u32s<const N: usize>(address: usize) -> Option<[u32; N]> {
+    let mut words = [0; N];
+    let bytes = u64::try_from(core::mem::size_of_val(&words)).ok()?;
+    let mut copied = 0;
+    let result = unsafe {
+        mach_vm_read_overwrite(
+            mach_task_self(),
+            address as u64,
+            bytes,
+            words.as_mut_ptr() as u64,
+            &raw mut copied,
+        )
+    };
+    (result == KERN_SUCCESS && copied == bytes).then_some(words)
 }
 
 /// The outcome of a failed [`reserve_fixed`] call.
@@ -304,7 +328,11 @@ pub(crate) fn mach_vm_region_iter() -> impl Iterator<Item = core::ops::Range<usi
 }
 
 // `ulock` operation codes and flags, from xnu's `sys/ulock.h`.
-const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
+//
+// Raw mutexes live in process-private Rust storage, so the private operation's
+// `(task, address)` key is the correct domain. The shared operation instead keys
+// through VM-object identity and is intended for interprocess mappings.
+const UL_COMPARE_AND_WAIT: u32 = 1;
 const ULF_WAKE_ALL: u32 = 0x0000_0100;
 /// Return `-errno` directly instead of setting `errno`, which keeps these calls
 /// free of thread-local access on the wait path.
@@ -328,6 +356,14 @@ pub(crate) fn ulock_wait(
     value: u32,
     timeout: Option<Duration>,
 ) -> UlockWaitResult {
+    // XNU reports an immediate compare mismatch with the same nonnegative return
+    // value as a real wake. A userspace precheck preserves the trait's distinct
+    // immediate-mismatch result when the value has already changed; a change
+    // racing after this load remains a permitted spurious wake.
+    if atomic.load(Ordering::Relaxed) != value {
+        return UlockWaitResult::ValueChanged;
+    }
+
     // `__ulock_wait2` takes nanoseconds, with zero meaning "no deadline". A
     // non-zero requested duration must therefore never round down to zero, or
     // a timed wait would silently become an infinite one.
@@ -344,7 +380,7 @@ pub(crate) fn ulock_wait(
     // compare-and-wait operation reads.
     let rc = unsafe {
         __ulock_wait2(
-            UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO,
+            UL_COMPARE_AND_WAIT | ULF_NO_ERRNO,
             addr,
             u64::from(value),
             timeout_ns,
@@ -361,21 +397,13 @@ pub(crate) fn ulock_wait(
         // wakeups anyway, so this is indistinguishable from a real one.
         libc::EINTR => UlockWaitResult::Woken,
         libc::ETIMEDOUT => UlockWaitResult::TimedOut,
-        // An immediate compare-mismatch (the value had already changed) is not
-        // actually reported as a negative errno at all -- xnu's
-        // sys_ulock_wait2 takes that path through `rc >= 0` above, identically
-        // to a real wake, since the syscall never queued a waiter to begin
-        // with. Nothing else negative is documented to occur here, but any
-        // other error still means the thread did not sleep, so it is reported
-        // the same way: "the value moved", the only non-sleeping outcome the
-        // trait models.
-        _ => UlockWaitResult::ValueChanged,
+        errno => panic!("__ulock_wait2 failed with errno {errno}"),
     }
 }
 
 /// Wake one or all threads parked on `atomic`, in the manner of `FUTEX_WAKE`.
 pub(crate) fn ulock_wake(atomic: &AtomicU32, all: bool) {
-    let mut operation = UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO;
+    let mut operation = UL_COMPARE_AND_WAIT | ULF_NO_ERRNO;
     if all {
         operation |= ULF_WAKE_ALL;
     }
@@ -383,10 +411,12 @@ pub(crate) fn ulock_wake(atomic: &AtomicU32, all: bool) {
         .cast_mut()
         .cast::<libc::c_void>();
     // SAFETY: `addr` points at a live `AtomicU32`.
-    //
-    // A failure here is `-ENOENT` ("nobody was waiting"), which is not an error
-    // for the caller: the trait already allows a wake to report nothing woken.
-    unsafe { __ulock_wake(operation, addr, 0) };
+    let rc = unsafe { __ulock_wake(operation, addr, 0) };
+    assert!(
+        rc == 0 || rc == -libc::ENOENT,
+        "__ulock_wake failed with errno {}",
+        -rc
+    );
 }
 
 /// Read a clock as whole nanoseconds.

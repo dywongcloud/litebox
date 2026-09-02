@@ -70,11 +70,12 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::io::IsTerminal as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PermissionUpdateError,
+    PermissionUpdateError, RemapError, SharedPageIoError,
 };
 use litebox::platform::{ImmediatelyWokenUp, UnblockedOrTimedOut};
 use litebox::utils::TruncateExt as _;
@@ -84,9 +85,37 @@ extern crate alloc;
 
 mod darwin;
 mod guest;
+mod hvf;
+mod hvf_backing;
+mod hvf_memory;
 mod net;
 mod seatbelt;
 
+pub use hvf::{
+    HvfBoundaryReport, HvfError, HvfFeatureRegister, HvfFeatureRegisters, HvfMonitor,
+    HvfSdkResidualReport, HvfSmokeCleanupFailure, HvfSmokeCleanupReport, HvfSmokeError,
+    HvfSmokeReport, HvfSmokeResidualReport, HvfSmokeResourceReport, HvfSmokeResourceState,
+    HvfStageOneRegisterReport, HvfVmReport, hvf_boundary_probe, hvf_smoke_probe,
+    hvf_smoke_retry_residual, publish_hvf_executable_bytes,
+};
+pub use hvf_backing::{
+    HvfHostBackingError, HvfHostBackingReport, HvfHostResourceReport, hvf_host_backing_probe,
+    hvf_host_resource_report, hvf_host_retry_residual,
+};
+pub use hvf_memory::{
+    HvfAddressSpace, HvfAddressSpaceId, HvfAddressSpaceReport, HvfAsid, HvfBackingIdentity,
+    HvfClaim, HvfExecutableGeneration, HvfGuestPermissions, HvfLedgerEntry, HvfMemory,
+    HvfMemoryError,
+    HvfForkResult, HvfMemoryFailureReport, HvfMemoryLimits, HvfMemoryReport, HvfMemoryUsage,
+    HvfMutation,
+    HvfPoisonConcurrencyReport, HvfPublicationTicket, HvfQuarantineRetryReport,
+    HvfPublicationEpoch, HvfRegisterFailureReport, HvfRetirementReport, HvfRetirementTicket,
+    HvfRootGeneration, HvfSharing, HvfWriteEpoch,
+    HvfTranslationRegime, HvfUnmapFailureReport, HvfUnmapResult, HvfVcpuMemorySnapshot,
+    hvf_memory_failure_probe, hvf_memory_probe, hvf_poison_concurrency_probe,
+    hvf_register_failure_probe, hvf_unmap_failure_probe, with_hvf_memory_failure_probe,
+    with_hvf_memory_probe,
+};
 pub use seatbelt::{enable_seatbelt_sandbox, enable_seatbelt_sandbox_with_outbound_network};
 
 use darwin::{
@@ -129,6 +158,14 @@ pub struct MacOsUserland {
     stdout_lock: std::sync::Mutex<()>,
     /// Serializes real host writes to stderr; see [`Self::stdout_lock`].
     stderr_lock: std::sync::Mutex<()>,
+    /// One unlinked sparse host file, opened before Seatbelt is installed, whose disjoint extents
+    /// provide coherent physical storage for guest shared mappings. Keeping one descriptor open
+    /// avoids any host-filesystem operation after sandbox entry.
+    shared_page_file: OwnedFd,
+    /// Logical-backing-to-sparse-file extents and currently installed aliases.
+    shared_page_registry: std::sync::Mutex<SharedPageRegistry>,
+    /// Wakes mappings waiting for a concurrent first-time backing initialization to finish.
+    shared_page_init_condvar: Condvar,
     /// The `utun` socket used for guest networking, if one was requested.
     tun: Option<std::os::fd::OwnedFd>,
     /// CoW-eligible memory regions registered via [`Self::register_cow_region`].
@@ -144,6 +181,373 @@ struct CowRegionInfo {
     file_path: std::path::PathBuf,
     /// Length of the backing file's registered slice.
     file_length: usize,
+}
+
+#[derive(Clone)]
+struct SharedPageExtent {
+    logical_range: core::ops::Range<usize>,
+    file_offset: usize,
+}
+
+#[derive(Clone)]
+struct SharedPageAlias {
+    virtual_range: core::ops::Range<usize>,
+    backing_identity: usize,
+    backing_offset: usize,
+}
+
+#[derive(Default)]
+struct SharedPageRegistry {
+    backings: alloc::collections::BTreeMap<usize, alloc::vec::Vec<SharedPageExtent>>,
+    initialized: alloc::collections::BTreeMap<usize, alloc::vec::Vec<core::ops::Range<usize>>>,
+    initializing: alloc::collections::BTreeMap<usize, alloc::vec::Vec<core::ops::Range<usize>>>,
+    aliases: alloc::vec::Vec<SharedPageAlias>,
+    next_file_offset: usize,
+}
+
+impl SharedPageRegistry {
+    fn ensure_extents(
+        &mut self,
+        fd: libc::c_int,
+        backing_identity: usize,
+        logical_range: core::ops::Range<usize>,
+    ) -> Result<alloc::vec::Vec<(core::ops::Range<usize>, usize)>, AllocationError> {
+        let existing = self.backings.entry(backing_identity).or_default();
+        existing.sort_by_key(|extent| extent.logical_range.start);
+
+        let mut gaps = alloc::vec::Vec::new();
+        let mut cursor = logical_range.start;
+        for extent in existing.iter() {
+            if extent.logical_range.end <= cursor {
+                continue;
+            }
+            if extent.logical_range.start >= logical_range.end {
+                break;
+            }
+            if extent.logical_range.start > cursor {
+                gaps.push(cursor..extent.logical_range.start.min(logical_range.end));
+            }
+            cursor = cursor.max(extent.logical_range.end).min(logical_range.end);
+            if cursor == logical_range.end {
+                break;
+            }
+        }
+        if cursor < logical_range.end {
+            gaps.push(cursor..logical_range.end);
+        }
+
+        let mut next_file_offset = self.next_file_offset;
+        let mut additions = alloc::vec::Vec::with_capacity(gaps.len());
+        for gap in gaps {
+            let file_offset = next_file_offset;
+            next_file_offset = next_file_offset
+                .checked_add(gap.len())
+                .ok_or(AllocationError::OutOfMemory)?;
+            additions.push(SharedPageExtent {
+                logical_range: gap,
+                file_offset,
+            });
+        }
+        let file_len =
+            libc::off_t::try_from(next_file_offset).map_err(|_| AllocationError::OutOfMemory)?;
+        if next_file_offset != self.next_file_offset {
+            // SAFETY: `fd` is the platform-owned sparse backing file and remains open for the
+            // platform's lifetime. Growing an unlinked sparse file allocates no data blocks until
+            // a mapped page is written.
+            if unsafe { libc::ftruncate(fd, file_len) } != 0 {
+                return Err(AllocationError::OutOfMemory);
+            }
+            self.next_file_offset = next_file_offset;
+            existing.extend(additions);
+            existing.sort_by_key(|extent| extent.logical_range.start);
+        }
+
+        let mut result = alloc::vec::Vec::new();
+        for extent in existing.iter() {
+            let start = extent.logical_range.start.max(logical_range.start);
+            let end = extent.logical_range.end.min(logical_range.end);
+            if start < end {
+                result.push((
+                    start..end,
+                    extent.file_offset + (start - extent.logical_range.start),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    fn gaps_excluding(
+        requested: core::ops::Range<usize>,
+        mut covered: alloc::vec::Vec<core::ops::Range<usize>>,
+    ) -> alloc::vec::Vec<core::ops::Range<usize>> {
+        covered.sort_by_key(|range| range.start);
+        let mut gaps = alloc::vec::Vec::new();
+        let mut cursor = requested.start;
+        for range in covered {
+            if range.end <= cursor {
+                continue;
+            }
+            if range.start >= requested.end {
+                break;
+            }
+            if range.start > cursor {
+                gaps.push(cursor..range.start.min(requested.end));
+            }
+            cursor = cursor.max(range.end).min(requested.end);
+            if cursor == requested.end {
+                break;
+            }
+        }
+        if cursor < requested.end {
+            gaps.push(cursor..requested.end);
+        }
+        gaps
+    }
+
+    fn uninitialized_ranges(
+        &self,
+        backing_identity: usize,
+        requested: core::ops::Range<usize>,
+    ) -> alloc::vec::Vec<core::ops::Range<usize>> {
+        Self::gaps_excluding(
+            requested,
+            self.initialized
+                .get(&backing_identity)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn claimable_initialization_ranges(
+        &self,
+        backing_identity: usize,
+        requested: core::ops::Range<usize>,
+    ) -> alloc::vec::Vec<core::ops::Range<usize>> {
+        let mut covered = self
+            .initialized
+            .get(&backing_identity)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(initializing) = self.initializing.get(&backing_identity) {
+            covered.extend(initializing.iter().cloned());
+        }
+        Self::gaps_excluding(requested, covered)
+    }
+
+    fn insert_merged_range(
+        ranges: &mut alloc::collections::BTreeMap<usize, alloc::vec::Vec<core::ops::Range<usize>>>,
+        backing_identity: usize,
+        new_range: core::ops::Range<usize>,
+    ) {
+        let ranges = ranges.entry(backing_identity).or_default();
+        ranges.push(new_range);
+        ranges.sort_by_key(|range| range.start);
+        let old = core::mem::take(ranges);
+        for range in old {
+            if let Some(last) = ranges.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                ranges.push(range);
+            }
+        }
+    }
+
+    fn mark_initialized(
+        &mut self,
+        backing_identity: usize,
+        initialized_range: core::ops::Range<usize>,
+    ) {
+        Self::insert_merged_range(&mut self.initialized, backing_identity, initialized_range);
+    }
+
+    fn mark_initializing(
+        &mut self,
+        backing_identity: usize,
+        initializing_range: core::ops::Range<usize>,
+    ) {
+        Self::insert_merged_range(&mut self.initializing, backing_identity, initializing_range);
+    }
+
+    fn finish_initializing(&mut self, backing_identity: usize, finished: &core::ops::Range<usize>) {
+        let Some(ranges) = self.initializing.get_mut(&backing_identity) else {
+            return;
+        };
+        let old = core::mem::take(ranges);
+        for range in old {
+            if range.end <= finished.start || range.start >= finished.end {
+                ranges.push(range);
+                continue;
+            }
+            if range.start < finished.start {
+                ranges.push(range.start..finished.start);
+            }
+            if range.end > finished.end {
+                ranges.push(finished.end..range.end);
+            }
+        }
+        if ranges.is_empty() {
+            self.initializing.remove(&backing_identity);
+        }
+    }
+
+    fn initialization_in_progress(
+        &self,
+        backing_identity: usize,
+        range: &core::ops::Range<usize>,
+    ) -> bool {
+        self.initializing
+            .get(&backing_identity)
+            .is_some_and(|ranges| {
+                ranges.iter().any(|initializing| {
+                    initializing.start < range.end && range.start < initializing.end
+                })
+            })
+    }
+
+    fn existing_extents(
+        &self,
+        backing_identity: usize,
+        logical_range: &core::ops::Range<usize>,
+    ) -> alloc::vec::Vec<(core::ops::Range<usize>, usize)> {
+        let mut result = alloc::vec::Vec::new();
+        let Some(extents) = self.backings.get(&backing_identity) else {
+            return result;
+        };
+        for extent in extents {
+            let start = extent.logical_range.start.max(logical_range.start);
+            let end = extent.logical_range.end.min(logical_range.end);
+            if start < end {
+                result.push((
+                    start..end,
+                    extent.file_offset + (start - extent.logical_range.start),
+                ));
+            }
+        }
+        result
+    }
+
+    fn forget_aliases(&mut self, removed: &core::ops::Range<usize>) {
+        let old = core::mem::take(&mut self.aliases);
+        for alias in old {
+            if alias.virtual_range.end <= removed.start || alias.virtual_range.start >= removed.end
+            {
+                self.aliases.push(alias);
+                continue;
+            }
+            if alias.virtual_range.start < removed.start {
+                self.aliases.push(SharedPageAlias {
+                    virtual_range: alias.virtual_range.start..removed.start,
+                    backing_identity: alias.backing_identity,
+                    backing_offset: alias.backing_offset,
+                });
+            }
+            if alias.virtual_range.end > removed.end {
+                self.aliases.push(SharedPageAlias {
+                    virtual_range: removed.end..alias.virtual_range.end,
+                    backing_identity: alias.backing_identity,
+                    backing_offset: alias.backing_offset
+                        + (removed.end - alias.virtual_range.start),
+                });
+            }
+        }
+    }
+}
+
+fn create_shared_page_file() -> OwnedFd {
+    let mut path = *b"/private/tmp/litebox-shared-pages.XXXXXX\0";
+    // SAFETY: `path` is a writable, NUL-terminated mkstemp template with six trailing X bytes.
+    let fd = unsafe { libc::mkstemp(path.as_mut_ptr().cast::<libc::c_char>()) };
+    assert!(
+        fd >= 0,
+        "failed to create shared-page backing file: {}",
+        std::io::Error::last_os_error()
+    );
+    // The descriptor, not the pathname, is the durable capability. Unlink before Seatbelt is
+    // installed so no guest operation can name or reopen the host object.
+    // SAFETY: `path` is still the NUL-terminated path mkstemp filled in.
+    let unlink_result = unsafe { libc::unlink(path.as_ptr().cast::<libc::c_char>()) };
+    if unlink_result != 0 {
+        // SAFETY: `fd` was returned by mkstemp and has not been transferred into OwnedFd yet.
+        unsafe { libc::close(fd) };
+        panic!(
+            "failed to unlink shared-page backing file: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: ownership of this newly opened descriptor transfers exactly once.
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+fn pread_all(
+    fd: libc::c_int,
+    mut data: &mut [u8],
+    mut offset: usize,
+) -> Result<(), SharedPageIoError> {
+    while !data.is_empty() {
+        let file_offset =
+            libc::off_t::try_from(offset).map_err(|_| SharedPageIoError::OutOfRange)?;
+        // SAFETY: `data` is writable for its complete length and `fd` remains open.
+        let result = unsafe {
+            libc::pread(
+                fd,
+                data.as_mut_ptr().cast::<libc::c_void>(),
+                data.len(),
+                file_offset,
+            )
+        };
+        if result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SharedPageIoError::Io);
+        }
+        let count = usize::try_from(result).map_err(|_| SharedPageIoError::Io)?;
+        if count == 0 {
+            return Err(SharedPageIoError::Io);
+        }
+        offset = offset
+            .checked_add(count)
+            .ok_or(SharedPageIoError::OutOfRange)?;
+        data = &mut data[count..];
+    }
+    Ok(())
+}
+
+fn pwrite_all(
+    fd: libc::c_int,
+    mut data: &[u8],
+    mut offset: usize,
+) -> Result<(), SharedPageIoError> {
+    while !data.is_empty() {
+        let file_offset =
+            libc::off_t::try_from(offset).map_err(|_| SharedPageIoError::OutOfRange)?;
+        // SAFETY: `data` is readable for its complete length and `fd` remains open.
+        let result = unsafe {
+            libc::pwrite(
+                fd,
+                data.as_ptr().cast::<libc::c_void>(),
+                data.len(),
+                file_offset,
+            )
+        };
+        if result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SharedPageIoError::Io);
+        }
+        let count = usize::try_from(result).map_err(|_| SharedPageIoError::Io)?;
+        if count == 0 {
+            return Err(SharedPageIoError::Io);
+        }
+        offset = offset
+            .checked_add(count)
+            .ok_or(SharedPageIoError::OutOfRange)?;
+        data = &data[count..];
+    }
+    Ok(())
 }
 
 impl core::fmt::Debug for MacOsUserland {
@@ -162,8 +566,7 @@ impl MacOsUserland {
     ///
     /// Panics if the requested `utun` device cannot be opened, if the fault
     /// handlers that make guest-memory accesses fallible cannot be installed,
-    /// or if the guest thread-pointer TSD slot the rewriter's `Host::MacOs`
-    /// gates have baked in cannot be reserved (see `reserve_guest_tpidr_tsd_slot`).
+    /// or if reserving a pthread TSD key for the guest thread pointer fails.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         Self::new_with_options(tun_device_name, false)
     }
@@ -201,13 +604,17 @@ impl MacOsUserland {
             stdin_held_open: core::sync::atomic::AtomicBool::new(hold_stdin_open),
             stdout_lock: std::sync::Mutex::new(()),
             stderr_lock: std::sync::Mutex::new(()),
+            shared_page_file: create_shared_page_file(),
+            shared_page_registry: std::sync::Mutex::new(SharedPageRegistry::default()),
+            shared_page_init_condvar: Condvar::new(),
             tun,
             cow_regions: std::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         };
 
-        // A platform must outlive every guest thread that can reach it, and
-        // there is exactly one per process, so leaking is the cheapest way to
-        // get a `'static` without reference counting on every access.
+        // A platform must outlive every guest thread that can reach it, so
+        // leaking is the cheapest way to get a `'static` without reference
+        // counting on every access. Runners construct one; tests may construct
+        // more, and every process-global facility is initialized only once.
         let platform: &'static Self = alloc::boxed::Box::leak(alloc::boxed::Box::new(platform));
         spawn_stdin_pump_thread(platform);
         platform
@@ -549,13 +956,14 @@ fn allocate_jit_pages(
         });
     }
 
-    let must_be_exact = fixed_address_behavior == FixedAddressBehavior::NoReplace;
+    let must_reserve = fixed_address_behavior == FixedAddressBehavior::NoReplace;
     let needs_correction = fixed_address_behavior == FixedAddressBehavior::Hint && {
         let start = kernel_chosen as usize;
         let end = start + suggested_range.len();
         start < GUEST_ADDR_MIN || end > GUEST_ADDR_MAX
     };
-    let reserved = if must_be_exact || needs_correction {
+    let fixed_mode_requires_remap = fixed_address_behavior != FixedAddressBehavior::Hint;
+    let reserved = if must_reserve || needs_correction {
         // `remap_to_fixed`'s `VM_FLAGS_OVERWRITE` silently replaces whatever
         // already occupies the destination, so `NoReplace` has to check
         // first -- exactly like the non-JIT path does with a plain
@@ -563,7 +971,7 @@ fn allocate_jit_pages(
         // destination until the remap overwrites it.
         match reserve_fixed(suggested_range) {
             Ok(()) => true,
-            Err(e) if must_be_exact => {
+            Err(e) if must_reserve => {
                 // SAFETY: `kernel_chosen` is the mapping just created above,
                 // still solely owned by this function.
                 unsafe { libc::munmap(kernel_chosen, suggested_range.len()) };
@@ -583,8 +991,9 @@ fn allocate_jit_pages(
     } else {
         false
     };
+    let must_remap = fixed_mode_requires_remap || reserved;
 
-    if !reserved {
+    if !must_remap {
         return Ok(kernel_chosen);
     }
 
@@ -608,7 +1017,9 @@ fn allocate_jit_pages(
     match remap_result {
         Ok(()) => Ok(suggested_range.start as *mut libc::c_void),
         Err(e) => {
-            release_reservation(suggested_range);
+            if reserved {
+                release_reservation(suggested_range);
+            }
             Err(match e {
                 ReservationError::AddressInUse => AllocationError::AddressInUse,
                 ReservationError::OutOfMemory => AllocationError::OutOfMemory,
@@ -1127,6 +1538,343 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
+    fn allocate_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        suggested_range: core::ops::Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        _can_grow_down: bool,
+        populate_pages_immediately: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+        if !suggested_range.start.is_multiple_of(ALIGN)
+            || !suggested_range.len().is_multiple_of(ALIGN)
+            || !backing_offset.is_multiple_of(ALIGN)
+        {
+            return Err(AllocationError::Unaligned);
+        }
+        let logical_end = backing_offset
+            .checked_add(suggested_range.len())
+            .ok_or(AllocationError::OutOfMemory)?;
+        let logical_range = backing_offset..logical_end;
+
+        let mut registry = self.shared_page_registry.lock().unwrap();
+        let extents = registry.ensure_extents(
+            self.shared_page_file.as_raw_fd(),
+            backing_identity,
+            logical_range.clone(),
+        )?;
+
+        // Reserve one contiguous destination first. Each sparse-file extent can then replace its
+        // matching subrange with MAP_FIXED without a gap being claimed by an unrelated host mmap.
+        let target_start = match fixed_address_behavior {
+            FixedAddressBehavior::Hint => {
+                // SAFETY: this is a temporary anonymous reservation at an advisory address.
+                let reservation = unsafe {
+                    libc::mmap(
+                        suggested_range.start as *mut libc::c_void,
+                        suggested_range.len(),
+                        libc::PROT_NONE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    )
+                };
+                if reservation == libc::MAP_FAILED {
+                    return Err(AllocationError::OutOfMemory);
+                }
+                let start = reservation as usize;
+                let end = start
+                    .checked_add(suggested_range.len())
+                    .ok_or(AllocationError::OutOfMemory)?;
+                if start < GUEST_ADDR_MIN || end > GUEST_ADDR_MAX {
+                    // SAFETY: `reservation` is the temporary mapping just created above.
+                    unsafe { libc::munmap(reservation, suggested_range.len()) };
+                    reserve_fixed(&suggested_range).map_err(|error| match error {
+                        ReservationError::AddressInUse => AllocationError::AddressInUse,
+                        ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+                    })?;
+                    suggested_range.start
+                } else {
+                    start
+                }
+            }
+            FixedAddressBehavior::NoReplace => {
+                reserve_fixed(&suggested_range).map_err(|error| match error {
+                    ReservationError::AddressInUse => AllocationError::AddressInUse,
+                    ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+                })?;
+                suggested_range.start
+            }
+            FixedAddressBehavior::Replace => suggested_range.start,
+        };
+        let target_range = target_start..target_start + suggested_range.len();
+
+        for (extent_range, file_offset) in extents {
+            let virtual_start = target_start + (extent_range.start - backing_offset);
+            let offset =
+                libc::off_t::try_from(file_offset).map_err(|_| AllocationError::OutOfMemory)?;
+            // SAFETY: the sparse file is live for the platform lifetime, this extent lies within
+            // its ftruncate'd length, and the complete destination was reserved above (or the
+            // caller explicitly requested replacement).
+            let ptr = unsafe {
+                libc::mmap(
+                    virtual_start as *mut libc::c_void,
+                    extent_range.len(),
+                    prot_flags(initial_permissions),
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    self.shared_page_file.as_raw_fd(),
+                    offset,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                // Drop both already-installed extents and any remainder of the reservation. For a
+                // replacing mmap Linux likewise cannot promise restoration after a partial host
+                // failure; for Hint/NoReplace this simply restores the range to being free.
+                // SAFETY: `target_range` is the mapping/reservation owned by this operation.
+                unsafe {
+                    libc::munmap(target_range.start as *mut libc::c_void, target_range.len())
+                };
+                return Err(match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINVAL) => AllocationError::Unaligned,
+                    _ => AllocationError::OutOfMemory,
+                });
+            }
+            debug_assert_eq!(ptr as usize, virtual_start);
+        }
+
+        registry.forget_aliases(&target_range);
+        registry.aliases.push(SharedPageAlias {
+            virtual_range: target_range.clone(),
+            backing_identity,
+            backing_offset,
+        });
+        drop(registry);
+
+        if populate_pages_immediately {
+            // SAFETY: the complete destination is now mapped.
+            unsafe {
+                libc::madvise(
+                    target_range.start as *mut libc::c_void,
+                    target_range.len(),
+                    libc::MADV_WILLNEED,
+                )
+            };
+        }
+
+        Ok(UserMutPtr::from_ptr(target_range.start as *mut u8))
+    }
+
+    fn initialize_shared_pages<E>(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        length: usize,
+        mut initialize: impl FnMut(core::ops::Range<usize>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let requested = backing_offset
+            ..backing_offset
+                .checked_add(length)
+                .expect("validated shared mapping range cannot overflow");
+        loop {
+            let mut registry = self.shared_page_registry.lock().unwrap();
+            if registry
+                .uninitialized_ranges(backing_identity, requested.clone())
+                .is_empty()
+            {
+                return Ok(());
+            }
+            let Some(claim) = registry
+                .claimable_initialization_ranges(backing_identity, requested.clone())
+                .into_iter()
+                .next()
+            else {
+                // Every missing byte is being initialized by another mapping. Wait without holding
+                // the registry, then re-derive the gaps; a failed peer leaves them claimable again.
+                registry = self.shared_page_init_condvar.wait(registry).unwrap();
+                drop(registry);
+                continue;
+            };
+            registry.mark_initializing(backing_identity, claim.clone());
+            drop(registry);
+
+            let relative = (claim.start - backing_offset)..(claim.end - backing_offset);
+            let result = initialize(relative);
+
+            let mut registry = self.shared_page_registry.lock().unwrap();
+            registry.finish_initializing(backing_identity, &claim);
+            if result.is_ok() {
+                registry.mark_initialized(backing_identity, claim);
+            }
+            self.shared_page_init_condvar.notify_all();
+            drop(registry);
+            result?;
+        }
+    }
+
+    fn read_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        data: &mut [u8],
+    ) -> Result<(), SharedPageIoError> {
+        let end = backing_offset
+            .checked_add(data.len())
+            .ok_or(SharedPageIoError::OutOfRange)?;
+        let requested = backing_offset..end;
+        let mut registry = self.shared_page_registry.lock().unwrap();
+        while registry.initialization_in_progress(backing_identity, &requested) {
+            registry = self.shared_page_init_condvar.wait(registry).unwrap();
+        }
+        let initialized = registry
+            .initialized
+            .get(&backing_identity)
+            .cloned()
+            .unwrap_or_default();
+        let extents = registry.existing_extents(backing_identity, &requested);
+        for (extent, file_offset) in extents {
+            for initialized_range in &initialized {
+                let start = extent.start.max(initialized_range.start);
+                let end = extent.end.min(initialized_range.end);
+                if start >= end {
+                    continue;
+                }
+                let output_start = start - backing_offset;
+                let physical_start = file_offset + (start - extent.start);
+                pread_all(
+                    self.shared_page_file.as_raw_fd(),
+                    &mut data[output_start..output_start + (end - start)],
+                    physical_start,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        data: &[u8],
+    ) -> Result<(), SharedPageIoError> {
+        let end = backing_offset
+            .checked_add(data.len())
+            .ok_or(SharedPageIoError::OutOfRange)?;
+        let requested = backing_offset..end;
+        let mut registry = self.shared_page_registry.lock().unwrap();
+        while registry.initialization_in_progress(backing_identity, &requested) {
+            registry = self.shared_page_init_condvar.wait(registry).unwrap();
+        }
+        let extents = registry.existing_extents(backing_identity, &requested);
+        for (extent, file_offset) in extents {
+            let input_start = extent.start - backing_offset;
+            pwrite_all(
+                self.shared_page_file.as_raw_fd(),
+                &data[input_start..input_start + extent.len()],
+                file_offset,
+            )?;
+            registry.mark_initialized(backing_identity, extent);
+        }
+        Ok(())
+    }
+
+    fn zero_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_range: core::ops::Range<usize>,
+    ) -> Result<(), SharedPageIoError> {
+        if backing_range.is_empty() {
+            return Ok(());
+        }
+        let mut registry = self.shared_page_registry.lock().unwrap();
+        while registry.initialization_in_progress(backing_identity, &backing_range) {
+            registry = self.shared_page_init_condvar.wait(registry).unwrap();
+        }
+        let extents = registry.existing_extents(backing_identity, &backing_range);
+        let zeroes = [0u8; 16384];
+        for (extent, file_offset) in extents {
+            let mut written = 0;
+            while written < extent.len() {
+                let count = (extent.len() - written).min(zeroes.len());
+                pwrite_all(
+                    self.shared_page_file.as_raw_fd(),
+                    &zeroes[..count],
+                    file_offset + written,
+                )?;
+                written += count;
+            }
+            registry.mark_initialized(backing_identity, extent);
+        }
+        Ok(())
+    }
+
+    unsafe fn remap_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        old_range: core::ops::Range<usize>,
+        new_range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+        if !old_range.start.is_multiple_of(ALIGN)
+            || !old_range.len().is_multiple_of(ALIGN)
+            || !new_range.start.is_multiple_of(ALIGN)
+            || !new_range.len().is_multiple_of(ALIGN)
+            || !backing_offset.is_multiple_of(ALIGN)
+        {
+            return Err(RemapError::Unaligned);
+        }
+        if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
+            return Err(RemapError::Overlapping);
+        }
+        if new_range.len() < old_range.len() {
+            return Err(RemapError::OutOfMemory);
+        }
+
+        let new_ptr =
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::allocate_shared_pages(
+                self,
+                backing_identity,
+                backing_offset,
+                new_range.clone(),
+                permissions,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace,
+            )
+            .map_err(|error| match error {
+                AllocationError::OutOfMemory => RemapError::OutOfMemory,
+                AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
+                    RemapError::AlreadyAllocated
+                }
+                AllocationError::Unaligned => RemapError::Unaligned,
+                AllocationError::BelowMinAddress
+                | AllocationError::AboveMaxAddress
+                | AllocationError::AddressPartiallyInUse => RemapError::OutOfMemory,
+                _ => RemapError::OutOfMemory,
+            })?;
+
+        // The destination already aliases the same physical bytes, so no copy is required.
+        // SAFETY: forwarded caller guarantee; the source is no longer needed after this move.
+        if unsafe {
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::deallocate_pages(
+                self, old_range,
+            )
+        }
+        .is_err()
+        {
+            // SAFETY: `new_range` was allocated solely by this operation and has not escaped.
+            let _ = unsafe {
+                <Self as litebox::platform::PageManagementProvider<ALIGN>>::deallocate_pages(
+                    self, new_range,
+                )
+            };
+            return Err(RemapError::AlreadyUnallocated);
+        }
+        Ok(new_ptr)
+    }
+
     unsafe fn deallocate_pages(
         &self,
         range: core::ops::Range<usize>,
@@ -1137,6 +1885,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // SAFETY: the caller guarantees the range is no longer in use.
         let rc = unsafe { libc::munmap(range.start as *mut libc::c_void, range.len()) };
         if rc == 0 {
+            self.shared_page_registry
+                .lock()
+                .unwrap()
+                .forget_aliases(&range);
             // Drop any JIT-region registration for this address so a later,
             // unrelated mapping at the same address is not mistaken for JIT by
             // the fault handler.
@@ -1364,6 +2116,9 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     fn wake_many(&self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
         // `ulock` can wake exactly one waiter or all of them, with nothing in
         // between, so anything above one wakes all. The trait permits this: a
         // wake is allowed to be spurious, and the return value is allowed to be
@@ -1626,19 +2381,16 @@ fn spawn_stdin_pump_thread(platform: &'static MacOsUserland) {
 impl MacOsUserland {
     /// Deliver `bytes` to the guest's stdin as if they had been typed on the host terminal:
     /// pushed through the same pump `spawn_stdin_pump_thread` feeds, so blocking reads,
-    /// non-blocking reads, and poll/select observers all see them identically. Blocks briefly
-    /// (1ms backoff) when the ring is full, exactly like the host pump does.
-    pub fn inject_stdin(&self, bytes: &[u8]) {
-        let mut data = bytes;
-        while !data.is_empty() {
-            let pushed = self.stdin_pump.push(data);
+    /// non-blocking reads, and poll/select observers all see them identically. This producer is
+    /// deliberately non-blocking: when the guest has stopped draining stdin and the ring is full,
+    /// the complete terminal sequence is dropped rather than stalling the input-client reader or
+    /// exposing a truncated escape sequence. Returns whether the bytes were accepted.
+    pub fn inject_stdin(&self, bytes: &[u8]) -> bool {
+        let accepted = self.stdin_pump.try_push_all(bytes);
+        if accepted && !bytes.is_empty() {
             self.notify_stdin_doorbell();
-            if pushed == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            data = &data[pushed..];
         }
+        accepted
     }
 
     /// Wakes any thread parked in `StdioProvider::read_from_stdin`'s blocking wait.
@@ -2714,89 +3466,46 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
 // Guest thread pointer
 // ---------------------------------------------------------------------------
 
-/// The pthread TSD key LiteBox reserved for the guest thread pointer, or
-/// `u32::MAX` before [`reserve_guest_tpidr_tsd_slot`] has run.
-static GUEST_TP_TSD_KEY: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The one process-wide pthread TSD key reserved for the guest thread pointer.
+/// Once initialized it is never deleted or replaced, so an already-loaded
+/// trampoline's byte offset remains valid for the process lifetime.
+static GUEST_TP_TSD_KEY: OnceLock<libc::pthread_key_t> = OnceLock::new();
 
-/// Reserve the pthread TSD slot the rewriter's `Host::MacOs` gates read the
-/// guest thread pointer from, recording it in [`GUEST_TP_TSD_KEY`].
+/// Return the process-wide pthread TSD key used for the guest thread pointer,
+/// reserving it on the first call.
 ///
-/// `litebox_syscall_rewriter::arm64`'s `Host::MacOs` gates are emitted
-/// *ahead of time*, when a binary is packaged -- they have
-/// `litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT` baked in as a fixed
-/// byte offset from `TPIDRRO_EL0`. For that to line up at guest-run time, this
-/// process's first `pthread_key_create` call would have to return exactly that
-/// slot. **It does not, and cannot be relied upon to:** measured on real
-/// hardware (Apple M3 Pro, macOS 26.3.1), the first dynamic key is 259 from a
-/// Rust binary and 258 from a C `main` -- libSystem's own startup claims a few
-/// dynamic keys first, and that count is undocumented and not stable across OS
-/// versions or across binaries with different static initializers. The AOT
-/// rewriter (a separate, earlier process) therefore cannot predict the runner's
-/// slot; a fixed baked immediate is fundamentally the wrong model. The real fix
-/// is load-time offset indirection (see the `macos-guest-tp-runtime-offset`
-/// roadmap item and `docs/roadmap.md`).
-///
-/// Both halves of that fix have landed: `Host::MacOs` gates no longer bake the
-/// slot number in, they read a byte offset from the trampoline header at run
-/// time, and `litebox_shim_linux`'s ELF loader (`loader/elf.rs`) already reads
-/// [`guest_tp_slot_byte_offset`] and writes it there via
-/// `litebox_common_linux::loader::ElfParsedFile::parse_trampoline` /
-/// `load_trampoline`, on every macOS load path. The mismatch below is
-/// therefore no longer live for a guest reached through this platform's
-/// loader; it stays as a defensive warning for any other embedder of this
-/// crate that constructs a trampoline without going through that path.
-///
-/// This reserves a key and records it, but does **not** hard fail on a mismatch:
-/// panicking here made the whole platform unconstructable on real hardware,
-/// blocking everything else (memory, syscalls, the context switch) that does not
-/// touch the guest thread pointer at all. Instead it warns loudly. A guest that
-/// never reads/writes `TPIDR_EL0` is unaffected; a guest that does would target
-/// the stale baked slot and is **not supported** until a loader fills the header
-/// slot. `litebox_runner_linux_on_macos_userland` already calls
-/// [`MacOsUserland::new`] for every guest it runs (see `docs/roadmap.md`'s
-/// "Running a guest on macOS"), so this path runs in production on every
-/// syscall-only guest today; only a `TPIDR_EL0`-using guest is unsupported.
+/// The key is assigned at runtime after libSystem has reserved its own dynamic
+/// keys, so it is not predictable when an image is packaged. Host::MacOs gates
+/// therefore read the key's byte offset from their trampoline header. Every
+/// supported macOS ELF load path writes [guest_tp_slot_byte_offset] to that
+/// header before making the trampoline executable; the rewriter's fixed slot
+/// constant is only the on-disk seed.
 ///
 /// # Panics
 ///
-/// Panics only if `pthread_key_create` itself fails (genuine resource
-/// exhaustion), not on a slot-number mismatch.
+/// Panics only if pthread_key_create itself fails due to resource exhaustion.
 fn reserve_guest_tpidr_tsd_slot() -> libc::pthread_key_t {
-    let mut key: libc::pthread_key_t = 0;
-    // SAFETY: `key` is a valid, uniquely-owned out-parameter; no destructor is
-    // needed since the platform (not pthread teardown) manages the guest
-    // thread pointer's lifetime.
-    let rc = unsafe { libc::pthread_key_create(&raw mut key, None) };
-    assert_eq!(
-        rc, 0,
-        "failed to reserve the guest thread-pointer TSD slot: pthread_key_create returned {rc}"
-    );
-    GUEST_TP_TSD_KEY.store(u32::try_from(key).unwrap_or(u32::MAX), Ordering::Relaxed);
-
-    let baked = litebox_syscall_rewriter::MACOS_GUEST_TPIDR_TSD_SLOT;
-    if u16::try_from(key).ok() != Some(baked) {
-        litebox_util_log::warn!(
-            key:? = key, baked_slot:? = baked;
-            "guest thread-pointer TSD slot mismatch: pthread_key_create gave a slot the \
-             AOT-rewritten Host::MacOs gates do not use. Guests that access TPIDR_EL0 are \
-             unsupported until load-time offset indirection lands (see docs/roadmap.md, \
-             macos-guest-tp-runtime-offset). Syscall-only guests are unaffected."
+    *GUEST_TP_TSD_KEY.get_or_init(|| {
+        let mut key: libc::pthread_key_t = 0;
+        // SAFETY: key is a valid, uniquely-owned out-parameter; no destructor
+        // is needed since the platform manages the guest thread pointer's
+        // lifetime and keeps the key for the process lifetime.
+        let rc = unsafe { libc::pthread_key_create(&raw mut key, None) };
+        assert_eq!(
+            rc, 0,
+            "failed to reserve the guest thread-pointer TSD slot: pthread_key_create returned {rc}"
         );
-    }
-    key
+        key
+    })
 }
 
-/// The pthread TSD key [`ArchSpecificRegister::TpidrEl0`] accessors and
-/// [`guest_tp_slot_byte_offset`] both address, or `None` before
-/// [`reserve_guest_tpidr_tsd_slot`] has run.
+/// The pthread TSD key [ArchSpecificRegister::TpidrEl0] accessors and
+/// [guest_tp_slot_byte_offset] both address, or None before
+/// [reserve_guest_tpidr_tsd_slot] has run.
 ///
-/// [`ArchSpecificRegister::TpidrEl0`]: litebox::platform::ArchSpecificRegister::TpidrEl0
+/// [ArchSpecificRegister::TpidrEl0]: litebox::platform::ArchSpecificRegister::TpidrEl0
 fn guest_tp_tsd_key() -> Option<libc::pthread_key_t> {
-    let key = GUEST_TP_TSD_KEY.load(Ordering::Relaxed);
-    if key == u32::MAX {
-        return None;
-    }
-    Some(libc::pthread_key_t::from(key))
+    GUEST_TP_TSD_KEY.get().copied()
 }
 
 /// The byte offset a `Host::MacOs` gate must add to `TPIDRRO_EL0` to reach this
@@ -2834,10 +3543,11 @@ pub fn guest_tp_slot_byte_offset() -> Option<usize> {
 ///
 /// # Safety
 ///
-/// `ctx` must describe a runnable guest context: a valid entry `pc`, and an `sp`
-/// addressing a guest stack with at least 16 usable bytes below it (see the
-/// `guest` module's below-`SP` staging note). Only one guest thread may run at a
-/// time on this platform; a second is a loud panic rather than corruption.
+/// `ctx` must be a valid, writable register context. Its guest `pc` or `sp` may
+/// fault when execution begins; the platform routes that as a guest exception
+/// rather than dereferencing either value in host switch code. Only one guest
+/// thread may run at a time on this platform; a second is a loud panic rather
+/// than corruption.
 pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
@@ -2849,6 +3559,24 @@ where
     ThreadHandle::run_with_handle(|| {
         with_signal_alt_stack(|| guest::run_thread(&shim, ctx));
     });
+}
+
+/// Constructing another platform must not invalidate a guest trampoline that
+/// already captured the first platform's guest-TP byte offset.
+#[cfg(test)]
+#[test]
+fn constructing_a_second_platform_preserves_guest_tp_slot_offset() {
+    use litebox::platform::SystemInfoProvider as _;
+
+    let first = MacOsUserland::new(None);
+    let before = first
+        .get_guest_tp_slot_offset()
+        .expect("the first platform reserved the process key");
+    let _second = MacOsUserland::new(None);
+    let after = first
+        .get_guest_tp_slot_offset()
+        .expect("the process key remains reserved");
+    assert_eq!(before, after);
 }
 
 /// The reserved key must convert into a byte offset the gates can actually use:
@@ -2867,18 +3595,16 @@ fn the_guest_tp_slot_offset_is_a_scaled_nonzero_byte_offset() {
     assert_ne!(offset, 0, "offset zero would address live libpthread state");
 }
 
-/// Reserving the guest thread-pointer TSD slot must not panic on real hardware
-/// even when the runtime key does not match the AOT-baked slot (it never does;
-/// see [`reserve_guest_tpidr_tsd_slot`]). A hard panic here previously made the
-/// whole platform unconstructable.
+/// Reserving the guest thread-pointer TSD key records the runtime-assigned key
+/// that both the architecture-specific accessors and trampoline offset use.
 #[cfg(test)]
 #[test]
-fn reserving_the_tsd_slot_does_not_panic_on_mismatch() {
+fn reserving_the_tsd_slot_records_the_runtime_key() {
     let key = reserve_guest_tpidr_tsd_slot();
     assert_eq!(
-        GUEST_TP_TSD_KEY.load(Ordering::Relaxed),
-        u32::try_from(key).unwrap(),
-        "the reserved key should be recorded for the future load-time-offset fix"
+        GUEST_TP_TSD_KEY.get().copied(),
+        Some(key),
+        "the reserved key should be recorded for runtime trampoline patching"
     );
 }
 
@@ -2895,7 +3621,14 @@ fn guest_tp_tsd_key_round_trips_a_pthread_specific_value() {
     reserve_guest_tpidr_tsd_slot();
     let key = guest_tp_tsd_key().expect("the key is recorded by now");
 
-    // SAFETY: `key` was just reserved above and is live for this thread.
+    // The process-wide key may have been used by an earlier test on this
+    // harness thread. Clear it before checking the null baseline.
+    // SAFETY: `key` is process-wide and live for this thread.
+    assert_eq!(
+        unsafe { libc::pthread_setspecific(key, core::ptr::null()) },
+        0
+    );
+    // SAFETY: same live key and thread as the clear above.
     let initial = unsafe { libc::pthread_getspecific(key) };
     assert!(
         initial.is_null(),
@@ -3061,6 +3794,42 @@ fn decode_mrs_ctr_el0(insn: u32) -> Option<u32> {
     }
 }
 
+fn decode_faulted_svc_gate(pc: usize) -> Option<usize> {
+    const SUB_SP_16: u32 = 0xd100_43ff;
+    const STR_X16_SP: u32 = 0xf900_03f0;
+    const STR_X16_SP_8: u32 = 0xf900_07f0;
+    const ADRP_X16_MASK: u32 = 0x9f00_001f;
+    const ADRP_X16: u32 = 0x9000_0010;
+    const ADD_X16_X16_MASK: u32 = 0xffc0_03ff;
+    const ADD_X16_X16: u32 = 0x9100_0210;
+    const B_MASK: u32 = 0xfc00_0000;
+    const B: u32 = 0x1400_0000;
+
+    if !pc.is_multiple_of(4) {
+        return None;
+    }
+    let gate = pc.checked_sub(4)?;
+    let words = darwin::read_task_u32s::<6>(gate)?;
+    if words[0] != SUB_SP_16
+        || words[1] != STR_X16_SP
+        || words[2] & ADRP_X16_MASK != ADRP_X16
+        || words[3] & ADD_X16_X16_MASK != ADD_X16_X16
+        || words[4] != STR_X16_SP_8
+        || words[5] & B_MASK != B
+    {
+        return None;
+    }
+
+    let immlo = (words[2] >> 29) & 0x3;
+    let immhi = (words[2] >> 5) & 0x7ffff;
+    let imm21 = (immhi << 2) | immlo;
+    let page_delta = ((u64::from(imm21) << 43).cast_signed() >> 43) << 12;
+    let adrp_pc = gate.checked_add(8)?;
+    let target_page = (adrp_pc & !0xfff).checked_add_signed(isize::try_from(page_delta).ok()?)?;
+    let continuation = target_page.checked_add(((words[3] >> 10) & 0xfff) as usize)?;
+    continuation.is_multiple_of(4).then_some(continuation)
+}
+
 unsafe extern "C" fn fault_handler(
     signum: libc::c_int,
     _info: *mut libc::siginfo_t,
@@ -3133,6 +3902,22 @@ unsafe extern "C" fn fault_handler(
             // SAFETY: makes JIT mappings executable for this thread; the
             // faulting branch/fetch re-runs and succeeds.
             unsafe { jit_write_protect(true) };
+            return;
+        }
+
+        if ec == 0x24
+            && is_write
+            && let Some(continuation) = decode_faulted_svc_gate(pc.trunc())
+        {
+            let recovery = unsafe {
+                guest::prepare_faulted_syscall_delivery(
+                    guest_state,
+                    &(*machine_context).thread_state,
+                    &(*machine_context).neon_state,
+                    continuation,
+                )
+            };
+            unsafe { (*machine_context).thread_state.pc = recovery as u64 };
             return;
         }
 
@@ -3418,16 +4203,15 @@ const ALT_STACK_GUARD_SIZE: usize = litebox::mm::linux::PAGE_SIZE;
 
 /// Runs `f` with an alternate signal stack installed on the calling thread.
 ///
-/// `guest::enter_guest_asm` stages the guest `PC` and `X0` in the 16 bytes
-/// below the guest `SP` for the brief window before it branches there, and
-/// AArch64 has no red zone protecting that staging area from a signal handler
-/// that runs on the interrupted stack. `darwin::install_handler` sets
-/// `SA_ONSTACK` on every handler this platform installs precisely so that risk
-/// is avoidable, but `SA_ONSTACK` only takes effect once a thread has actually
-/// registered a stack for it to use -- every entry point that can run guest
-/// code ([`ThreadProvider::spawn_thread`](litebox::platform::ThreadProvider::spawn_thread)
-/// and the free [`run_thread`]) wraps its call in this so that registration
-/// always happens first.
+/// Guest execution owns the hardware `SP`, and a hardware fault may mean that
+/// guest-controlled value is itself unmapped. A host signal handler therefore
+/// cannot safely run on the interrupted stack. `darwin::install_handler` sets
+/// `SA_ONSTACK` on every handler this platform installs, but that flag only
+/// takes effect once a thread has registered a stack for it to use. Every entry
+/// point that can run guest code
+/// ([`ThreadProvider::spawn_thread`](litebox::platform::ThreadProvider::spawn_thread)
+/// and the free [`run_thread`]) wraps its call in this so registration always
+/// happens first.
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let alt_stack_size = libc::SIGSTKSZ * 2;
     // SAFETY: an anonymous mapping with no fixed-address request has no

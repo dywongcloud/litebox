@@ -8,7 +8,7 @@
     reason = "still under development, remove before merging PR"
 )]
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -37,10 +37,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics impossible due to type invariants"
-    )]
     #[must_use]
     pub fn insert<Subsystem: FdEnabledSubsystem>(
         &mut self,
@@ -50,6 +46,24 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             entry: alloc::boxed::Box::new(entry.into()),
             metadata: AnyMap::new(),
         };
+        self.insert_handle(EntryHandle(Arc::new(RwLock::new(entry)), PhantomData))
+    }
+
+    /// Insert another descriptor for an existing open file description.
+    ///
+    /// Entry-scoped state and metadata remain shared with the descriptor from which
+    /// `handle` originated. Descriptor-scoped metadata is intentionally initialized
+    /// empty, matching `dup(2)` and `SCM_RIGHTS` semantics.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics impossible due to type invariants"
+    )]
+    #[must_use]
+    pub fn insert_handle<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        handle: EntryHandle<Platform, Subsystem>,
+    ) -> TypedFd<Subsystem> {
+        let EntryHandle(entry, PhantomData) = handle;
         let idx = self
             .entries
             .iter()
@@ -58,7 +72,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(IndividualEntry::new(Arc::new(RwLock::new(entry))));
+        let old = self.entries[idx].replace(IndividualEntry::new(entry));
         assert!(old.is_none());
         TypedFd {
             _phantom: PhantomData,
@@ -516,15 +530,95 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 }
 
+/// A process-local identity for one open file description.
+///
+/// The value stays unique for as long as either a strong or weak entry handle exists. It is
+/// intentionally opaque: callers may compare or order identities, but cannot turn one back into
+/// an entry without an [`EntryHandle`] or [`WeakEntryHandle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryIdentity(usize);
+
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
 /// maintaining access to the descriptor table itself.
 pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
     Arc<RwLock<Platform, DescriptorEntry>>,
-    PhantomData<Subsystem>,
+    PhantomData<fn() -> Subsystem>,
 );
+
+/// A non-owning handle to an open file description.
+///
+/// Unlike [`EntryHandle`], this does not keep the entry alive after the final descriptor closes.
+/// It is therefore suitable for kernel-style observer registrations such as epoll interests.
+pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
+    Weak<RwLock<Platform, DescriptorEntry>>,
+    PhantomData<fn() -> Subsystem>,
+);
+
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
+    for WeakEntryHandle<Platform, Subsystem>
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), PhantomData)
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
+    WeakEntryHandle<Platform, Subsystem>
+{
+    /// Try to acquire a strong handle. This fails after the final descriptor and in-flight strong
+    /// handle to the open file description have gone away.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<EntryHandle<Platform, Subsystem>> {
+        self.0
+            .upgrade()
+            .map(|entry| EntryHandle(entry, PhantomData))
+    }
+
+    /// Return the stable identity of the open file description this weak handle refers to.
+    #[must_use]
+    pub fn identity(&self) -> EntryIdentity {
+        EntryIdentity(self.0.as_ptr().addr())
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
+    for EntryHandle<Platform, Subsystem>
+{
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0), PhantomData)
+    }
+}
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     EntryHandle<Platform, Subsystem>
 {
+    /// Create a non-owning handle to this open file description.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakEntryHandle<Platform, Subsystem> {
+        WeakEntryHandle(Arc::downgrade(&self.0), PhantomData)
+    }
+
+    /// Return the stable identity of this open file description.
+    #[must_use]
+    pub fn identity(&self) -> EntryIdentity {
+        EntryIdentity(Arc::as_ptr(&self.0).addr())
+    }
+
+    /// Apply `f` to entry-scoped metadata.
+    ///
+    /// Descriptor-scoped metadata is deliberately unavailable through an entry handle because it
+    /// belongs to one numeric descriptor rather than to the shared open file description.
+    pub fn with_metadata<T, R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, MetadataError>
+    where
+        T: core::any::Any + Clone + Send + Sync,
+    {
+        self.0
+            .read()
+            .metadata
+            .get::<T>()
+            .map(f)
+            .ok_or(MetadataError::NoSuchMetadata)
+    }
+
     /// Get the entry behind this handle.
     ///
     /// Note: this grabs a lock, thus the result should not be held for too long, to prevent

@@ -151,6 +151,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
             Backend::Local { pollee, .. } => pollee.register_observer(observer, mask),
         }
     }
+
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        match &self.backend {
+            Backend::Brokered(counter) => counter.unregister_observer(observer),
+            Backend::Local { pollee, .. } => pollee.unregister_observer(observer),
+        }
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {

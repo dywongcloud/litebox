@@ -20,6 +20,7 @@
 use alloc::vec::Vec;
 
 use litebox::{
+    event::{Events, IOPollable, observer::Observer, polling::Pollee},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
@@ -36,6 +37,7 @@ impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for NetlinkSocket<Platform>
 /// later `recv`s drain, in order.
 pub(crate) struct NetlinkSocket<Platform: RawSyncPrimitivesProvider> {
     pending: Mutex<Platform, Vec<u8>>,
+    pollee: Pollee<Platform>,
     interface_addr: [u8; 4],
 }
 
@@ -171,10 +173,11 @@ fn build_addr_dump(out: &mut Vec<u8>, seq: u32, eth_addr: [u8; 4]) {
     push_msg(out, NLMSG_DONE, seq, &0i32.to_ne_bytes());
 }
 
-impl<Platform: RawSyncPrimitivesProvider> NetlinkSocket<Platform> {
+impl<Platform: ShimPlatform> NetlinkSocket<Platform> {
     pub(crate) fn new(interface_ip: core::net::Ipv4Addr) -> Self {
         Self {
             pending: Mutex::new(Vec::new()),
+            pollee: Pollee::new(),
             interface_addr: interface_ip.octets(),
         }
     }
@@ -183,6 +186,7 @@ impl<Platform: RawSyncPrimitivesProvider> NetlinkSocket<Platform> {
     /// Returns the number of request bytes "sent" (always the whole buffer).
     pub(crate) fn handle_send(&self, req: &[u8]) -> usize {
         let mut out = self.pending.lock();
+        let was_empty = out.is_empty();
         let mut off = 0usize;
         while off + 16 <= req.len() {
             let nlmsg_len =
@@ -202,6 +206,11 @@ impl<Platform: RawSyncPrimitivesProvider> NetlinkSocket<Platform> {
             let step = (nlmsg_len.max(16) + 3) & !3;
             off += step;
         }
+        let became_readable = was_empty && !out.is_empty();
+        drop(out);
+        if became_readable {
+            self.pollee.notify_observers(Events::IN);
+        }
         req.len()
     }
 
@@ -219,5 +228,23 @@ impl<Platform: RawSyncPrimitivesProvider> NetlinkSocket<Platform> {
         buf[..n].copy_from_slice(&pending[..n]);
         pending.drain(..n);
         Ok(n)
+    }
+}
+
+impl<Platform: ShimPlatform> IOPollable for NetlinkSocket<Platform> {
+    fn check_io_events(&self) -> Events {
+        let mut events = Events::OUT;
+        if !self.pending.lock().is_empty() {
+            events |= Events::IN;
+        }
+        events
+    }
+
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
+
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        self.pollee.unregister_observer(observer);
     }
 }

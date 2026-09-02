@@ -159,6 +159,14 @@ pub(crate) struct RemoteSignalTarget<Platform: ShimPlatform> {
     shared_pending: Arc<Mutex<Platform, PendingSignals>>,
 }
 
+impl<Platform: ShimPlatform> Clone for RemoteSignalTarget<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            shared_pending: self.shared_pending.clone(),
+        }
+    }
+}
+
 impl<Platform: ShimPlatform> RemoteSignalTarget<Platform> {
     /// Queues a shim-generated `siginfo` on the target process.
     ///
@@ -172,6 +180,15 @@ impl<Platform: ShimPlatform> RemoteSignalTarget<Platform> {
     pub(crate) fn post(&self, signal: Signal, siginfo: Siginfo) {
         assert!(!signal.is_rt_signal() && siginfo.code >= 0);
         self.shared_pending.lock().push_from_kernel(signal, siginfo);
+    }
+
+    pub(crate) fn post_from_user(
+        &self,
+        limits: &super::process::ResourceLimits,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) {
+        self.shared_pending.lock().push(limits, signal, siginfo);
     }
 }
 
@@ -241,7 +258,7 @@ impl<Platform: ShimPlatform> Clone for SignalHandlers<Platform> {
     }
 }
 
-struct PendingSignals {
+pub(crate) struct PendingSignals {
     /// The set of pending signals.
     pending: SigSet,
     /// The queue of pending siginfo structures.
@@ -249,7 +266,7 @@ struct PendingSignals {
 }
 
 impl PendingSignals {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: SigSet::empty(),
             queue: VecDeque::new(),
@@ -312,7 +329,12 @@ impl PendingSignals {
         self.pending.add(signal);
     }
 
-    fn push(&mut self, rlimits: &super::process::ResourceLimits, signal: Signal, siginfo: Siginfo) {
+    pub(crate) fn push(
+        &mut self,
+        rlimits: &super::process::ResourceLimits,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) {
         assert_eq!(signal.as_i32(), siginfo.signo);
 
         // Don't queue duplicates for standard signals.
@@ -330,6 +352,23 @@ impl PendingSignals {
         }
         self.queue.push_back(siginfo);
         self.pending.add(signal);
+    }
+
+    /// Moves every entry queued here into `dest`, preserving standard-signal dedup (an entry
+    /// whose signal is already pending in `dest` is dropped, matching `push`'s own dedup rule --
+    /// this can only apply to standard signals, since `push`'s realtime-signal branch never
+    /// hits `pending.contains` at all). Does not re-apply an `RLIMIT_SIGPENDING` check: the
+    /// limit was already enforced when each entry was queued here.
+    pub(crate) fn drain_into(&mut self, dest: &mut Self) {
+        for siginfo in self.queue.drain(..) {
+            let signal = Signal::try_from(siginfo.signo).expect("queued an invalid signal");
+            if !signal.is_rt_signal() && dest.pending.contains(signal) {
+                continue;
+            }
+            dest.queue.push_back(siginfo);
+            dest.pending.add(signal);
+        }
+        self.pending = SigSet::empty();
     }
 }
 
@@ -362,6 +401,18 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
+        #[cfg(target_pointer_width = "64")]
+        __pad: 0,
+        data: SiginfoData::new_zeroed(),
+    }
+}
+
+/// Creates the kernel-originated signal requested through `PR_SET_PDEATHSIG`.
+pub(crate) fn siginfo_parent_death(signal: Signal) -> Siginfo {
+    Siginfo {
+        signo: signal.as_i32(),
+        errno: 0,
+        code: SI_KERNEL,
         #[cfg(target_pointer_width = "64")]
         __pad: 0,
         data: SiginfoData::new_zeroed(),
@@ -680,7 +731,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
-        self.do_kill(Some(pid), None, signal)
+        if signal == 0 {
+            if pid == 0 || pid == self.pid || (pid > 0 && self.global.processes.is_live(pid)) {
+                return Ok(0);
+            }
+            return Err(Errno::ESRCH);
+        }
+        let signal = Signal::try_from(signal)?;
+        if pid == 0 {
+            let process_group_id = self.process().process_group_id();
+            self.send_shared_signal(signal, siginfo_kill(signal));
+            self.global.processes.send_process_group_signal(
+                process_group_id,
+                self.pid,
+                signal,
+                siginfo_kill(signal),
+            );
+            return Ok(0);
+        }
+        if pid > 0 && pid != self.pid {
+            return self
+                .global
+                .processes
+                .send_process_signal(pid, signal, siginfo_kill(signal))
+                .then_some(0)
+                .ok_or(Errno::ESRCH);
+        }
+        self.do_kill(Some(pid), None, signal.as_i32())
     }
 
     pub(crate) fn sys_tkill(&self, tid: i32, signal: i32) -> Result<usize, Errno> {
@@ -693,13 +770,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
-        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
-            self.send_signal(signal, siginfo_kill(signal));
-            Ok(0)
-        } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
-            Err(Errno::ESRCH)
+        if pid.is_some_and(|pid| pid != self.pid) {
+            log_unsupported!("sys_{{t|tg}}kill with remote pid");
+            return Err(Errno::ESRCH);
         }
+        let Some(tid) = tid else {
+            self.send_signal(signal, siginfo_kill(signal));
+            return Ok(0);
+        };
+        if tid == self.tid {
+            self.send_signal(signal, siginfo_kill(signal));
+            return Ok(0);
+        }
+        // A sibling thread's `SignalState.pending` is a bare `RefCell`, not `Send`/`Sync` --
+        // only reachable from the thread it belongs to -- so delivery goes through
+        // `ThreadRemote::remote_pending`, the one piece of a thread's signal state built to be
+        // touched remotely. `thread_remote` returns `None` once the target has detached
+        // (exited), which is exactly when a real `tkill` would also report ESRCH: Linux never
+        // resurrects a reaped tid.
+        let Some(remote) = self.process().thread_remote(tid) else {
+            return Err(Errno::ESRCH);
+        };
+        remote.deliver_remote_signal(&self.process().limits, signal, siginfo_kill(signal));
+        Ok(0)
     }
 
     /// Returns whether there are any pending signals that can be delivered.
@@ -711,6 +804,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// a signal in the first place; this is where that is enforced, rather than at the sending
     /// end, because a sender in another guest process cannot see the target's live handler table.
     pub(crate) fn has_pending_signals(&self) -> bool {
+        self.thread_remote()
+            .drain_remote_signals_into(&mut self.signals.pending.borrow_mut());
         let blocked = self.signals.blocked.get();
         let thread_pending = self.signals.pending.borrow().pending & !blocked;
         let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
@@ -740,6 +835,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+        self.thread_remote()
+            .drain_remote_signals_into(&mut self.signals.pending.borrow_mut());
         loop {
             let blocked = self.signals.blocked.get();
             let (signal, siginfo) = {
@@ -960,5 +1057,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern crate std;
+
+    #[test]
+    fn kill_zero_signals_only_the_callers_process_group() {
+        let caller = crate::syscalls::tests::init_platform(None);
+        let peer = caller
+            .global
+            .clone()
+            .new_test_task(caller.files.borrow().fs.clone());
+        let outsider = caller
+            .global
+            .clone()
+            .new_test_task(caller.files.borrow().fs.clone());
+
+        caller.register_for_remote_signals();
+        peer.register_for_remote_signals();
+        outsider.register_for_remote_signals();
+        assert_eq!(caller.sys_setpgid(0, 3131), Ok(()));
+        assert_eq!(peer.sys_setpgid(0, 3131), Ok(()));
+        assert_eq!(outsider.sys_setpgid(0, 4242), Ok(()));
+        assert_eq!(caller.sys_kill(0, 0), Ok(0));
+        assert!(caller.pending_signal_set().is_empty());
+        assert!(peer.pending_signal_set().is_empty());
+        assert!(outsider.pending_signal_set().is_empty());
+
+        assert_eq!(caller.sys_kill(0, Signal::SIGUSR1.as_i32()), Ok(0));
+        assert!(caller.pending_signal_set().contains(Signal::SIGUSR1));
+        assert!(peer.pending_signal_set().contains(Signal::SIGUSR1));
+        assert!(!outsider.pending_signal_set().contains(Signal::SIGUSR1));
     }
 }

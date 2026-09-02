@@ -156,6 +156,10 @@ where
         self.pollee.register_observer(observer, mask);
     }
 
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        self.pollee.unregister_observer(observer);
+    }
+
     fn check_io_events(&self) -> Events {
         let readiness = match self
             .broker

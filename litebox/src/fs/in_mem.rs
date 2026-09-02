@@ -17,7 +17,10 @@ use super::errors::{
     ReadDirError, ReadError, ReadlinkError, RenameError, RmdirError, SeekError, SymlinkError,
     TruncateError, UnlinkError, UtimeError, WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence, Timestamp, UserInfo};
+use super::{
+    AccessCredentials, DacAccessKind, DirEntry, FileStatus, FileType, Mode, NodeInfo, SeekWhence,
+    Timestamp, UserInfo,
+};
 
 /// Just a random constant that is distinct from other file systems. In this case, it is
 /// `b'IMem'.hex()`.
@@ -77,6 +80,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         self.current_user = UserInfo { user, group };
     }
 
+    /// Return the identity used for permission and ownership checks.
+    pub fn current_user(&self) -> UserInfo {
+        self.current_user
+    }
+
     /// Execute `f` with superuser/root privileges.
     ///
     /// This function primarily exists to initialize files. Most regular interaction with the file
@@ -121,6 +129,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
             write_allowed: _,
             position: _,
             append_mode: _,
+            path_only: _,
         } = &mut descriptor_table.get_entry_mut(fd).unwrap().entry
         else {
             panic!("must only be used on files, not directories")
@@ -162,9 +171,202 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {}
+impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileSystem<Platform> {
+    fn mkdir_for_copy_up(
+        &self,
+        _token: &super::private::CopyUpToken,
+        path: &str,
+        mode: Mode,
+        owner: UserInfo,
+    ) -> Result<(), MkdirError> {
+        let path = self.absolute_path(path)?;
+        self.mkdir_inner(path, mode, owner, false, AccessCredentials::root())
+    }
+
+    fn create_file_for_copy_up(
+        &self,
+        _token: &super::private::CopyUpToken,
+        path: &str,
+        mode: Mode,
+        owner: UserInfo,
+    ) -> Result<FileFd<Platform>, OpenError> {
+        let path = self.absolute_path(path)?;
+        self.create_file_for_copy_up_inner(path, mode, owner)
+    }
+
+    fn publish_file_for_copy_up(
+        &self,
+        _token: &super::private::CopyUpToken,
+        staging_path: &str,
+        destination_path: &str,
+    ) -> Result<(), RenameError> {
+        let staging_path = self.absolute_path(staging_path)?;
+        let destination_path = self.absolute_path(destination_path)?;
+        if staging_path == destination_path {
+            return Err(RenameError::InvalidArgument);
+        }
+
+        let mut root = self.root.write();
+        let (staging_parent, staging_entry) =
+            root.parent_and_entry_as(&staging_path, AccessCredentials::root())?;
+        let staging_parent = staging_parent.map(|(_, directory)| directory);
+        let Some(Entry::File(_)) = staging_entry else {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        };
+        let Some(staging_parent) = staging_parent else {
+            return Err(RenameError::InvalidArgument);
+        };
+
+        let (destination_parent, destination_entry) =
+            root.parent_and_entry_as(&destination_path, AccessCredentials::root())?;
+        let destination_parent = destination_parent.map(|(_, directory)| directory);
+        if destination_entry.is_some() {
+            return Err(RenameError::AlreadyExists);
+        }
+        let Some(destination_parent) = destination_parent else {
+            return Err(RenameError::InvalidArgument);
+        };
+        if !Arc::ptr_eq(&staging_parent, &destination_parent) {
+            return Err(RenameError::InvalidArgument);
+        }
+
+        let staging_name: String = staging_path
+            .components()
+            .map_err(PathError::from)?
+            .last()
+            .ok_or(RenameError::InvalidArgument)?
+            .into();
+        let destination_name: String = destination_path
+            .components()
+            .map_err(PathError::from)?
+            .last()
+            .ok_or(RenameError::InvalidArgument)?
+            .into();
+        let mut parent = staging_parent.write();
+        if parent.children.get(&staging_name) != Some(&FileType::RegularFile)
+            || parent.children.contains_key(&destination_name)
+        {
+            return Err(RenameError::Io);
+        }
+        let Some(staging_entry) = root.entries.remove(&staging_path) else {
+            return Err(RenameError::Io);
+        };
+        parent.children.remove(&staging_name);
+        parent
+            .children
+            .insert(destination_name, FileType::RegularFile);
+        root.entries.insert(destination_path, staging_entry);
+        Ok(())
+    }
+
+    fn remove_file_for_copy_up(
+        &self,
+        _token: &super::private::CopyUpToken,
+        staging_path: &str,
+    ) -> Result<(), UnlinkError> {
+        let staging_path = self.absolute_path(staging_path)?;
+        let mut root = self.root.write();
+        let (parent, entry) =
+            root.parent_and_entry_as(&staging_path, AccessCredentials::root())?;
+        let parent = parent.map(|(_, directory)| directory);
+        let Some(Entry::File(_)) = entry else {
+            return match entry {
+                Some(Entry::Dir(_)) => Err(UnlinkError::IsADirectory),
+                Some(Entry::SymLink(_)) => Err(UnlinkError::Io),
+                Some(Entry::File(_)) => unreachable!(),
+                None => Err(PathError::NoSuchFileOrDirectory.into()),
+            };
+        };
+        let Some(parent) = parent else {
+            return Err(UnlinkError::IsADirectory);
+        };
+        let Some(staging_name) = staging_path.components().map_err(PathError::from)?.last() else {
+            return Err(UnlinkError::IsADirectory);
+        };
+        let mut parent = parent.write();
+        if parent.children.get(staging_name) != Some(&FileType::RegularFile)
+            || !matches!(root.entries.get(&staging_path), Some(Entry::File(_)))
+        {
+            return Err(UnlinkError::Io);
+        }
+        parent.children.remove(staging_name);
+        root.entries.remove(&staging_path);
+        Ok(())
+    }
+
+    fn read_file_for_copy_up(
+        &self,
+        _token: &super::private::CopyUpToken,
+        fd: &FileFd<Platform>,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd).ok_or(ReadError::ClosedFd)?;
+        let Descriptor::File { file, .. } = &entry.entry else {
+            return Err(ReadError::NotAFile);
+        };
+        let file = file.read();
+        let start = offset.min(file.data.len());
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(ReadError::Io)?
+            .min(file.data.len());
+        let size = end.checked_sub(start).ok_or(ReadError::Io)?;
+        buf[..size].copy_from_slice(&file.data[start..end]);
+        Ok(size)
+    }
+
+    fn set_times_for_copy_up(
+        &self,
+        _token: &super::private::CopyUpToken,
+        fd: &FileFd<Platform>,
+        atime: Timestamp,
+        mtime: Timestamp,
+        ctime: Timestamp,
+    ) -> Result<(), UtimeError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let entry = descriptor_table.get_entry(fd).ok_or(UtimeError::ClosedFd)?;
+        let Descriptor::File { file, .. } = &entry.entry else {
+            return Err(UtimeError::Io);
+        };
+        let mut file = file.write();
+        file.atime = atime;
+        file.mtime = mtime;
+        file.ctime = ctime;
+        Ok(())
+    }
+}
 
 impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
+    fn update_owner(
+        credentials: AccessCredentials<'_>,
+        perms: &mut Permissions,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        if credentials.user() != 0 {
+            if !credentials.owns(perms.userinfo)
+                || user.is_some_and(|user| user != perms.userinfo.user)
+                || group.is_some_and(|group| !credentials.in_group(group))
+            {
+                return Err(ChownError::NotTheOwner);
+            }
+        }
+        let changed = user.is_some_and(|user| user != perms.userinfo.user)
+            || group.is_some_and(|group| group != perms.userinfo.group);
+        if let Some(user) = user {
+            perms.userinfo.user = user;
+        }
+        if let Some(group) = group {
+            perms.userinfo.group = group;
+        }
+        if changed {
+            perms.mode.remove(Mode::SUID | Mode::SGID);
+        }
+        Ok(())
+    }
+
     // Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     // for any relative paths from current working directory.
     //
@@ -180,16 +382,126 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
             Ok((self.current_working_dir.clone() + path.as_rust_str()?).normalized()?)
         }
     }
+
+    fn mkdir_inner(
+        &self,
+        path: String,
+        mode: Mode,
+        owner: UserInfo,
+        require_parent_write: bool,
+        credentials: AccessCredentials<'_>,
+    ) -> Result<(), MkdirError> {
+        let mut root = self.root.write();
+        let (parent, entry) = root.parent_and_entry_as(&path, credentials)?;
+        let Some((_parent_path, parent)) = parent else {
+            return Err(MkdirError::AlreadyExists);
+        };
+        let None = entry else {
+            return Err(MkdirError::AlreadyExists);
+        };
+        let mut parent = parent.write();
+        if require_parent_write
+            && !super::dac_allows_as(
+                credentials,
+                parent.perms.userinfo,
+                parent.perms.mode,
+                DacAccessKind::Write,
+            )
+        {
+            return Err(MkdirError::NoWritePerms);
+        }
+        let old = parent.children.insert(
+            path.components().unwrap().last().unwrap().into(),
+            FileType::Directory,
+        );
+        assert!(old.is_none());
+        let old = root.entries.insert(
+            path,
+            Entry::Dir(Arc::new(sync::RwLock::new(DirX {
+                perms: Permissions {
+                    mode,
+                    userinfo: owner,
+                },
+                children: HashMap::default(),
+                unique_id: self.fresh_id(),
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
+            }))),
+        );
+        assert!(old.is_none());
+        Ok(())
+    }
+
+    fn create_file_for_copy_up_inner(
+        &self,
+        path: String,
+        mode: Mode,
+        owner: UserInfo,
+    ) -> Result<FileFd<Platform>, OpenError> {
+        let mut root = self.root.write();
+        let (parent, entry) =
+            root.parent_and_entry_as(&path, AccessCredentials::root())?;
+        let Some((_, parent)) = parent else {
+            return Err(OpenError::AlreadyExists);
+        };
+        if entry.is_some() {
+            return Err(OpenError::AlreadyExists);
+        }
+        let mut parent = parent.write();
+        let old = parent.children.insert(
+            path.components().unwrap().last().unwrap().into(),
+            FileType::RegularFile,
+        );
+        assert!(old.is_none());
+        let file = Arc::new(sync::RwLock::new(FileX {
+            perms: Permissions {
+                mode,
+                userinfo: owner,
+            },
+            data: Vec::new().into(),
+            unique_id: self.fresh_id(),
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+            ctime: Timestamp::default(),
+        }));
+        let old = root.entries.insert(path, Entry::File(file.clone()));
+        assert!(old.is_none());
+        drop(parent);
+        drop(root);
+        Ok(self
+            .litebox
+            .descriptor_table_mut()
+            .insert(Descriptor::File {
+                file,
+                read_allowed: false,
+                write_allowed: true,
+                position: 0,
+                append_mode: false,
+                path_only: false,
+            }))
+    }
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem<Platform> {
     fn open(
         &self,
         path: impl crate::path::Arg,
+        flags: super::OFlags,
+        mode: super::Mode,
+    ) -> Result<FileFd<Platform>, OpenError> {
+        self.open_as(self.current_user.into(), path, flags, mode)
+    }
+
+    fn open_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
         mut flags: super::OFlags,
         mode: super::Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         use super::OFlags;
+        flags = flags.normalized_for_open();
         let currently_supported_oflags: OFlags = OFlags::CREAT
             | OFlags::RDONLY
             | OFlags::WRONLY
@@ -200,15 +512,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             | OFlags::DIRECTORY
             | OFlags::NONBLOCK
             | OFlags::LARGEFILE
+            | OFlags::NOATIME
             | OFlags::NOFOLLOW
-            | OFlags::APPEND;
+            | OFlags::APPEND
+            | OFlags::PATH;
         if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!("{flags:?}")
+            return Err(OpenError::UnsupportedFlags);
         }
         let path = self.absolute_path(path)?;
         let (entry, created) = if flags.contains(OFlags::CREAT) {
             let mut root = self.root.write();
-            let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+            let (parent, entry) = root.parent_and_entry_as(&path, credentials)?;
             if let Some(entry) = entry {
                 if flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
@@ -222,23 +536,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     unreachable!()
                 };
                 let mut parent = parent.write();
-                if !self.current_user.can_write(&parent.perms) {
+                if !super::dac_allows_as(
+                    credentials,
+                    parent.perms.userinfo,
+                    parent.perms.mode,
+                    DacAccessKind::Write,
+                ) {
                     return Err(OpenError::NoWritePerms);
                 }
                 // When both O_CREAT and O_DIRECTORY are specified in flags and the
                 // file specified by pathname does not exist, open() will create a
                 // regular file (i.e., O_DIRECTORY is ignored).
                 flags.remove(OFlags::DIRECTORY);
+                let owner = credentials
+                    .as_user_info()
+                    .ok_or(OpenError::OperationNotPermitted)?;
                 let old = parent.children.insert(
                     path.components().unwrap().last().unwrap().into(),
                     FileType::RegularFile,
                 );
                 assert!(old.is_none());
                 let entry = Entry::File(Arc::new(sync::RwLock::new(FileX {
-                    perms: Permissions {
-                        mode,
-                        userinfo: self.current_user,
-                    },
+                    perms: Permissions { mode, userinfo: owner },
                     data: Vec::new().into(),
                     unique_id: self.fresh_id(),
                     atime: Timestamp::default(),
@@ -251,29 +570,54 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
         } else {
             let root = self.root.read();
-            let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+            let (_, entry) = root.parent_and_entry_as(&path, credentials)?;
             let Some(entry) = entry else {
                 return Err(PathError::NoSuchFileOrDirectory)?;
             };
             (entry, false)
         };
+        if flags.contains(OFlags::NOATIME) {
+            let owner = entry.perms().userinfo;
+            if credentials.user() != 0 && !credentials.owns(owner) {
+                return Err(OpenError::OperationNotPermitted);
+            }
+        }
+        let path_only = flags.contains(OFlags::PATH);
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        let read_allowed = if access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR {
-            if !created && !self.current_user.can_read(&entry.perms()) {
-                return Err(OpenError::AccessNotAllowed);
-            }
-            true
-        } else {
-            false
-        };
-        let write_allowed = if access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR {
-            if !created && !self.current_user.can_write(&entry.perms()) {
-                return Err(OpenError::AccessNotAllowed);
-            }
-            true
-        } else {
-            false
-        };
+        let read_allowed =
+            if !path_only && (access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR) {
+                if !created {
+                    let permissions = entry.perms();
+                    if !super::dac_allows_as(
+                        credentials,
+                        permissions.userinfo,
+                        permissions.mode,
+                        DacAccessKind::Read,
+                    ) {
+                        return Err(OpenError::AccessNotAllowed);
+                    }
+                }
+                true
+            } else {
+                false
+            };
+        let write_allowed =
+            if !path_only && (access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR) {
+                if !created {
+                    let permissions = entry.perms();
+                    if !super::dac_allows_as(
+                        credentials,
+                        permissions.userinfo,
+                        permissions.mode,
+                        DacAccessKind::Write,
+                    ) {
+                        return Err(OpenError::AccessNotAllowed);
+                    }
+                }
+                true
+            } else {
+                false
+            };
         let append_mode = flags.contains(OFlags::APPEND);
         let fd = match entry {
             Entry::File(file) => {
@@ -288,16 +632,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         write_allowed,
                         position: 0,
                         append_mode,
+                        path_only,
                     })
             }
             Entry::Dir(dir) => self
                 .litebox
                 .descriptor_table_mut()
-                .insert(Descriptor::Dir { dir: dir.clone() }),
+                .insert(Descriptor::Dir {
+                    dir: dir.clone(),
+                    position: Arc::new(sync::Mutex::new(0)),
+                    path_only,
+                }),
+            Entry::SymLink(link) if path_only => {
+                if flags.contains(OFlags::DIRECTORY) {
+                    return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+                }
+                self.litebox
+                    .descriptor_table_mut()
+                    .insert(Descriptor::SymLink { link: link.clone() })
+            }
             Entry::SymLink(_) => {
                 // The shim resolves symlink following before it ever calls
-                // `open`, so a symlink reaching here means O_NOFOLLOW was set on
-                // the final component -- which `open(2)` answers with ELOOP.
+                // `open`, so a symlink reaching here without O_PATH means
+                // O_NOFOLLOW was set on the final component.
                 return Err(OpenError::TooManySymbolicLinks);
             }
         };
@@ -325,16 +682,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         mut offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ReadError::ClosedFd)?
+            .entry;
+        if match descriptor {
+            Descriptor::File { path_only, .. } | Descriptor::Dir { path_only, .. } => *path_only,
+            Descriptor::SymLink { .. } => true,
+        } {
+            return Err(ReadError::NotForReading);
+        }
         let Descriptor::File {
             file,
             read_allowed,
             write_allowed: _,
             position,
             append_mode: _,
-        } = &mut descriptor_table
-            .get_entry_mut(fd)
-            .ok_or(ReadError::ClosedFd)?
-            .entry
+            path_only: _,
+        } = descriptor
         else {
             return Err(ReadError::NotAFile);
         };
@@ -362,16 +727,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         mut offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(WriteError::ClosedFd)?
+            .entry;
+        if match descriptor {
+            Descriptor::File { path_only, .. } | Descriptor::Dir { path_only, .. } => *path_only,
+            Descriptor::SymLink { .. } => true,
+        } {
+            return Err(WriteError::NotForWriting);
+        }
         let Descriptor::File {
             file,
             read_allowed: _,
             write_allowed,
             position,
             append_mode,
-        } = &mut descriptor_table
-            .get_entry_mut(fd)
-            .ok_or(WriteError::ClosedFd)?
-            .entry
+            path_only: _,
+        } = descriptor
         else {
             return Err(WriteError::NotAFile);
         };
@@ -416,33 +789,59 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::File {
-            file,
-            read_allowed: _,
-            write_allowed: _,
-            position,
-            append_mode: _,
-        } = &mut descriptor_table
+        let descriptor = &mut descriptor_table
             .get_entry_mut(fd)
             .ok_or(SeekError::ClosedFd)?
-            .entry
-        else {
-            return Err(SeekError::NotAFile);
-        };
-        let file_len = file.read().data.len();
-        let base = match whence {
-            SeekWhence::RelativeToBeginning => 0,
-            SeekWhence::RelativeToCurrentOffset => *position,
-            SeekWhence::RelativeToEnd => file_len,
-        };
-        let new_posn = base
-            .checked_add_signed(offset)
-            .ok_or(SeekError::InvalidOffset)?;
-        if new_posn > file_len {
-            Err(SeekError::InvalidOffset)
-        } else {
-            *position = new_posn;
-            Ok(new_posn)
+            .entry;
+        match descriptor {
+            Descriptor::File {
+                file,
+                position,
+                path_only,
+                ..
+            } => {
+                if *path_only {
+                    return Err(SeekError::NotAFile);
+                }
+                let file_len = file.read().data.len();
+                let base = match whence {
+                    SeekWhence::RelativeToBeginning => 0,
+                    SeekWhence::RelativeToCurrentOffset => *position,
+                    SeekWhence::RelativeToEnd => file_len,
+                };
+                let new_position = base
+                    .checked_add_signed(offset)
+                    .ok_or(SeekError::InvalidOffset)?;
+                if isize::try_from(new_position).is_err() {
+                    return Err(SeekError::InvalidOffset);
+                }
+                *position = new_position;
+                Ok(new_position)
+            }
+            Descriptor::Dir {
+                position,
+                path_only,
+                ..
+            } => {
+                if *path_only {
+                    return Err(SeekError::NotAFile);
+                }
+                let mut position = position.lock();
+                let base = match whence {
+                    SeekWhence::RelativeToBeginning => 0,
+                    SeekWhence::RelativeToCurrentOffset => *position,
+                    SeekWhence::RelativeToEnd => return Err(SeekError::InvalidOffset),
+                };
+                let new_position = base
+                    .checked_add_signed(offset)
+                    .ok_or(SeekError::InvalidOffset)?;
+                if isize::try_from(new_position).is_err() {
+                    return Err(SeekError::InvalidOffset);
+                }
+                *position = new_position;
+                Ok(new_position)
+            }
+            Descriptor::SymLink { .. } => Err(SeekError::NotAFile),
         }
     }
 
@@ -453,16 +852,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
         let descriptor_table = self.litebox.descriptor_table();
+        let descriptor = &mut descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(TruncateError::ClosedFd)?
+            .entry;
+        if match descriptor {
+            Descriptor::File { path_only, .. } | Descriptor::Dir { path_only, .. } => *path_only,
+            Descriptor::SymLink { .. } => true,
+        } {
+            return Err(TruncateError::PathOnlyFd);
+        }
         let Descriptor::File {
             file,
             read_allowed: _,
             write_allowed,
             position,
             append_mode: _,
-        } = &mut descriptor_table
-            .get_entry_mut(fd)
-            .ok_or(TruncateError::ClosedFd)?
-            .entry
+            path_only: _,
+        } = descriptor
         else {
             return Err(TruncateError::IsDirectory);
         };
@@ -487,16 +894,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 
     fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
+        self.chmod_as(self.current_user.into(), path, mode)
+    }
+
+    fn chmod_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
+        mode: super::Mode,
+    ) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry_as(&path, credentials)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         match entry {
             Entry::File(file) => {
                 let perms = &mut file.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(credentials.user() == 0 || credentials.owns(perms.userinfo)) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -504,7 +920,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             }
             Entry::Dir(dir) => {
                 let perms = &mut dir.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(credentials.user() == 0 || credentials.owns(perms.userinfo)) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -515,7 +931,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             // ownership check still applies.
             Entry::SymLink(link) => {
                 let perms = &mut link.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(credentials.user() == 0 || credentials.owns(perms.userinfo)) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -525,20 +941,36 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 
     fn fd_chmod(&self, fd: &FileFd<Platform>, mode: super::Mode) -> Result<(), ChmodError> {
+        self.fd_chmod_as(self.current_user.into(), fd, mode)
+    }
+
+    fn fd_chmod_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        fd: &FileFd<Platform>,
+        mode: super::Mode,
+    ) -> Result<(), ChmodError> {
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.get_entry(fd).ok_or(ChmodError::ClosedFd)?;
         match &entry.entry {
+            Descriptor::File {
+                path_only: true, ..
+            }
+            | Descriptor::Dir {
+                path_only: true, ..
+            }
+            | Descriptor::SymLink { .. } => Err(ChmodError::PathOnlyFd),
             Descriptor::File { file, .. } => {
                 let perms = &mut file.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(credentials.user() == 0 || credentials.owns(perms.userinfo)) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
                 Ok(())
             }
-            Descriptor::Dir { dir } => {
+            Descriptor::Dir { dir, .. } => {
                 let perms = &mut dir.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                if !(credentials.user() == 0 || credentials.owns(perms.userinfo)) {
                     return Err(ChmodError::NotTheOwner);
                 }
                 perms.mode = mode;
@@ -553,52 +985,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
+        self.chown_as(self.current_user.into(), path, user, group)
+    }
+
+    fn chown_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry_as(&path, credentials)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
         match entry {
             Entry::File(file) => {
                 let perms = &mut file.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
-                    return Err(ChownError::NotTheOwner);
-                }
-                if let Some(new_user) = user {
-                    perms.userinfo.user = new_user;
-                }
-                if let Some(new_group) = group {
-                    perms.userinfo.group = new_group;
-                }
-                Ok(())
+                Self::update_owner(credentials, perms, user, group)
             }
             Entry::Dir(dir) => {
                 let perms = &mut dir.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
-                    return Err(ChownError::NotTheOwner);
-                }
-                if let Some(new_user) = user {
-                    perms.userinfo.user = new_user;
-                }
-                if let Some(new_group) = group {
-                    perms.userinfo.group = new_group;
-                }
-                Ok(())
+                Self::update_owner(credentials, perms, user, group)
             }
             // `lchown` on the link itself (following callers resolve first).
             Entry::SymLink(link) => {
                 let perms = &mut link.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
-                    return Err(ChownError::NotTheOwner);
-                }
-                if let Some(new_user) = user {
-                    perms.userinfo.user = new_user;
-                }
-                if let Some(new_group) = group {
-                    perms.userinfo.group = new_group;
-                }
-                Ok(())
+                Self::update_owner(credentials, perms, user, group)
             }
         }
     }
@@ -609,34 +1024,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
+        self.fd_chown_as(self.current_user.into(), fd, user, group)
+    }
+
+    fn fd_chown_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        fd: &FileFd<Platform>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.get_entry(fd).ok_or(ChownError::ClosedFd)?;
         match &entry.entry {
+            Descriptor::File {
+                path_only: true, ..
+            }
+            | Descriptor::Dir {
+                path_only: true, ..
+            }
+            | Descriptor::SymLink { .. } => Err(ChownError::PathOnlyFd),
             Descriptor::File { file, .. } => {
                 let perms = &mut file.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
-                    return Err(ChownError::NotTheOwner);
-                }
-                if let Some(new_user) = user {
-                    perms.userinfo.user = new_user;
-                }
-                if let Some(new_group) = group {
-                    perms.userinfo.group = new_group;
-                }
-                Ok(())
+                Self::update_owner(credentials, perms, user, group)
             }
-            Descriptor::Dir { dir } => {
+            Descriptor::Dir { dir, .. } => {
                 let perms = &mut dir.write().perms;
-                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
-                    return Err(ChownError::NotTheOwner);
-                }
-                if let Some(new_user) = user {
-                    perms.userinfo.user = new_user;
-                }
-                if let Some(new_group) = group {
-                    perms.userinfo.group = new_group;
-                }
-                Ok(())
+                Self::update_owner(credentials, perms, user, group)
             }
         }
     }
@@ -647,13 +1061,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         atime: Option<Timestamp>,
         mtime: Option<Timestamp>,
     ) -> Result<(), UtimeError> {
+        self.utimensat_as(self.current_user.into(), path, atime, mtime)
+    }
+
+    fn utimensat_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry_as(&path, credentials)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
-        if !self.current_user.can_write(&entry.perms()) {
+        let permissions = entry.perms();
+        if !(credentials.user() == 0 || credentials.owns(permissions.userinfo)) {
             return Err(UtimeError::NoWritePerms);
         }
         match entry {
@@ -703,12 +1128,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         atime: Option<Timestamp>,
         mtime: Option<Timestamp>,
     ) -> Result<(), UtimeError> {
+        self.fd_utimensat_as(self.current_user.into(), fd, atime, mtime)
+    }
+
+    fn fd_utimensat_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        fd: &FileFd<Platform>,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.get_entry(fd).ok_or(UtimeError::ClosedFd)?;
         match &entry.entry {
+            Descriptor::File {
+                path_only: true, ..
+            }
+            | Descriptor::Dir {
+                path_only: true, ..
+            }
+            | Descriptor::SymLink { .. } => return Err(UtimeError::PathOnlyFd),
             Descriptor::File { file, .. } => {
                 let mut file = file.write();
-                if !self.current_user.can_write(&file.perms) {
+                if !(credentials.user() == 0 || credentials.owns(file.perms.userinfo)) {
                     return Err(UtimeError::NoWritePerms);
                 }
                 if let Some(atime) = atime {
@@ -721,9 +1163,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     file.ctime = changed;
                 }
             }
-            Descriptor::Dir { dir } => {
+            Descriptor::Dir { dir, .. } => {
                 let mut dir = dir.write();
-                if !self.current_user.can_write(&dir.perms) {
+                if !(credentials.user() == 0 || credentials.owns(dir.perms.userinfo)) {
                     return Err(UtimeError::NoWritePerms);
                 }
                 if let Some(atime) = atime {
@@ -741,9 +1183,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
+        self.unlink_as(self.current_user.into(), path)
+    }
+
+    fn unlink_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
+    ) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry_as(&path, credentials)?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
             return Err(UnlinkError::IsADirectory);
@@ -754,9 +1204,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if let Entry::Dir(_) = entry {
             return Err(UnlinkError::IsADirectory);
         }
+        let victim_owner = entry.perms().userinfo;
         let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
+        if !super::dac_allows_as(
+            credentials,
+            parent.perms.userinfo,
+            parent.perms.mode,
+            DacAccessKind::Write,
+        ) {
             return Err(UnlinkError::NoWritePerms);
+        }
+        if !super::sticky_directory_allows_removal(
+            credentials,
+            parent.perms.userinfo,
+            parent.perms.mode,
+            victim_owner,
+        ) {
+            return Err(UnlinkError::OperationNotPermitted);
         }
         let removed = parent
             .children
@@ -779,13 +1243,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         newpath: impl crate::path::Arg,
         noreplace: bool,
     ) -> Result<(), RenameError> {
+        self.rename_as(self.current_user.into(), oldpath, newpath, noreplace)
+    }
+
+    fn rename_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+        noreplace: bool,
+    ) -> Result<(), RenameError> {
         let old = self.absolute_path(oldpath)?;
         let new = self.absolute_path(newpath)?;
 
         // Renaming a path to itself is a no-op success, provided the path exists.
         if old == new {
             let root = self.root.read();
-            let (_, entry) = root.parent_and_entry(&old, self.current_user)?;
+            let (_, entry) = root.parent_and_entry_as(&old, credentials)?;
             return if entry.is_some() {
                 Ok(())
             } else {
@@ -805,7 +1279,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         // Resolve source and destination. `parent_and_entry` hands back the parent
         // path as a `&str` borrowed from `root`; project it away (keeping the parent
         // `Arc`) so the later `root.entries` mutation is permitted.
-        let (old_parent, old_entry) = root.parent_and_entry(&old, self.current_user)?;
+        let (old_parent, old_entry) = root.parent_and_entry_as(&old, credentials)?;
         let old_parent = old_parent.map(|(_, dir)| dir);
         let Some(old_val) = old_entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
@@ -815,7 +1289,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(RenameError::InvalidArgument);
         };
 
-        let (new_parent, new_entry) = root.parent_and_entry(&new, self.current_user)?;
+        let (new_parent, new_entry) = root.parent_and_entry_as(&new, credentials)?;
         let new_parent = new_parent.map(|(_, dir)| dir);
         let Some(new_parent) = new_parent else {
             // `new` is the root directory itself.
@@ -823,11 +1297,42 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         };
 
         // Write permission is required on both the source and destination directories.
-        if !self.current_user.can_write(&old_parent.read().perms) {
+        let old_parent_permissions = old_parent.read().perms.clone();
+        if !super::dac_allows_as(
+            credentials,
+            old_parent_permissions.userinfo,
+            old_parent_permissions.mode,
+            DacAccessKind::Write,
+        ) {
             return Err(RenameError::NoWritePerms);
         }
-        if !self.current_user.can_write(&new_parent.read().perms) {
+        let new_parent_permissions = new_parent.read().perms.clone();
+        if !super::dac_allows_as(
+            credentials,
+            new_parent_permissions.userinfo,
+            new_parent_permissions.mode,
+            DacAccessKind::Write,
+        ) {
             return Err(RenameError::NoWritePerms);
+        }
+
+        if !super::sticky_directory_allows_removal(
+            credentials,
+            old_parent_permissions.userinfo,
+            old_parent_permissions.mode,
+            old_val.perms().userinfo,
+        ) {
+            return Err(RenameError::OperationNotPermitted);
+        }
+        if let Some(new_entry) = &new_entry
+            && !super::sticky_directory_allows_removal(
+                credentials,
+                new_parent_permissions.userinfo,
+                new_parent_permissions.mode,
+                new_entry.perms().userinfo,
+            )
+        {
+            return Err(RenameError::OperationNotPermitted);
         }
 
         let old_is_dir = matches!(&old_val, Entry::Dir(_));
@@ -905,47 +1410,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
+        self.mkdir_as(self.current_user.into(), path, mode)
+    }
+
+    fn mkdir_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
+        mode: super::Mode,
+    ) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
-        let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
-        let Some((_parent_path, parent)) = parent else {
-            // Attempted to make `/`
-            return Err(MkdirError::AlreadyExists);
-        };
-        let None = entry else {
-            return Err(MkdirError::AlreadyExists);
-        };
-        let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
-            return Err(MkdirError::NoWritePerms);
-        }
-        let old = parent.children.insert(
-            path.components().unwrap().last().unwrap().into(),
-            FileType::Directory,
-        );
-        assert!(old.is_none());
-        let old = root.entries.insert(
-            path,
-            Entry::Dir(Arc::new(sync::RwLock::new(DirX {
-                perms: Permissions {
-                    mode,
-                    userinfo: self.current_user,
-                },
-                children: HashMap::default(),
-                unique_id: self.fresh_id(),
-                atime: Timestamp::default(),
-                mtime: Timestamp::default(),
-                ctime: Timestamp::default(),
-            }))),
-        );
-        assert!(old.is_none());
-        Ok(())
+        let owner = credentials.as_user_info().ok_or(MkdirError::NoWritePerms)?;
+        self.mkdir_inner(path, mode, owner, true, credentials)
     }
 
     fn symlink(&self, target: &str, linkpath: impl crate::path::Arg) -> Result<(), SymlinkError> {
+        self.symlink_as(self.current_user.into(), target, linkpath)
+    }
+
+    fn symlink_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        target: &str,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
         let path = self.absolute_path(linkpath)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry_as(&path, credentials)?;
         let Some((_parent_path, parent)) = parent else {
             // A link at `/` -- the root already exists.
             return Err(SymlinkError::AlreadyExists);
@@ -954,9 +1445,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             return Err(SymlinkError::AlreadyExists);
         };
         let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
+        if !super::dac_allows_as(
+            credentials,
+            parent.perms.userinfo,
+            parent.perms.mode,
+            DacAccessKind::Write,
+        ) {
             return Err(SymlinkError::NoWritePerms);
         }
+        let owner = credentials
+            .as_user_info()
+            .ok_or(SymlinkError::NoWritePerms)?;
         let old = parent.children.insert(
             path.components().unwrap().last().unwrap().into(),
             FileType::SymLink,
@@ -970,7 +1469,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 // checks apply to the resolved target, never to the link node.
                 perms: Permissions {
                     mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                    userinfo: self.current_user,
+                    userinfo: owner,
                 },
                 unique_id: self.fresh_id(),
                 atime: Timestamp::default(),
@@ -983,9 +1482,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 
     fn readlink(&self, path: impl crate::path::Arg) -> Result<String, ReadlinkError> {
+        self.readlink_as(self.current_user.into(), path)
+    }
+
+    fn readlink_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
+    ) -> Result<String, ReadlinkError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry_as(&path, credentials)?;
         match entry {
             Some(Entry::SymLink(link)) => Ok(link.read().target.clone()),
             Some(_) => Err(ReadlinkError::NotASymlink),
@@ -994,9 +1501,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
+        self.rmdir_as(self.current_user.into(), path)
+    }
+
+    fn rmdir_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
+    ) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry_as(&path, credentials)?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
             return Err(RmdirError::Busy);
@@ -1007,12 +1522,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Entry::Dir(dir) = entry else {
             return Err(RmdirError::NotADirectory);
         };
+        let victim_owner = dir.read().perms.userinfo;
+        let mut parent = parent.write();
+        if !super::dac_allows_as(
+            credentials,
+            parent.perms.userinfo,
+            parent.perms.mode,
+            DacAccessKind::Write,
+        ) {
+            return Err(RmdirError::NoWritePerms);
+        }
+        if !super::sticky_directory_allows_removal(
+            credentials,
+            parent.perms.userinfo,
+            parent.perms.mode,
+            victim_owner,
+        ) {
+            return Err(RmdirError::OperationNotPermitted);
+        }
         if !dir.read().children.is_empty() {
             return Err(RmdirError::NotEmpty);
-        }
-        let mut parent = parent.write();
-        if !self.current_user.can_write(&parent.perms) {
-            return Err(RmdirError::NoWritePerms);
         }
         let removed = parent
             .children
@@ -1027,11 +1556,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
 
     fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
         let descriptor_table = self.litebox.descriptor_table();
-        let Descriptor::Dir { dir } = &descriptor_table
+        let entry = descriptor_table
             .get_entry(fd)
-            .ok_or(ReadDirError::ClosedFd)?
-            .entry
-        else {
+            .ok_or(ReadDirError::ClosedFd)?;
+        if match &entry.entry {
+            Descriptor::File { path_only, .. } | Descriptor::Dir { path_only, .. } => *path_only,
+            Descriptor::SymLink { .. } => true,
+        } {
+            return Err(ReadDirError::PathOnlyFd);
+        }
+        let Descriptor::Dir { dir, .. } = &entry.entry else {
             return Err(ReadDirError::NotADirectory);
         };
 
@@ -1100,10 +1634,45 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(entries)
     }
 
+    fn with_dir_position<T>(
+        &self,
+        fd: &FileFd<Platform>,
+        f: impl FnOnce(&mut usize) -> T,
+    ) -> Result<T, ReadDirError> {
+        let position = {
+            let descriptor_table = self.litebox.descriptor_table();
+            let entry = descriptor_table
+                .get_entry(fd)
+                .ok_or(ReadDirError::ClosedFd)?;
+            if match &entry.entry {
+                Descriptor::File { path_only, .. } | Descriptor::Dir { path_only, .. } => {
+                    *path_only
+                }
+                Descriptor::SymLink { .. } => true,
+            } {
+                return Err(ReadDirError::PathOnlyFd);
+            }
+            let Descriptor::Dir { position, .. } = &entry.entry else {
+                return Err(ReadDirError::NotADirectory);
+            };
+            Arc::clone(position)
+        };
+        let mut position = position.lock();
+        Ok(f(&mut position))
+    }
+
     fn file_status(&self, path: impl crate::path::Arg) -> Result<FileStatus, FileStatusError> {
+        self.file_status_as(self.current_user.into(), path)
+    }
+
+    fn file_status_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl crate::path::Arg,
+    ) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         let root = self.root.read();
-        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry_as(&path, credentials)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
@@ -1184,6 +1753,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     file.ctime,
                 )
             }
+            Descriptor::SymLink { link } => {
+                let link = link.read();
+                (
+                    super::FileType::SymLink,
+                    link.perms.clone(),
+                    link.target.len(),
+                    link.unique_id,
+                    link.atime,
+                    link.mtime,
+                    link.ctime,
+                )
+            }
             Descriptor::Dir { dir, .. } => {
                 let dir = dir.read();
                 (
@@ -1218,14 +1799,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.get_entry(fd)?;
         match &entry.entry {
-            Descriptor::File { file, .. } => {
+            Descriptor::File {
+                file,
+                read_allowed: true,
+                path_only: false,
+                ..
+            } => {
                 let file = file.read();
                 match &file.data {
                     alloc::borrow::Cow::Borrowed(slice) => Some(*slice),
                     alloc::borrow::Cow::Owned(_) => None,
                 }
             }
-            Descriptor::Dir { .. } => None,
+            Descriptor::File { .. }
+            | Descriptor::Dir { .. }
+            | Descriptor::SymLink { .. } => None,
         }
     }
 }
@@ -1263,10 +1851,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
         }
     }
 
-    fn parent_and_entry(
+    fn parent_and_entry_as(
         &self,
         path: &str,
-        current_user: UserInfo,
+        credentials: AccessCredentials<'_>,
     ) -> ParentAndEntry<'_, Dir<Platform>, Entry<Platform>> {
         let mut real_components_seen = false;
         let mut collected = String::new();
@@ -1294,12 +1882,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> RootDir<Platform> {
                     return Err(PathError::ComponentNotADirectory);
                 }
                 (parent_path, Entry::Dir(dir)) => {
-                    if !current_user.can_execute(&dir.read().perms) {
+                    let permissions = dir.read().perms.clone();
+                    if !super::dac_allows_as(
+                        credentials,
+                        permissions.userinfo,
+                        permissions.mode,
+                        DacAccessKind::DirectorySearch,
+                    ) {
                         return Err(PathError::NoSearchPerms {
                             #[cfg(debug_assertions)]
                             dir: parent_path.clone(),
                             #[cfg(debug_assertions)]
-                            perms: dir.read().perms.mode,
+                            perms: permissions.mode,
                         });
                     }
                     parent_dir = Some((parent_path.as_str(), dir.clone()));
@@ -1379,48 +1973,6 @@ struct Permissions {
     userinfo: UserInfo,
 }
 
-impl UserInfo {
-    fn can_read(self, perms: &Permissions) -> bool {
-        perms.can_read_by(self)
-    }
-    fn can_write(self, perms: &Permissions) -> bool {
-        perms.can_write_by(self)
-    }
-    fn can_execute(self, perms: &Permissions) -> bool {
-        perms.can_execute_by(self)
-    }
-}
-
-impl Permissions {
-    fn can_read_by(&self, current: UserInfo) -> bool {
-        if self.userinfo.user == current.user {
-            self.mode.contains(Mode::RUSR)
-        } else if self.userinfo.group == current.group {
-            self.mode.contains(Mode::RGRP)
-        } else {
-            self.mode.contains(Mode::ROTH)
-        }
-    }
-    fn can_write_by(&self, current: UserInfo) -> bool {
-        if self.userinfo.user == current.user {
-            self.mode.contains(Mode::WUSR)
-        } else if self.userinfo.group == current.group {
-            self.mode.contains(Mode::WGRP)
-        } else {
-            self.mode.contains(Mode::WOTH)
-        }
-    }
-    fn can_execute_by(&self, current: UserInfo) -> bool {
-        if self.userinfo.user == current.user {
-            self.mode.contains(Mode::XUSR)
-        } else if self.userinfo.group == current.group {
-            self.mode.contains(Mode::XGRP)
-        } else {
-            self.mode.contains(Mode::XOTH)
-        }
-    }
-}
-
 pub(crate) enum Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
     File {
         file: File<Platform>,
@@ -1428,9 +1980,15 @@ pub(crate) enum Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
         write_allowed: bool,
         position: usize,
         append_mode: bool,
+        path_only: bool,
     },
     Dir {
         dir: Dir<Platform>,
+        position: Arc<sync::Mutex<Platform, usize>>,
+        path_only: bool,
+    },
+    SymLink {
+        link: SymLink<Platform>,
     },
 }
 

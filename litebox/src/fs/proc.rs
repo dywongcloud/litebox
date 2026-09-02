@@ -76,14 +76,20 @@ pub struct Proc<Platform: RawSyncPrimitivesProvider + 'static> {
 struct ProcInner<Platform: RawSyncPrimitivesProvider + 'static> {
     root_inode: NodeInfo,
     pid_dir_inode: NodeInfo,
+    sys_dir_inode: NodeInfo,
+    sys_kernel_dir_inode: NodeInfo,
     meminfo_inode: NodeInfo,
     mounts_inode: NodeInfo,
     stat_system_inode: NodeInfo,
     cpuinfo_inode: NodeInfo,
+    overflowuid_inode: NodeInfo,
+    overflowgid_inode: NodeInfo,
     stat_inode: NodeInfo,
     statm_inode: NodeInfo,
     status_inode: NodeInfo,
     cmdline_inode: NodeInfo,
+    net_dir_inode: NodeInfo,
+    net_dev_inode: NodeInfo,
     task: RwLock<Platform, ProcTaskInfo>,
 }
 
@@ -103,14 +109,20 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Proc<Platform> {
             inner: Arc::new(ProcInner {
                 root_inode: allocator.next(),
                 pid_dir_inode: allocator.next(),
+                sys_dir_inode: allocator.next(),
+                sys_kernel_dir_inode: allocator.next(),
                 meminfo_inode: allocator.next(),
                 mounts_inode: allocator.next(),
                 stat_system_inode: allocator.next(),
                 cpuinfo_inode: allocator.next(),
+                overflowuid_inode: allocator.next(),
+                overflowgid_inode: allocator.next(),
                 stat_inode: allocator.next(),
                 statm_inode: allocator.next(),
                 status_inode: allocator.next(),
                 cmdline_inode: allocator.next(),
+                net_dir_inode: allocator.next(),
+                net_dev_inode: allocator.next(),
                 task: RwLock::new(ProcTaskInfo::default()),
             }),
         }
@@ -163,10 +175,12 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Proc<Platform> {
             ProcFile::Mounts => render_mounts(),
             ProcFile::StatSystem => render_stat_system(),
             ProcFile::Cpuinfo => render_cpuinfo(),
+            ProcFile::OverflowUid | ProcFile::OverflowGid => b"65534\n".to_vec(),
             ProcFile::PidStat => render_stat(&self.inner.task.read()),
             ProcFile::PidStatm => render_statm(),
             ProcFile::PidStatus => render_status(&self.inner.task.read()),
             ProcFile::PidCmdline => self.inner.task.read().cmdline.clone(),
+            ProcFile::NetDev => render_net_dev(),
         }
     }
 }
@@ -312,6 +326,25 @@ fn render_status(task: &ProcTaskInfo) -> Vec<u8> {
     .into_bytes()
 }
 
+/// `/proc/net/dev` content: the two-line header plus one row per interface (see
+/// `proc_net_dev(5)`), receive/transmit byte and packet counters. `busybox ifconfig` with no
+/// arguments reads this to enumerate interface names before querying each one's address/flags
+/// through the `SIOCGIF*` ioctls (see `litebox_shim_linux::syscalls::file::sys_ioctl_siocgif`);
+/// without it, `ifconfig`'s no-args form fails at this file open, never reaching those ioctls.
+/// Matches the fixed `lo` + `eth0` table both that ioctl handler and the netlink `getifaddrs`
+/// path already synthesise. All counters are zero: this process model keeps no real packet
+/// accounting, and zero is the same "no traffic yet" shape a freshly booted real interface
+/// reports.
+fn render_net_dev() -> Vec<u8> {
+    String::from(
+        "Inter-|   Receive                                                |  Transmit\n \
+         face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n \
+         lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n\
+         eth0:      0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n",
+    )
+    .into_bytes()
+}
+
 /// Which synthetic directory a walk/dir handle refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcDir {
@@ -319,6 +352,12 @@ pub enum ProcDir {
     Root,
     /// `/proc/<pid>`, the single guest task's directory.
     PidDir,
+    /// `/proc/sys`.
+    SysDir,
+    /// `/proc/sys/kernel`.
+    SysKernelDir,
+    /// `/proc/net`.
+    NetDir,
 }
 
 /// Which synthetic file a file handle refers to.
@@ -330,11 +369,17 @@ pub enum ProcFile {
     StatSystem,
     /// `/proc/cpuinfo`.
     Cpuinfo,
+    /// `/proc/sys/kernel/overflowuid`.
+    OverflowUid,
+    /// `/proc/sys/kernel/overflowgid`.
+    OverflowGid,
     PidStat,
     /// `/proc/<pid>/statm`.
     PidStatm,
     PidStatus,
     PidCmdline,
+    /// `/proc/net/dev`.
+    NetDev,
 }
 
 impl ProcFile {
@@ -350,11 +395,19 @@ impl ProcFile {
         ("status", ProcFile::PidStatus),
         ("cmdline", ProcFile::PidCmdline),
     ];
+    const SYS_KERNEL_FILES: &'static [(&'static str, ProcFile)] = &[
+        ("overflowuid", ProcFile::OverflowUid),
+        ("overflowgid", ProcFile::OverflowGid),
+    ];
+    const NET_DIR_FILES: &'static [(&'static str, ProcFile)] = &[("dev", ProcFile::NetDev)];
 
     fn in_dir(dir: ProcDir, name: &str) -> Option<ProcFile> {
         let table = match dir {
             ProcDir::Root => Self::ROOT_FILES,
             ProcDir::PidDir => Self::PID_DIR_FILES,
+            ProcDir::SysDir => &[],
+            ProcDir::SysKernelDir => Self::SYS_KERNEL_FILES,
+            ProcDir::NetDir => Self::NET_DIR_FILES,
         };
         table.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
     }
@@ -418,6 +471,24 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
                         });
                         current = ProcDir::PidDir;
                         index += 1;
+                    } else if component == "sys" {
+                        walked.push(WalkedComponent {
+                            permissions: PermissionCheck::ByResolver(PermissionInfo {
+                                mode: READONLY_DIR_MODE,
+                                owner: UserInfo::ROOT,
+                            }),
+                        });
+                        current = ProcDir::SysDir;
+                        index += 1;
+                    } else if component == "net" {
+                        walked.push(WalkedComponent {
+                            permissions: PermissionCheck::ByResolver(PermissionInfo {
+                                mode: READONLY_DIR_MODE,
+                                owner: UserInfo::ROOT,
+                            }),
+                        });
+                        current = ProcDir::NetDir;
+                        index += 1;
                     } else if ProcFile::in_dir(ProcDir::Root, component).is_some() {
                         return Ok(WalkOutcome {
                             components: walked,
@@ -430,6 +501,39 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
                 }
                 ProcDir::PidDir => {
                     if ProcFile::in_dir(ProcDir::PidDir, component).is_some() {
+                        return Ok(WalkOutcome {
+                            components: walked,
+                            last: WalkingDirHandle::from_typed::<Self>(current),
+                            stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                        });
+                    }
+                    return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                }
+                ProcDir::SysDir if component == "kernel" => {
+                    walked.push(WalkedComponent {
+                        permissions: PermissionCheck::ByResolver(PermissionInfo {
+                            mode: READONLY_DIR_MODE,
+                            owner: UserInfo::ROOT,
+                        }),
+                    });
+                    current = ProcDir::SysKernelDir;
+                    index += 1;
+                }
+                ProcDir::SysKernelDir => {
+                    if ProcFile::in_dir(ProcDir::SysKernelDir, component).is_some() {
+                        return Ok(WalkOutcome {
+                            components: walked,
+                            last: WalkingDirHandle::from_typed::<Self>(current),
+                            stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                        });
+                    }
+                    return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                }
+                ProcDir::SysDir => {
+                    return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                }
+                ProcDir::NetDir => {
+                    if ProcFile::in_dir(ProcDir::NetDir, component).is_some() {
                         return Ok(WalkOutcome {
                             components: walked,
                             last: WalkingDirHandle::from_typed::<Self>(current),
@@ -477,8 +581,10 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
             return Err(OpenError::ReadOnlyFileSystem);
         }
         let owner = match dir {
-            ProcDir::Root => UserInfo::ROOT,
             ProcDir::PidDir => self.task_owner(),
+            ProcDir::Root | ProcDir::SysDir | ProcDir::SysKernelDir | ProcDir::NetDir => {
+                UserInfo::ROOT
+            }
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(file),
@@ -506,9 +612,40 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
                     file_type: FileType::Directory,
                     ino_info: Some(self.inner.pid_dir_inode.clone()),
                 });
+                entries.push(DirEntry {
+                    name: String::from("sys"),
+                    file_type: FileType::Directory,
+                    ino_info: Some(self.inner.sys_dir_inode.clone()),
+                });
+                entries.push(DirEntry {
+                    name: String::from("net"),
+                    file_type: FileType::Directory,
+                    ino_info: Some(self.inner.net_dir_inode.clone()),
+                });
                 Ok(entries)
             }
             ProcDir::PidDir => Ok(ProcFile::PID_DIR_FILES
+                .iter()
+                .map(|(name, _)| DirEntry {
+                    name: String::from(*name),
+                    file_type: FileType::RegularFile,
+                    ino_info: None,
+                })
+                .collect()),
+            ProcDir::SysDir => Ok(alloc::vec![DirEntry {
+                name: String::from("kernel"),
+                file_type: FileType::Directory,
+                ino_info: Some(self.inner.sys_kernel_dir_inode.clone()),
+            }]),
+            ProcDir::SysKernelDir => Ok(ProcFile::SYS_KERNEL_FILES
+                .iter()
+                .map(|(name, _)| DirEntry {
+                    name: String::from(*name),
+                    file_type: FileType::RegularFile,
+                    ino_info: None,
+                })
+                .collect()),
+            ProcDir::NetDir => Ok(ProcFile::NET_DIR_FILES
                 .iter()
                 .map(|(name, _)| DirEntry {
                     name: String::from(*name),
@@ -548,10 +685,13 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
             ProcFile::Mounts => (self.inner.mounts_inode.clone(), UserInfo::ROOT),
             ProcFile::StatSystem => (self.inner.stat_system_inode.clone(), UserInfo::ROOT),
             ProcFile::Cpuinfo => (self.inner.cpuinfo_inode.clone(), UserInfo::ROOT),
+            ProcFile::OverflowUid => (self.inner.overflowuid_inode.clone(), UserInfo::ROOT),
+            ProcFile::OverflowGid => (self.inner.overflowgid_inode.clone(), UserInfo::ROOT),
             ProcFile::PidStat => (self.inner.stat_inode.clone(), self.task_owner()),
             ProcFile::PidStatm => (self.inner.statm_inode.clone(), self.task_owner()),
             ProcFile::PidStatus => (self.inner.status_inode.clone(), self.task_owner()),
             ProcFile::PidCmdline => (self.inner.cmdline_inode.clone(), self.task_owner()),
+            ProcFile::NetDev => (self.inner.net_dev_inode.clone(), UserInfo::ROOT),
         };
         Ok(FileStatus {
             file_type: FileType::RegularFile,
@@ -576,6 +716,9 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
             // `busybox ps` gets a process's uid/gid by `stat`-ing `/proc/<pid>` itself
             // (`PSSCAN_UIDGID`), not by parsing `/proc/<pid>/status` -- this owner is load-bearing.
             ProcDir::PidDir => (self.inner.pid_dir_inode.clone(), self.task_owner()),
+            ProcDir::SysDir => (self.inner.sys_dir_inode.clone(), UserInfo::ROOT),
+            ProcDir::SysKernelDir => (self.inner.sys_kernel_dir_inode.clone(), UserInfo::ROOT),
+            ProcDir::NetDir => (self.inner.net_dir_inode.clone(), UserInfo::ROOT),
         };
         Ok(FileStatus {
             file_type: FileType::Directory,

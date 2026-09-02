@@ -25,6 +25,7 @@ pub fn do_mmap<
     prot: ProtFlags,
     flags: MapFlags,
     ensure_space_after: bool,
+    shared_futex_backing: Option<(litebox::mm::linux::SharedFutexBacking, usize)>,
     op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, litebox::mm::linux::MappingError>,
 ) -> Result<UserPtrMut<u8>, litebox::mm::linux::MappingError> {
     let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_platform_ptr::<Platform>(p));
@@ -59,29 +60,47 @@ pub fn do_mmap<
         None => None,
     };
     let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-        },
+    let (before_perms, after_perms) = match prot {
+        ProtFlags::PROT_READ_EXEC => (
+            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE,
+            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                | litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC,
+        ),
+        ProtFlags::PROT_READ_WRITE => {
+            let perms = litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE;
+            (perms, perms)
+        }
+        ProtFlags::PROT_READ => (
+            litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE,
+            litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
+        ),
+        ProtFlags::PROT_NONE => (
+            litebox::platform::page_mgmt::MemoryRegionPermissions::empty(),
+            litebox::platform::page_mgmt::MemoryRegionPermissions::empty(),
+        ),
         _ => {
             #[cfg(debug_assertions)]
             todo!("Unsupported prot flags {:?}", prot);
-            // TODO: create inaccessible pages for now. Creating mapping
-            // for both executable and writable might be needed for JIT.
             #[cfg(not(debug_assertions))]
-            unsafe {
-                pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-            }
+            (
+                litebox::platform::page_mgmt::MemoryRegionPermissions::empty(),
+                litebox::platform::page_mgmt::MemoryRegionPermissions::empty(),
+            )
         }
+    };
+    unsafe {
+        pm.create_pages_with_shared_futex_backing(
+            suggested_addr,
+            length,
+            flags,
+            before_perms,
+            after_perms,
+            shared_futex_backing,
+            op,
+        )
     }
     .map(UserPtrMut::from_platform_ptr::<Platform>)
 }

@@ -15,7 +15,10 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError, Waker},
     },
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
+    fd::{
+        EntryHandle, EntryIdentity, FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd,
+        WeakEntryHandle,
+    },
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
@@ -54,72 +57,133 @@ bitflags::bitflags! {
 }
 
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
-    Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
-    Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
-    File(Arc<crate::FileFd<FS>>),
-    Socket(Arc<super::net::SocketFd<Platform>>),
-    Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
-    Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>>),
+    Eventfd(WeakEntryHandle<Platform, super::eventfd::EventfdSubsystem<Platform>>),
+    Epoll(WeakEntryHandle<Platform, super::epoll::EpollSubsystem<Platform, FS>>),
+    File(WeakEntryHandle<Platform, FS>),
+    Socket(WeakEntryHandle<Platform, crate::Network<Platform>>),
+    Pipe(WeakEntryHandle<Platform, litebox::pipes::Pipes<Platform>>),
+    Unix(WeakEntryHandle<Platform, crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>),
+    Netlink(WeakEntryHandle<Platform, crate::syscalls::netlink::NetlinkSubsystem<Platform>>),
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Clone for EpollDescriptor<Platform, FS> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Eventfd(file) => Self::Eventfd(file.clone()),
+            Self::Epoll(file) => Self::Epoll(file.clone()),
+            Self::File(file) => Self::File(file.clone()),
+            Self::Socket(socket) => Self::Socket(socket.clone()),
+            Self::Pipe(pipe) => Self::Pipe(pipe.clone()),
+            Self::Unix(unix) => Self::Unix(unix.clone()),
+            Self::Netlink(netlink) => Self::Netlink(netlink.clone()),
+        }
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
-    pub fn try_from(files: &FilesState<Platform, FS>, raw_fd: usize) -> Result<Self, Errno> {
+    pub fn try_from(
+        global: &GlobalState<Platform, FS>,
+        files: &FilesState<Platform, FS>,
+        raw_fd: usize,
+    ) -> Result<Self, Errno> {
         let rds = files.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-            return Ok(EpollDescriptor::File(fd));
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(Errno::EBADF)?;
+            return Ok(Self::File(handle.downgrade()));
         }
         if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::Socket(fd));
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(Errno::EBADF)?;
+            return Ok(Self::Socket(handle.downgrade()));
         }
         if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::Pipe(fd));
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(Errno::EBADF)?;
+            return Ok(Self::Pipe(handle.downgrade()));
         }
         if let Ok(fd) =
             rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem<Platform>>(raw_fd)
         {
-            return Ok(EpollDescriptor::Eventfd(fd));
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(Errno::EBADF)?;
+            return Ok(Self::Eventfd(handle.downgrade()));
         }
         if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<Platform, FS>>(raw_fd) {
-            return Ok(EpollDescriptor::Epoll(fd));
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(Errno::EBADF)?;
+            return Ok(Self::Epoll(handle.downgrade()));
         }
         if let Ok(fd) =
             rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<Platform, FS>>(raw_fd)
         {
-            return Ok(EpollDescriptor::Unix(fd));
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(Errno::EBADF)?;
+            return Ok(Self::Unix(handle.downgrade()));
+        }
+        if let Ok(fd) =
+            rds.fd_from_raw_integer::<super::netlink::NetlinkSubsystem<Platform>>(raw_fd)
+        {
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(Errno::EBADF)?;
+            return Ok(Self::Netlink(handle.downgrade()));
         }
         Err(Errno::EBADF)
     }
-}
 
-enum DescriptorRef<Platform: ShimPlatform, FS: ShimFS> {
-    Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
-    Epoll(Weak<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
-    File(Weak<crate::FileFd<FS>>),
-    Socket(Weak<super::net::SocketFd<Platform>>),
-    Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
-    Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>>),
-}
-
-impl<Platform: ShimPlatform, FS: ShimFS> DescriptorRef<Platform, FS> {
-    fn from(value: &EpollDescriptor<Platform, FS>) -> Self {
-        match value {
-            EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
-            EpollDescriptor::Epoll(file) => Self::Epoll(Arc::downgrade(file)),
-            EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
-            EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
-            EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
-            EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
+    fn identity(&self) -> EntryIdentity {
+        match self {
+            Self::Eventfd(file) => file.identity(),
+            Self::Epoll(file) => file.identity(),
+            Self::File(file) => file.identity(),
+            Self::Socket(socket) => socket.identity(),
+            Self::Pipe(pipe) => pipe.identity(),
+            Self::Unix(unix) => unix.identity(),
+            Self::Netlink(netlink) => netlink.identity(),
         }
     }
 
-    fn upgrade(&self) -> Option<EpollDescriptor<Platform, FS>> {
+    fn is_alive(&self) -> bool {
         match self {
-            DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(EpollDescriptor::Eventfd),
-            DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
-            DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
-            DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
-            DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
-            DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
+            Self::Eventfd(file) => file.upgrade().is_some(),
+            Self::Epoll(file) => file.upgrade().is_some(),
+            Self::File(file) => file.upgrade().is_some(),
+            Self::Socket(socket) => socket.upgrade().is_some(),
+            Self::Pipe(pipe) => pipe.upgrade().is_some(),
+            Self::Unix(unix) => unix.upgrade().is_some(),
+            Self::Netlink(netlink) => netlink.upgrade().is_some(),
+        }
+    }
+
+    pub(crate) fn is_epoll_identity(&self, identity: EntryIdentity) -> bool {
+        matches!(self, Self::Epoll(epoll) if epoll.identity() == identity)
+    }
+
+    fn epoll_handle(&self) -> Option<EntryHandle<Platform, EpollSubsystem<Platform, FS>>> {
+        match self {
+            Self::Epoll(epoll) => epoll.upgrade(),
+            _ => None,
         }
     }
 }
@@ -135,16 +199,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
     ) -> Option<Events> {
         // `/dev/input/event*` fds have real queue-backed readiness through the input registry
         // (X11/libinput poll these and only read after `IN` -- dummy always-ready would spin
-        // them on empty reads). Checked before the generic closure below so `observer` is still
-        // whole to hand to the registry.
+        // them on empty reads). Register before checking the queue: an input record arriving
+        // between a check and a later registration would otherwise leave Xorg asleep until the
+        // next record, making every click or key appear one event late.
         if let EpollDescriptor::File(file) = self
+            && let Some(file) = file.upgrade()
             && let Some(registry) = global.input_registry.as_ref()
-            && let Some(minor) = crate::syscalls::file::input_event_minor_of(global, file)
-            && let Some(events) = registry.check_io_events(minor)
+            && let Ok(minor) = file.with_metadata(|meta: &super::file::InputEventMinor| meta.minor)
         {
             if let Some(observer) = observer {
                 registry.register_observer(minor, observer, mask);
             }
+            let events = registry.check_io_events(minor)?;
             return Some(events & (mask | Events::ALWAYS_POLLED));
         }
         let poll = |iop: &dyn IOPollable| {
@@ -155,54 +221,156 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
         };
         match self {
             EpollDescriptor::Eventfd(fd) => {
-                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                let handle = fd.upgrade()?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             EpollDescriptor::Epoll(fd) => {
-                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                let handle = fd.upgrade()?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             EpollDescriptor::File(file) => {
+                let file = file.upgrade()?;
                 // Real files in general still get dummy "always ready" events -- only stdin has
                 // a real, epoll-observable readiness signal (see `StdioProvider::stdin_pollable`
                 // and `litebox::platform::StdinPump`); stdout/stderr writes to a real terminal
                 // essentially never block in practice, so `Events::OUT` dummy readiness for them
                 // remains a reasonable approximation.
-                let events = match global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(file, |stream: &litebox::platform::StdioStream| *stream)
-                {
-                    Ok(litebox::platform::StdioStream::Stdin) => {
-                        match global.platform.stdin_pollable() {
-                            Some(pollable) => poll(pollable),
-                            // Platform can't distinguish real readiness: fall back to the
-                            // pre-existing dummy "always ready" behavior.
-                            None => Events::IN,
+                let events =
+                    match file.with_metadata(|stream: &litebox::platform::StdioStream| *stream) {
+                        Ok(litebox::platform::StdioStream::Stdin) => {
+                            match global.platform.stdin_pollable() {
+                                Some(pollable) => poll(pollable),
+                                // Platform can't distinguish real readiness: fall back to the
+                                // pre-existing dummy "always ready" behavior.
+                                None => Events::IN,
+                            }
                         }
-                    }
-                    Ok(
-                        litebox::platform::StdioStream::Stdout
-                        | litebox::platform::StdioStream::Stderr,
-                    )
-                    | Err(_) => Events::OUT,
-                };
+                        Ok(
+                            litebox::platform::StdioStream::Stdout
+                            | litebox::platform::StdioStream::Stderr,
+                        )
+                        | Err(_) => Events::OUT,
+                    };
                 Some(events & mask)
             }
             EpollDescriptor::Socket(fd) => {
-                let proxy = match global.get_proxy(fd) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log_unsupported!("epoll poll with socket fd: {:?}", e);
-                        return None;
-                    }
-                };
-                Some(poll(&proxy))
+                let handle = fd.upgrade()?;
+                let proxy = handle
+                    .with_metadata(|proxy: &super::net::SocketProxy<Platform>| proxy.0.clone())
+                    .ok()?;
+                Some(poll(proxy.as_ref()))
             }
-            EpollDescriptor::Pipe(fd) => global.with_linux_pipe_iopollable(fd, poll).ok(),
+            EpollDescriptor::Pipe(fd) => {
+                let handle = fd.upgrade()?;
+                Some(global.pipes.with_iopollable_handle(&handle, poll))
+            }
             EpollDescriptor::Unix(fd) => {
-                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                let handle = fd.upgrade()?;
                 Some(handle.with_entry(|entry| poll(entry)))
+            }
+            EpollDescriptor::Netlink(fd) => {
+                let handle = fd.upgrade()?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+        }
+    }
+
+    /// Resolves where a transient observer must be removed before registering it.
+    ///
+    /// Most registrations live in the open file description and can be found again through this
+    /// descriptor's weak handle. Input queues and stdin are different: their subjects outlive the
+    /// filesystem entry. Remember those special routes now so closing the last descriptor while
+    /// `poll` is asleep cannot strand a dead observer in a long-lived subject.
+    fn transient_registration_target(
+        &self,
+        global: &GlobalState<Platform, FS>,
+    ) -> PollRegistrationTarget<Platform, FS> {
+        if let Self::File(file) = self
+            && let Some(file) = file.upgrade()
+        {
+            if global.input_registry.is_some()
+                && let Ok(minor) =
+                    file.with_metadata(|meta: &super::file::InputEventMinor| meta.minor)
+            {
+                return PollRegistrationTarget::InputDevice(minor);
+            }
+            if let Ok(litebox::platform::StdioStream::Stdin) =
+                file.with_metadata(|stream: &litebox::platform::StdioStream| *stream)
+                && global.platform.stdin_pollable().is_some()
+            {
+                return PollRegistrationTarget::Stdin;
+            }
+        }
+        PollRegistrationTarget::Descriptor(self.clone())
+    }
+
+    /// Removes a registration previously made by [`Self::poll`]. The descriptor only keeps weak
+    /// open-file-description handles, so cleanup never extends the lifetime of the polled object.
+    fn unregister_observer(
+        &self,
+        global: &GlobalState<Platform, FS>,
+        observer: Weak<dyn Observer<Events>>,
+    ) {
+        // Input devices bypass the filesystem's dummy readiness path and register directly on the
+        // queue owned by InputRegistry, so their cleanup must take that same path.
+        if let EpollDescriptor::File(file) = self
+            && let Some(file) = file.upgrade()
+            && let Some(registry) = global.input_registry.as_ref()
+            && let Ok(minor) = file.with_metadata(|meta: &super::file::InputEventMinor| meta.minor)
+        {
+            registry.unregister_observer(minor, observer);
+            return;
+        }
+
+        let unregister = |iop: &dyn IOPollable| {
+            iop.unregister_observer(observer.clone());
+        };
+        match self {
+            EpollDescriptor::Eventfd(fd) => {
+                if let Some(handle) = fd.upgrade() {
+                    handle.with_entry(|entry| unregister(entry));
+                }
+            }
+            EpollDescriptor::Epoll(fd) => {
+                if let Some(handle) = fd.upgrade() {
+                    handle.with_entry(|entry| unregister(entry));
+                }
+            }
+            EpollDescriptor::File(file) => {
+                let Some(file) = file.upgrade() else {
+                    return;
+                };
+                if let Ok(litebox::platform::StdioStream::Stdin) =
+                    file.with_metadata(|stream: &litebox::platform::StdioStream| *stream)
+                    && let Some(pollable) = global.platform.stdin_pollable()
+                {
+                    unregister(pollable);
+                }
+            }
+            EpollDescriptor::Socket(fd) => {
+                let Some(handle) = fd.upgrade() else {
+                    return;
+                };
+                if let Ok(proxy) = handle
+                    .with_metadata(|proxy: &super::net::SocketProxy<Platform>| proxy.0.clone())
+                {
+                    unregister(proxy.as_ref());
+                }
+            }
+            EpollDescriptor::Pipe(fd) => {
+                if let Some(handle) = fd.upgrade() {
+                    global.pipes.with_iopollable_handle(&handle, unregister);
+                }
+            }
+            EpollDescriptor::Unix(fd) => {
+                if let Some(handle) = fd.upgrade() {
+                    handle.with_entry(|entry| unregister(entry));
+                }
+            }
+            EpollDescriptor::Netlink(fd) => {
+                if let Some(handle) = fd.upgrade() {
+                    handle.with_entry(|entry| unregister(entry));
+                }
             }
         }
     }
@@ -283,16 +451,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         // is held across both the cycle check and the insert below -- see `EPOLL_NEST_LOCK` for why
         // splitting those into separate critical sections would reopen the race this closes.
         let _nest_guard = matches!(file, EpollDescriptor::Epoll(_)).then(|| EPOLL_NEST_LOCK.lock());
-        if let EpollDescriptor::Epoll(inner_fd) = file
-            && Self::nested_epoll_reaches(global, self_fd, inner_fd, 1)?
-        {
-            return Err(Errno::ELOOP);
+        if let Some(inner_handle) = file.epoll_handle() {
+            let self_handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(self_fd)
+                .ok_or(Errno::EBADF)?;
+            if self_handle.identity() == inner_handle.identity() {
+                return Err(Errno::EINVAL);
+            }
+            if Self::nested_epoll_reaches(&self_handle, &inner_handle, 1)? {
+                return Err(Errno::ELOOP);
+            }
         }
 
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
         if let Some(entry) = interests.get(&key)
-            && entry.desc.upgrade().is_some()
+            && entry.desc.is_alive()
         {
             return Err(Errno::EEXIST);
         }
@@ -301,7 +477,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
 
         let mask = Events::from_bits_truncate(event.events);
         let entry = EpollEntry::new(
-            DescriptorRef::from(file),
+            file.clone(),
             mask,
             EpollFlags::from_bits_truncate(event.events),
             event.data,
@@ -325,30 +501,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     /// Must be called with `EPOLL_NEST_LOCK` held. Under that lock, every edge in the existing
     /// nested-epoll graph got there by passing this same check, so the graph is acyclic by
     /// induction going in -- the walk below can therefore only ever revisit `self_fd` itself
-    /// (caught up front via `Arc::ptr_eq`, before `self_fd`'s own entry is ever locked), never an
-    /// intermediate node, so it can't re-lock an entry it is already holding on this call stack.
-    /// Depth is also capped, mirroring real Linux's nesting limit, so a long acyclic chain can't
-    /// blow the stack either.
+    /// (caught up front by open-file-description identity, before `self_fd`'s own entry is ever
+    /// locked), never an intermediate node, so it can't re-lock an entry it is already holding on
+    /// this call stack. Depth is also capped, mirroring real Linux's nesting limit, so a long
+    /// acyclic chain can't blow the stack either.
     fn nested_epoll_reaches(
-        global: &GlobalState<Platform, FS>,
-        self_fd: &Arc<TypedFd<EpollSubsystem<Platform, FS>>>,
-        fd: &Arc<TypedFd<EpollSubsystem<Platform, FS>>>,
+        self_fd: &EntryHandle<Platform, EpollSubsystem<Platform, FS>>,
+        fd: &EntryHandle<Platform, EpollSubsystem<Platform, FS>>,
         depth: u32,
     ) -> Result<bool, Errno> {
         const MAX_NESTED_EPOLL_DEPTH: u32 = 5;
-        if Arc::ptr_eq(self_fd, fd) {
+        if self_fd.identity() == fd.identity() {
             return Ok(true);
         }
         if depth > MAX_NESTED_EPOLL_DEPTH {
             return Err(Errno::ELOOP);
         }
-        let Some(handle) = global.litebox.descriptor_table().entry_handle(fd) else {
-            return Ok(false);
-        };
-        handle.with_entry(|entry: &Self| {
+        fd.with_entry(|entry: &Self| {
             for nested in entry.interests.lock().values() {
-                if let Some(EpollDescriptor::Epoll(inner_fd)) = nested.desc.upgrade()
-                    && Self::nested_epoll_reaches(global, self_fd, &inner_fd, depth + 1)?
+                if let Some(inner_fd) = nested.desc.epoll_handle()
+                    && Self::nested_epoll_reaches(self_fd, &inner_fd, depth + 1)?
                 {
                     return Ok(true);
                 }
@@ -373,7 +545,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         let mut interests = self.interests.lock();
         let key = EpollEntryKey::new(fd, file);
         let entry = interests.get(&key).ok_or(Errno::ENOENT)?;
-        if entry.desc.upgrade().is_none() {
+        if !entry.desc.is_alive() {
             // The file descriptor is closed, remove the entry
             interests.remove(&key);
             return Err(Errno::ENOENT);
@@ -427,29 +599,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> IOPollable for EpollFile<Platform, FS> 
     fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
         self.ready.pollee.register_observer(observer, mask);
     }
+
+    fn unregister_observer(&self, observer: Weak<dyn Observer<Events>>) {
+        self.ready.pollee.unregister_observer(observer);
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct EpollEntryKey(u32, usize);
+struct EpollEntryKey(u32, EntryIdentity);
 impl EpollEntryKey {
     fn new<Platform: ShimPlatform, FS: ShimFS>(
         fd: u32,
         desc: &EpollDescriptor<Platform, FS>,
     ) -> Self {
-        let ptr = match desc {
-            EpollDescriptor::Eventfd(file) => Arc::as_ptr(file).addr(),
-            EpollDescriptor::Epoll(file) => Arc::as_ptr(file).addr(),
-            EpollDescriptor::File(file) => Arc::as_ptr(file).addr(),
-            EpollDescriptor::Socket(socket_fd) => Arc::as_ptr(socket_fd).addr(),
-            EpollDescriptor::Pipe(pipe_fd) => Arc::as_ptr(pipe_fd).addr(),
-            EpollDescriptor::Unix(unix) => Arc::as_ptr(unix).addr(),
-        };
-        Self(fd, ptr)
+        Self(fd, desc.identity())
     }
 }
 
 struct EpollEntry<Platform: ShimPlatform, FS: ShimFS> {
-    desc: DescriptorRef<Platform, FS>,
+    desc: EpollDescriptor<Platform, FS>,
     inner: litebox::sync::Mutex<Platform, EpollEntryInner>,
     ready: Arc<ReadySet<Platform, FS>>,
     is_ready: AtomicBool,
@@ -465,7 +633,7 @@ struct EpollEntryInner {
 
 impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
     fn new(
-        desc: DescriptorRef<Platform, FS>,
+        desc: EpollDescriptor<Platform, FS>,
         mask: Events,
         flags: EpollFlags,
         data: u64,
@@ -482,7 +650,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
     }
 
     fn poll(&self, global: &GlobalState<Platform, FS>) -> Option<(Option<EpollEvent>, bool)> {
-        let file = self.desc.upgrade()?;
         let inner = self.inner.lock();
 
         if !self.is_enabled.load(core::sync::atomic::Ordering::Relaxed) {
@@ -490,7 +657,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollEntry<Platform, FS> {
             return None;
         }
 
-        let events = file.poll(global, inner.mask, None)?;
+        let events = self.desc.poll(global, inner.mask, None)?;
         if events.is_empty() {
             Some((None, false))
         } else {
@@ -616,6 +783,35 @@ struct PollEntry<Platform: ShimPlatform> {
 
 struct PollEntryObserver<Platform: ShimPlatform>(Waker<Platform>);
 
+enum PollRegistrationTarget<Platform: ShimPlatform, FS: ShimFS> {
+    Descriptor(EpollDescriptor<Platform, FS>),
+    InputDevice(usize),
+    Stdin,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> PollRegistrationTarget<Platform, FS> {
+    fn unregister(self, global: &GlobalState<Platform, FS>, observer: Weak<dyn Observer<Events>>) {
+        match self {
+            Self::Descriptor(descriptor) => descriptor.unregister_observer(global, observer),
+            Self::InputDevice(minor) => {
+                if let Some(registry) = global.input_registry.as_ref() {
+                    registry.unregister_observer(minor, observer);
+                }
+            }
+            Self::Stdin => {
+                if let Some(pollable) = global.platform.stdin_pollable() {
+                    pollable.unregister_observer(observer);
+                }
+            }
+        }
+    }
+}
+
+struct PollRegistration<Platform: ShimPlatform, FS: ShimFS> {
+    target: PollRegistrationTarget<Platform, FS>,
+    observer: Weak<dyn Observer<Events>>,
+}
+
 impl<Platform: ShimPlatform> Clone for PollEntryObserver<Platform> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -647,35 +843,41 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         global: &GlobalState<Platform, FS>,
         files: &FilesState<Platform, FS>,
         waker: Option<&Waker<Platform>>,
+        registrations: &mut Vec<PollRegistration<Platform, FS>>,
     ) -> bool {
         let mut is_ready = false;
         for entry in &mut self.entries {
             entry.revents = if entry.fd < 0 {
                 continue;
-            } else if let Ok(poll_descriptor) =
-                EpollDescriptor::try_from(files, entry.fd.reinterpret_as_unsigned() as usize)
-            {
-                let observer = if !is_ready && let Some(waker) = waker {
-                    // TODO: a separate allocation is necessary here
-                    // because registering an observer twice with two
-                    // different event masks results in the last one
-                    // replacing the first. If this is changed to
-                    // instead combine the new event mask into the existing
-                    // registration's mask, then we can use a single observer
-                    // for all entries.
-                    let observer = Arc::new(PollEntryObserver(waker.clone()));
-                    let weak = Arc::downgrade(&observer);
-                    entry.observer = Some(observer);
-                    Some(weak as _)
-                } else {
-                    // The poll set is already ready, or we have already
-                    // registered the observer for this entry.
-                    None
-                };
-                // TODO: add machinery to unregister the observer to avoid leaks.
-                poll_descriptor
-                    .poll(global, entry.mask, observer)
-                    .unwrap_or(Events::NVAL)
+            } else if let Ok(poll_descriptor) = EpollDescriptor::try_from(
+                global,
+                files,
+                entry.fd.reinterpret_as_unsigned() as usize,
+            ) {
+                let observer: Option<Weak<dyn Observer<Events>>> =
+                    if !is_ready && let Some(waker) = waker {
+                        // A separate allocation is necessary here because registering an observer
+                        // twice with two different event masks results in the last one replacing
+                        // the first. If registration instead combines masks, this can become one
+                        // observer shared by all entries.
+                        let observer = Arc::new(PollEntryObserver(waker.clone()));
+                        let weak = Arc::downgrade(&observer);
+                        entry.observer = Some(observer);
+                        Some(weak)
+                    } else {
+                        // The poll set is already ready, or this scan is only checking readiness.
+                        None
+                    };
+                let registration_target = observer
+                    .as_ref()
+                    .map(|_| poll_descriptor.transient_registration_target(global));
+                let events = poll_descriptor
+                    .poll(global, entry.mask, observer.clone())
+                    .unwrap_or(Events::NVAL);
+                if let (Some(observer), Some(target)) = (observer, registration_target) {
+                    registrations.push(PollRegistration { target, observer });
+                }
+                events
             } else {
                 Events::NVAL
             };
@@ -692,7 +894,9 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         global: &GlobalState<Platform, FS>,
         files: &FilesState<Platform, FS>,
     ) {
-        self.scan_once(global, files, None);
+        let mut registrations = Vec::new();
+        self.scan_once(global, files, None, &mut registrations);
+        debug_assert!(registrations.is_empty());
     }
 
     /// Waits for any of the fds in the poll set to become ready.
@@ -702,19 +906,38 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         cx: &WaitContext<'_, Platform>,
         files: &FilesState<Platform, FS>,
     ) -> Result<(), WaitError> {
-        if self.scan_once(global, files, None) {
+        let mut registrations = Vec::new();
+        if self.scan_once(global, files, None, &mut registrations) {
             return Ok(());
         }
 
         let mut register = true;
-        cx.wait_until(|| {
-            if self.scan_once(global, files, register.then_some(cx.waker())) {
+        let result = cx.wait_until(|| {
+            if self.scan_once(
+                global,
+                files,
+                register.then_some(cx.waker()),
+                &mut registrations,
+            ) {
                 return true;
             }
             // Don't register observers again in the next iteration.
             register = false;
             false
-        })
+        });
+
+        // Every registration above belongs only to this wait. Remove it on readiness, timeout, or
+        // interruption before dropping the strong observers, leaving permanent epoll interests
+        // untouched.
+        for registration in registrations.drain(..) {
+            registration
+                .target
+                .unregister(global, registration.observer);
+        }
+        for entry in &mut self.entries {
+            entry.observer = None;
+        }
+        result
     }
 
     /// Returns the accumulated `revents` for each entry in the poll set.

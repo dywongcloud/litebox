@@ -14,8 +14,8 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use linux::{
-    CreatePagesFlags, MappingError, PageFaultError, PageRange, VmArea, VmFlags, Vmem,
-    VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
+    CreatePagesFlags, MappingError, PageFaultError, PageRange, SharedFutexBacking, VmArea, VmFlags,
+    Vmem, VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
 };
 
 use crate::{
@@ -25,7 +25,7 @@ use crate::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{MemoryRegionPermissions, RemapError},
     },
-    sync::{RawSyncPrimitivesProvider, RwLock},
+    sync::{RawSyncPrimitivesProvider, RwLock, RwLockReadGuard},
 };
 
 /// A page manager to support `mmap`, `munmap`, and etc.
@@ -34,6 +34,32 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
+}
+
+/// A stable read-side view of a page manager's mapping metadata.
+///
+/// Keeping this guard alive prevents concurrent mmap/munmap/mremap operations from changing the
+/// mapping identity used by synchronization primitives.
+pub struct MappingReadGuard<'a, Platform, const ALIGN: usize>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    vmem: RwLockReadGuard<'a, Platform, Vmem<Platform, ALIGN>>,
+}
+
+impl<Platform, const ALIGN: usize> MappingReadGuard<'_, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    /// Returns the flags for the mapping containing `address`.
+    pub fn flags_at(&self, address: usize) -> Option<VmFlags> {
+        self.vmem.flags_at(address)
+    }
+
+    /// Returns the stable shared-backing identity and byte offset for `address`.
+    pub fn shared_futex_key_at(&self, address: usize) -> Option<(usize, usize)> {
+        self.vmem.shared_futex_key_at(address)
+    }
 }
 
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
@@ -73,6 +99,7 @@ where
         flags: CreatePagesFlags,
         before_perms: MemoryRegionPermissions,
         after_perms: MemoryRegionPermissions,
+        shared_futex_backing: Option<(SharedFutexBacking, usize)>,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
@@ -80,7 +107,15 @@ where
     {
         let addr = {
             let mut vmem = self.vmem.write();
-            unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
+            unsafe {
+                vmem.create_pages(
+                    suggested_address,
+                    length,
+                    flags,
+                    before_perms,
+                    shared_futex_backing,
+                )
+            }?
         };
         // call the user function with the pages
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
@@ -103,6 +138,34 @@ where
             unsafe { vmem.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
         }
         Ok(addr)
+    }
+
+    /// Creates pages whose non-private futexes are keyed by a stable backing object and byte
+    /// offset rather than by this mapping's virtual address.
+    pub unsafe fn create_pages_with_shared_futex_backing<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        before_perms: MemoryRegionPermissions,
+        after_perms: MemoryRegionPermissions,
+        shared_futex_backing: Option<(SharedFutexBacking, usize)>,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                before_perms,
+                after_perms,
+                shared_futex_backing,
+                op,
+            )
+        }
     }
 
     /// Create readable and executable pages.
@@ -140,6 +203,7 @@ where
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 // keep READ, turn off WRITE and turn on EXEC
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                None,
                 op,
             )
         }
@@ -172,7 +236,7 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
+        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, None, op) }
     }
 
     /// Create read-only pages.
@@ -210,6 +274,7 @@ where
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 // keep READ, turn off WRITE
                 MemoryRegionPermissions::READ,
+                None,
                 op,
             )
         }
@@ -248,6 +313,7 @@ where
                 flags,
                 MemoryRegionPermissions::empty(),
                 MemoryRegionPermissions::empty(),
+                None,
                 op,
             )
         }
@@ -275,7 +341,11 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let flags = CreatePagesFlags::IS_STACK | flags;
-        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
+        unsafe {
+            self.create_pages(suggested_address, length, flags, perms, perms, None, |_| {
+                Ok(0)
+            })
+        }
     }
 
     /// Set the initial program break address.
@@ -379,6 +449,7 @@ where
                     length,
                     CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                     perms,
+                    None,
                 )
             }?;
         }
@@ -672,6 +743,7 @@ where
         let vma = VmArea::new(
             VmFlags::from(permissions) | VmFlags::may_flags_for_mapping(shared, is_file_backed),
             is_file_backed,
+            None,
         );
         let mut vmem = self.vmem.write();
         if !replace && vmem.overlapping(range.into()).next().is_some() {
@@ -679,6 +751,13 @@ where
         }
         vmem.register_existing_mapping_overwrite(range, vma);
         Some(())
+    }
+
+    /// Locks mapping metadata for a stable sequence of identity-sensitive operations.
+    pub fn lock_mappings(&self) -> MappingReadGuard<'_, Platform, ALIGN> {
+        MappingReadGuard {
+            vmem: self.vmem.read(),
+        }
     }
 
     /// Returns all mappings in a vector.

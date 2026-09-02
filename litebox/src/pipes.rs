@@ -35,6 +35,7 @@ use crate::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
     },
+    fd::EntryHandle,
     fs::OFlags,
     platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
@@ -216,6 +217,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             PipeEnd::Sender(p) => Ok(f(p)),
             PipeEnd::BrokerReceiver(p) | PipeEnd::BrokerSender(p) => Ok(f(p)),
         }
+    }
+
+    /// Perform `f` with the [`IOPollable`] associated with an already-resolved pipe entry.
+    ///
+    /// This is the open-file-description counterpart of [`Self::with_iopollable`]. It lets an
+    /// epoll registration continue to observe a pipe after the particular numeric descriptor used
+    /// for `EPOLL_CTL_ADD` closes, as long as another duplicate still keeps the description alive.
+    pub fn with_iopollable_handle<R>(
+        &self,
+        handle: &EntryHandle<Platform, Self>,
+        f: impl FnOnce(&dyn IOPollable) -> R,
+    ) -> R {
+        handle.with_entry(|entry| match &entry.entry {
+            PipeEnd::Receiver(p) => f(p),
+            PipeEnd::Sender(p) => f(p),
+            PipeEnd::BrokerReceiver(p) | PipeEnd::BrokerSender(p) => f(p),
+        })
     }
 }
 
@@ -511,6 +529,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerPi
         self.pollee.register_observer(observer, filter);
     }
 
+    fn unregister_observer(&self, observer: Weak<dyn Observer<Events>>) {
+        self.pollee.unregister_observer(observer);
+    }
+
     fn check_io_events(&self) -> Events {
         match self.readiness() {
             Ok(readiness) => readiness_events(readiness),
@@ -759,6 +781,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for Write
         self.endpoint.pollee.register_observer(observer, filter);
     }
 
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        self.endpoint.pollee.unregister_observer(observer);
+    }
+
     fn check_io_events(&self) -> Events {
         let rb = self.endpoint.rb.lock();
         let mut events = Events::empty();
@@ -794,6 +820,10 @@ struct ReadEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> IOPollable for ReadEnd<Platform, T> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, filter: Events) {
         self.endpoint.pollee.register_observer(observer, filter);
+    }
+
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        self.endpoint.pollee.unregister_observer(observer);
     }
 
     fn check_io_events(&self) -> Events {

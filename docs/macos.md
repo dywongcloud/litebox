@@ -37,6 +37,50 @@ verifies the crate's hand-written Mach/BSD struct layouts (used by the fault
 handler to read `ucontext_t::uc_mcontext`) against an actual Darwin toolchain,
 since nothing else in a Linux-hosted development loop can.
 
+### Hypervisor.framework release boundary
+
+The stock-code backend requires Apple Silicon, macOS 26 or newer, and a macOS
+26 SDK or newer. The combined runner retains its macOS 11 deployment target so
+the native backend still launches on older hosts; post-macOS-11 HVF imports are
+weak and the production boundary checks `__builtin_available(macOS 26.0, *)`
+before making any such call. `litebox_platform_macos_userland/build.rs`
+compiles the narrow C boundary and linked EL1 monitor against the active SDK
+headers, so Apple enum, object, and structure layouts do not get copied into
+Rust constants. A release runner is built and signed with the checked-in
+entitlement manifest as follows:
+
+```sh
+cargo build --release --locked -p litebox_runner_linux_on_macos_userland
+codesign --force --options runtime --sign - \
+  --entitlements litebox_runner_linux_on_macos_userland/entitlements.plist \
+  target/release/litebox_runner_linux_on_macos_userland
+codesign --display --entitlements - \
+  target/release/litebox_runner_linux_on_macos_userland
+target/release/litebox_runner_linux_on_macos_userland \
+  --unstable --hvf-boundary
+target/release/litebox_runner_linux_on_macos_userland \
+  --unstable --hvf-memory
+```
+
+The boundary diagnostic validates the active-SDK configuration, maps and
+unmaps the monitor, and creates, verifies, and destroys a vCPU. The compact
+memory diagnostic does not run guest instructions. It proves that IPA zero is
+reserved for the monitor, GVA=HVA mappings receive compact non-identity IPAs,
+16 KiB stage-one roots software-walk to the same pages, stage-two permissions
+can move from RW to RX without RWX, rejected overlap transactions publish no
+new root generation, and released IPA is reused without poisoning the VM. The
+linked 16 KiB monitor remains the source of truth, but the VM owns an aligned
+allocator-backed copy: Hypervisor.framework rejects file-backed Mach-O
+`__TEXT` pages as stage-two backing.
+
+`com.apple.security.hypervisor=true` is mandatory for
+Hypervisor.framework VM creation. `com.apple.security.cs.allow-jit=true` remains
+required when the native rewritten backend is packaged with Hardened Runtime.
+The legacy `com.apple.vm.hypervisor` entitlement belongs only to deployment
+targets through macOS 10.15 and is deliberately absent. Notarization and
+Hardened Runtime do not grant Hypervisor.framework authorization; the final
+executable still needs the hypervisor entitlement.
+
 ## What the host imposes
 
 ### 16 KiB pages
