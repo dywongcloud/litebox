@@ -8,17 +8,20 @@ use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, RefCell, UnsafeCell};
 use core::mem::offset_of;
-use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::ops::{Deref, DerefMut, Range};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
-use litebox::mm::linux::VmFlags;
+use litebox::mm::linux::{PAGE_SIZE, VmFlags};
 use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
-use litebox::sync::Mutex;
+use litebox::sync::{
+    Mutex,
+    futex::{FutexKey, FutexManager},
+};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
@@ -55,10 +58,105 @@ unsafe impl<Platform: ShimPlatform> Send for ThreadState<Platform> {}
 
 impl<Platform: ShimPlatform> ThreadState<Platform> {
     pub fn new_process(pid: i32, process_group_id: i32) -> Self {
+        Self::new_process_with_shared_futex_manager(
+            pid,
+            process_group_id,
+            Arc::new(FutexManager::new()),
+            None,
+        )
+    }
+
+    fn new_forked_process(
+        pid: i32,
+        process_group_id: i32,
+        shared_futex_manager: Arc<FutexManager<Platform>>,
+        launch: Arc<ProcessLaunch<Platform>>,
+    ) -> Self {
+        Self::new_process_with_shared_futex_manager(
+            pid,
+            process_group_id,
+            shared_futex_manager,
+            Some(launch),
+        )
+    }
+
+    fn new_vfork_copy_process(
+        pid: i32,
+        process_group_id: i32,
+        shared_futex_manager: Arc<FutexManager<Platform>>,
+        completion: Arc<VforkCompletion<Platform>>,
+        launch: Arc<ProcessLaunch<Platform>>,
+    ) -> Self {
+        let futex_namespace = shared_futex_manager.new_private_namespace();
+        Self::new_process_with_futex_namespace(
+            pid,
+            process_group_id,
+            shared_futex_manager,
+            futex_namespace,
+            Some(completion),
+            None,
+            Some(launch),
+        )
+    }
+
+    fn new_vforked_process(
+        pid: i32,
+        process_group_id: i32,
+        parent: &Process<Platform>,
+        completion: Arc<VforkCompletion<Platform>>,
+        launch: Arc<ProcessLaunch<Platform>>,
+    ) -> Self {
+        Self::new_process_with_futex_namespace(
+            pid,
+            process_group_id,
+            parent.futex_manager.clone(),
+            parent.futex_namespace(),
+            Some(completion),
+            Some(parent),
+            Some(launch),
+        )
+    }
+
+    fn new_process_with_shared_futex_manager(
+        pid: i32,
+        process_group_id: i32,
+        shared_futex_manager: Arc<FutexManager<Platform>>,
+        launch: Option<Arc<ProcessLaunch<Platform>>>,
+    ) -> Self {
+        let futex_namespace = shared_futex_manager.new_private_namespace();
+        Self::new_process_with_futex_namespace(
+            pid,
+            process_group_id,
+            shared_futex_manager,
+            futex_namespace,
+            None,
+            None,
+            launch,
+        )
+    }
+
+    fn new_process_with_futex_namespace(
+        pid: i32,
+        process_group_id: i32,
+        futex_manager: Arc<FutexManager<Platform>>,
+        futex_namespace: usize,
+        vfork_completion: Option<Arc<VforkCompletion<Platform>>>,
+        shared_vm_parent: Option<&Process<Platform>>,
+        launch: Option<Arc<ProcessLaunch<Platform>>>,
+    ) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, process_group_id, remote.clone())),
+            process: Arc::new(Process::new(
+                pid,
+                process_group_id,
+                remote.clone(),
+                futex_manager,
+                futex_namespace,
+                vfork_completion,
+                shared_vm_parent,
+                launch,
+            )),
             remote,
             attached_tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -209,6 +307,20 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// blockable atomic.
     fork_gate: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
     inner: Arc<Mutex<Platform, ProcessInner<Platform>>>,
+    /// The swappable identity of the Linux `mm_struct`-like bookkeeping this process uses.
+    /// A vfork child gets its own slot pointing at the parent's identity, then swaps only its slot
+    /// to a fresh identity on successful exec.
+    vm: Arc<VmBookkeepingSlot<Platform>>,
+    /// Futex wait queues inherited by every process in one fork family.
+    ///
+    /// Each independent VM identity has a distinct private futex namespace; MAP_SHARED
+    /// non-private keys instead use the manager's reserved shared namespace zero.
+    futex_manager: Arc<FutexManager<Platform>>,
+    vfork_completion: Mutex<Platform, Option<Arc<VforkCompletion<Platform>>>>,
+    /// Whether this vfork child points at its parent's live VM identity, independently of whether
+    /// its parent waits for exec/exit. Lone `CLONE_VFORK` waits but owns a copied VM.
+    shares_parent_vm: AtomicBool,
+    launch: Option<Arc<ProcessLaunch<Platform>>>,
     /// Resource limits for this process.
     pub(crate) limits: Arc<ResourceLimits>,
     /// Process-wide alarm timer.
@@ -219,16 +331,16 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// Needed because `fork` has to be able to save and restore *this* process's memory without
     /// touching a sibling's -- see [`Task::save_address_space`]. The page manager's own view is
     /// process-blind: it is one flat map of every guest mapping in the shim.
-    pub(crate) owned_ranges: Mutex<Platform, OwnedRanges>,
-    /// Runtime ELF rewriting state for this process's fd namespace.
-    pub(crate) elf_patch_cache: Mutex<Platform, super::mm::ElfPatchCache>,
+    pub(crate) owned_ranges: SharedVmLockedField<Platform, OwnedRanges>,
+    /// Runtime ELF rewriting state for this process's VM identity.
+    pub(crate) elf_patch_cache: SharedVmLockedField<Platform, super::mm::ElfPatchCache>,
     /// This process's program break.
     ///
     /// Every guest process shares one [`litebox::mm::PageManager`] (they live at disjoint
     /// addresses in the one host address space), and that manager tracks a single break, so the
     /// authoritative per-process value has to live here and be swapped into the manager around
     /// each break operation. See `Task::sys_brk`.
-    pub(crate) brk: core::sync::atomic::AtomicUsize,
+    pub(crate) brk: SharedVmAtomicUsize<Platform>,
     /// Total host CPU time (nanoseconds) consumed by every thread of this process so far.
     ///
     /// Each thread adds its own [`litebox::platform::TimeProvider::thread_cpu_time`] reading
@@ -273,6 +385,16 @@ impl OwnedRanges {
         self.ranges.insert(at, range);
     }
 
+    fn insert_bounded(&mut self, range: Range<usize>, max_ranges: usize) {
+        self.insert(range);
+        if self.ranges.len() > max_ranges {
+            let start = self.ranges.first().unwrap().start;
+            let end = self.ranges.last().unwrap().end;
+            self.ranges.clear();
+            self.ranges.push(start..end);
+        }
+    }
+
     /// Removes `range`, splitting any entry that only partially overlaps it.
     pub(crate) fn remove(&mut self, range: Range<usize>) {
         if range.is_empty() {
@@ -306,6 +428,164 @@ impl OwnedRanges {
             let end = r.end.min(range.end);
             (start < end).then_some(start..end)
         })
+    }
+}
+
+struct VmLockedValue<Platform: ShimPlatform, T> {
+    state: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    value: UnsafeCell<T>,
+}
+
+impl<Platform: ShimPlatform, T> VmLockedValue<Platform, T> {
+    fn new(value: T) -> Self {
+        Self {
+            state: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn lock(&self) {
+        loop {
+            if self
+                .state
+                .underlying_atomic()
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+            let _ = self.state.block(1);
+        }
+    }
+
+    unsafe fn unlock(&self) {
+        self.state
+            .underlying_atomic()
+            .store(0, Ordering::Release);
+        self.state.wake_all();
+    }
+}
+
+unsafe impl<Platform: ShimPlatform, T: Send> Send for VmLockedValue<Platform, T> {}
+unsafe impl<Platform: ShimPlatform, T: Send> Sync for VmLockedValue<Platform, T> {}
+
+struct VmBookkeeping<Platform: ShimPlatform> {
+    owned_ranges: VmLockedValue<Platform, OwnedRanges>,
+    elf_patch_cache: VmLockedValue<Platform, super::mm::ElfPatchCache>,
+    brk: AtomicUsize,
+    futex_namespace: usize,
+}
+
+impl<Platform: ShimPlatform> VmBookkeeping<Platform> {
+    fn new(futex_namespace: usize) -> Self {
+        Self {
+            owned_ranges: VmLockedValue::new(OwnedRanges::default()),
+            elf_patch_cache: VmLockedValue::new(BTreeMap::new()),
+            brk: AtomicUsize::new(0),
+            futex_namespace,
+        }
+    }
+}
+
+struct VmBookkeepingSlot<Platform: ShimPlatform> {
+    current: Mutex<Platform, Arc<VmBookkeeping<Platform>>>,
+}
+
+impl<Platform: ShimPlatform> VmBookkeepingSlot<Platform> {
+    fn new(futex_namespace: usize) -> Self {
+        Self {
+            current: Mutex::new(Arc::new(VmBookkeeping::new(futex_namespace))),
+        }
+    }
+
+    fn shared_with(other: &Self) -> Self {
+        Self {
+            current: Mutex::new(other.current.lock().clone()),
+        }
+    }
+
+    fn current(&self) -> Arc<VmBookkeeping<Platform>> {
+        self.current.lock().clone()
+    }
+
+    fn detach(&self, futex_namespace: usize) {
+        *self.current.lock() = Arc::new(VmBookkeeping::new(futex_namespace));
+    }
+}
+
+pub(crate) struct SharedVmLockedField<Platform: ShimPlatform, T> {
+    vm: Arc<VmBookkeepingSlot<Platform>>,
+    field: fn(&VmBookkeeping<Platform>) -> &VmLockedValue<Platform, T>,
+}
+
+impl<Platform: ShimPlatform, T> SharedVmLockedField<Platform, T> {
+    fn new(
+        vm: Arc<VmBookkeepingSlot<Platform>>,
+        field: fn(&VmBookkeeping<Platform>) -> &VmLockedValue<Platform, T>,
+    ) -> Self {
+        Self { vm, field }
+    }
+
+    pub(crate) fn lock(&self) -> SharedVmLockedFieldGuard<Platform, T> {
+        let vm = self.vm.current();
+        (self.field)(&vm).lock();
+        SharedVmLockedFieldGuard {
+            vm,
+            field: self.field,
+        }
+    }
+}
+
+pub(crate) struct SharedVmLockedFieldGuard<Platform: ShimPlatform, T> {
+    vm: Arc<VmBookkeeping<Platform>>,
+    field: fn(&VmBookkeeping<Platform>) -> &VmLockedValue<Platform, T>,
+}
+
+impl<Platform: ShimPlatform, T> SharedVmLockedFieldGuard<Platform, T> {
+    fn value(&self) -> &VmLockedValue<Platform, T> {
+        (self.field)(&self.vm)
+    }
+}
+
+impl<Platform: ShimPlatform, T> Deref for SharedVmLockedFieldGuard<Platform, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.value().value.get() }
+    }
+}
+
+impl<Platform: ShimPlatform, T> DerefMut for SharedVmLockedFieldGuard<Platform, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.value().value.get() }
+    }
+}
+
+impl<Platform: ShimPlatform, T> Drop for SharedVmLockedFieldGuard<Platform, T> {
+    fn drop(&mut self) {
+        unsafe { self.value().unlock() };
+    }
+}
+
+pub(crate) struct SharedVmAtomicUsize<Platform: ShimPlatform> {
+    vm: Arc<VmBookkeepingSlot<Platform>>,
+    field: fn(&VmBookkeeping<Platform>) -> &AtomicUsize,
+}
+
+impl<Platform: ShimPlatform> SharedVmAtomicUsize<Platform> {
+    fn new(
+        vm: Arc<VmBookkeepingSlot<Platform>>,
+        field: fn(&VmBookkeeping<Platform>) -> &AtomicUsize,
+    ) -> Self {
+        Self { vm, field }
+    }
+
+    pub(crate) fn load(&self, order: Ordering) -> usize {
+        (self.field)(&self.vm.current()).load(order)
+    }
+
+    pub(crate) fn store(&self, value: usize, order: Ordering) {
+        (self.field)(&self.vm.current()).store(value, order);
     }
 }
 
@@ -349,8 +629,97 @@ pub(crate) struct SharedAddressSpace<Platform: ShimPlatform> {
     holder: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
 }
 
+const PROCESS_LAUNCH_PENDING: u32 = 0;
+const PROCESS_LAUNCH_COMMITTED: u32 = 1;
+const PROCESS_LAUNCH_ABORTED: u32 = 2;
+
+struct ProcessLaunch<Platform: ShimPlatform> {
+    state: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+}
+
+impl<Platform: ShimPlatform> ProcessLaunch<Platform> {
+    fn new() -> Self {
+        Self {
+            state: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+        }
+    }
+
+    fn commit(&self) {
+        self.state
+            .underlying_atomic()
+            .store(PROCESS_LAUNCH_COMMITTED, Ordering::Release);
+        self.state.wake_all();
+    }
+
+    fn abort(&self) {
+        self.state
+            .underlying_atomic()
+            .store(PROCESS_LAUNCH_ABORTED, Ordering::Release);
+        self.state.wake_all();
+    }
+
+    fn wait(&self) -> bool {
+        loop {
+            let state = self.state.underlying_atomic().load(Ordering::Acquire);
+            match state {
+                PROCESS_LAUNCH_COMMITTED => return true,
+                PROCESS_LAUNCH_ABORTED => return false,
+                PROCESS_LAUNCH_PENDING => {
+                    let _ = self.state.block(PROCESS_LAUNCH_PENDING);
+                }
+                _ => unreachable!("invalid process launch state"),
+            }
+        }
+    }
+
+    fn is_committed(&self) -> bool {
+        self.state.underlying_atomic().load(Ordering::Acquire) == PROCESS_LAUNCH_COMMITTED
+    }
+}
+
+const VFORK_ACTIVE: u32 = 0;
+const VFORK_COMPLETE: u32 = 1;
+
+pub(crate) struct VforkCompletion<Platform: ShimPlatform> {
+    state: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+}
+
+impl<Platform: ShimPlatform> VforkCompletion<Platform> {
+    fn new() -> Self {
+        let state = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        state
+            .underlying_atomic()
+            .store(VFORK_ACTIVE, Ordering::Relaxed);
+        Self { state }
+    }
+
+    fn complete(&self) {
+        if self
+            .state
+            .underlying_atomic()
+            .swap(VFORK_COMPLETE, Ordering::Release)
+            == VFORK_ACTIVE
+        {
+            self.state.wake_all();
+        }
+    }
+
+    fn wait(&self) {
+        loop {
+            let state = self.state.underlying_atomic().load(Ordering::Acquire);
+            if state == VFORK_COMPLETE {
+                return;
+            }
+            let _ = self.state.block(state);
+        }
+    }
+}
+
 /// A copy of a guest process's private memory, as `(start address, contents)` pairs.
 type MemoryImage = Vec<(usize, alloc::boxed::Box<[u8]>)>;
+
+/// Above this many disjoint below-SP ABI ranges, preserve their one bounding interval instead.
+const MAX_PRESERVED_STACK_RANGES: usize = 64;
 
 /// One member's place in a [`SharedAddressSpace`].
 pub(crate) struct AddressSpaceMembership<Platform: ShimPlatform> {
@@ -360,6 +729,9 @@ pub(crate) struct AddressSpaceMembership<Platform: ShimPlatform> {
     /// This member's copy of its own private memory, taken when it gave the token up. `Some`
     /// exactly while [`Self::holding`] is false and the member still intends to come back.
     parked: RefCell<Option<MemoryImage>>,
+    /// Small guest ranges whose contents remain semantically live even when they sit below the
+    /// current stack pointer. Clone child-TID words are the canonical case.
+    preserved_stack_ranges: RefCell<OwnedRanges>,
 }
 
 /// The value of [`SharedAddressSpace::holder`] when no member holds the token. No tid is ever
@@ -722,9 +1094,11 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
             .any(|(&child, r)| r.ppid == parent && filter.matches(child) && r.status.is_some())
     }
 
-    /// Drops `child`'s record entirely, waited for or not.
-    fn forget(&self, child: i32) {
-        self.inner.lock().children.remove(&child);
+    /// Removes every process-table trace of a child whose host thread could not be spawned.
+    fn forget_failed_spawn(&self, child: i32) {
+        let mut inner = self.inner.lock();
+        inner.children.remove(&child);
+        inner.live.remove(&child);
     }
 
     pub(crate) fn register_waiter(
@@ -828,11 +1202,25 @@ pub(crate) enum ExitStatus {
 
 impl<Platform: ShimPlatform> Process<Platform> {
     /// Creates a new process with the given initial thread.
-    fn new(pid: i32, process_group_id: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
+    fn new(
+        pid: i32,
+        process_group_id: i32,
+        remote: Arc<ThreadRemote<Platform>>,
+        futex_manager: Arc<FutexManager<Platform>>,
+        futex_namespace: usize,
+        vfork_completion: Option<Arc<VforkCompletion<Platform>>>,
+        shared_vm_parent: Option<&Process<Platform>>,
+        launch: Option<Arc<ProcessLaunch<Platform>>>,
+    ) -> Self {
         let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         let fork_gate = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         fork_gate.underlying_atomic().store(0, Ordering::Relaxed);
+        let shares_parent_vm = shared_vm_parent.is_some();
+        let vm = Arc::new(match shared_vm_parent {
+            Some(parent) => VmBookkeepingSlot::shared_with(&parent.vm),
+            None => VmBookkeepingSlot::new(futex_namespace),
+        });
         Self {
             nr_threads,
             fork_gate,
@@ -842,19 +1230,58 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 is_killing_other_threads: false,
                 threads: BTreeMap::from_iter([(pid, remote)]),
             })),
+            vm: vm.clone(),
+            futex_manager,
+            vfork_completion: Mutex::new(vfork_completion),
+            shares_parent_vm: AtomicBool::new(shares_parent_vm),
+            launch,
             limits: Arc::new(ResourceLimits::default()),
             alarm_timer: Mutex::new(Alarm {
                 handle: None,
                 deadline: None,
             }),
-            brk: core::sync::atomic::AtomicUsize::new(0),
-            owned_ranges: Mutex::new(OwnedRanges::default()),
-            elf_patch_cache: Mutex::new(BTreeMap::new()),
+            brk: SharedVmAtomicUsize::new(vm.clone(), |vm| &vm.brk),
+            owned_ranges: SharedVmLockedField::new(vm.clone(), |vm| &vm.owned_ranges),
+            elf_patch_cache: SharedVmLockedField::new(vm, |vm| &vm.elf_patch_cache),
             cpu_time_nanos: core::sync::atomic::AtomicU64::new(0),
             session_id: AtomicI32::new(pid),
             process_group_id: Arc::new(AtomicI32::new(process_group_id)),
             controlling_pty: AtomicU32::new(NO_CONTROLLING_PTY),
         }
+    }
+
+    fn futex_manager(&self) -> &FutexManager<Platform> {
+        self.futex_manager.as_ref()
+    }
+
+    fn futex_namespace(&self) -> usize {
+        self.vm.current().futex_namespace
+    }
+
+    fn detach_vfork_vm(&self) {
+        let futex_namespace = self.futex_manager.new_private_namespace();
+        self.vm.detach(futex_namespace);
+        self.shares_parent_vm.store(false, Ordering::Release);
+    }
+
+    fn shares_parent_vm(&self) -> bool {
+        self.shares_parent_vm.load(Ordering::Acquire)
+    }
+
+    fn complete_vfork(&self) {
+        if let Some(completion) = self.vfork_completion.lock().take() {
+            completion.complete();
+        }
+    }
+
+    fn await_launch(&self) -> bool {
+        self.launch.as_ref().is_none_or(|launch| launch.wait())
+    }
+
+    fn exit_is_publishable(&self) -> bool {
+        self.launch
+            .as_ref()
+            .is_none_or(|launch| launch.is_committed())
     }
 
     /// Returns this process's process-group ID.
@@ -1178,9 +1605,12 @@ impl SupplementaryGroups {
 pub(crate) struct Credentials {
     pub uid: u32,
     pub euid: u32,
+    pub suid: u32,
     pub gid: u32,
     pub egid: u32,
+    pub sgid: u32,
     supplementary_groups: SupplementaryGroups,
+    no_new_privs: bool,
 }
 
 impl Credentials {
@@ -1192,10 +1622,21 @@ impl Credentials {
         Self {
             uid,
             euid,
+            suid: euid,
             gid,
             egid,
+            sgid: egid,
             supplementary_groups: SupplementaryGroups::default(),
+            no_new_privs: false,
         }
+    }
+
+    pub(crate) fn supplementary_groups(&self) -> &[u32] {
+        self.supplementary_groups.as_slice()
+    }
+
+    pub(crate) fn no_new_privs(&self) -> bool {
+        self.no_new_privs
     }
 }
 
@@ -1281,12 +1722,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(0)
             }
             PrctlArg::GetDumpable => Ok(1),
-            PrctlArg::SetNoNewPrivs => Ok(0),
-            PrctlArg::GetNoNewPrivs => {
-                // LiteBox never permits an exec to gain guest privileges, so this property is
-                // effectively permanent even before the guest asks to set it.
-                Ok(1)
+            PrctlArg::SetNoNewPrivs => {
+                let mut credentials = self.credentials.borrow().as_ref().clone();
+                credentials.no_new_privs = true;
+                *self.credentials.borrow_mut() = Arc::new(credentials);
+                Ok(0)
             }
+            PrctlArg::GetNoNewPrivs => Ok(usize::from(
+                self.credentials.borrow().no_new_privs(),
+            )),
             // `PrctlArg` is `#[non_exhaustive]`; the syscall decoder rejects every option not
             // represented above with `EINVAL` before constructing one.
             _ => unreachable!(),
@@ -1344,45 +1788,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `handle_futex_death` (`kernel/futex/core.c`). Without this, a thread that dies while
     /// still holding a robust `pthread_mutex_t` would leave every future waiter on that lock
     /// blocked forever, since its owner can never call `FUTEX_WAKE` again.
-    fn handle_futex_death(&self, futex_addr: UserPtr<u32>, _pending_op: bool) -> Result<(), Errno> {
+    fn handle_futex_death(&self, futex_addr: UserPtr<u32>, pending_op: bool) -> Result<(), Errno> {
         if !futex_addr.as_usize().is_multiple_of(4) {
             return Err(Errno::EINVAL);
         }
         let futex_addr = UserPtrMut::from_usize(futex_addr.as_usize());
 
-        let Some(word) = futex_addr.read_at_offset::<Platform>(0) else {
+        let Some(mut word) = futex_addr.read_at_offset::<Platform>(0) else {
             return Err(Errno::EFAULT);
         };
 
-        // Only touch the word if it's still (nominally) owned by this dying thread -- a lock
-        // that was already unlocked and re-acquired by someone else, or never actually locked by
-        // us despite being linked into our robust list, must be left alone.
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "tid is always non-negative; only ever compared against another tid read \
-                      back from a futex word, never used arithmetically"
-        )]
-        if (word & FUTEX_TID_MASK) != self.tid as u32 {
-            return Ok(());
-        }
+        loop {
+            // Only touch the word if it's still (nominally) owned by this dying thread -- a lock
+            // that was already unlocked and re-acquired by someone else, or never actually locked
+            // by us despite being linked into our robust list, must be left alone.
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "tid is always non-negative; only ever compared against another tid read \
+                          back from a futex word, never used arithmetically"
+            )]
+            if (word & FUTEX_TID_MASK) != self.tid as u32 {
+                return Ok(());
+            }
 
-        let had_waiters = word & FUTEX_WAITERS != 0;
-        let new_word = (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
-        if futex_addr
-            .write_at_offset::<Platform>(0, new_word)
-            .is_none()
-        {
-            return Err(Errno::EFAULT);
+            let had_waiters = word & FUTEX_WAITERS != 0;
+            let new_word = (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+            match futex_addr.compare_exchange::<Platform>(word, new_word) {
+                None => return Err(Errno::EFAULT),
+                Some(Err(actual)) => {
+                    word = actual;
+                    continue;
+                }
+                Some(Ok(_)) => {
+                    if had_waiters || pending_op {
+                        let _ = self.sys_futex(FutexArgs::Wake {
+                            addr: futex_addr,
+                            flags: litebox_common_linux::FutexFlags::empty(),
+                            count: 1,
+                        });
+                    }
+                    return Ok(());
+                }
+            }
         }
-
-        if had_waiters {
-            let _ = self.sys_futex(FutexArgs::Wake {
-                addr: futex_addr,
-                flags: litebox_common_linux::FutexFlags::PRIVATE,
-                count: 1,
-            });
-        }
-        Ok(())
     }
 }
 
@@ -1411,7 +1859,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
             if entry.as_usize() != pending.as_usize() {
                 self.handle_futex_death(
-                    UserPtr::from_usize(entry.as_usize() + futex_offset),
+                    UserPtr::from_usize(entry.as_usize().wrapping_add_signed(futex_offset)),
                     false,
                 )?;
             }
@@ -1424,8 +1872,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         if pending.as_usize() != 0 {
-            let _ = self
-                .handle_futex_death(UserPtr::from_usize(pending.as_usize() + futex_offset), true);
+            let _ = self.handle_futex_death(
+                UserPtr::from_usize(pending.as_usize().wrapping_add_signed(futex_offset)),
+                true,
+            );
         }
         Ok(())
     }
@@ -1449,28 +1899,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ordering::Relaxed,
         );
 
-        let is_last_thread = self.thread.detach_from_process();
+        let exit_is_publishable = self.process().exit_is_publishable();
+        let clear_child_tid_on_exit =
+            self.process().nr_threads() > 1 || self.process().shares_parent_vm();
+        let can_touch_guest_memory = self
+            .address_space
+            .borrow()
+            .as_ref()
+            .is_none_or(|membership| membership.holding.get());
+        if exit_is_publishable && can_touch_guest_memory {
+            if let Some(clear_child_tid) = self.thread.clear_child_tid.take()
+                && clear_child_tid_on_exit
+            {
+                let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
+                // Cast from *i32 to *u32.
+                let clear_child_tid = UserPtrMut::from_usize(clear_child_tid.as_usize());
+                let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
+                    addr: clear_child_tid,
+                    flags: litebox_common_linux::FutexFlags::empty(),
+                    count: 1,
+                });
+            }
+            if let Some(robust_list) = self.thread.robust_list.take() {
+                let _ = self.wake_robust_list(robust_list);
+            }
+        } else {
+            // An aborted `ProcessLaunch` never entered guest userspace, and a parked copying-fork
+            // task does not currently own the bytes at its guest addresses. Neither may clear a
+            // child-TID word or walk a robust list in whichever process image is actually live.
+            self.thread.clear_child_tid.take();
+            self.thread.robust_list.take();
+        }
 
-        if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
-            // Clear the child TID if requested
-            // TODO: if we are the last thread, we don't need to clear it
-            let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
-            // Cast from *i32 to *u32
-            let clear_child_tid = UserPtrMut::from_usize(clear_child_tid.as_usize());
-            let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
-                addr: clear_child_tid,
-                flags: litebox_common_linux::FutexFlags::PRIVATE,
-                count: 1,
-            });
-        }
-        if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = self.wake_robust_list(robust_list);
-        }
+        // Keep this thread counted until every exit-time access to guest memory is complete. An
+        // execing sibling waits for `nr_threads == 1` before tearing the old address space down.
+        let is_last_thread = self.thread.detach_from_process();
 
         // Every write to guest memory above is done, so a task that shares its address space can
         // now hand it back -- which it must, or the members still alive would wait for it
-        // forever. See [`SharedAddressSpace`].
-        let _ = self.leave_address_space();
+        // forever. An aborted launch never received the fork token in the first place, despite its
+        // not-yet-running membership being constructed as the future holder, so it must only drop
+        // that membership rather than release the actual parent's token. See [`SharedAddressSpace`].
+        if exit_is_publishable {
+            let _ = self.leave_address_space();
+        } else {
+            self.address_space.borrow_mut().take();
+        }
 
         // `FilesState` is shared (via `Arc`) across every `CLONE_FILES` thread of the process,
         // and closing an fd is only ever done explicitly (via `do_close`, which routes through
@@ -1492,12 +1966,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let status = self.thread.process.inner.lock().exit_status;
             let cpu_time_nanos = self.thread.process.cpu_time_nanos.load(Ordering::Relaxed);
             self.global.processes.unregister_process(self.pid);
-            self.global
-                .processes
-                .record_exit(self.pid, status, cpu_time_nanos);
-            self.global
-                .processes
-                .signal_and_discard_children_of(self.pid);
+            if exit_is_publishable {
+                self.global
+                    .processes
+                    .record_exit(self.pid, status, cpu_time_nanos);
+                self.global
+                    .processes
+                    .signal_and_discard_children_of(self.pid);
+            }
+            self.process().complete_vfork();
         }
     }
 
@@ -1533,6 +2010,27 @@ const GUEST_TLS_REGISTER: ArchSpecificRegister = ArchSpecificRegister::TpidrEl0;
 struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
     /// Task struct that maintains all per-thread data
     task: Task<Platform, FS>,
+}
+
+#[derive(Clone, Copy)]
+enum ProcessCloneKind {
+    Fork,
+    VforkCopy,
+    VforkShared,
+}
+
+impl ProcessCloneKind {
+    fn copies_vm(self) -> bool {
+        matches!(self, Self::Fork | Self::VforkCopy)
+    }
+
+    fn waits_for_exec_or_exit(self) -> bool {
+        matches!(self, Self::VforkCopy | Self::VforkShared)
+    }
+
+    fn shares_parent_vm(self) -> bool {
+        matches!(self, Self::VforkShared)
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<Platform, FS> {
@@ -1621,16 +2119,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             flags.remove(CloneFlags::DETACHED);
         }
 
-        // A `fork(2)`: libc issues it as a bare `clone(exit_signal, 0)` with no sharing flags at
-        // all. `vfork(2)` and `posix_spawn` add `CLONE_VM | CLONE_VFORK`, which asks for exactly
-        // the semantics this shim implements anyway (see `SharedAddressSpace`), so accept those --
-        // but only together, and only without `CLONE_THREAD`, which would mean a thread rather
-        // than a process.
-        let fork_optional_flags = CloneFlags::VM | CloneFlags::VFORK;
-        if !flags.intersects(!fork_optional_flags)
-            && (flags & fork_optional_flags).bits() != CloneFlags::VM.bits()
-        {
-            return self.do_fork(ctx, args);
+        let process_kind_flags = CloneFlags::VM | CloneFlags::VFORK;
+        let process_tid_flags =
+            CloneFlags::PARENT_SETTID | CloneFlags::CHILD_SETTID | CloneFlags::CHILD_CLEARTID;
+        let supported_process_flags = process_kind_flags | process_tid_flags;
+        if !flags.intersects(!supported_process_flags) {
+            match flags & process_kind_flags {
+                kind_flags if kind_flags.is_empty() => {
+                    return self.do_process_clone(ctx, args, flags, ProcessCloneKind::Fork);
+                }
+                kind_flags if kind_flags.bits() == CloneFlags::VFORK.bits() => {
+                    return self.do_process_clone(ctx, args, flags, ProcessCloneKind::VforkCopy);
+                }
+                kind_flags if kind_flags.bits() == process_kind_flags.bits() => {
+                    return self.do_process_clone(ctx, args, flags, ProcessCloneKind::VforkShared);
+                }
+                _ => {}
+            }
         }
 
         let required_clone_flags =
@@ -1796,46 +2301,68 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(usize::try_from(child_tid).unwrap())
     }
 
-    /// Creates a new *process* sharing this one's address space, and suspends the caller until
-    /// that child hands the address space back -- which it does as soon as it blocks, `execve`s
-    /// or exits, not only at the end of its life. See [`SharedAddressSpace`] for why a copying
-    /// `fork` is not representable here and how the sharing works.
-    ///
-    /// Unlike `vfork`, and like `fork`, the child gets its own copy of everything that is not
-    /// memory: its own pid, its own file-descriptor table (so the shell's `dup2`/`close` dance
-    /// between `fork` and `exec` cannot reach back into the parent's stdio), its own working
-    /// directory and umask, and its own signal dispositions.
-    fn do_fork(
+    fn do_process_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
         args: &litebox_common_linux::CloneArgs,
+        flags: CloneFlags,
+        kind: ProcessCloneKind,
     ) -> Result<usize, Errno> {
         const MAX_SIGNAL_NUMBER: u64 = 64;
         if args.exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
         }
-        if args.stack != 0 || args.set_tid != 0 || args.cgroup != 0 {
+        if args.stack != 0
+            || args.stack_size != 0
+            || args.set_tid != 0
+            || args.set_tid_size != 0
+            || args.cgroup != 0
+        {
             log_unsupported!("fork with a stack, set_tid or cgroup");
             return Err(Errno::EINVAL);
         }
-        // The child runs on this process's memory and takes a turn at it (see
-        // `SharedAddressSpace`), which only works while nothing else is running on that memory.
-        // A sibling thread has no turn to lose and would keep writing to pages the child is
-        // about to have rolled back under it -- so for a multithreaded caller (libuv's
-        // fork/dup2/execve spawn path is the motivating case: Node's threadpool exists by the
-        // time the first `child_process` call forks), park every sibling at the process's fork
-        // gate for the duration of the child's turn. The guard reopens the gate when this
-        // thread's turn resumes, on error, and on panic alike.
-        let _fork_gate_guard = if self.process().nr_threads() > 1 {
-            Some(self.park_sibling_threads_for_fork())
+        let child_tid_ptr =
+            (args.child_tid != 0).then(|| UserPtrMut::from_usize(args.child_tid.trunc()));
+        let set_child_tid = flags
+            .contains(CloneFlags::CHILD_SETTID)
+            .then_some(child_tid_ptr)
+            .flatten();
+        let clear_child_tid = flags
+            .contains(CloneFlags::CHILD_CLEARTID)
+            .then_some(child_tid_ptr)
+            .flatten();
+        let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) {
+            Some(UserPtrMut::from_usize(args.parent_tid.trunc()))
         } else {
             None
         };
+        if matches!(kind, ProcessCloneKind::VforkCopy) && self.process().nr_threads() > 1 {
+            // A copied VM still uses the one native host mapping. Keeping only the calling parent
+            // task suspended while sibling threads continue on the parent's copy needs a
+            // process-wide address-space membership, which this backend does not yet have.
+            log_unsupported!("CLONE_VFORK without CLONE_VM from a multithreaded process");
+            return Err(Errno::ENOSYS);
+        }
+        let _fork_gate_guard = match kind {
+            ProcessCloneKind::Fork if self.process().nr_threads() > 1 => {
+                Some(self.park_sibling_threads_for_fork())
+            }
+            ProcessCloneKind::Fork
+            | ProcessCloneKind::VforkCopy
+            | ProcessCloneKind::VforkShared => None,
+        };
+        let parent_tid_is_shared = set_parent_tid.is_some_and(|ptr| {
+            let start = ptr.as_usize();
+            let end = start.saturating_add(core::mem::size_of::<i32>());
+            self.global.pm.mappings().into_iter().any(|(range, flags)| {
+                range.start <= start && end <= range.end && flags.contains(VmFlags::VM_SHARED)
+            })
+        });
+        // A vfork child shares every byte with its parent. An ordinary fork child sees a
+        // CLONE_PARENT_SETTID store only when the pointer itself names a shared mapping; private
+        // parent memory is updated after the parent reacquires its own image below.
+        let set_parent_tid_before_child = kind.shares_parent_vm() || parent_tid_is_shared;
 
-        // The child runs on this thread's guest stack, below this thread's current `sp`, and gets
-        // the address-space token, so the parent must not touch guest memory again until it takes
-        // the token back. Everything else about the child is copied here, in the parent, before
-        // it can run.
         let child_pid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let files = self.files.borrow().fork_copy(self)?;
         let fs = alloc::sync::Arc::new((**self.fs.borrow()).clone());
@@ -1851,17 +2378,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .filter(|tls| *tls != 0)
             .map(ThreadLocalDescriptor::from_usize);
 
-        // This task becomes a member of a shared address space if it was not one already, with
-        // itself as the current holder -- it is, after all, the thread running right now.
-        let shared = self.join_address_space();
+        let created_parent_address_space = kind.copies_vm() && !self.shares_address_space();
+        let fork_sp = guest_stack_pointer(ctx);
+        let child_tid_range = (set_child_tid.is_some() || clear_child_tid.is_some())
+            .then(|| {
+                let start = child_tid_ptr.unwrap().as_usize();
+                start..start.saturating_add(core::mem::size_of::<i32>())
+            })
+            .and_then(|tid_range| {
+                self.global
+                    .pm
+                    .mappings()
+                    .into_iter()
+                    .any(|(stack, flags)| {
+                        flags.contains(VmFlags::VM_WRITE)
+                            && !flags.contains(VmFlags::VM_SHARED)
+                            && stack.start < fork_sp
+                            && fork_sp <= stack.end
+                            && stack.start <= tid_range.start
+                            && tid_range.end <= stack.end
+                    })
+                    .then_some(tid_range)
+            });
+        let (shared, preserved_stack_ranges) = if kind.copies_vm() {
+            let shared = self.join_address_space();
+            let mut ranges = self.preserved_address_space_ranges();
+            if let Some(range) = child_tid_range.as_ref() {
+                ranges.insert_bounded(range.clone(), MAX_PRESERVED_STACK_RANGES);
+            }
+            (Some(shared), ranges)
+        } else {
+            (None, OwnedRanges::default())
+        };
+        let vfork_completion = kind
+            .waits_for_exec_or_exit()
+            .then(|| Arc::new(VforkCompletion::new()));
+        let launch = Arc::new(ProcessLaunch::new());
 
-        let thread = ThreadState::new_process(child_pid, self.process().process_group_id());
+        let thread = match kind {
+            ProcessCloneKind::Fork => ThreadState::new_forked_process(
+                child_pid,
+                self.process().process_group_id(),
+                self.process().futex_manager.clone(),
+                launch.clone(),
+            ),
+            ProcessCloneKind::VforkCopy => ThreadState::new_vfork_copy_process(
+                child_pid,
+                self.process().process_group_id(),
+                self.process().futex_manager.clone(),
+                vfork_completion.as_ref().unwrap().clone(),
+                launch.clone(),
+            ),
+            ProcessCloneKind::VforkShared => ThreadState::new_vforked_process(
+                child_pid,
+                self.process().process_group_id(),
+                self.process(),
+                vfork_completion.as_ref().unwrap().clone(),
+                launch.clone(),
+            ),
+        };
         thread.init_state.set(ThreadInitState::NewThread {
             // No stack of its own: it runs on the parent's, below the parent's `sp`.
             stack: None,
             tls,
-            set_child_tid: None,
+            set_child_tid,
         });
+        thread.clear_child_tid.set(clear_child_tid);
 
         let child = Task {
             global: self.global.clone(),
@@ -1875,14 +2457,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             fs: fs.into(),
             files: Arc::new(files).into(),
             signals: self.signals.clone_for_new_process(),
-            // The child starts out holding the token: it is about to run on this memory, and the
-            // hand-off below transfers it without ever letting the token go free.
-            address_space: RefCell::new(Some(AddressSpaceMembership {
+            address_space: RefCell::new(shared.as_ref().map(|shared| AddressSpaceMembership {
                 shared: shared.clone(),
                 holding: Cell::new(true),
                 parked: RefCell::new(None),
+                preserved_stack_ranges: RefCell::new(preserved_stack_ranges.clone()),
             })),
-            guest_sp: Cell::new(guest_stack_pointer(ctx)),
+            guest_sp: Cell::new(fork_sp),
         };
         child.process().session_id.store(
             self.process().session_id.load(Ordering::Acquire),
@@ -1892,14 +2473,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.process().controlling_pty.load(Ordering::Acquire),
             Ordering::Release,
         );
-        child.process().brk.store(
-            self.process().brk.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        // The child is running on this memory, so it owns it in the same sense the parent does --
-        // which matters if the child `fork`s again before it `exec`s.
-        *child.process().owned_ranges.lock() = self.process().owned_ranges.lock().clone();
-        *child.process().elf_patch_cache.lock() = self.process().elf_patch_cache.lock().clone();
+        if kind.copies_vm() {
+            child.process().brk.store(
+                self.process().brk.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            // A forked child initially owns a snapshot of the same ranges and patch state. A
+            // vfork child already resolves these fields through the parent's live VM identity.
+            *child.process().owned_ranges.lock() = self.process().owned_ranges.lock().clone();
+            *child.process().elf_patch_cache.lock() =
+                self.process().elf_patch_cache.lock().clone();
+        }
         self.global.processes.add_child(child_pid, self.pid);
         // Registered before the child can run, so a child that exits immediately still finds its
         // parent (this one) in the live set and can post it a `SIGCHLD`.
@@ -1910,29 +2494,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             child.process(),
         );
 
-        // Done last, so that the copy captures memory exactly as the child will find it.
-        self.park_and_hand_off(guest_stack_pointer(ctx), child_pid);
-
         let r = unsafe {
             self.global
                 .platform
                 .spawn_thread(ctx, Box::new(NewThreadArgs { task: child }))
         };
         if let Err(err) = r {
-            litebox_util_log::error!(err:% = err; "failed to spawn forked process");
-            // Dropping the child's `Task` on the way out of `spawn_thread` already gave the token
-            // back and turned the child into a zombie; since the child never existed as far as
-            // the guest is concerned, drop the record too rather than leave an unwaitable pid.
-            self.global.processes.forget(child_pid);
-            self.acquire_address_space();
+            litebox_util_log::error!(err:% = err; "failed to spawn child process");
+            launch.abort();
+            self.global.processes.forget_failed_spawn(child_pid);
+            if created_parent_address_space {
+                // `join_address_space` made this membership solely for the child that failed to
+                // launch. The parent still holds the token, so discard the bookkeeping without
+                // releasing it; retaining it would spuriously make later thread clones fail.
+                self.address_space.borrow_mut().take();
+            }
             return Err(Errno::ENOMEM);
         }
+        if kind.copies_vm()
+            && let Some(range) = child_tid_range
+        {
+            self.preserve_address_space_range(range);
+        }
+        // The child host thread exists but remains blocked behind `ProcessLaunch`. A shared-memory
+        // parent-TID store must be visible before it starts; a private ordinary-fork store is
+        // deliberately deferred until the parent's snapshotted image is live again.
+        if set_parent_tid_before_child && let Some(parent_tid_ptr) = set_parent_tid {
+            let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_pid);
+        }
+        // Keep the new host thread behind its launch gate until spawn has succeeded. This makes
+        // registration and exit publication transactional: an error cannot leave a zombie or
+        // SIGCHLD for a child that never ran. For a copying fork, hand off the snapshotted address
+        // space only now: if host-thread creation failed, the parent still owns the token and can
+        // return ENOMEM instead of waiting forever for a child that does not exist.
+        if kind.copies_vm() {
+            self.park_and_hand_off(fork_sp, child_pid);
+        }
+        launch.commit();
 
-        // Blocks until some member -- the child, or whoever it in turn handed on to -- gives the
-        // address space back, then puts this task's own memory into it. Unlike a real `vfork`
-        // this does not have to be the end of the child's life: it is enough for the child to
-        // block on something.
-        self.acquire_address_space();
+        let parent_image_is_live = match kind {
+            ProcessCloneKind::Fork => self.acquire_address_space(),
+            ProcessCloneKind::VforkCopy => {
+                vfork_completion.as_ref().unwrap().wait();
+                self.acquire_address_space()
+            }
+            ProcessCloneKind::VforkShared => {
+                vfork_completion.as_ref().unwrap().wait();
+                false
+            }
+        };
+        if parent_image_is_live
+            && !set_parent_tid_before_child
+            && let Some(parent_tid_ptr) = set_parent_tid
+        {
+            let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_pid);
+        }
         Ok(usize::try_from(child_pid).unwrap())
     }
 
@@ -1952,8 +2568,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             shared: shared.clone(),
             holding: Cell::new(true),
             parked: RefCell::new(None),
+            preserved_stack_ranges: RefCell::new(OwnedRanges::default()),
         });
         shared
+    }
+
+    fn preserve_address_space_range(&self, range: Range<usize>) {
+        let slot = self.address_space.borrow();
+        let membership = slot.as_ref().expect("preserving a range before fork join");
+        membership
+            .preserved_stack_ranges
+            .borrow_mut()
+            .insert_bounded(range, MAX_PRESERVED_STACK_RANGES);
+    }
+
+    fn preserved_address_space_ranges(&self) -> OwnedRanges {
+        let slot = self.address_space.borrow();
+        let membership = slot.as_ref().expect("copying ranges before fork join");
+        let ranges = membership.preserved_stack_ranges.borrow().clone();
+        ranges
     }
 
     /// Copies this task's memory out and passes the address space directly to `tid`.
@@ -1966,7 +2599,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let slot = self.address_space.borrow();
         let membership = slot.as_ref().expect("forking outside an address space");
         assert!(membership.holding.get());
-        let saved = self.save_address_space(sp);
+        let preserved = membership.preserved_stack_ranges.borrow();
+        let saved = self.save_address_space(sp, &preserved);
+        drop(preserved);
         *membership.parked.borrow_mut() = Some(saved);
         membership.holding.set(false);
         membership.shared.hand_off_to(tid);
@@ -1991,7 +2626,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             *slot = None;
             return;
         }
-        let saved = self.save_address_space(self.guest_sp.get());
+        let preserved = membership.preserved_stack_ranges.borrow();
+        let saved = self.save_address_space(self.guest_sp.get(), &preserved);
+        drop(preserved);
         *membership.parked.borrow_mut() = Some(saved);
         membership.holding.set(false);
         membership.shared.release();
@@ -2000,27 +2637,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Takes the address space back and restores this task's memory into it, blocking until the
     /// current holder gives it up.
     ///
-    /// Does nothing if this task is not sharing an address space, or already holds it.
-    pub(crate) fn acquire_address_space(&self) {
+    /// Does nothing if this task is not sharing an address space, or already holds it. Returns
+    /// whether this task's own memory image is live when the call completes.
+    pub(crate) fn acquire_address_space(&self) -> bool {
         let slot = self.address_space.borrow();
         let Some(membership) = slot.as_ref() else {
-            return;
+            return true;
         };
         if membership.holding.get() {
-            return;
+            return true;
         }
         if !membership.shared.acquire(self.tid, || self.is_exiting()) {
-            // Being torn down. Nothing will run guest code on this task's behalf again, so its
-            // copy of the address space is worthless; drop it and let the members that are still
-            // alive have the space.
-            drop(slot);
-            *self.address_space.borrow_mut() = None;
-            return;
+            // Preserve the non-holding membership until exit cleanup. Dropping it here would make
+            // `prepare_for_exit` mistake whichever sibling's image is live for this task's own and
+            // dereference stale robust-list/child-TID pointers into that sibling.
+            return false;
         }
         membership.holding.set(true);
         if let Some(saved) = membership.parked.borrow_mut().take() {
             self.restore_address_space(saved);
         }
+        true
     }
 
     /// Leaves the shared address space for good, waking anything waiting for it.
@@ -2087,41 +2724,51 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// * Only ranges this process owns, so that a sibling guest process running concurrently at
     ///   other addresses is never rolled back. See [`Process::owned_ranges`].
-    /// * Of the mapping holding the stack pointer, only `[sp, end)`. Everything below `sp` is
-    ///   dead memory on both supported architectures (neither the AArch64 nor the x86-64 Linux
-    ///   ABI keeps live data below the stack pointer across a call), and it is where the child
-    ///   does most of its work -- saving the whole 8 MiB stack mapping would make every `fork`
-    ///   pointlessly expensive to preserve nothing.
-    fn save_address_space(&self, sp: usize) -> MemoryImage {
+    /// * Of the mapping holding the stack pointer, only the ABI-live suffix is copied: `[sp, end)`
+    ///   on AArch64 and the 128-byte red zone plus that suffix on x86-64. Explicit kernel ABI
+    ///   pointers below that boundary, such as clone child-TID words, are copied separately through
+    ///   `preserved_stack_ranges`; this avoids copying the whole 8 MiB stack on every handoff.
+    fn save_address_space(&self, sp: usize, preserved_stack_ranges: &OwnedRanges) -> MemoryImage {
         let owned = self.process().owned_ranges.lock();
         let mut saved = Vec::new();
+        let mut save = |start: usize, end: usize| {
+            if start >= end {
+                return;
+            }
+            match UserPtr::<u8>::from_usize(start).to_owned_slice::<Platform>(end - start) {
+                Some(bytes) => saved.push((start, bytes)),
+                // Only reachable if a mapping this process owns is no longer readable, which no
+                // correct program arranges. Loud, because the consequence is that this task's own
+                // writes to that range are silently lost the next time another member runs.
+                None => litebox_util_log::error!(
+                    pid:? = self.pid, start:? = start, end:? = end;
+                    "could not copy a mapping out before giving up the address space; this \
+                     process's data in it will be whatever the next process to run leaves there"
+                ),
+            }
+        };
+        #[cfg(target_arch = "x86_64")]
+        let live_stack_start = sp.saturating_sub(128);
+        #[cfg(target_arch = "aarch64")]
+        let live_stack_start = sp;
+
         for (range, flags) in self.global.pm.mappings() {
             if !flags.contains(VmFlags::VM_WRITE) || flags.contains(VmFlags::VM_SHARED) {
                 continue;
             }
-            let stack = range.contains(&sp);
+            let stack = range.start < sp && sp <= range.end;
             for part in owned.intersect(&range) {
                 let start = if stack {
-                    part.start.max(sp)
+                    part.start.max(live_stack_start)
                 } else {
                     part.start
                 };
-                if start >= part.end {
-                    continue;
-                }
-                match UserPtr::<u8>::from_usize(start).to_owned_slice::<Platform>(part.end - start)
-                {
-                    Some(bytes) => saved.push((start, bytes)),
-                    // Only reachable if a mapping this process owns is no longer readable, which
-                    // no correct program arranges. Loud, because the consequence is that this
-                    // task's own writes to that range are silently lost the next time another
-                    // member of the address space runs.
-                    None => litebox_util_log::error!(
-                        pid:? = self.pid, start:? = start, end:? = part.end;
-                        "could not copy a mapping out before giving up the address space; this \
-                         process's data in it will be whatever the next process to run leaves \
-                         there"
-                    ),
+                save(start, part.end);
+                if stack {
+                    for extra in preserved_stack_ranges.intersect(&part) {
+                        // The main suffix already includes anything at or above `start`.
+                        save(extra.start, extra.end.min(start));
+                    }
                 }
             }
         }
@@ -2920,25 +3567,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `setuid`.
     ///
-    /// A privileged task may become any uid; this also sets `euid` to match,
-    /// since with no saved-set-uid tracked here there is nothing else for a
-    /// privileged `setuid` to leave behind for a later drop-and-reclaim. An
-    /// unprivileged task may only switch its effective uid to its current
-    /// real or effective uid, same as the raw Linux syscall (the POSIX
-    /// behavior of applying this to every thread in the process is a glibc
-    /// wrapper feature this shim, operating at the raw-syscall level, does
-    /// not need to reproduce).
-    ///
-    /// # Errors
-    ///
-    /// `EPERM` if the task is unprivileged and `uid` is neither its current
-    /// uid nor euid.
+    /// A privileged task sets its real, effective, and saved user IDs together. An
+    /// unprivileged task may only select its real or saved ID as the new effective ID.
     pub(crate) fn sys_setuid(&self, uid: u32) -> Result<(), Errno> {
-        let mut new = self.credentials.borrow().as_ref().clone();
-        if self.is_privileged() {
+        let old = self.credentials.borrow().clone();
+        let mut new = old.as_ref().clone();
+        if old.euid == 0 {
             new.uid = uid;
             new.euid = uid;
-        } else if uid == new.uid || uid == new.euid {
+            new.suid = uid;
+        } else if uid == old.uid || uid == old.suid {
             new.euid = uid;
         } else {
             return Err(Errno::EPERM);
@@ -2947,23 +3585,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    /// Handle syscall `setgid`.
-    ///
-    /// See [`Self::sys_setuid`]; the same policy applies with `gid`/`egid` in
-    /// place of `uid`/`euid`, gated on the same privilege check (Linux
-    /// privileges `setgid` on `CAP_SETGID` rather than `CAP_SETUID`, but
-    /// LiteBox tracks neither, so both fall back to the one uid-0 check).
-    ///
-    /// # Errors
-    ///
-    /// `EPERM` if the task is unprivileged and `gid` is neither its current
-    /// gid nor egid.
+    /// Handle syscall `setgid`; see [`Self::sys_setuid`] for the analogous user-ID rules.
     pub(crate) fn sys_setgid(&self, gid: u32) -> Result<(), Errno> {
-        let mut new = self.credentials.borrow().as_ref().clone();
-        if self.is_privileged() {
+        let old = self.credentials.borrow().clone();
+        let mut new = old.as_ref().clone();
+        if old.euid == 0 {
             new.gid = gid;
             new.egid = gid;
-        } else if gid == new.gid || gid == new.egid {
+            new.sgid = gid;
+        } else if gid == old.gid || gid == old.sgid {
             new.egid = gid;
         } else {
             return Err(Errno::EPERM);
@@ -2972,60 +3602,55 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    /// Handle syscall `setresuid` -- also how libc implements `seteuid(2)`
-    /// (`setresuid(-1, euid, -1)`). `u32::MAX` leaves a field unchanged.
-    ///
-    /// LiteBox keeps no saved-set-id, so `suid` is accepted and discarded; the
-    /// privilege model is the same one-uid-0 check every set-id call here uses.
-    ///
-    /// # Errors
-    ///
-    /// `EPERM` if the task is unprivileged and a requested id is not one it
-    /// already holds.
-    pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, _suid: u32) -> Result<(), Errno> {
-        let old = self.credentials.borrow().as_ref().clone();
-        let privileged = self.is_privileged();
-        let (held_real, held_effective) = (old.uid, old.euid);
-        let allowed = |v: u32| privileged || v == held_real || v == held_effective;
-        let mut new = old;
-        if ruid != u32::MAX {
-            if !allowed(ruid) {
+    /// Handle syscall `setresuid`. `u32::MAX` leaves the corresponding field unchanged.
+    pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
+        let old = self.credentials.borrow().clone();
+        let privileged = old.euid == 0;
+        let allowed = |value: u32| {
+            privileged || value == old.uid || value == old.euid || value == old.suid
+        };
+        for value in [ruid, euid, suid] {
+            if value != u32::MAX && !allowed(value) {
                 return Err(Errno::EPERM);
             }
+        }
+
+        let mut new = old.as_ref().clone();
+        if ruid != u32::MAX {
             new.uid = ruid;
         }
         if euid != u32::MAX {
-            if !allowed(euid) {
-                return Err(Errno::EPERM);
-            }
             new.euid = euid;
+        }
+        if suid != u32::MAX {
+            new.suid = suid;
         }
         *self.credentials.borrow_mut() = Arc::new(new);
         Ok(())
     }
 
-    /// Handle syscall `setresgid`; see [`Self::sys_setresuid`], with gids.
-    ///
-    /// # Errors
-    ///
-    /// `EPERM` under the same policy as [`Self::sys_setresuid`].
-    pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, _sgid: u32) -> Result<(), Errno> {
-        let old = self.credentials.borrow().as_ref().clone();
-        let privileged = self.is_privileged();
-        let (held_real, held_effective) = (old.gid, old.egid);
-        let allowed = |v: u32| privileged || v == held_real || v == held_effective;
-        let mut new = old;
-        if rgid != u32::MAX {
-            if !allowed(rgid) {
+    /// Handle syscall `setresgid`; see [`Self::sys_setresuid`], with group IDs.
+    pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
+        let old = self.credentials.borrow().clone();
+        let privileged = old.euid == 0;
+        let allowed = |value: u32| {
+            privileged || value == old.gid || value == old.egid || value == old.sgid
+        };
+        for value in [rgid, egid, sgid] {
+            if value != u32::MAX && !allowed(value) {
                 return Err(Errno::EPERM);
             }
+        }
+
+        let mut new = old.as_ref().clone();
+        if rgid != u32::MAX {
             new.gid = rgid;
         }
         if egid != u32::MAX {
-            if !allowed(egid) {
-                return Err(Errno::EPERM);
-            }
             new.egid = egid;
+        }
+        if sgid != u32::MAX {
+            new.sgid = sgid;
         }
         *self.credentials.borrow_mut() = Arc::new(new);
         Ok(())
@@ -3190,27 +3815,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn futex_key(
+        &self,
+        mappings: &litebox::mm::MappingReadGuard<'_, Platform, PAGE_SIZE>,
+        addr: UserPtrMut<u32>,
+        flags: &litebox_common_linux::FutexFlags,
+    ) -> Result<FutexKey, Errno> {
+        if !addr.as_usize().is_multiple_of(align_of::<u32>()) {
+            return Err(Errno::EINVAL);
+        }
+        let key = if flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
+            FutexKey::new(self.process().futex_namespace(), addr.as_usize())
+        } else {
+            let mapping = mappings.flags_at(addr.as_usize()).ok_or(Errno::EFAULT)?;
+            if mapping.contains(VmFlags::VM_SHARED) {
+                let (backing, offset) = mappings
+                    .shared_futex_key_at(addr.as_usize())
+                    .ok_or(Errno::EFAULT)?;
+                FutexKey::new_shared(backing, offset)
+            } else {
+                FutexKey::new(self.process().futex_namespace(), addr.as_usize())
+            }
+        };
+        Ok(key)
+    }
+
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
-        /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
-        /// It should be fine to treat shared futexes as private for now.
-        macro_rules! warn_shared_futex {
-            ($flag:ident) => {
-                if !$flag.contains(litebox_common_linux::FutexFlags::PRIVATE) {
-                    log_unsupported!("shared futex");
-                }
-            };
-        }
-
         let res = match arg {
             FutexArgs::Wake { addr, flags, count } => {
-                warn_shared_futex!(flags);
-                let Some(count) = core::num::NonZeroU32::new(count) else {
-                    return Ok(0);
-                };
-                self.global
-                    .futex_manager
-                    .wake(addr.to_platform_ptr::<Platform>(), count, None)? as usize
+                // Linux's traditional FUTEX_WAKE takes a signed `int`. Its queue loop wakes one
+                // waiter before testing whether the count has been reached, so zero and negative
+                // raw values both mean one wake rather than zero or an enormous unsigned quota.
+                let count = if (count as i32) <= 0 { 1 } else { count };
+                let count = core::num::NonZeroU32::new(count).unwrap();
+                let mappings = self.global.pm.lock_mappings();
+                let key = self.futex_key(&mappings, addr, &flags)?;
+                self.process()
+                    .futex_manager()
+                    .wake_keyed(key, count, None)? as usize
+            }
+            FutexArgs::WakeBitset {
+                addr,
+                flags,
+                count,
+                bitmask,
+            } => {
+                let count = if (count as i32) <= 0 { 1 } else { count };
+                let count = core::num::NonZeroU32::new(count).unwrap();
+                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
+                let mappings = self.global.pm.lock_mappings();
+                let key = self.futex_key(&mappings, addr, &flags)?;
+                self.process()
+                    .futex_manager()
+                    .wake_keyed(key, count, Some(bitmask))? as usize
             }
             FutexArgs::Wait {
                 addr,
@@ -3218,13 +3876,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 val,
                 timeout,
             } => {
-                warn_shared_futex!(flags);
                 let timeout = timeout.read::<Platform>()?;
-                self.global.futex_manager.wait(
+                let mappings = self.global.pm.lock_mappings();
+                let key = self.futex_key(&mappings, addr, &flags)?;
+                self.process().futex_manager().wait_keyed(
                     &self.wait_cx().with_timeout(timeout),
+                    key,
                     addr.to_platform_ptr::<Platform>(),
                     val,
                     None,
+                    || drop(mappings),
                 )?;
                 0
             }
@@ -3235,7 +3896,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 timeout,
                 bitmask,
             } => {
-                warn_shared_futex!(flags);
+                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
                 let deadline = if let Some(timeout) = timeout.read::<Platform>()? {
                     let clock_id =
                         if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
@@ -3247,11 +3908,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 } else {
                     None
                 };
-                self.global.futex_manager.wait(
+                let mappings = self.global.pm.lock_mappings();
+                let key = self.futex_key(&mappings, addr, &flags)?;
+                self.process().futex_manager().wait_keyed(
                     &self.wait_cx().with_deadline(deadline),
+                    key,
                     addr.to_platform_ptr::<Platform>(),
                     val,
-                    core::num::NonZeroU32::new(bitmask),
+                    Some(bitmask),
+                    || drop(mappings),
                 )?;
                 0
             }
@@ -3262,10 +3927,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 num_to_requeue,
                 addr2,
             } => {
-                warn_shared_futex!(flags);
-                self.global.futex_manager.requeue(
+                let mappings = self.global.pm.lock_mappings();
+                let key1 = self.futex_key(&mappings, addr, &flags)?;
+                let key2 = self.futex_key(&mappings, addr2, &flags)?;
+                self.process().futex_manager().requeue_keyed(
+                    key1,
+                    key2,
                     addr.to_platform_ptr::<Platform>(),
-                    addr2.to_platform_ptr::<Platform>(),
                     num_to_wake,
                     num_to_requeue,
                     None,
@@ -3279,10 +3947,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 addr2,
                 expected_value,
             } => {
-                warn_shared_futex!(flags);
-                self.global.futex_manager.requeue(
+                let mappings = self.global.pm.lock_mappings();
+                let key1 = self.futex_key(&mappings, addr, &flags)?;
+                let key2 = self.futex_key(&mappings, addr2, &flags)?;
+                self.process().futex_manager().requeue_keyed(
+                    key1,
+                    key2,
                     addr.to_platform_ptr::<Platform>(),
-                    addr2.to_platform_ptr::<Platform>(),
                     num_to_wake,
                     num_to_requeue,
                     Some(expected_value),
@@ -3301,7 +3972,7 @@ const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
 
 /// Maximum shebang (#!) recursion depth (from Linux's `exec_binprm`)
-const SHEBANG_MAX_RECURSION: u32 = 6;
+const SHEBANG_MAX_RECURSION: u32 = 4;
 
 /// Maximum length of a shebang line that we inspect. Matches Linux `BINPRM_BUF_SIZE`.
 const SHEBANG_MAX_LINE: usize = 256;
@@ -3335,33 +4006,33 @@ fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Resolve shebang (`#!`) chains for the given path and argv if the file starts with a shebang line.
-    /// Otherwise, returns the original path and argv.
+    /// Resolve shebang (`#!`) chains for the given path and argv.
+    ///
+    /// Every probe follows symlinks. A script still contributes the spelling used to reach it to
+    /// the interpreter's argv, while the returned non-script path is the final followed target the
+    /// ELF loader must open.
     pub(crate) fn resolve_shebang(
         &self,
         mut path: alloc::string::String,
         mut argv: alloc::vec::Vec<alloc::ffi::CString>,
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
-        for _ in 0..SHEBANG_MAX_RECURSION {
+        let mut recursion = 0;
+        loop {
             let full_path = self.resolve_path(&path)?;
-            let file = self.do_open(
-                full_path,
-                litebox::fs::OFlags::RDONLY,
-                litebox::fs::Mode::empty(),
-            )?;
+            let full_path = self.follow_open_path(full_path, litebox::fs::OFlags::RDONLY)?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
-            let files = self.files.borrow();
-            let n = match files.fs.read(&file, &mut header, Some(0)) {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = files.fs.close(&file);
-                    return Err(Errno::from(e));
-                }
-            };
-            let _ = files.fs.close(&file);
+            let n = crate::loader::elf::read_executable_header(
+                self,
+                full_path.clone(),
+                &mut header,
+            )?;
 
             match parse_shebang(&header[..n]) {
                 Some((interp, opt_arg)) => {
+                    if recursion == SHEBANG_MAX_RECURSION {
+                        return Err(Errno::ELOOP);
+                    }
+                    recursion += 1;
                     let mut new_argv = alloc::vec::Vec::new();
                     new_argv.push(alloc::ffi::CString::new(interp).map_err(|_| Errno::EINVAL)?);
                     if let Some(arg) = opt_arg {
@@ -3375,10 +4046,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     path = alloc::string::String::from(interp);
                     argv = new_argv;
                 }
-                None => return Ok((path, argv)),
+                None => {
+                    let path = full_path.into_string().map_err(|_| Errno::EINVAL)?;
+                    return Ok((path, argv));
+                }
             }
         }
-        Err(Errno::ELOOP)
+    }
+
+    fn credentials_for_exec(
+        &self,
+        status: &litebox::fs::FileStatus,
+    ) -> (Arc<Credentials>, bool) {
+        let old = self.credentials.borrow().clone();
+        let mut candidate = old.as_ref().clone();
+        if !old.no_new_privs() {
+            if status.mode.contains(litebox::fs::Mode::SUID) {
+                candidate.euid = u32::from(status.owner.user);
+            }
+            if status
+                .mode
+                .contains(litebox::fs::Mode::SGID | litebox::fs::Mode::XGRP)
+            {
+                candidate.egid = u32::from(status.owner.group);
+            }
+        }
+        candidate.suid = candidate.euid;
+        candidate.sgid = candidate.egid;
+        let transitioned = candidate.euid != old.euid || candidate.egid != old.egid;
+        let secure = transitioned
+            || candidate.euid != candidate.uid
+            || candidate.egid != candidate.gid;
+        (Arc::new(candidate), secure)
     }
 
     /// Handle syscall `execve`.
@@ -3444,6 +4143,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
+        let (exec_credentials, secure_exec) = self.credentials_for_exec(loader.main_status());
 
         // After this point, the old program is torn down and failures must terminate the process.
 
@@ -3461,11 +4161,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = self.wake_robust_list(robust_list);
         }
-        self.thread.clear_child_tid.set(None);
+        let shares_parent_vm = self.process().shares_parent_vm();
+        if shares_parent_vm {
+            // Linux's mm_release clears and wakes this address on vfork exec while the old VM is
+            // still shared with the suspended parent. Do it before detaching the child's VM slot;
+            // retaining the pointer into the old image would instead corrupt parent memory later.
+            if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
+                let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
+                let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
+                    addr: UserPtrMut::from_usize(clear_child_tid.as_usize()),
+                    flags: litebox_common_linux::FutexFlags::empty(),
+                    count: 1,
+                });
+            }
+        } else {
+            self.thread.clear_child_tid.set(None);
+        }
 
         self.signals.reset_for_exec();
 
-        if self.leave_address_space_if_alone() {
+        if shares_parent_vm {
+            // The child has so far operated on the parent's live VM identity. Swap only this
+            // process's slot to a fresh identity before building the new image; the suspended
+            // parent keeps the original identity, including every pre-exec mapping and brk change.
+            self.process().detach_vfork_vm();
+        } else if self.leave_address_space_if_alone() {
             // Release only the mappings this process owns, not everything the
             // (process-blind) page manager tracks. "Alone in the shared
             // address space" -- or never having shared at all -- does not
@@ -3518,14 +4238,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     owned.intersect(&r).collect::<Vec<_>>()
                 }
             };
-            unsafe { self.global.pm.release_memory(release) }
-                .expect("failed to release memory mappings");
-        } else {
-            // Another guest process is still living in this address space (see
-            // `SharedAddressSpace`), so these mappings are not this task's alone to tear down:
-            // doing so would destroy the process this one is about to hand the space back to. The
-            // new image is loaded alongside them instead -- it is position-independent, and
-            // `Vmem::get_unmmaped_area` places it where nobody else is.
+            if let Err(error) = unsafe { self.global.pm.release_memory(release) } {
+                litebox_util_log::error!(error:? = error; "execve: failed to release old mappings");
+                self.exit_group(ExitStatus::Signal(
+                    litebox_common_linux::signal::Signal::SIGKILL,
+                ));
+                return Err(error.into());
+            }
         }
 
         // Either the old mappings are gone or (for a `fork`ed child) they were never this
@@ -3533,19 +4252,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.process().owned_ranges.lock().clear();
         self.process().elf_patch_cache.lock().clear();
 
-        self.global
+        if let Err(error) = self
+            .global
             .platform
             .set_arch_specific_register(&GUEST_TLS_REGISTER, 0)
-            .expect("failed to clear guest TLS on execve");
+        {
+            litebox_util_log::error!(error:? = error; "execve: failed to clear guest TLS");
+            self.exit_group(ExitStatus::Signal(
+                litebox_common_linux::signal::Signal::SIGKILL,
+            ));
+            return Err(Errno::EIO);
+        }
 
-        self.load_program(loader, argv_vec, envp_vec)
-            .expect("TODO: terminate the process cleanly");
+        if let Err(error) = self.load_program_with_credentials(
+            loader,
+            argv_vec,
+            envp_vec,
+            exec_credentials,
+            secure_exec,
+        ) {
+            self.exit_group(ExitStatus::Signal(
+                litebox_common_linux::signal::Signal::SIGKILL,
+            ));
+            return Err(error.into());
+        }
 
         self.init_thread_context(ctx);
         // The new image is fully built, at addresses no other member of the old address space
         // owns, so this task no longer needs the shared one. Handing it back here rather than
         // earlier means no other member ever observes a half-built image.
         let _ = self.leave_address_space();
+        self.process().complete_vfork();
         Ok(0)
     }
 
@@ -3553,17 +4290,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// to start executing it.
     pub(crate) fn load_program(
         &self,
-        mut loader: crate::loader::elf::ElfLoader<'_, Platform, FS>,
+        loader: crate::loader::elf::ElfLoader<'_, Platform, FS>,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        // Captured before `argv` moves into `loader.load` below: publishes
-        // `/proc/<pid>/cmdline` for this load (initial program load, or `execve`).
-        if let Some(proc) = &self.global.proc_handle {
-            let argv_bytes: alloc::vec::Vec<&[u8]> =
-                argv.iter().map(alloc::ffi::CString::as_bytes).collect();
-            proc.set_cmdline(&argv_bytes);
-        }
+        let (credentials, secure) = self.credentials_for_exec(loader.main_status());
+        self.load_program_with_credentials(loader, argv, envp, credentials, secure)
+    }
+
+    fn load_program_with_credentials(
+        &self,
+        mut loader: crate::loader::elf::ElfLoader<'_, Platform, FS>,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
+        credentials: Arc<Credentials>,
+        secure: bool,
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        let proc_argv = self.global.proc_handle.as_ref().map(|_| {
+            argv.iter()
+                .map(|arg| arg.as_bytes().to_vec())
+                .collect::<alloc::vec::Vec<_>>()
+        });
 
         // The loader publishes the new image's initial break through the (single, shared) page
         // manager; take it back out into this process's own slot, restoring the manager's
@@ -3571,7 +4318,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `Process::brk`.
         let load_info = {
             let _guard = self.global.brk_lock.lock();
-            let load_info = loader.load(argv, envp, self.init_auxv())?;
+            let auxv = self.init_auxv(credentials.as_ref(), secure);
+            let load_info = loader.load(argv, envp, auxv)?;
             let initial_brk = self.global.pm.swap_brk(0);
             if initial_brk == 0 {
                 // The loader did not publish a break for this image; the first `brk` this
@@ -3584,6 +4332,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             load_info
         };
 
+        // Commit the candidate credentials only after every fallible image-building step succeeded.
+        *self.credentials.borrow_mut() = credentials;
+        if let (Some(proc), Some(argv)) = (&self.global.proc_handle, proc_argv) {
+            let argv: alloc::vec::Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+            proc.set_cmdline(&argv);
+        }
         self.set_task_comm(loader.comm());
 
         self.thread
@@ -3593,6 +4347,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn handle_init_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if !self.process().await_launch() {
+            self.thread.remote.is_exiting.store(true, Ordering::Release);
+            return;
+        }
         self.init_thread_context(ctx);
         // Attach the thread handle so that the thread can be interrupted.
         self.thread

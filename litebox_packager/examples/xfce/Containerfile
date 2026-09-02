@@ -54,7 +54,7 @@ FROM ${LITEBOX_ALPINE_BASE_IMAGE}
 RUN apk add --no-cache --upgrade \
         apk-tools \
         adwaita-xfce-icon-theme dbus dbus-x11 duktape-libs \
-        font-cursor-misc font-dejavu font-misc-misc \
+        font-cursor-misc font-dejavu font-misc-misc setpriv \
         thunar xf86-input-evdev xf86-video-fbdev \
         xfce4-panel xfce4-settings xfce4-terminal xfdesktop xfwm4 \
         xclock xeyes xmessage xorg-server xrandr xset xterm \
@@ -64,20 +64,38 @@ RUN apk add --no-cache --upgrade \
 COPY --from=x18-verifier /verified-x18repo /x18repo
 RUN set -eux; \
     cp /x18repo/litebox-x18.rsa.pub /etc/apk/keys/; \
+    manifest=/x18repo/litebox-x18-packages.tsv; \
+    chromium_apks=''; \
+    for name in chromium chromium-common chromium-angle; do \
+        entry=$(awk -F'|' -v name="$name" '$1 == name { print $3 "|" $4 }' "$manifest"); \
+        [ -n "$entry" ] && [ "${entry%%|*}" = chromium ]; \
+        relative_path=${entry#*|}; \
+        case "$relative_path" in \
+            */aarch64/*.apk) ;; \
+            *) printf 'invalid Chromium APK path: %s\n' "$relative_path" >&2; exit 1 ;; \
+        esac; \
+        candidate=/x18repo/$relative_path; \
+        [ -f "$candidate" ]; \
+        chromium_apks="$chromium_apks $candidate"; \
+    done; \
+    apk add --no-cache $chromium_apks; \
     cp /etc/apk/world /tmp/apk-world.before-x18-overlay; \
     cp /etc/apk/world /tmp/apk-world.for-x18-overlay; \
     removal_targets='mesa-egl mesa-gles mesa-gl mesa-gbm mesa libelf libxshmfence libxxf86vm llvm22-libs spirv-tools'; \
     printf '%s\n' $removal_targets | LC_ALL=C sort \
+        > /tmp/removal-target-packages; \
+    [ "$(wc -l < /tmp/removal-target-packages | tr -d '[:space:]')" -eq 10 ]; \
+    printf '%s\n' mesa-gl libxxf86vm | LC_ALL=C sort \
         > /tmp/expected-removed-packages; \
-    [ "$(wc -l < /tmp/expected-removed-packages | tr -d '[:space:]')" -eq 10 ]; \
-    while IFS= read -r retained; do \
+    [ "$(wc -l < /tmp/expected-removed-packages | tr -d '[:space:]')" -eq 2 ]; \
+    for retained in $removal_targets; do \
         if grep -Fx "$retained" /tmp/apk-world.before-x18-overlay > /dev/null; then \
             printf 'forbidden dependency unexpectedly belongs to the final image world: %s\n' \
                 "$retained" >&2; \
             exit 1; \
         fi; \
         printf '%s\n' "$retained" >> /tmp/apk-world.for-x18-overlay; \
-    done < /tmp/expected-removed-packages; \
+    done; \
     cp /tmp/apk-world.for-x18-overlay /etc/apk/world; \
     required=/x18repo/litebox-x18-required-origins.txt; \
     manifest=/x18repo/litebox-x18-packages.tsv; \
@@ -107,8 +125,11 @@ RUN set -eux; \
         esac; \
         candidate=/x18repo/$relative_path; \
         [ -f "$candidate" ]; \
-        overlay="$overlay $candidate"; \
         printf '%s\n' "$origin" >> /tmp/selected-origins; \
+        if [ "$origin" = chromium ]; then \
+            continue; \
+        fi; \
+        overlay="$overlay $candidate"; \
         selected=$((selected + 1)); \
     done; \
     [ "$selected" -gt 0 ]; \
@@ -154,17 +175,26 @@ RUN set -eux; \
     cmp /tmp/apk-world.before-x18-overlay /etc/apk/world; \
     for installed in $(awk -F: '$1 == "P" { print $2 }' /lib/apk/db/installed); do \
         case "$installed" in \
-            ffmpeg*|gstreamer*|gst-*|llvm*-libs|mesa|mesa-*|tumbler|webkit2gtk*) \
+            ffmpeg|gstreamer*|gst-*|libxxf86vm|mesa-gl|tumbler|webkit2gtk*) \
                 printf 'forbidden desktop package remained installed: %s\n' "$installed" >&2; \
                 exit 1 ;; \
         esac; \
     done; \
-    [ "$required_count" -eq 66 ]; \
+    [ "$required_count" -eq 70 ]; \
+    sandbox=/usr/lib/chromium/chrome-sandbox; \
+    [ -f "$sandbox" ] && [ ! -L "$sandbox" ]; \
+    [ "$(stat -c '%u:%g' "$sandbox")" = 0:0 ]; \
+    [ "$(stat -c '%a' "$sandbox")" = 4755 ]; \
+    addgroup -S -g 1000 litebox; \
+    adduser -S -D -H -u 1000 -G litebox -s /bin/sh litebox; \
+    [ "$(id -u litebox)" = 1000 ]; \
+    [ "$(id -g litebox)" = 1000 ]; \
     rm -f /tmp/apk-world.before-x18-overlay \
         /tmp/apk-world.for-x18-overlay \
         /tmp/installed.before-x18-overlay \
         /tmp/installed.after-mesa-removal \
-        /tmp/removal-plan-packages /tmp/expected-removed-packages \
+        /tmp/removal-plan-packages /tmp/removal-target-packages \
+        /tmp/expected-removed-packages \
         /tmp/removed-packages /tmp/added-packages \
         /tmp/required-origins /tmp/selected-origins \
         /tmp/selected-origins.unique \

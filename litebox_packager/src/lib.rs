@@ -216,8 +216,6 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
     );
 
     // --- Phase 3: Rewrite ELFs (parallel) ---
-    // The litebox tar RO filesystem does not support symlinks, so each file is
-    // placed as a regular file copy at every needed path.
     eprintln!("Rewriting {} unique ELF files...", file_map.len());
 
     let file_map_vec: Vec<(&PathBuf, &Vec<PathBuf>)> = file_map.iter().collect();
@@ -228,11 +226,15 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
         .map(|(real_path, tar_paths): (&PathBuf, &Vec<PathBuf>)| {
             let data = std::fs::read(real_path)
                 .with_context(|| format!("failed to read {}", real_path.display()))?;
-            let mode = {
+            let metadata = std::fs::metadata(real_path)
+                .with_context(|| format!("failed to stat {}", real_path.display()))?;
+            let (mode, uid, gid) = {
                 use std::os::unix::fs::MetadataExt as _;
-                std::fs::metadata(real_path)
-                    .with_context(|| format!("failed to stat {}", real_path.display()))?
-                    .mode()
+                (
+                    metadata.mode(),
+                    u64::from(metadata.uid()),
+                    u64::from(metadata.gid()),
+                )
             };
 
             let rewritten = if no_rewrite.contains(real_path) {
@@ -250,11 +252,13 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
                     .to_str()
                     .with_context(|| format!("non-UTF8 path: {}", path.display()))?;
                 let tar_path = tar_path.strip_prefix('/').unwrap_or(tar_path).to_string();
-                entries.push(TarEntry {
+                entries.push(TarEntry::regular(
                     tar_path,
-                    data: rewritten.clone(),
+                    rewritten.clone(),
                     mode,
-                });
+                    uid,
+                    gid,
+                ));
             }
             Ok(entries)
         })
@@ -290,9 +294,15 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
         }
         let data = std::fs::read(&inc.host_path)
             .with_context(|| format!("failed to read included file {}", inc.host_path.display()))?;
-        let mode = {
+        let metadata = std::fs::metadata(&inc.host_path)
+            .with_context(|| format!("failed to stat included file {}", inc.host_path.display()))?;
+        let (mode, uid, gid) = {
             use std::os::unix::fs::MetadataExt as _;
-            std::fs::metadata(&inc.host_path).map_or(0o755, |m| m.mode())
+            (
+                metadata.mode(),
+                u64::from(metadata.uid()),
+                u64::from(metadata.gid()),
+            )
         };
         let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose)?;
         if args.verbose {
@@ -302,11 +312,13 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
                 inc.tar_path
             );
         }
-        tar_entries.push(TarEntry {
-            tar_path: inc.tar_path.clone(),
-            data: rewritten,
+        tar_entries.push(TarEntry::regular(
+            inc.tar_path.clone(),
+            rewritten,
             mode,
-        });
+            uid,
+            gid,
+        ));
     }
 
     finalize_tar(tar_entries, &args)?;
@@ -344,11 +356,16 @@ fn run_oci_rootfs_tar(rootfs_tar: &Path, args: &CliArgs) -> anyhow::Result<()> {
     all(target_arch = "aarch64", target_vendor = "apple")
 ))]
 fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow::Result<()> {
+    const GENERATED_UID: u64 = 1000;
+    const GENERATED_GID: u64 = 1000;
+    const LITEBOX_TAR_PATH: &str = "litebox";
+
     // --- Phase 2: Scan rootfs for files ---
     eprintln!("Scanning rootfs...");
     let file_map = oci::scan_rootfs(
         &extracted.rootfs_path,
         &extracted.symlink_map,
+        &extracted.ownership,
         &extracted.permissions,
         args.verbose,
     )?;
@@ -368,9 +385,21 @@ fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow:
         })
         .collect();
 
-    let exec_count = file_map.files.values().filter(|e| e.is_executable).count();
+    let exec_count = file_map
+        .files
+        .values()
+        .filter(|entry| {
+            matches!(
+                &entry.kind,
+                oci::RootfsEntryKind::Regular {
+                    is_executable: true,
+                    ..
+                }
+            )
+        })
+        .count();
     let total_count = file_map.files.len();
-    eprintln!("Found {total_count} files ({exec_count} executables to rewrite)");
+    eprintln!("Found {total_count} entries ({exec_count} executable regular files to rewrite)");
 
     // --- Phase 3: Rewrite ELFs in parallel ---
     eprintln!("Rewriting {exec_count} executable ELF files...");
@@ -380,20 +409,34 @@ fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow:
     let par_results: Vec<anyhow::Result<TarEntry>> = file_entries
         .into_par_iter()
         .map(|(_key_path, entry)| {
-            let data = std::fs::read(&entry.read_path)
-                .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
-
-            let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
-                rewrite_elf(&data, &entry.read_path, verbose)?
-            } else {
-                data
-            };
-
-            Ok(TarEntry {
-                tar_path: entry.tar_path,
-                data: rewritten,
-                mode: entry.mode,
-            })
+            let oci::RootfsEntry {
+                tar_path,
+                kind,
+                mode,
+                uid,
+                gid,
+            } = entry;
+            match kind {
+                oci::RootfsEntryKind::Regular {
+                    read_path,
+                    is_executable,
+                } => {
+                    let data = std::fs::read(&read_path)
+                        .with_context(|| format!("failed to read {}", read_path.display()))?;
+                    let data = if is_executable && !no_rewrite.contains(&read_path) {
+                        rewrite_elf(&data, &read_path, verbose)?
+                    } else {
+                        data
+                    };
+                    Ok(TarEntry::regular(tar_path, data, mode, uid, gid))
+                }
+                oci::RootfsEntryKind::Symlink { link_target } => {
+                    Ok(TarEntry::symlink(tar_path, link_target, mode, uid, gid))
+                }
+                oci::RootfsEntryKind::Directory => {
+                    Ok(TarEntry::directory(tar_path, mode, uid, gid))
+                }
+            }
         })
         .collect();
 
@@ -407,6 +450,15 @@ fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow:
 
     // --- Phase 4: Store config.json and generate config_and_run.sh from image config ---
 
+    if added_tar_paths.insert(LITEBOX_TAR_PATH.to_string()) {
+        tar_entries.push(TarEntry::directory(
+            LITEBOX_TAR_PATH.to_string(),
+            0o755,
+            GENERATED_UID,
+            GENERATED_GID,
+        ));
+    }
+
     // Always store the raw OCI config JSON for future use.
     {
         const CONFIG_JSON_TAR_PATH: &str = "litebox/config.json";
@@ -417,11 +469,13 @@ fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow:
                     extracted.config_json.len()
                 );
             }
-            tar_entries.push(TarEntry {
-                tar_path: CONFIG_JSON_TAR_PATH.to_string(),
-                data: extracted.config_json.clone(),
-                mode: 0o644,
-            });
+            tar_entries.push(TarEntry::regular(
+                CONFIG_JSON_TAR_PATH.to_string(),
+                extracted.config_json.clone(),
+                0o644,
+                GENERATED_UID,
+                GENERATED_GID,
+            ));
         } else {
             eprintln!("warning: tar already contains {CONFIG_JSON_TAR_PATH}, skipping");
         }
@@ -434,11 +488,13 @@ fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow:
             if args.verbose {
                 eprintln!("  Generating {CONFIG_AND_RUN_TAR_PATH} from image config");
             }
-            tar_entries.push(TarEntry {
-                tar_path: CONFIG_AND_RUN_TAR_PATH.to_string(),
-                data: script.into_bytes(),
-                mode: 0o755,
-            });
+            tar_entries.push(TarEntry::regular(
+                CONFIG_AND_RUN_TAR_PATH.to_string(),
+                script.into_bytes(),
+                0o755,
+                GENERATED_UID,
+                GENERATED_GID,
+            ));
         } else {
             eprintln!(
                 "warning: tar already contains {CONFIG_AND_RUN_TAR_PATH}, skipping generation"
@@ -771,9 +827,10 @@ fn rewrite_host() -> litebox_syscall_rewriter::Host {
 ///
 /// Non-ELF files (shell scripts, data files with executable bits, etc.) are
 /// detected via a magic-byte check and returned unmodified without being sent
-/// through the rewriter. For actual ELF files, benign rewriter errors (already
-/// hooked, no syscalls, unsupported object, missing `.text`) are treated as
-/// warnings and the original bytes are returned.
+/// through the rewriter. An actual ELF must match the host architecture, and
+/// every error returned by the rewriter is fatal. Benign cases such as an
+/// already-hooked binary or one with no rewrite sites remain successful when
+/// the rewriter returns them unchanged.
 fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8>> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
@@ -783,18 +840,18 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
         return Ok(data.to_vec());
     }
 
-    // Skip ELF files whose architecture doesn't match the target. OCI images
-    // may contain cross-architecture binaries (e.g., aarch64 in an x86_64
-    // image) which the rewriter cannot handle.
+    // A different-architecture ELF cannot be rewritten into something LiteBox
+    // can execute natively, so emitting its original bytes would create a
+    // package that fails only at run time.
     let target_machine = target_elf_machine();
-    if target_machine != 0 && elf_machine(data).is_some_and(|machine| machine != target_machine) {
-        if verbose {
-            eprintln!(
-                "  {} (wrong ELF architecture, skipping rewrite)",
-                path.display()
-            );
-        }
-        return Ok(data.to_vec());
+    if target_machine != 0
+        && let Some(machine) = elf_machine(data)
+        && machine != target_machine
+    {
+        bail!(
+            "cannot rewrite executable ELF {}: e_machine {machine} does not match host e_machine {target_machine}",
+            path.display()
+        );
     }
 
     let host = rewrite_host();
@@ -806,7 +863,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
     // "XNU destroys a live guest x18" section. Substituting a cached,
     // `-ffixed-x18`-rebuilt replacement before rewriting closes that gap for
     // any macOS-targeted package containing a standard Alpine musl. A cache
-    // miss warns and preserves the historical fail-open behavior unless the
+    // miss warns and continues rewriting the original musl input unless the
     // caller sets `LITEBOX_REQUIRE_MUSL_X18=1`, which makes the missing
     // validated generation fatal.
     let data = if matches!(host, litebox_syscall_rewriter::Host::MacOs)
@@ -835,60 +892,145 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
     };
     let data = data.as_slice();
 
-    match litebox_syscall_rewriter::hook_syscalls_in_elf_for_host(data, None, host) {
-        Ok(rewritten) => {
-            if verbose {
-                eprintln!("  {} (rewritten)", path.display());
-            }
-            Ok(rewritten)
-        }
-        Err(e) => {
-            // Include the file as-is when rewriting fails. This can happen for
-            // ELFs with unsupported architectures (e.g., aarch64 binaries in an
-            // x86_64 image) or unusual ELF layouts. The runtime patcher or
-            // platform syscall interception will handle these at execution time.
-            eprintln!(
-                "  warning: failed to rewrite {}: {e}; including as-is",
+    let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf_for_host(data, None, host)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to rewrite executable ELF {}: {error}",
                 path.display()
-            );
-            Ok(data.to_vec())
-        }
+            )
+        })?;
+    if verbose {
+        eprintln!("  {} (rewritten)", path.display());
     }
+    Ok(rewritten)
 }
 
 // ---------------------------------------------------------------------------
 // Tar archive construction
 // ---------------------------------------------------------------------------
 
+enum TarEntryKind {
+    Regular(Vec<u8>),
+    Symlink(Vec<u8>),
+    Directory,
+}
+
 struct TarEntry {
     tar_path: String,
-    data: Vec<u8>,
+    kind: TarEntryKind,
     mode: u32,
+    uid: u64,
+    gid: u64,
+}
+
+impl TarEntry {
+    fn regular(tar_path: String, data: Vec<u8>, mode: u32, uid: u64, gid: u64) -> Self {
+        Self {
+            tar_path,
+            kind: TarEntryKind::Regular(data),
+            mode,
+            uid,
+            gid,
+        }
+    }
+
+    fn symlink(tar_path: String, link_target: Vec<u8>, mode: u32, uid: u64, gid: u64) -> Self {
+        Self {
+            tar_path,
+            kind: TarEntryKind::Symlink(link_target),
+            mode,
+            uid,
+            gid,
+        }
+    }
+
+    fn directory(tar_path: String, mode: u32, uid: u64, gid: u64) -> Self {
+        Self {
+            tar_path,
+            kind: TarEntryKind::Directory,
+            mode,
+            uid,
+            gid,
+        }
+    }
+}
+
+const USTAR_MAX_FILE_SIZE: u64 = (1_u64 << 33) - 1;
+const USTAR_MAX_ID: u64 = (1_u64 << 21) - 1;
+
+fn ustar_header(entry: &TarEntry) -> anyhow::Result<Header> {
+    let mut header = Header::new_ustar();
+    header
+        .set_path(&entry.tar_path)
+        .with_context(|| format!("failed to encode ustar path {}", entry.tar_path))?;
+    header.set_mode(entry.mode & 0o7777);
+    if entry.uid > USTAR_MAX_ID {
+        bail!(
+            "uid {} for {} exceeds pure ustar's maximum numeric id {USTAR_MAX_ID}",
+            entry.uid,
+            entry.tar_path
+        );
+    }
+    if entry.gid > USTAR_MAX_ID {
+        bail!(
+            "gid {} for {} exceeds pure ustar's maximum numeric id {USTAR_MAX_ID}",
+            entry.gid,
+            entry.tar_path
+        );
+    }
+    header.set_uid(entry.uid);
+    header.set_gid(entry.gid);
+
+    match &entry.kind {
+        TarEntryKind::Regular(data) => {
+            let size = u64::try_from(data.len())
+                .with_context(|| format!("file size cannot fit u64 for {}", entry.tar_path))?;
+            if size > USTAR_MAX_FILE_SIZE {
+                bail!(
+                    "regular file {} is {size} bytes, exceeding pure ustar's {USTAR_MAX_FILE_SIZE}-byte limit",
+                    entry.tar_path
+                );
+            }
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(size);
+        }
+        TarEntryKind::Symlink(link_target) => {
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_link_name_literal(link_target).with_context(|| {
+                format!(
+                    "failed to encode ustar link target for {} -> {}",
+                    entry.tar_path,
+                    String::from_utf8_lossy(link_target)
+                )
+            })?;
+        }
+        TarEntryKind::Directory => {
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+        }
+    }
+    header.set_cksum();
+    Ok(header)
 }
 
 fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
+    let headers = entries
+        .iter()
+        .map(ustar_header)
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let file = std::fs::File::create(output)
         .with_context(|| format!("failed to create output file {}", output.display()))?;
     let mut builder = Builder::new(file);
 
-    for entry in entries {
-        // Note: we use the ustar format because the runtime tar filesystem
-        // (`litebox/src/fs/tar_ro.rs`) uses the `tar_no_std` crate which only
-        // supports ustar. This limits path lengths to 256 bytes (with the
-        // name/prefix split).
-        let mut header = Header::new_ustar();
-        header.set_size(entry.data.len() as u64);
-        // Mask to permission bits only (rwxrwxrwx). The full st_mode from
-        // MetadataExt::mode() includes file type bits (e.g., 0o100755) which
-        // the litebox tar_ro filesystem's ModeFlags parser cannot handle.
-        header.set_mode(entry.mode & 0o777);
-        header.set_uid(1000);
-        header.set_gid(1000);
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, &entry.tar_path, entry.data.as_slice())
-            .with_context(|| format!("failed to add {} to tar", entry.tar_path))?;
+    for (entry, header) in entries.iter().zip(&headers) {
+        let append_result = match &entry.kind {
+            TarEntryKind::Regular(data) => builder.append(header, data.as_slice()),
+            TarEntryKind::Symlink(_) | TarEntryKind::Directory => {
+                builder.append(header, std::io::empty())
+            }
+        };
+        append_result.with_context(|| format!("failed to add {} to tar", entry.tar_path))?;
     }
 
     builder.finish().context("failed to finalize tar archive")?;

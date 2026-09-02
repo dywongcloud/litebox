@@ -309,8 +309,10 @@ CONTAINER_ID=""
 # during packaging, not before. binutils' readelf/objdump aren't reliably
 # present on a macOS host, so the scan runs inside a scratch Alpine
 # container fed the packaged tar directly, mirroring the closure walk
-# already used above for the pre-packaging gate. The entry binaries
-# start-desktop.sh execs, plus their full recursive NEEDED closure.
+# already used above for the pre-packaging gate. The desktop entry binaries
+# start-desktop.sh execs are scanned with their full recursive NEEDED closure;
+# Chromium and its set-ID sandbox helper are scanned directly, while its cold
+# codec/GPU dependencies remain outside the about:blank smoke path.
 # Scanning the whole image's 348 installed packages (measured live: the
 # xfce4 metapackage pulls in a stock closure roughly 4x DEFAULT_PACKAGES's
 # ~80 rebuilt origins -- webkit2gtk, ffmpeg's codec stack, poppler -- none
@@ -348,6 +350,11 @@ if ! "$CONTAINER_ENGINE" exec "$SCAN_CONTAINER" sh -c '
         done
         queue="$next"
     done
+    # Chromium itself is rebuilt with x18 reserved and must pass the same
+    # zero-residual gate. Its deliberately cold codec/GPU dependency graph
+    # remains outside the painted about:blank smoke path, like the other
+    # installed-but-unreached media packages documented above.
+    seen="$seen /scan/usr/lib/chromium/chromium /scan/usr/lib/chromium/chrome-sandbox"
     total=0
     for file in $seen; do
         readelf -h "$file" > /dev/null 2>&1 || continue
@@ -360,7 +367,7 @@ if ! "$CONTAINER_ENGINE" exec "$SCAN_CONTAINER" sh -c '
     echo "total residual x18 register references across the live smoke-test closure: $total"
     [ "$total" -eq 0 ]
 '; then
-    echo "the desktop/terminal smoke-test closure still contains x18 instructions; patch the named assembly/build path" >&2
+    echo "the desktop/terminal closure or Chromium payload still contains x18 instructions; patch the named assembly/build path" >&2
     exit 1
 fi
 scan_cleanup

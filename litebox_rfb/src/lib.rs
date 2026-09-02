@@ -27,5 +27,6 @@ mod server;
 pub mod web;
 
 pub use server::{
-    FramebufferSource, InputEvent, KeyEvent, PointerEvent, RfbServer, ShutdownHandle,
+    FramebufferSource, InputClientId, InputEvent, InputMessage, KeyEvent, PointerEvent, RfbServer,
+    ShutdownHandle,
 };

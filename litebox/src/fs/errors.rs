@@ -69,6 +69,8 @@ pub enum WriteError {
     NotAFile,
     #[error("file not open for writing")]
     NotForWriting,
+    #[error("write would require copy-up into a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error("I/O error")]
     Io,
 }
@@ -98,8 +100,12 @@ pub enum TruncateError {
     IsDirectory,
     #[error("file is not opened for writing")]
     NotForWriting,
+    #[error("operation not permitted on an `O_PATH` fd")]
+    PathOnlyFd,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
+    #[error("truncate would require copy-up into a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error("I/O error")]
     Io,
 }
@@ -176,6 +182,8 @@ pub enum UtimeError {
 pub enum UnlinkError {
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
+    #[error("the sticky-directory ownership rule forbids removal")]
+    OperationNotPermitted,
     #[error("pathname is a directory")]
     IsADirectory,
     #[error("the named file resides on a read-only filesystem")]
@@ -236,6 +244,8 @@ pub enum ReadlinkError {
 pub enum RenameError {
     #[error("a directory in the rename does not allow write permission")]
     NoWritePerms,
+    #[error("the sticky-directory ownership rule forbids the rename")]
+    OperationNotPermitted,
     #[error("newpath is a non-empty directory")]
     NotEmpty,
     #[error("newpath is an existing directory but oldpath is not")]
@@ -262,6 +272,8 @@ pub enum RenameError {
 pub enum RmdirError {
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
+    #[error("the sticky-directory ownership rule forbids removal")]
+    OperationNotPermitted,
     #[error(
         "currently in use by the system, or something prevents its removal (e.g., is the root directory)"
     )]
@@ -284,6 +296,8 @@ pub enum RmdirError {
 pub enum ReadDirError {
     #[error("fd has been closed already")]
     ClosedFd,
+    #[error("operation not permitted on an `O_PATH` fd")]
+    PathOnlyFd,
     #[error("fd does not point to a directory")]
     NotADirectory,
     #[error("I/O error")]

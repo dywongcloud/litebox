@@ -28,7 +28,6 @@ use litebox::{
     pipes::Pipes,
     platform::TimeProvider,
     shim::ContinueOperation,
-    sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox_common_linux::{
@@ -341,7 +340,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let global = Arc::new(GlobalState {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
-            futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
@@ -353,6 +351,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             pty_registry: Arc::new(syscalls::file::PtyRegistry::new()),
             guest_images: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+            shared_file_backings: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             termios: litebox::sync::Mutex::new(litebox_common_linux::Termios::default_cooked()),
             stdio_foreground_pgid: core::sync::atomic::AtomicI32::new(0),
             processes: syscalls::process::ProcessTable::new(),
@@ -695,6 +694,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<Platform, FS>>) -> R,
         unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform, FS>>) -> R,
+        netlink: impl FnOnce(&TypedFd<syscalls::netlink::NetlinkSubsystem<Platform>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -720,6 +720,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> syscalls::file::FilesState<Platform, FS
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(unix(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(netlink(&fd));
         }
         Err(Errno::EBADF)
     }
@@ -977,6 +981,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -1648,8 +1653,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     litebox: litebox::LiteBox<Platform>,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
-    /// The futex manager for handling futex operations.
-    futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
     /// The network subsystem.
@@ -1667,6 +1670,12 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// monotonically (never pruned on unmap) and survives the mapping fd's
     /// close, unlike [`Self::elf_patch_cache`]. See `Task::find_guest_image`.
     guest_images: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::mm::GuestImage>>,
+    /// Stable shared-page identities keyed by filesystem device/inode, so aliases opened through
+    /// different file descriptions still converge on one backing object.
+    shared_file_backings: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<(usize, usize), litebox::mm::linux::SharedFutexBacking>,
+    >,
     /// Handle to the `/proc` backend mounted by [`LinuxShimBuilder::default_fs`], if any --
     /// `None` when the shim was built with a filesystem that doesn't mount one.
     /// `Task::set_task_comm` publishes the guest task's identity here as it becomes known.

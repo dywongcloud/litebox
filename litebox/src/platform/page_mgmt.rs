@@ -67,6 +67,94 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
+    /// Allocates an alias of a stable shared backing object.
+    ///
+    /// Every call carrying the same `backing_identity` and overlapping
+    /// `backing_offset` range must expose the same bytes immediately, even when
+    /// the returned virtual addresses differ. Platforms without a native shared
+    /// backing implementation retain the ordinary allocation behavior by
+    /// default; their shims may still provide sharing through an address-space
+    /// handoff, but simultaneous aliases will not be coherent until the platform
+    /// overrides this method.
+    #[expect(unused_variables, reason = "default body ignores backing metadata")]
+    fn allocate_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        suggested_range: Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        can_grow_down: bool,
+        populate_pages_immediately: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+        self.allocate_pages(
+            suggested_range,
+            initial_permissions,
+            can_grow_down,
+            populate_pages_immediately,
+            fixed_address_behavior,
+        )
+    }
+
+    /// Initializes portions of a shared backing object that have not been initialized before.
+    ///
+    /// `initialize` receives ranges relative to `backing_offset`; an implementation with a
+    /// canonical shared-page store calls it only for gaps that have never been initialized. The
+    /// callback runs while that store's initialization state is serialized, so two simultaneous
+    /// first mappings cannot overwrite one another with stale file bytes. The default calls it for
+    /// the complete range because a platform without canonical aliases allocates independent pages.
+    fn initialize_shared_pages<E>(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        length: usize,
+        mut initialize: impl FnMut(Range<usize>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let _ = (backing_identity, backing_offset);
+        initialize(0..length)
+    }
+
+    /// Overlays bytes currently held by a canonical shared backing onto `data`.
+    ///
+    /// Bytes for which the platform has no initialized canonical storage are left unchanged. The
+    /// default is a no-op for platforms whose shared mappings are managed outside this provider.
+    fn read_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        data: &mut [u8],
+    ) -> Result<(), SharedPageIoError> {
+        let _ = (backing_identity, backing_offset, data);
+        Ok(())
+    }
+
+    /// Propagates a file write into any canonical shared backing storage that already exists.
+    ///
+    /// A range that has never been mapped need not allocate storage; its eventual first mapping is
+    /// initialized from the file itself. The default is a no-op.
+    fn write_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        data: &[u8],
+    ) -> Result<(), SharedPageIoError> {
+        let _ = (backing_identity, backing_offset, data);
+        Ok(())
+    }
+
+    /// Zeroes any canonical shared storage intersecting `backing_range` after file truncation.
+    ///
+    /// This operates only on storage that already exists; future mappings obtain zero-filled bytes
+    /// from the resized file. The default is a no-op.
+    fn zero_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_range: Range<usize>,
+    ) -> Result<(), SharedPageIoError> {
+        let _ = (backing_identity, backing_range);
+        Ok(())
+    }
+
     /// De-allocated all pages in the given `range`.
     ///
     /// # Safety
@@ -155,6 +243,24 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         (unsafe { self.deallocate_pages(old_range) }).expect("failed to deallocate old range");
 
         Ok(new_ptr)
+    }
+
+    /// Moves a stable shared backing alias while preserving its backing offset.
+    ///
+    /// Platforms that expose canonical shared pages override this so the destination aliases the
+    /// same physical storage rather than receiving a private byte copy. Other platforms retain the
+    /// ordinary remap behavior.
+    unsafe fn remap_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+        let _ = (backing_identity, backing_offset);
+        // SAFETY: this method has the same safety contract as `remap_pages` and forwards it.
+        unsafe { self.remap_pages(old_range, new_range, permissions) }
     }
 
     /// Update the permissions on pages in `range` to `new_permissions`.
@@ -284,6 +390,15 @@ pub enum PermissionUpdateError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     Unallocated,
+}
+
+/// Failure while synchronizing a canonical shared backing with file-descriptor I/O.
+#[derive(Error, Debug)]
+pub enum SharedPageIoError {
+    #[error("shared backing range overflow")]
+    OutOfRange,
+    #[error("host shared backing I/O failed")]
+    Io,
 }
 
 /// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]

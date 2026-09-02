@@ -25,10 +25,10 @@
 #
 # The companion `build-musl-x18-fixed.sh` covers musl itself through the
 # packager's content-addressed cache. This script covers the loaded closure
-# of Xorg, dbus, GTK, XFCE, their image/font stack, and the small X clients
-# used for live smoke tests. Deliberately cold media/web content (WebKit,
-# ffmpeg, GStreamer, Mesa/LLVM) remains stock; launching it is still subject
-# to the platform's general x18 restriction.
+# of Xorg, dbus, GTK, XFCE, their image/font stack, the small X clients
+# used for live smoke tests, and Chromium's hot startup path. Deliberately cold media/web
+# dependencies (WebKit, ffmpeg, GStreamer, Mesa/LLVM) remain stock; launching
+# those paths is still subject to the platform's general x18 restriction.
 #
 # The build container is kept as `litebox-x18-repo-build`. Each origin builds
 # in a private REPODEST assembled from signed, digest-verified origins. Its APKs
@@ -111,6 +111,11 @@ DEFAULT_PACKAGES=(
     xfce4-panel xfdesktop
     # Xt smoke clients
     libxt libxaw libxfont2 libxft libxmu libxpm xterm
+    # Sandboxed browser and its hot startup security/runtime dependencies.
+    # Chromium's unbundled C/C++ build consumes the global fixed-register
+    # flags, while the absolute rustc wrapper above closes its Rust toolchain
+    # escape hatch.
+    chromium nspr nss double-conversion
 )
 if [ $# -gt 0 ]; then
     EXPORT_PACKAGES=("$@")
@@ -165,7 +170,7 @@ APORTS_COMMIT="${LITEBOX_APORTS_COMMIT:-013edf8b29199933e8ea34dde460b5584b979042
     fatal "invalid immutable aports commit for $ALPINE_BRANCH"
 
 BUILD_CONTAINER="${LITEBOX_X18_BUILD_CONTAINER:-litebox-x18-repo-build}"
-BUILD_VERSION="8"
+BUILD_VERSION="9"
 BUILD_RECIPE_SHA256="$(shasum -a 256 "$0" | cut -d" " -f1)"
 BUILD_STATE="$BUILD_VERSION|$BUILD_RECIPE_SHA256|$ALPINE_BRANCH|$APORTS_COMMIT|$BASE_IMAGE"
 

@@ -43,6 +43,9 @@ pub trait IOPollable {
         mask: Events,
     );
 
+    /// Unregister a previously registered observer.
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn observer::Observer<Events>>);
+
     /// Get the current set of active events at this moment in time.
     ///
     /// This does not _by itself_ cause any triggering for observers; instead `notify_observer`
@@ -58,6 +61,9 @@ impl<T: IOPollable> IOPollable for alloc::sync::Arc<T> {
         mask: Events,
     ) {
         self.as_ref().register_observer(observer, mask);
+    }
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn observer::Observer<Events>>) {
+        self.as_ref().unregister_observer(observer);
     }
     fn check_io_events(&self) -> Events {
         self.as_ref().check_io_events()

@@ -199,6 +199,8 @@ pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,
     pub(super) broadcast: bool,
+    pub(super) receive_ipv4_returned_options: bool,
+    pub(super) receive_ipv4_ttl: bool,
     /// Receiving timeout, None (default value) means no timeout
     pub(super) recv_timeout: Option<core::time::Duration>,
     /// Sending timeout, None (default value) means no timeout
@@ -213,6 +215,11 @@ pub(super) struct SocketOptions {
 #[derive(Clone)]
 pub(crate) struct SocketOFlags(pub OFlags);
 pub(crate) struct SocketProxy<Platform: ShimPlatform>(pub Arc<NetworkProxy<Platform>>);
+
+#[derive(Clone, Copy, Default)]
+struct IcmpProxySocket {
+    peer: Option<Ipv4Addr>,
+}
 
 impl<Platform: ShimPlatform> Clone for SocketProxy<Platform> {
     fn clone(&self) -> Self {
@@ -434,6 +441,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
 
         match optname {
             SocketOptionName::IP(ip) => match ip {
+                // These IPv4 receive controls are advisory for the in-process stack. The bounded
+                // ICMP bridge returns only the echo message, and BusyBox ping does not consume
+                // ancillary TTL or returned-option data, so accepting them preserves Linux's
+                // socket setup behavior without exposing a raw-packet path.
+                litebox_common_linux::IpOption::RETOPTS
+                | litebox_common_linux::IpOption::RECVTTL => {
+                    let enabled = super::read_from_user::<u32, Platform>(optval, optlen)? != 0;
+                    self.with_socket_options_mut(fd, |options| match ip {
+                        litebox_common_linux::IpOption::RETOPTS => {
+                            options.receive_ipv4_returned_options = enabled;
+                        }
+                        litebox_common_linux::IpOption::RECVTTL => {
+                            options.receive_ipv4_ttl = enabled;
+                        }
+                        litebox_common_linux::IpOption::TOS => unreachable!(),
+                    });
+                    return Ok(());
+                }
                 // IP_TOS is an advisory traffic-class hint. Accept it (we don't
                 // propagate the bit anywhere) instead of returning EOPNOTSUPP,
                 // which Node's Socket.setTypeOfService treats as fatal and
@@ -605,6 +630,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
                 litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                litebox_common_linux::IpOption::RETOPTS => self
+                    .with_socket_options(fd, |options| options.receive_ipv4_returned_options)
+                    .into(),
+                litebox_common_linux::IpOption::RECVTTL => self
+                    .with_socket_options(fd, |options| options.receive_ipv4_ttl)
+                    .into(),
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -724,6 +755,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         .map_err(Errno::from)
     }
 
+    fn icmp_proxy_socket(&self, fd: &SocketFd<Platform>) -> Option<IcmpProxySocket> {
+        self.litebox
+            .descriptor_table()
+            .with_metadata(fd, |state: &IcmpProxySocket| *state)
+            .ok()
+    }
+
+    fn set_icmp_proxy_peer(&self, fd: &SocketFd<Platform>, peer: Ipv4Addr) -> Result<(), Errno> {
+        self.litebox
+            .descriptor_table_mut()
+            .with_metadata_mut(fd, |state: &mut IcmpProxySocket| state.peer = Some(peer))
+            .map_err(|err| match err {
+                litebox::fd::MetadataError::NoSuchMetadata => Errno::ENOTSOCK,
+                litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+            })
+    }
+
     fn bind(&self, fd: &SocketFd<Platform>, sockaddr: SocketAddr) -> Result<(), Errno> {
         self.net.lock().bind(fd, &sockaddr).map_err(Errno::from)
     }
@@ -734,6 +782,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         fd: &SocketFd<Platform>,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
+        if self.icmp_proxy_socket(fd).is_some() {
+            let SocketAddr::V4(peer) = sockaddr else {
+                return Err(Errno::EAFNOSUPPORT);
+            };
+            if peer.ip().is_unspecified() {
+                return Err(Errno::EADDRNOTAVAIL);
+            }
+            self.set_icmp_proxy_peer(fd, *peer.ip())?;
+            self.get_proxy(fd)?.set_state(SocketState::Connected);
+            return Ok(());
+        }
         if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
             return Err(Errno::ECONNREFUSED);
         }
@@ -777,6 +836,45 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
+        let guest_len = buf.len();
+        let icmp_state = self.icmp_proxy_socket(fd);
+        let framed = if let Some(state) = icmp_state {
+            const MAX_ICMP_ECHO_SIZE: usize = 4096;
+            if !(8..=MAX_ICMP_ECHO_SIZE).contains(&buf.len()) {
+                return Err(if buf.len() > MAX_ICMP_ECHO_SIZE {
+                    Errno::EMSGSIZE
+                } else {
+                    Errno::EINVAL
+                });
+            }
+            // Only the bounded unprivileged-ping use case is bridged; this is not a general raw
+            // ICMP tunnel.
+            if buf[0] != 8 || buf[1] != 0 {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let target = match sockaddr {
+                Some(SocketAddr::V4(target)) => *target.ip(),
+                Some(SocketAddr::V6(_)) => return Err(Errno::EAFNOSUPPORT),
+                None => state.peer.ok_or(Errno::EDESTADDRREQ)?,
+            };
+            if target.is_unspecified() || target.is_multicast() || target == Ipv4Addr::BROADCAST {
+                return Err(Errno::EINVAL);
+            }
+            let mut frame = alloc::vec::Vec::with_capacity(
+                litebox::net::ICMP_ECHO_PROXY_PREFIX_LEN + buf.len(),
+            );
+            frame.extend_from_slice(&target.octets());
+            frame.extend_from_slice(buf);
+            Some(frame)
+        } else {
+            None
+        };
+        let wire_buf = framed.as_deref().unwrap_or(buf);
+        let wire_sockaddr = if framed.is_some() {
+            Some(SocketAddr::V4(litebox::net::ICMP_ECHO_PROXY_ADDR))
+        } else {
+            sockaddr
+        };
         let proxy = self.get_proxy(fd)?;
 
         // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
@@ -830,7 +928,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
-        let is_empty_stream = buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
+        let is_empty_stream = guest_len == 0 && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
 
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -840,8 +938,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     proxy.register_observer(observer, filter);
                     Ok(())
                 },
-                || match proxy.try_write(buf, new_flags, sockaddr) {
-                    Ok(0) if buf.is_empty() => Ok(0),
+                || match proxy.try_write(wire_buf, new_flags, wire_sockaddr) {
+                    Ok(n) if framed.is_some() && n == wire_buf.len() => Ok(guest_len),
+                    Ok(_) if framed.is_some() => Err(TryOpError::Other(Errno::EIO)),
+                    Ok(0) if guest_len == 0 => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
@@ -893,6 +993,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         }
 
         let proxy = self.get_proxy(fd)?;
+        if self.icmp_proxy_socket(fd).is_some() {
+            let frame_len = buf
+                .len()
+                .checked_add(litebox::net::ICMP_ECHO_PROXY_PREFIX_LEN)
+                .ok_or(Errno::EINVAL)?;
+            let mut frame = alloc::vec![0u8; frame_len];
+            return cx
+                .with_timeout(timeout)
+                .wait_on_events(
+                    is_nonblock,
+                    Events::IN,
+                    |observer, filter| {
+                        proxy.register_observer(observer, filter);
+                        Ok(())
+                    },
+                    || match proxy.try_read(&mut frame, new_flags, None) {
+                        Ok(n) if n < litebox::net::ICMP_ECHO_PROXY_PREFIX_LEN => {
+                            Err(TryOpError::TryAgain)
+                        }
+                        Ok(n) => {
+                            let payload_len = n - litebox::net::ICMP_ECHO_PROXY_PREFIX_LEN;
+                            let available =
+                                n.min(frame.len()) - litebox::net::ICMP_ECHO_PROXY_PREFIX_LEN;
+                            let copied = available.min(buf.len());
+                            buf[..copied].copy_from_slice(
+                                &frame[litebox::net::ICMP_ECHO_PROXY_PREFIX_LEN
+                                    ..litebox::net::ICMP_ECHO_PROXY_PREFIX_LEN + copied],
+                            );
+                            if let Some(source_addr) = source_addr.as_deref_mut() {
+                                *source_addr = Some(SocketAddr::V4(SocketAddrV4::new(
+                                    Ipv4Addr::new(frame[0], frame[1], frame[2], frame[3]),
+                                    0,
+                                )));
+                            }
+                            Ok(if flags.contains(ReceiveFlags::TRUNC) {
+                                payload_len
+                            } else {
+                                copied
+                            })
+                        }
+                        Err(ChannelReadError::ReadShutdown) => Ok(0),
+                        Err(ChannelReadError::ConnectionClosed) => {
+                            match proxy.get_async_error(true) {
+                                Some(err) => Err(TryOpError::Other(err.into())),
+                                None => Ok(0),
+                            }
+                        }
+                        Err(ChannelReadError::NotConnected) => {
+                            Err(TryOpError::Other(Errno::ENOTCONN))
+                        }
+                    },
+                )
+                .map_err(Errno::from);
+        }
         cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
@@ -1027,6 +1181,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     log_unsupported!("protocol = {protocol}");
                     Errno::EPROTONOSUPPORT
                 })?;
+                let mut icmp_proxy = false;
                 let protocol = match ty {
                     SockType::Stream => {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
@@ -1034,12 +1189,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                         litebox::net::Protocol::Tcp
                     }
-                    SockType::Datagram => {
-                        if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
-                            return Err(Errno::EINVAL);
+                    SockType::Datagram => match protocol {
+                        IPProtocol::Default | IPProtocol::UDP => litebox::net::Protocol::Udp,
+                        IPProtocol::ICMP => {
+                            icmp_proxy = true;
+                            litebox::net::Protocol::Udp
                         }
-                        litebox::net::Protocol::Udp
-                    }
+                        IPProtocol::TCP | IPProtocol::RAW => return Err(Errno::EINVAL),
+                        // `IPProtocol` is non-exhaustive; `try_from` admitted only a declared value.
+                        _ => unreachable!(),
+                    },
                     // No raw IP networking of any kind is available: the host has no `tun`
                     // device without root (see `net_proxy`'s module doc), so there is no path
                     // to actually emit an ICMP echo or any other raw packet. `EPERM` matches
@@ -1055,6 +1214,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
+                if icmp_proxy {
+                    let old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_entry_metadata(&socket, IcmpProxySocket::default());
+                    assert!(old.is_none());
+                }
                 let Ok(raw_fd) = files.insert_raw_fd(socket) else {
                     unimplemented!()
                 };
@@ -1089,19 +1256,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // address state is ever touched; see `crate::syscalls::netlink`.
                 let interface_ip = self.global.net.lock().interface_ip();
                 let socket = crate::syscalls::netlink::NetlinkSocket::new(interface_ip);
-                let typed = self
-                    .global
-                    .litebox
-                    .descriptor_table_mut()
+                let mut status = OFlags::RDWR;
+                status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                let mut descriptors = self.global.litebox.descriptor_table_mut();
+                let typed = descriptors
                     .insert::<crate::syscalls::netlink::NetlinkSubsystem<Platform>>(socket);
+                let old = descriptors.set_entry_metadata(&typed, SocketOFlags(status));
+                assert!(old.is_none());
                 if flags.contains(SockFlags::CLOEXEC) {
-                    let old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                    let old = descriptors.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
                 }
+                drop(descriptors);
                 files.insert_raw_fd(typed).map_err(|typed| {
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE

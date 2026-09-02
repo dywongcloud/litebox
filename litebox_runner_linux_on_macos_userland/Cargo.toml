@@ -14,5 +14,10 @@ litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", defaul
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+libc = { version = "0.2.169", default-features = false }
+rustls = { version = "0.23.32", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.1"
+
 [lints]
 workspace = true

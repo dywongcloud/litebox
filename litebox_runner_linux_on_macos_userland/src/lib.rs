@@ -53,7 +53,11 @@ pub struct CliArgs {
     /// The program path refers to a path inside the tar archive provided via
     /// `--initial-files`. All binaries must be pre-rewritten with the syscall
     /// rewriter.
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    #[arg(
+        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure"],
+        trailing_var_arg = true,
+        value_hint = clap::ValueHint::CommandWithArguments
+    )]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
@@ -65,11 +69,91 @@ pub struct CliArgs {
     ///
     /// All ELF binaries should be pre-rewritten with the syscall rewriter
     /// (e.g., via `litebox-packager`), for `Host::MacOs`.
-    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
-    pub initial_files: PathBuf,
+    #[arg(
+        long = "initial-files",
+        value_name = "PATH_TO_TAR",
+        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure"],
+        value_hint = clap::ValueHint::FilePath
+    )]
+    pub initial_files: Option<PathBuf>,
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
+    /// Run the bounded Hypervisor.framework architecture probe and exit.
+    ///
+    /// This does not run the requested Linux program and does not select the
+    /// native guest backend. It verifies the compact-IPA, 16 KiB stage-one,
+    /// stock-SVC/HVC and x18-preservation path that the opt-in HVF backend will
+    /// use. The runner executable must carry the
+    /// `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-smoke",
+        requires = "unstable",
+        conflicts_with = "hvf_boundary",
+        help_heading = "Unstable Options"
+    )]
+    pub hvf_smoke: bool,
+    /// Exercise the production Hypervisor.framework SDK boundary and exit.
+    ///
+    /// This creates the process-global VM through the active macOS SDK,
+    /// validates the linked EL1 monitor, maps and unmaps it with compact IPA,
+    /// then creates, verifies, and destroys a vCPU. The runner executable must
+    /// carry the `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-boundary",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub hvf_boundary: bool,
+    /// Exercise compact IPA allocation, the GVA=HVA ledger, fresh stage-one
+    /// roots, stage-two protection, and transactional rejection without running
+    /// guest instructions.
+    #[arg(
+        long = "hvf-memory",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary"],
+        help_heading = "Unstable Options"
+    )]
+    pub hvf_memory: bool,
+    /// Inject compact-memory rollback and host-slot restoration failures, then
+    /// prove exact manager quarantine and cleanup-only recovery. This intentionally
+    /// poisons its short-lived diagnostic process.
+    #[arg(
+        long = "hvf-memory-failure",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure"],
+        help_heading = "Unstable Options"
+    )]
+    pub hvf_memory_failure: bool,
+    /// Prove that a pending poison request rejects normal admission, waits for
+    /// the in-flight owner to release, and leaves cleanup-only admission available.
+    /// This intentionally poisons its short-lived diagnostic process.
+    #[arg(
+        long = "hvf-poison",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory"],
+        help_heading = "Unstable Options"
+    )]
+    pub hvf_poison: bool,
+    /// Inject a stage-one register readback mismatch and prove that the partially
+    /// programmed vCPU is destroyed and the diagnostic process is poisoned.
+    #[arg(
+        long = "hvf-register-failure",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_poison", "hvf_unmap_failure"],
+        help_heading = "Unstable Options"
+    )]
+    pub hvf_register_failure: bool,
+    /// Perform one explicit stage-two unmap, inject stage-two protect and unmap
+    /// failures, and prove exact logical quarantine, bounded cleanup retry, and
+    /// cleanup-only admission after poison without claiming physical residuals.
+    #[arg(
+        long = "hvf-unmap-failure",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_poison", "hvf_register_failure"],
+        help_heading = "Unstable Options"
+    )]
+    pub hvf_unmap_failure: bool,
     /// Connect to a `utun` device with this name (e.g. `utun4`).
     ///
     /// Creating the interface needs root on this host, so the guest has no
@@ -132,11 +216,12 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub vnc_web: Option<u16>,
-    /// Give the guest web access without root: an HTTP proxy (CONNECT + absolute-URI) on the
-    /// guest's loopback at `127.0.0.1:3128`, bridged to real host connections. Point the guest
-    /// at it (`http_proxy=http://127.0.0.1:3128`, `links -http-proxy 127.0.0.1:3128`). Widens
-    /// the Seatbelt profile with `(allow network-outbound)` -- outbound only; inbound stays
-    /// denied.
+    /// Give the guest rootless network access: an HTTP proxy (CONNECT + absolute-URI) on the
+    /// guest's loopback at `127.0.0.1:3128`, a DNS responder, and a bounded ICMP Echo bridge for
+    /// `ping`, all backed by ordinary host sockets. Standard lowercase and uppercase HTTP(S)
+    /// proxy environment variables default to the HTTP endpoint and can be overridden with
+    /// `--env`. Widens the Seatbelt profile with `(allow network-outbound)` -- outbound only;
+    /// inbound stays denied.
     #[arg(
         long = "net-proxy",
         requires = "unstable",
@@ -205,107 +290,229 @@ fn keysym_to_tty_bytes(keysym: u32, ctrl: bool) -> Option<Vec<u8>> {
     }
 }
 
-/// Build the closure that routes one viewer's [`litebox_rfb::InputEvent`]s into the guest:
-/// evdev + PS/2-mice injection for pointer events, evdev + tty-byte injection for keys. Each
-/// attached viewer (RFB or web) gets its own instance; the small per-viewer state (button
-/// mask, Ctrl) means two concurrent viewers behave like two hands on one mouse, exactly as
-/// the RFB server's `run` doc comment describes.
+#[derive(Default)]
+struct InputClientState {
+    held_keys: std::collections::BTreeSet<u16>,
+    button_mask: u8,
+}
+
+#[derive(Default)]
+struct InputRouterState {
+    clients: std::collections::BTreeMap<litebox_rfb::InputClientId, InputClientState>,
+    key_owners: std::collections::BTreeMap<u16, usize>,
+    button_owners: [usize; 3],
+    latest_pointer: (u16, u16),
+}
+
+struct InputRouter {
+    input_registry: Option<litebox::fs::devices::InputRegistry<Platform>>,
+    input_framebuffer: Option<litebox::fs::devices::Framebuffer<Platform>>,
+    platform: &'static Platform,
+    epoch: std::time::Instant,
+    state: std::sync::Mutex<InputRouterState>,
+}
+
+impl InputRouter {
+    fn pointer_coordinates(&self, p: litebox_rfb::PointerEvent) -> (i32, i32) {
+        let (width, height) = self.input_framebuffer.as_ref().map_or((1024, 768), |fb| {
+            let geo = fb.geometry();
+            (geo.xres.max(1), geo.yres.max(1))
+        });
+        let range = i64::from(litebox::fs::devices::ABS_RANGE_MAX);
+        let scale = |v: u16, extent: u32| -> i32 {
+            let clamped = i64::from(v).min(i64::from(extent) - 1);
+            i32::try_from(clamped * range / i64::from(extent.max(1)))
+                .unwrap_or(litebox::fs::devices::ABS_RANGE_MAX)
+        };
+        (scale(p.x, width), scale(p.y, height))
+    }
+
+    fn inject_pointer(
+        &self,
+        registry: &litebox::fs::devices::InputRegistry<Platform>,
+        p: litebox_rfb::PointerEvent,
+        aggregate_buttons: u8,
+        transitions: &[(u16, bool)],
+        wheel: i8,
+        now: std::time::Duration,
+    ) {
+        let (x, y) = self.pointer_coordinates(p);
+        registry.inject_pointer_abs(x, y, transitions, now);
+        if wheel != 0 {
+            registry.inject_wheel(-i32::from(wheel), now);
+        }
+        let ps2_buttons = (aggregate_buttons & 0x01)
+            | ((aggregate_buttons >> 2) & 0x01) << 1
+            | ((aggregate_buttons >> 1) & 0x01) << 2;
+        registry.inject_mice_pointer(i32::from(p.x), i32::from(p.y), ps2_buttons, wheel);
+    }
+
+    fn handle(&self, message: litebox_rfb::InputMessage) {
+        let Some(registry) = self.input_registry.as_ref() else {
+            return;
+        };
+        let now = self.epoch.elapsed();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut tty_bytes = None;
+        match message {
+            litebox_rfb::InputMessage::Connected(client) => {
+                state.clients.entry(client).or_default();
+            }
+            litebox_rfb::InputMessage::Event { client, event } => match event {
+                litebox_rfb::InputEvent::Key(key) => {
+                    if let Some(code) = litebox_rfb::keymap::keysym_to_evdev(key.key) {
+                        let Some(client_state) = state.clients.get_mut(&client) else {
+                            return;
+                        };
+                        let changed = if key.down {
+                            client_state.held_keys.insert(code)
+                        } else {
+                            client_state.held_keys.remove(&code)
+                        };
+                        if changed {
+                            if key.down {
+                                let owners = state.key_owners.entry(code).or_default();
+                                *owners += 1;
+                                if *owners == 1 {
+                                    registry.inject_key(code, true, now);
+                                }
+                            } else if let Some(owners) = state.key_owners.get_mut(&code) {
+                                *owners -= 1;
+                                if *owners == 0 {
+                                    state.key_owners.remove(&code);
+                                    registry.inject_key(code, false, now);
+                                }
+                            }
+                        }
+                        if key.down {
+                            let ctrl = state.key_owners.contains_key(&29)
+                                || state.key_owners.contains_key(&97);
+                            tty_bytes = keysym_to_tty_bytes(key.key, ctrl);
+                        }
+                    } else if key.down {
+                        tty_bytes = keysym_to_tty_bytes(key.key, false);
+                    }
+                }
+                litebox_rfb::InputEvent::Pointer(p) => {
+                    let Some(client_state) = state.clients.get_mut(&client) else {
+                        return;
+                    };
+                    let old_mask = client_state.button_mask;
+                    client_state.button_mask = p.button_mask;
+                    state.latest_pointer = (p.x, p.y);
+                    let changed = old_mask ^ p.button_mask;
+                    let mut transitions = Vec::new();
+                    for (index, btn) in [
+                        litebox::fs::devices::BTN_LEFT,
+                        litebox::fs::devices::BTN_MIDDLE,
+                        litebox::fs::devices::BTN_RIGHT,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let bit = 1u8 << index;
+                        if changed & bit == 0 {
+                            continue;
+                        }
+                        let down = p.button_mask & bit != 0;
+                        if down {
+                            state.button_owners[index] += 1;
+                            if state.button_owners[index] == 1 {
+                                transitions.push((btn, true));
+                            }
+                        } else {
+                            state.button_owners[index] -= 1;
+                            if state.button_owners[index] == 0 {
+                                transitions.push((btn, false));
+                            }
+                        }
+                    }
+                    let aggregate_buttons = state
+                        .button_owners
+                        .iter()
+                        .enumerate()
+                        .fold(0u8, |mask, (index, owners)| {
+                            mask | u8::from(*owners != 0) << index
+                        });
+                    let wheel = if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
+                        -1
+                    } else {
+                        i8::from(changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0)
+                    };
+                    self.inject_pointer(registry, p, aggregate_buttons, &transitions, wheel, now);
+                }
+            },
+            litebox_rfb::InputMessage::Disconnected(client) => {
+                let Some(client_state) = state.clients.remove(&client) else {
+                    return;
+                };
+                for code in client_state.held_keys {
+                    if let Some(owners) = state.key_owners.get_mut(&code) {
+                        *owners -= 1;
+                        if *owners == 0 {
+                            state.key_owners.remove(&code);
+                            registry.inject_key(code, false, now);
+                        }
+                    }
+                }
+                let mut transitions = Vec::new();
+                for (index, btn) in [
+                    litebox::fs::devices::BTN_LEFT,
+                    litebox::fs::devices::BTN_MIDDLE,
+                    litebox::fs::devices::BTN_RIGHT,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if client_state.button_mask & (1 << index) != 0 {
+                        state.button_owners[index] -= 1;
+                        if state.button_owners[index] == 0 {
+                            transitions.push((btn, false));
+                        }
+                    }
+                }
+                if !transitions.is_empty() {
+                    let aggregate_buttons = state
+                        .button_owners
+                        .iter()
+                        .enumerate()
+                        .fold(0u8, |mask, (index, owners)| {
+                            mask | u8::from(*owners != 0) << index
+                        });
+                    let p = litebox_rfb::PointerEvent {
+                        button_mask: aggregate_buttons,
+                        x: state.latest_pointer.0,
+                        y: state.latest_pointer.1,
+                    };
+                    self.inject_pointer(registry, p, aggregate_buttons, &transitions, 0, now);
+                }
+            }
+        }
+        drop(state);
+        if let Some(bytes) = tty_bytes {
+            let _ = self.platform.inject_stdin(&bytes);
+        }
+    }
+}
+
+/// Build a cloneable callback that routes every RFB and browser connection through one shared
+/// ownership model before injecting aggregate evdev, PS/2-mouse, and tty input.
 fn build_input_handler(
     input_registry: Option<litebox::fs::devices::InputRegistry<Platform>>,
     input_framebuffer: Option<litebox::fs::devices::Framebuffer<Platform>>,
     platform: &'static Platform,
-) -> impl Fn(litebox_rfb::InputEvent) + Send + Sync + 'static {
-    // RFB `PointerEvent`s carry a whole button-state mask per event; evdev wants
-    // per-button transitions. Tracked under a mutex because the handler can be called
-    // concurrently from several connected clients' threads.
-    let last_buttons = std::sync::Mutex::new(0u8);
-    // Control-key state for the tty translation: RFB sends Control_L down, then the letter
-    // with its plain keysym, so the modifier must be remembered.
-    let ctrl_held = std::sync::atomic::AtomicBool::new(false);
-    // Timestamps only need to be monotonic; consumers compare deltas, never absolute values.
-    let epoch = std::time::Instant::now();
-    move |event| {
-        let Some(registry) = input_registry.as_ref() else {
-            return;
-        };
-        let now = epoch.elapsed();
-        match event {
-            litebox_rfb::InputEvent::Key(key) => {
-                if let Some(code) = litebox_rfb::keymap::keysym_to_evdev(key.key) {
-                    registry.inject_key(code, key.down, now);
-                }
-                // Also deliver the key to the guest tty: fbdev-console programs
-                // (links2 -g, shells, editors) read the keyboard from stdin, not
-                // evdev. Dual delivery is harmless -- a given program only ever
-                // consumes one of the two.
-                match key.key {
-                    0xffe3 | 0xffe4 => {
-                        ctrl_held.store(key.down, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    _ if key.down => {
-                        let ctrl = ctrl_held.load(std::sync::atomic::Ordering::Relaxed);
-                        if let Some(bytes) = keysym_to_tty_bytes(key.key, ctrl) {
-                            platform.inject_stdin(&bytes);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            litebox_rfb::InputEvent::Pointer(p) => {
-                // Scale the RFB screen coordinate into the tablet's fixed 0..=32767
-                // range against the *current* framebuffer geometry (resizes included).
-                let (width, height) = input_framebuffer.as_ref().map_or((1024, 768), |fb| {
-                    let geo = fb.geometry();
-                    (geo.xres.max(1), geo.yres.max(1))
-                });
-                let range = i64::from(litebox::fs::devices::ABS_RANGE_MAX);
-                let scale = |v: u16, extent: u32| -> i32 {
-                    let clamped = i64::from(v).min(i64::from(extent) - 1);
-                    i32::try_from(clamped * range / i64::from(extent.max(1)))
-                        .unwrap_or(litebox::fs::devices::ABS_RANGE_MAX)
-                };
-                let x = scale(p.x, width);
-                let y = scale(p.y, height);
-                let mut last = last_buttons
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let changed = *last ^ p.button_mask;
-                let mut transitions = Vec::new();
-                for (bit, btn) in [
-                    (0u8, litebox::fs::devices::BTN_LEFT),
-                    (1, litebox::fs::devices::BTN_MIDDLE),
-                    (2, litebox::fs::devices::BTN_RIGHT),
-                ] {
-                    if changed & (1 << bit) != 0 {
-                        transitions.push((btn, p.button_mask & (1 << bit) != 0));
-                    }
-                }
-                // RFB encodes each scroll click as a press+release of button 4/5; a
-                // press edge is one wheel step.
-                if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
-                    registry.inject_wheel(1, now);
-                }
-                if changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0 {
-                    registry.inject_wheel(-1, now);
-                }
-                *last = p.button_mask;
-                drop(last);
-                registry.inject_pointer_abs(x, y, &transitions, now);
-                // Also feed `/dev/input/mice` (PS/2 button byte: bit0 left, bit1
-                // right, bit2 middle; wheel +1 = scroll down). Consumers read one
-                // device or the other, never both.
-                let ps2_buttons = (p.button_mask & 0x01)
-                    | ((p.button_mask >> 2) & 0x01) << 1
-                    | ((p.button_mask >> 1) & 0x01) << 2;
-                let wheel = if changed & (1 << 3) != 0 && p.button_mask & (1 << 3) != 0 {
-                    -1i8
-                } else {
-                    i8::from(changed & (1 << 4) != 0 && p.button_mask & (1 << 4) != 0)
-                };
-                registry.inject_mice_pointer(i32::from(p.x), i32::from(p.y), ps2_buttons, wheel);
-            }
-        }
-    }
+) -> impl Fn(litebox_rfb::InputMessage) + Clone + Send + Sync + 'static {
+    let router = std::sync::Arc::new(InputRouter {
+        input_registry,
+        input_framebuffer,
+        platform,
+        epoch: std::time::Instant::now(),
+        state: std::sync::Mutex::new(InputRouterState::default()),
+    });
+    move |message| router.handle(message)
 }
 
 /// Run a Linux program with LiteBox on unmodified macOS.
@@ -331,7 +538,61 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
         .init();
 
-    let tar_file = &cli_args.initial_files;
+    if cli_args.hvf_smoke {
+        let report = litebox_platform_macos_userland::hvf_smoke_probe()
+            .map_err(|error| anyhow!("HVF smoke failed: {error}"))?;
+        println!("HVF smoke passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_boundary {
+        let report = litebox_platform_macos_userland::hvf_boundary_probe()
+            .map_err(|error| anyhow!("HVF production boundary failed: {error}"))?;
+        println!("HVF production boundary passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_memory {
+        litebox_platform_macos_userland::with_hvf_memory_probe(|report| {
+            println!("HVF compact memory passed:\n{report:#?}");
+        })
+        .map_err(|error| anyhow!("HVF compact memory failed: {error}"))?;
+        return Ok(());
+    }
+
+    if cli_args.hvf_memory_failure {
+        litebox_platform_macos_userland::with_hvf_memory_failure_probe(|report| {
+            println!("HVF compact-memory failure recovery passed:\n{report:#?}");
+        })
+        .map_err(|error| anyhow!("HVF compact-memory failure recovery failed: {error}"))?;
+        return Ok(());
+    }
+
+    if cli_args.hvf_poison {
+        let report = litebox_platform_macos_userland::hvf_poison_concurrency_probe()
+            .map_err(|error| anyhow!("HVF poison serialization failed: {error}"))?;
+        println!("HVF poison serialization passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_register_failure {
+        let report = litebox_platform_macos_userland::hvf_register_failure_probe()
+            .map_err(|error| anyhow!("HVF register-failure quarantine failed: {error}"))?;
+        println!("HVF register-failure quarantine passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_unmap_failure {
+        let report = litebox_platform_macos_userland::hvf_unmap_failure_probe()
+            .map_err(|error| anyhow!("HVF unmap-failure quarantine failed: {error}"))?;
+        println!("HVF unmap-failure quarantine passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    let tar_file = cli_args
+        .initial_files
+        .as_ref()
+        .expect("clap requires --initial-files unless an HVF diagnostic is selected");
     if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
         anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
     }
@@ -416,6 +677,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // process-wide and are inherited by every thread (per this crate's own seatbelt module doc
     // comment), so a thread spawned pre-sandbox keeps running exactly as before after the main
     // thread sandboxes itself.
+    let input_handler = build_input_handler(shim.input_registry(), shim.framebuffer(), platform);
     let vnc_worker = if cli_args.vnc {
         let framebuffer = shim
             .framebuffer()
@@ -441,7 +703,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             "vnc server listening"
         );
         let shutdown_handle = server.shutdown_handle();
-        let on_input = build_input_handler(shim.input_registry(), shim.framebuffer(), platform);
+        let on_input = input_handler.clone();
         let worker = std::thread::spawn(move || {
             if let Err(e) = server.run(on_input) {
                 litebox_util_log::warn!(error:% = e; "vnc server stopped");
@@ -474,7 +736,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             addr:% = server.local_addr().map_err(|e| anyhow!("{e}"))?;
             "web viewer listening -- open http://127.0.0.1 at this port"
         );
-        let on_input = build_input_handler(shim.input_registry(), shim.framebuffer(), platform);
+        let on_input = input_handler.clone();
         std::thread::spawn(move || {
             if let Err(e) = server.run(on_input) {
                 litebox_util_log::warn!(error:% = e; "web viewer server stopped");
@@ -491,6 +753,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .listen_in_guest(std::net::SocketAddr::from(net_proxy::PROXY_ADDR), 16)
             .map_err(|e| anyhow!("failed to start the in-guest proxy listener: {e:?}"))?;
         let resolvers = net_proxy::snapshot_resolvers();
+        let tls = net_proxy::build_tls_client_config()
+            .map_err(|e| anyhow!("failed to load host TLS trust roots: {e}"))?;
         litebox_util_log::info!(
             addr:? = net_proxy::PROXY_ADDR, resolvers:? = resolvers;
             "guest http proxy listening"
@@ -502,9 +766,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             addr:? = net_proxy::DNS_ADDR;
             "guest dns responder listening"
         );
+        let icmp_host = net_proxy::open_icmp_socket()
+            .map_err(|e| anyhow!("failed to open the host ICMP echo socket: {e}"))?;
+        let icmp_socket = shim
+            .bind_udp_in_guest(std::net::SocketAddr::V4(litebox::net::ICMP_ECHO_PROXY_ADDR))
+            .map_err(|e| anyhow!("failed to start the in-guest ICMP echo bridge: {e:?}"))?;
+        litebox_util_log::info!(
+            addr:% = litebox::net::ICMP_ECHO_PROXY_ADDR;
+            "guest ICMP echo bridge listening"
+        );
         let dns_resolvers = resolvers.clone();
         std::thread::spawn(move || net_proxy::serve_dns(&dns_socket, dns_resolvers));
-        std::thread::spawn(move || net_proxy::serve(&listener, resolvers));
+        std::thread::spawn(move || net_proxy::serve_icmp(&icmp_socket, icmp_host));
+        std::thread::spawn(move || net_proxy::serve(&listener, resolvers, tls));
     }
 
     let argv = cli_args
@@ -515,30 +789,43 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 .map_err(|e| anyhow!("program argument {x:?} contains an embedded NUL byte: {e}"))
         })
         .collect::<Result<Vec<_>>>()?;
-    let envp: Vec<_> = cli_args
-        .environment_variables
+    let mut guest_environment = cli_args.environment_variables.clone();
+    if cli_args.net_proxy {
+        const PROXY_URL: &str = "http://127.0.0.1:3128";
+        for (name, value) in [
+            ("http_proxy", PROXY_URL),
+            ("https_proxy", PROXY_URL),
+            ("HTTP_PROXY", PROXY_URL),
+            ("HTTPS_PROXY", PROXY_URL),
+            ("no_proxy", "localhost,127.0.0.1,::1"),
+            ("NO_PROXY", "localhost,127.0.0.1,::1"),
+        ] {
+            if !guest_environment
+                .iter()
+                .any(|entry| entry.split_once('=').is_some_and(|(key, _)| key == name))
+            {
+                guest_environment.push(format!("{name}={value}"));
+            }
+        }
+    }
+    if cli_args.forward_environment_variables {
+        for (name, value) in std::env::vars() {
+            if !guest_environment
+                .iter()
+                .any(|entry| entry.split_once('=').is_some_and(|(key, _)| key == name))
+            {
+                guest_environment.push(format!("{name}={value}"));
+            }
+        }
+    }
+    let envp = guest_environment
         .iter()
-        .map(|x| {
-            std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).map_err(|e| {
-                anyhow!("environment variable {x:?} contains an embedded NUL byte: {e}")
+        .map(|entry| {
+            std::ffi::CString::new(entry.bytes().collect::<Vec<u8>>()).map_err(|e| {
+                anyhow!("environment variable {entry:?} contains an embedded NUL byte: {e}")
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let envp = if cli_args.forward_environment_variables {
-        let forwarded = std::env::vars()
-            .map(|(k, v)| {
-                std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
-                    .map_err(|e| {
-                        anyhow!(
-                            "host environment variable {k:?} contains an embedded NUL byte: {e}"
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        envp.into_iter().chain(forwarded).collect()
-    } else {
-        envp
-    };
 
     // Drop into the Seatbelt sandbox before any guest-controlled byte is parsed.
     // This is the exact counterpart, and the exact lifecycle position, of the

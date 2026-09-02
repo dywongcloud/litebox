@@ -81,6 +81,26 @@ impl StdinPump {
         n
     }
 
+    /// Attempts to enqueue all of `data` without waiting for the consumer. Returns `false` and
+    /// leaves the buffer unchanged if there is not enough room for the whole slice. This is useful
+    /// for latency-sensitive producers such as an input-client reader: they must never stall behind
+    /// a guest that has stopped draining stdin, and partially enqueuing a multi-byte terminal escape
+    /// sequence would corrupt the next sequence the guest reads.
+    pub fn try_push_all(&self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        let mut prod = self.prod.lock();
+        if prod.vacant_len() < data.len() {
+            return false;
+        }
+        let n = prod.push_slice(data);
+        drop(prod);
+        debug_assert_eq!(n, data.len());
+        self.notify(Events::IN);
+        true
+    }
+
     /// Marks the real host stdin as closed/EOF. Idempotent; safe to call more than once (e.g. if
     /// the background reader thread sees repeated EOF reads).
     pub fn mark_eof(&self) {
@@ -147,6 +167,12 @@ impl IOPollable for StdinPump {
         self.observers
             .lock()
             .push((observer, filter | Events::ALWAYS_POLLED));
+    }
+
+    fn unregister_observer(&self, observer: Weak<dyn Observer<Events>>) {
+        self.observers
+            .lock()
+            .retain(|(registered, _)| !registered.ptr_eq(&observer));
     }
 
     fn check_io_events(&self) -> Events {

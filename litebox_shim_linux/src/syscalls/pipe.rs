@@ -10,7 +10,7 @@
 use core::num::NonZero;
 
 use litebox::{
-    event::{IOPollable, wait::WaitContext},
+    event::wait::WaitContext,
     fd::MetadataError,
     fs::{Mode, OFlags},
     pipes::{Flags, HalfPipeType, PipeFd},
@@ -155,13 +155,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         Ok(read_write_mode.bits() | InodeType::NamedPipe as u32)
     }
 
-    pub(crate) fn with_linux_pipe_iopollable<R>(
-        &self,
-        fd: &PipeFd<Platform>,
-        f: impl FnOnce(&dyn IOPollable) -> R,
-    ) -> Result<R, Errno> {
-        self.pipes.with_iopollable(fd, f).map_err(Errno::from)
-    }
 }
 
 fn metadata_to_errno(err: MetadataError) -> Errno {

@@ -29,9 +29,9 @@ use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::server::{FramebufferSource, InputEvent, KeyEvent, PointerEvent};
-
-type InputHandler = dyn Fn(InputEvent) + Send + Sync;
+use crate::server::{
+    FramebufferSource, InputClient, InputEvent, InputHandler, InputMessage, KeyEvent, PointerEvent,
+};
 
 /// Interval between frame pushes to a connected browser. Same cadence as the RFB server's
 /// `UPDATE_INTERVAL`; unchanged frames are skipped entirely, so idle cost is one snapshot+hash
@@ -92,7 +92,7 @@ impl<F: FramebufferSource> WebServer<F> {
     /// # Errors
     ///
     /// Returns any accept-loop error other than the polling `WouldBlock`.
-    pub fn run(&self, on_input: impl Fn(InputEvent) + Send + Sync + 'static) -> io::Result<()> {
+    pub fn run(&self, on_input: impl Fn(InputMessage) + Send + Sync + 'static) -> io::Result<()> {
         self.listener.set_nonblocking(true)?;
         let on_input: Arc<InputHandler> = Arc::new(on_input);
         while !self.shutdown.load(Ordering::Relaxed) {
@@ -273,6 +273,22 @@ impl WsWriter {
         }
         self.write(|stream| write_ws_frame(stream, true, opcode, payload))
     }
+
+    fn try_write_control(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        if !matches!(opcode, 0x8 | 0xa) || payload.len() > 125 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid WebSocket control frame",
+            ));
+        }
+        let Ok(mut stream) = self.stream.try_lock() else {
+            // A framebuffer write can fill the socket after the peer has stopped reading. Input
+            // teardown must never wait behind it; closing the TCP stream is itself a valid close
+            // response when the best-effort control frame cannot be written immediately.
+            return Ok(());
+        };
+        write_ws_frame(&mut stream, true, opcode, payload)
+    }
 }
 
 /// After the 101: a pusher thread streams changed frames while this thread reads input
@@ -285,6 +301,7 @@ fn serve_websocket<F: FramebufferSource>(
     let write_stream = stream.try_clone()?;
     write_stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
     let writer = Arc::new(WsWriter::new(write_stream));
+    let mut input_client = InputClient::connect(&**on_input);
     let pusher_stop = Arc::new(AtomicBool::new(false));
     let pusher = {
         let framebuffer = Arc::clone(framebuffer);
@@ -322,7 +339,9 @@ fn serve_websocket<F: FramebufferSource>(
         })
     };
 
-    let result = read_ws_loop(stream, &writer, on_input);
+    let result = read_ws_loop(stream, &writer, &mut input_client);
+    // Input cleanup must not wait behind a framebuffer writer blocked on the disconnected socket.
+    drop(input_client);
     pusher_stop.store(true, Ordering::Relaxed);
     let _ = pusher.join();
     result
@@ -371,7 +390,7 @@ fn write_ws_frame(stream: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8])
 fn read_ws_loop(
     mut stream: TcpStream,
     writer: &WsWriter,
-    on_input: &Arc<InputHandler>,
+    input_client: &mut InputClient<'_>,
 ) -> io::Result<()> {
     loop {
         let mut hdr = [0u8; 2];
@@ -418,13 +437,13 @@ fn read_ws_loop(
             0x2 => match payload.first() {
                 Some(1) if payload.len() == 6 => {
                     let key = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
-                    on_input(InputEvent::Key(KeyEvent {
+                    input_client.send(InputEvent::Key(KeyEvent {
                         down: payload[1] != 0,
                         key,
                     }));
                 }
                 Some(2) if payload.len() == 6 => {
-                    on_input(InputEvent::Pointer(PointerEvent {
+                    input_client.send(InputEvent::Pointer(PointerEvent {
                         button_mask: payload[1],
                         x: u16::from_be_bytes([payload[2], payload[3]]),
                         y: u16::from_be_bytes([payload[4], payload[5]]),
@@ -441,7 +460,8 @@ fn read_ws_loop(
             0x9 => writer.write_control(0xa, &payload)?,
             // Close -> close with the same payload.
             0x8 => {
-                writer.write_control(0x8, &payload)?;
+                input_client.disconnect();
+                writer.try_write_control(0x8, &payload)?;
                 return Ok(());
             }
             // Pong has no application effect.

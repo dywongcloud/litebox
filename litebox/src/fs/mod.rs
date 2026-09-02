@@ -37,11 +37,117 @@ use errors::{
 /// A private module, to help support writing sealed traits. This module should _itself_ never be
 /// made public.
 mod private {
+    /// Capability required for physical upper-layer scaffolding during copy-up.
+    ///
+    /// The constructor is private to this module, so ordinary filesystem callers cannot bypass
+    /// merged-namespace authorization checks.
+    pub struct CopyUpToken(());
+
+    pub const COPY_UP: CopyUpToken = CopyUpToken(());
+
     /// A trait to help seal the main `FileSystem` trait.
     ///
     /// This trait is explicitly public, but unnameable, thereby preventing code outside this crate
     /// from implementing this trait.
-    pub trait Sealed {}
+    pub trait Sealed {
+        /// Materialize a directory that already exists in a lower layer. The default backend has no
+        /// privileged copy-up facility and therefore performs an ordinary `mkdir`; writable upper
+        /// backends may override this while keeping the capability inaccessible to callers.
+        fn mkdir_for_copy_up(
+            &self,
+            _token: &CopyUpToken,
+            path: &str,
+            mode: super::Mode,
+            _owner: super::UserInfo,
+        ) -> Result<(), super::errors::MkdirError>
+        where
+            Self: super::FileSystem,
+        {
+            self.mkdir(path, mode)
+        }
+
+        /// Create a private regular-file staging node for copy-up. As with
+        /// [`Self::mkdir_for_copy_up`], only a backend that can atomically install the supplied
+        /// ownership should override the ordinary fallback.
+        fn create_file_for_copy_up(
+            &self,
+            _token: &CopyUpToken,
+            path: &str,
+            mode: super::Mode,
+            _owner: super::UserInfo,
+        ) -> Result<crate::fd::TypedFd<Self>, super::errors::OpenError>
+        where
+            Self: super::FileSystem,
+        {
+            self.open(
+                path,
+                super::OFlags::CREAT | super::OFlags::EXCL | super::OFlags::WRONLY,
+                mode,
+            )
+        }
+
+        /// Publish a fully prepared private regular-file staging node. Writable upper backends may
+        /// bypass physical-parent permissions here because the layered filesystem already checked
+        /// authorization against the merged parent before it began copy-up.
+        fn publish_file_for_copy_up(
+            &self,
+            _token: &CopyUpToken,
+            staging_path: &str,
+            destination_path: &str,
+        ) -> Result<(), super::errors::RenameError>
+        where
+            Self: super::FileSystem,
+        {
+            self.rename(staging_path, destination_path, true)
+        }
+
+        /// Remove a private staging name while open descriptors retain its inode. This is used for
+        /// detached copy-up and for rollback; it has the same narrow physical-parent bypass as the
+        /// other copy-up capabilities.
+        fn remove_file_for_copy_up(
+            &self,
+            _token: &CopyUpToken,
+            staging_path: &str,
+        ) -> Result<(), super::errors::UnlinkError>
+        where
+            Self: super::FileSystem,
+        {
+            self.unlink(staging_path)
+        }
+
+        /// Read an already-open regular-file object for copy-up without consulting that open
+        /// description's guest-visible access mode or changing its offset. This is necessary for a
+        /// write-only descriptor whose pathname may already have been unlinked or replaced.
+        fn read_file_for_copy_up(
+            &self,
+            _token: &CopyUpToken,
+            fd: &crate::fd::TypedFd<Self>,
+            buf: &mut [u8],
+            offset: usize,
+        ) -> Result<usize, super::errors::ReadError>
+        where
+            Self: super::FileSystem,
+        {
+            self.read(fd, buf, Some(offset))
+        }
+
+        /// Preserve source timestamps on a private staging file. Backends with internal metadata
+        /// access may override this to retain ctime and bypass permissions already authorized by the
+        /// merged copy-up operation.
+        fn set_times_for_copy_up(
+            &self,
+            _token: &CopyUpToken,
+            fd: &crate::fd::TypedFd<Self>,
+            atime: super::Timestamp,
+            mtime: super::Timestamp,
+            _ctime: super::Timestamp,
+        ) -> Result<(), super::errors::UtimeError>
+        where
+            Self: super::FileSystem,
+        {
+            self.fd_utimensat(fd, Some(atime), Some(mtime))
+        }
+    }
 }
 
 /// A `FileSystem` provides access to all file-system related functionality provided by LiteBox.
@@ -223,6 +329,17 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
     fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError>;
 
+    /// Run `f` while holding exclusive access to a directory open-file description's position.
+    ///
+    /// Independent opens have independent positions, while duplicated descriptors share one
+    /// position. Callers can therefore atomically consume a directory snapshot and publish the
+    /// continuation position that a later directory read or [`Self::seek`] observes.
+    fn with_dir_position<T>(
+        &self,
+        fd: &TypedFd<Self>,
+        f: impl FnOnce(&mut usize) -> T,
+    ) -> Result<T, ReadDirError>;
+
     /// Obtain the status of a file/directory/... on the file-system.
     fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
 
@@ -238,6 +355,171 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         None
+    }
+
+    fn open_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, OpenError> {
+        self.open(path, flags, mode)
+    }
+
+    fn open_executable_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+    ) -> Result<(TypedFd<Self>, FileStatus), OpenError> {
+        let path = path
+            .as_rust_str()
+            .map_err(errors::PathError::from)
+            .map_err(OpenError::from)?;
+        let searched_status = self.file_status_as(credentials, path).map_err(|error| match error {
+            FileStatusError::PathError(error) => OpenError::PathError(error),
+            FileStatusError::Io | FileStatusError::ClosedFd => OpenError::Io,
+        })?;
+        if !matches!(searched_status.file_type, FileType::RegularFile)
+            || !dac_allows_as(
+                credentials,
+                searched_status.owner,
+                searched_status.mode,
+                DacAccessKind::NonDirectoryExecute,
+            )
+        {
+            return Err(OpenError::AccessNotAllowed);
+        }
+        let fd = self.open_as(
+            AccessCredentials::root(),
+            path,
+            OFlags::RDONLY,
+            Mode::empty(),
+        )?;
+        let opened_status = self.fd_file_status(&fd).map_err(|_| OpenError::Io)?;
+        if opened_status.node_info != searched_status.node_info {
+            let _ = self.close(&fd);
+            return Err(OpenError::Io);
+        }
+        Ok((fd, opened_status))
+    }
+
+    fn chmod_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        self.chmod(path, mode)
+    }
+
+    fn fd_chmod_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        fd: &TypedFd<Self>,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        self.fd_chmod(fd, mode)
+    }
+
+    fn chown_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        self.chown(path, user, group)
+    }
+
+    fn fd_chown_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        fd: &TypedFd<Self>,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        self.fd_chown(fd, user, group)
+    }
+
+    fn utimensat_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        self.utimensat(path, atime, mtime)
+    }
+
+    fn fd_utimensat_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        fd: &TypedFd<Self>,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        self.fd_utimensat(fd, atime, mtime)
+    }
+
+    fn unlink_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+    ) -> Result<(), UnlinkError> {
+        self.unlink(path)
+    }
+
+    fn mkdir_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
+        self.mkdir(path, mode)
+    }
+
+    fn rmdir_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+    ) -> Result<(), RmdirError> {
+        self.rmdir(path)
+    }
+
+    fn symlink_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        target: &str,
+        linkpath: impl path::Arg,
+    ) -> Result<(), SymlinkError> {
+        self.symlink(target, linkpath)
+    }
+
+    fn readlink_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+    ) -> Result<alloc::string::String, ReadlinkError> {
+        self.readlink(path)
+    }
+
+    fn rename_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        oldpath: impl path::Arg,
+        newpath: impl path::Arg,
+        noreplace: bool,
+    ) -> Result<(), RenameError> {
+        self.rename(oldpath, newpath, noreplace)
+    }
+
+    fn file_status_as(
+        &self,
+        _credentials: AccessCredentials<'_>,
+        path: impl path::Arg,
+    ) -> Result<FileStatus, FileStatusError> {
+        self.file_status(path)
     }
 }
 
@@ -382,6 +664,21 @@ bitflags! {
     }
 }
 
+impl OFlags {
+    /// Apply Linux's `O_PATH` flag filtering before pathname lookup or open-time side effects.
+    ///
+    /// With `O_PATH`, only `O_CLOEXEC`, `O_DIRECTORY`, and `O_NOFOLLOW` remain meaningful; all
+    /// other flag bits, including the access mode, `O_CREAT`, and `O_TRUNC`, are ignored.
+    #[must_use]
+    pub fn normalized_for_open(self) -> Self {
+        if self.contains(Self::PATH) {
+            self & (Self::PATH | Self::CLOEXEC | Self::DIRECTORY | Self::NOFOLLOW)
+        } else {
+            self
+        }
+    }
+}
+
 /// The `whence` directive to [`FileSystem::seek`]
 #[derive(Copy, Clone)]
 pub enum SeekWhence {
@@ -439,6 +736,53 @@ pub struct UserInfo {
     pub group: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AccessCredentials<'a> {
+    user: u32,
+    group: u32,
+    supplementary_groups: &'a [u32],
+}
+
+impl<'a> AccessCredentials<'a> {
+    pub const fn new(user: u32, group: u32, supplementary_groups: &'a [u32]) -> Self {
+        Self {
+            user,
+            group,
+            supplementary_groups,
+        }
+    }
+
+    pub const fn root() -> AccessCredentials<'static> {
+        AccessCredentials::new(0, 0, &[])
+    }
+
+    pub(crate) const fn user(self) -> u32 {
+        self.user
+    }
+
+    pub(crate) fn as_user_info(self) -> Option<UserInfo> {
+        Some(UserInfo {
+            user: self.user.try_into().ok()?,
+            group: self.group.try_into().ok()?,
+        })
+    }
+
+    pub(crate) fn owns(self, owner: UserInfo) -> bool {
+        self.user == u32::from(owner.user)
+    }
+
+    pub(crate) fn in_group(self, group: u16) -> bool {
+        let group = u32::from(group);
+        self.group == group || self.supplementary_groups.contains(&group)
+    }
+}
+
+impl From<UserInfo> for AccessCredentials<'static> {
+    fn from(value: UserInfo) -> Self {
+        Self::new(u32::from(value.user), u32::from(value.group), &[])
+    }
+}
+
 /// Device/Inode information
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct NodeInfo {
@@ -462,6 +806,62 @@ pub struct DirEntry {
 impl UserInfo {
     /// The root user
     pub const ROOT: Self = Self { user: 0, group: 0 };
+}
+
+/// The operation whose discretionary-access-control permission is being evaluated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DacAccessKind {
+    Read,
+    Write,
+    DirectorySearch,
+    #[allow(
+        dead_code,
+        reason = "the filesystem has no regular-file execution permission caller yet"
+    )]
+    NonDirectoryExecute,
+}
+
+pub(crate) fn dac_allows_as(
+    current: AccessCredentials<'_>,
+    owner: UserInfo,
+    mode: Mode,
+    access: DacAccessKind,
+) -> bool {
+    if current.user() == 0 {
+        return match access {
+            DacAccessKind::Read | DacAccessKind::Write | DacAccessKind::DirectorySearch => true,
+            DacAccessKind::NonDirectoryExecute => {
+                mode.intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH)
+            }
+        };
+    }
+
+    let (owner_bit, group_bit, other_bit) = match access {
+        DacAccessKind::Read => (Mode::RUSR, Mode::RGRP, Mode::ROTH),
+        DacAccessKind::Write => (Mode::WUSR, Mode::WGRP, Mode::WOTH),
+        DacAccessKind::DirectorySearch | DacAccessKind::NonDirectoryExecute => {
+            (Mode::XUSR, Mode::XGRP, Mode::XOTH)
+        }
+    };
+    if current.owns(owner) {
+        mode.contains(owner_bit)
+    } else if current.in_group(owner.group) {
+        mode.contains(group_bit)
+    } else {
+        mode.contains(other_bit)
+    }
+}
+
+pub(crate) fn sticky_directory_allows_removal(
+    credentials: AccessCredentials<'_>,
+    parent_owner: UserInfo,
+    parent_mode: Mode,
+    victim_owner: UserInfo,
+) -> bool {
+    !parent_mode.contains(Mode::SVTX)
+        || credentials.user() == 0
+        || credentials.owns(parent_owner)
+        || credentials.owns(victim_owner)
 }
 
 /// The size reported as the size of a directory.

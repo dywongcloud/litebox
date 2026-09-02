@@ -72,7 +72,7 @@
       <property name="items" type="array">
         <!-- xfce4-terminal is installed but segfaults on launch under this
              platform's x18 constraint (its GTK/VTE code sits outside the
-             x18-fixed package closure -- see build-x18-desktop-repo.sh's
+             x18-fixed package closure; see build-x18-desktop-repo.sh's
              DEFAULT_PACKAGES comment). xterm is in that closure and is the
              terminal start-desktop.sh actually launches and verifies, so
              the taskbar launcher points at it directly instead. -->

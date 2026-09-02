@@ -6,6 +6,7 @@
 //! move, and protect memory mappings within a process's virtual address space.
 
 use core::ops::Range;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use rangemap::RangeMap;
@@ -73,22 +74,13 @@ bitflags::bitflags! {
 
 impl VmFlags {
     /// Compute the default `VM_MAY*` and `VM_SHARED` flags for a mapping.
-    ///
-    /// Write permission (`VM_MAYWRITE`) is restricted only for shared **file-backed**
-    /// mappings, because writes cannot be propagated back to the underlying file.
-    pub(super) fn may_flags_for_mapping(shared: bool, file_backed: bool) -> Self {
-        let restrict_write = shared && file_backed;
-        let may = if restrict_write {
-            Self::VM_MAY_ACCESS_FLAGS & !Self::VM_MAYWRITE
-        } else {
-            Self::VM_MAY_ACCESS_FLAGS
-        };
+    pub(super) fn may_flags_for_mapping(shared: bool, _file_backed: bool) -> Self {
         let shared_flag = if shared {
             Self::VM_SHARED
         } else {
             Self::empty()
         };
-        may | shared_flag
+        Self::VM_MAY_ACCESS_FLAGS | shared_flag
     }
 }
 
@@ -277,6 +269,37 @@ impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
     }
 }
 
+static NEXT_SHARED_FUTEX_BACKING_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Stable identity of one shared memory backing object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedFutexBacking {
+    identity: usize,
+}
+
+impl SharedFutexBacking {
+    /// Allocates a process-wide identity that is never reused.
+    pub fn new() -> Self {
+        let identity = NEXT_SHARED_FUTEX_BACKING_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+                identity.checked_add(1)
+            })
+            .expect("shared futex backing identity space exhausted");
+        Self { identity }
+    }
+
+    /// Returns this backing object's process-wide stable identity.
+    pub fn identity(self) -> usize {
+        self.identity
+    }
+}
+
+impl Default for SharedFutexBacking {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Virtual memory area
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct VmArea {
@@ -284,6 +307,21 @@ pub(super) struct VmArea {
     flags: VmFlags,
     /// Whether this area is backed by a file
     is_file_backed: bool,
+    /// Identity and original virtual origin of shared backing, used to derive futex keys that
+    /// survive virtual-address moves without aliasing unrelated shared mappings.
+    shared_futex: Option<SharedFutexMapping>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedFutexPosition {
+    PendingOffset(usize),
+    Origin(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedFutexMapping {
+    identity: usize,
+    position: SharedFutexPosition,
 }
 
 impl VmArea {
@@ -301,10 +339,18 @@ impl VmArea {
 
     /// Create a new [`VmArea`] with the given flags.
     #[inline]
-    pub(super) fn new(flags: VmFlags, is_file_backed: bool) -> Self {
+    pub(super) fn new(
+        flags: VmFlags,
+        is_file_backed: bool,
+        shared_futex_backing: Option<(SharedFutexBacking, usize)>,
+    ) -> Self {
         Self {
             flags,
             is_file_backed,
+            shared_futex: shared_futex_backing.map(|(backing, offset)| SharedFutexMapping {
+                identity: backing.identity,
+                position: SharedFutexPosition::PendingOffset(offset),
+            }),
         }
     }
 }
@@ -342,6 +388,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmArea {
                     flags: VmFlags::empty(),
                     is_file_backed: false,
+                    shared_futex: None,
                 },
             );
         }
@@ -354,6 +401,51 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         self.vmas.iter()
     }
 
+    /// Returns the flags for the mapping containing `address`.
+    pub(super) fn flags_at(&self, address: usize) -> Option<VmFlags> {
+        self.vmas
+            .get_key_value(&address)
+            .map(|(_, vma)| vma.flags())
+    }
+
+    /// Returns a shared-backing futex identity and byte offset for `address`.
+    pub(super) fn shared_futex_key_at(&self, address: usize) -> Option<(usize, usize)> {
+        let (_, vma) = self.vmas.get_key_value(&address)?;
+        let shared = vma.shared_futex?;
+        let SharedFutexPosition::Origin(origin) = shared.position else {
+            return None;
+        };
+        Some((shared.identity, address.wrapping_sub(origin)))
+    }
+
+    fn assign_shared_futex_identity(&mut self, vma: &mut VmArea, origin: usize) {
+        if !vma.flags.contains(VmFlags::VM_SHARED) {
+            vma.shared_futex = None;
+            return;
+        }
+        match vma.shared_futex {
+            Some(SharedFutexMapping {
+                identity,
+                position: SharedFutexPosition::PendingOffset(offset),
+            }) => {
+                vma.shared_futex = Some(SharedFutexMapping {
+                    identity,
+                    position: SharedFutexPosition::Origin(origin.wrapping_sub(offset)),
+                });
+            }
+            Some(SharedFutexMapping {
+                position: SharedFutexPosition::Origin(_),
+                ..
+            }) => {}
+            None => {
+                vma.shared_futex = Some(SharedFutexMapping {
+                    identity: SharedFutexBacking::new().identity,
+                    position: SharedFutexPosition::Origin(origin),
+                });
+            }
+        }
+    }
+
     /// Insert an already-allocated region (e.g., via CoW) without calling the platform allocator.
     ///
     /// Any existing tracked mappings that overlap `range` are silently removed from tracking
@@ -362,8 +454,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) fn register_existing_mapping_overwrite(
         &mut self,
         range: PageRange<ALIGN>,
-        vma: VmArea,
+        mut vma: VmArea,
     ) {
+        self.assign_shared_futex_identity(&mut vma, range.start);
         self.vmas.insert(range.into(), vma);
     }
 
@@ -473,7 +566,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn insert_mapping(
         &mut self,
         suggested_range: PageRange<ALIGN>,
-        vma: VmArea,
+        mut vma: VmArea,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
@@ -523,6 +616,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 }
             }
         };
+        if vma.flags.contains(VmFlags::VM_SHARED) && vma.shared_futex.is_none() {
+            vma.shared_futex = Some(SharedFutexMapping {
+                identity: SharedFutexBacking::new().identity,
+                position: SharedFutexPosition::PendingOffset(0),
+            });
+        }
+        let shared_allocation = vma.shared_futex.map(|shared| {
+            let offset = match shared.position {
+                SharedFutexPosition::PendingOffset(offset) => offset,
+                SharedFutexPosition::Origin(origin) => start.wrapping_sub(origin),
+            };
+            (shared.identity, offset)
+        });
         let permissions: u8 = vma
             .flags
             .intersection(VmFlags::VM_ACCESS_FLAGS)
@@ -536,21 +642,35 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        let ret = self
-            .platform
-            .allocate_pages(
-                suggested_range.into(),
-                MemoryRegionPermissions::from_bits(permissions).unwrap(),
+        let permissions = MemoryRegionPermissions::from_bits(permissions).unwrap();
+        let suggested_range = Range::from(suggested_range);
+        let suggested_len = suggested_range.len();
+        let ret = if let Some((identity, offset)) = shared_allocation {
+            self.platform.allocate_shared_pages(
+                identity,
+                offset,
+                suggested_range,
+                permissions,
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
                 platform_fixed_address_behavior,
             )
-            .map_err(|err| match err {
-                AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-                other => other,
-            })?;
+        } else {
+            self.platform.allocate_pages(
+                suggested_range,
+                permissions,
+                vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                populate_pages_immediately,
+                platform_fixed_address_behavior,
+            )
+        }
+        .map_err(|err| match err {
+            AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+            other => other,
+        })?;
         let new_start = ret.as_usize();
-        let new_end = new_start + suggested_range.len();
+        let new_end = new_start + suggested_len;
+        self.assign_shared_futex_identity(&mut vma, new_start);
         self.vmas.insert(new_start..new_end, vma);
         debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
         debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
@@ -682,8 +802,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             if self.vmas.overlaps(&r) {
                 return Err(VmemResizeError::RangeOccupied(r));
             }
-            if cur_vma.is_file_backed() {
-                unimplemented!("file-backed mapping expansion is not supported yet");
+            if cur_vma.is_file_backed() && !cur_vma.flags.contains(VmFlags::VM_SHARED) {
+                unimplemented!("private file-backed mapping expansion is not supported yet");
             }
             let range = PageRange::new(range.end, new_end).unwrap();
             // Try to extend the mapping. Although we checked that there are no
@@ -744,22 +864,49 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .expect("VMEM: range not found");
         assert!(cur_range.contains(&(old_range.end - 1)));
 
-        if vma.is_file_backed() {
-            unimplemented!("file-backed mapping move is not supported yet");
+        if vma.is_file_backed() && !vma.flags.contains(VmFlags::VM_SHARED) {
+            unimplemented!("private file-backed mapping move is not supported yet");
         }
         let new_addr = self
             .get_unmmaped_area(suggested_new_address, new_size, false)
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
+        let shared_remap = vma.shared_futex.map(|shared| {
+            let SharedFutexPosition::Origin(origin) = shared.position else {
+                unreachable!("installed shared futex mappings always have an origin")
+            };
+            (
+                shared.identity,
+                old_range.start.wrapping_sub(origin),
+            )
+        });
         let new_addr = unsafe {
-            self.platform
-                .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
+            if let Some((identity, offset)) = shared_remap {
+                self.platform.remap_shared_pages(
+                    identity,
+                    offset,
+                    old_range.into(),
+                    new_range.into(),
+                    vma.flags.into(),
+                )
+            } else {
+                self.platform
+                    .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
+            }
         }
         .map_err(VmemMoveError::RemapError)?;
 
+        let mut moved_vma = *vma;
         let new_start = new_addr.as_usize();
         let new_end = new_start + new_size.as_usize();
-        self.vmas.insert(new_start..new_end, *vma);
+        if let Some(shared) = &mut moved_vma.shared_futex {
+            let SharedFutexPosition::Origin(origin) = &mut shared.position else {
+                unreachable!("installed shared futex mappings always have an origin")
+            };
+            let old_offset = old_range.start.wrapping_sub(*origin);
+            *origin = new_start.wrapping_sub(old_offset);
+        }
+        self.vmas.insert(new_start..new_end, moved_vma);
         self.vmas.remove(old_range.into());
         Ok(new_addr)
     }
@@ -825,6 +972,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmArea {
                     flags: new_flags,
                     is_file_backed: vma.is_file_backed,
+                    shared_futex: vma.shared_futex,
                 },
             );
             if !before.is_empty() {
@@ -864,6 +1012,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         perms: MemoryRegionPermissions,
+        shared_futex_backing: Option<(SharedFutexBacking, usize)>,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
@@ -880,6 +1029,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                             VmFlags::empty()
                         },
                     flags.contains(CreatePagesFlags::MAP_FILE),
+                    shared_futex_backing,
                 ),
                 flags,
             )

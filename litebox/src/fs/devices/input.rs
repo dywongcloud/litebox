@@ -152,8 +152,13 @@ impl QueuedEvent {
 /// injection must never block or grow without bound when no guest is reading).
 const QUEUE_CAP: usize = 1024;
 
+struct DeviceData {
+    queue: VecDeque<QueuedEvent>,
+    key_bitmap: [u8; KEY_BITMAP_BYTES],
+}
+
 struct DeviceState<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
-    queue: Mutex<Platform, VecDeque<QueuedEvent>>,
+    data: Mutex<Platform, DeviceData>,
     pollee: Pollee<Platform>,
 }
 
@@ -256,7 +261,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
     #[must_use]
     pub fn new() -> Self {
         let device = || DeviceState {
-            queue: Mutex::new(VecDeque::new()),
+            data: Mutex::new(DeviceData {
+                queue: VecDeque::new(),
+                key_bitmap: [0; KEY_BITMAP_BYTES],
+            }),
             pollee: Pollee::new(),
         };
         Self {
@@ -282,12 +290,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
         let usec = u64::from(now.subsec_micros());
         let dev = &self.inner.devices[kind.index()];
         {
-            let mut queue = dev.queue.lock();
+            let mut data = dev.data.lock();
             for &(r#type, code, value) in events {
-                if queue.len() >= QUEUE_CAP {
-                    queue.pop_front();
+                if r#type == EV_KEY && usize::from(code) <= KEY_MAX {
+                    let bit = usize::from(code);
+                    if value == 0 {
+                        data.key_bitmap[bit / 8] &= !(1 << (bit % 8));
+                    } else if value == 1 {
+                        data.key_bitmap[bit / 8] |= 1 << (bit % 8);
+                    }
                 }
-                queue.push_back(QueuedEvent {
+                if data.queue.len() >= QUEUE_CAP {
+                    data.queue.pop_front();
+                }
+                data.queue.push_back(QueuedEvent {
                     sec,
                     usec,
                     r#type,
@@ -296,10 +312,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
                 });
             }
             // Every batch ends in a SYN_REPORT so consumers see a complete frame.
-            if queue.len() >= QUEUE_CAP {
-                queue.pop_front();
+            if data.queue.len() >= QUEUE_CAP {
+                data.queue.pop_front();
             }
-            queue.push_back(QueuedEvent {
+            data.queue.push_back(QueuedEvent {
                 sec,
                 usec,
                 r#type: EV_SYN,
@@ -386,17 +402,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
             return self.mice_try_drain(buf);
         }
         let dev = &self.inner.devices[kind.index()];
-        let mut queue = dev.queue.lock();
+        let mut data = dev.data.lock();
         let mut written = 0;
         while written + INPUT_EVENT_SIZE <= buf.len() {
-            let Some(event) = queue.pop_front() else {
+            let Some(event) = data.queue.pop_front() else {
                 break;
             };
             event.serialize_into(&mut buf[written..written + INPUT_EVENT_SIZE]);
             written += INPUT_EVENT_SIZE;
         }
-        if !queue.is_empty() {
-            drop(queue);
+        if !data.queue.is_empty() {
+            drop(data);
             // More events remain: leave the readiness signal up for the next reader/poller.
             dev.pollee.notify_observers(Events::IN);
         }
@@ -416,7 +432,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
             return Some(events);
         }
         let dev = &self.inner.devices[kind.index()];
-        if !dev.queue.lock().is_empty() {
+        if !dev.data.lock().queue.is_empty() {
             events |= Events::IN;
         }
         Some(events)
@@ -438,6 +454,26 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
                 self.inner.devices[kind.index()]
                     .pollee
                     .register_observer(observer, mask);
+            }
+            None => {}
+        }
+    }
+
+    /// Unregister a poll observer from the device at `minor`. No-op for a minor outside this
+    /// registry.
+    pub fn unregister_observer(
+        &self,
+        minor: usize,
+        observer: alloc::sync::Weak<dyn Observer<Events>>,
+    ) {
+        match DeviceKind::from_minor(minor) {
+            Some(DeviceKind::Mice) => {
+                self.inner.mice.pollee.unregister_observer(observer);
+            }
+            Some(kind) => {
+                self.inner.devices[kind.index()]
+                    .pollee
+                    .unregister_observer(observer);
             }
             None => {}
         }
@@ -656,10 +692,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
             // EVIOCGPHYS / EVIOCGUNIQ: unset -- ENOENT, the errno libevdev explicitly
             // tolerates (any other failure aborts its device setup).
             0x07 | 0x08 => EvdevIoctlReply::NoEntry,
-            // EVIOCGPROP / EVIOCGKEY / EVIOCGLED / EVIOCGSND / EVIOCGSW: all-zero bitmaps
-            // (no properties, no keys currently held as far as ioctl state goes, no
-            // LEDs/sounds/switches).
-            0x09 | 0x18 | 0x19 | 0x1a | 0x1b => copy_counted(&vec![0u8; size]),
+            // EVIOCGPROP / EVIOCGLED / EVIOCGSND / EVIOCGSW: all-zero bitmaps (no
+            // properties, LEDs, sounds, or switches).
+            0x09 | 0x19 | 0x1a | 0x1b => copy_counted(&vec![0u8; size]),
+            // EVIOCGKEY reports the device's current aggregate key/button state. This state is
+            // updated when input is injected, independently of whether queued records were read.
+            0x18 => {
+                let data = self.inner.devices[kind.index()].data.lock();
+                copy_counted(&data.key_bitmap)
+            }
             // EVIOCGBIT(ev, len): nr = 0x20 + ev.
             0x20..=0x3f => {
                 let ev = u16::try_from(nr - 0x20).unwrap_or(u16::MAX);

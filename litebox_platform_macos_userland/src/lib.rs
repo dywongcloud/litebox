@@ -70,11 +70,12 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::io::IsTerminal as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PermissionUpdateError,
+    PermissionUpdateError, RemapError, SharedPageIoError,
 };
 use litebox::platform::{ImmediatelyWokenUp, UnblockedOrTimedOut};
 use litebox::utils::TruncateExt as _;
@@ -84,9 +85,37 @@ extern crate alloc;
 
 mod darwin;
 mod guest;
+mod hvf;
+mod hvf_backing;
+mod hvf_memory;
 mod net;
 mod seatbelt;
 
+pub use hvf::{
+    HvfBoundaryReport, HvfError, HvfFeatureRegister, HvfFeatureRegisters, HvfMonitor,
+    HvfSdkResidualReport, HvfSmokeCleanupFailure, HvfSmokeCleanupReport, HvfSmokeError,
+    HvfSmokeReport, HvfSmokeResidualReport, HvfSmokeResourceReport, HvfSmokeResourceState,
+    HvfStageOneRegisterReport, HvfVmReport, hvf_boundary_probe, hvf_smoke_probe,
+    hvf_smoke_retry_residual, publish_hvf_executable_bytes,
+};
+pub use hvf_backing::{
+    HvfHostBackingError, HvfHostBackingReport, HvfHostResourceReport, hvf_host_backing_probe,
+    hvf_host_resource_report, hvf_host_retry_residual,
+};
+pub use hvf_memory::{
+    HvfAddressSpace, HvfAddressSpaceId, HvfAddressSpaceReport, HvfAsid, HvfBackingIdentity,
+    HvfClaim, HvfExecutableGeneration, HvfGuestPermissions, HvfLedgerEntry, HvfMemory,
+    HvfMemoryError,
+    HvfForkResult, HvfMemoryFailureReport, HvfMemoryLimits, HvfMemoryReport, HvfMemoryUsage,
+    HvfMutation,
+    HvfPoisonConcurrencyReport, HvfPublicationTicket, HvfQuarantineRetryReport,
+    HvfPublicationEpoch, HvfRegisterFailureReport, HvfRetirementReport, HvfRetirementTicket,
+    HvfRootGeneration, HvfSharing, HvfWriteEpoch,
+    HvfTranslationRegime, HvfUnmapFailureReport, HvfUnmapResult, HvfVcpuMemorySnapshot,
+    hvf_memory_failure_probe, hvf_memory_probe, hvf_poison_concurrency_probe,
+    hvf_register_failure_probe, hvf_unmap_failure_probe, with_hvf_memory_failure_probe,
+    with_hvf_memory_probe,
+};
 pub use seatbelt::{enable_seatbelt_sandbox, enable_seatbelt_sandbox_with_outbound_network};
 
 use darwin::{
@@ -129,6 +158,14 @@ pub struct MacOsUserland {
     stdout_lock: std::sync::Mutex<()>,
     /// Serializes real host writes to stderr; see [`Self::stdout_lock`].
     stderr_lock: std::sync::Mutex<()>,
+    /// One unlinked sparse host file, opened before Seatbelt is installed, whose disjoint extents
+    /// provide coherent physical storage for guest shared mappings. Keeping one descriptor open
+    /// avoids any host-filesystem operation after sandbox entry.
+    shared_page_file: OwnedFd,
+    /// Logical-backing-to-sparse-file extents and currently installed aliases.
+    shared_page_registry: std::sync::Mutex<SharedPageRegistry>,
+    /// Wakes mappings waiting for a concurrent first-time backing initialization to finish.
+    shared_page_init_condvar: Condvar,
     /// The `utun` socket used for guest networking, if one was requested.
     tun: Option<std::os::fd::OwnedFd>,
     /// CoW-eligible memory regions registered via [`Self::register_cow_region`].
@@ -144,6 +181,373 @@ struct CowRegionInfo {
     file_path: std::path::PathBuf,
     /// Length of the backing file's registered slice.
     file_length: usize,
+}
+
+#[derive(Clone)]
+struct SharedPageExtent {
+    logical_range: core::ops::Range<usize>,
+    file_offset: usize,
+}
+
+#[derive(Clone)]
+struct SharedPageAlias {
+    virtual_range: core::ops::Range<usize>,
+    backing_identity: usize,
+    backing_offset: usize,
+}
+
+#[derive(Default)]
+struct SharedPageRegistry {
+    backings: alloc::collections::BTreeMap<usize, alloc::vec::Vec<SharedPageExtent>>,
+    initialized: alloc::collections::BTreeMap<usize, alloc::vec::Vec<core::ops::Range<usize>>>,
+    initializing: alloc::collections::BTreeMap<usize, alloc::vec::Vec<core::ops::Range<usize>>>,
+    aliases: alloc::vec::Vec<SharedPageAlias>,
+    next_file_offset: usize,
+}
+
+impl SharedPageRegistry {
+    fn ensure_extents(
+        &mut self,
+        fd: libc::c_int,
+        backing_identity: usize,
+        logical_range: core::ops::Range<usize>,
+    ) -> Result<alloc::vec::Vec<(core::ops::Range<usize>, usize)>, AllocationError> {
+        let existing = self.backings.entry(backing_identity).or_default();
+        existing.sort_by_key(|extent| extent.logical_range.start);
+
+        let mut gaps = alloc::vec::Vec::new();
+        let mut cursor = logical_range.start;
+        for extent in existing.iter() {
+            if extent.logical_range.end <= cursor {
+                continue;
+            }
+            if extent.logical_range.start >= logical_range.end {
+                break;
+            }
+            if extent.logical_range.start > cursor {
+                gaps.push(cursor..extent.logical_range.start.min(logical_range.end));
+            }
+            cursor = cursor.max(extent.logical_range.end).min(logical_range.end);
+            if cursor == logical_range.end {
+                break;
+            }
+        }
+        if cursor < logical_range.end {
+            gaps.push(cursor..logical_range.end);
+        }
+
+        let mut next_file_offset = self.next_file_offset;
+        let mut additions = alloc::vec::Vec::with_capacity(gaps.len());
+        for gap in gaps {
+            let file_offset = next_file_offset;
+            next_file_offset = next_file_offset
+                .checked_add(gap.len())
+                .ok_or(AllocationError::OutOfMemory)?;
+            additions.push(SharedPageExtent {
+                logical_range: gap,
+                file_offset,
+            });
+        }
+        let file_len =
+            libc::off_t::try_from(next_file_offset).map_err(|_| AllocationError::OutOfMemory)?;
+        if next_file_offset != self.next_file_offset {
+            // SAFETY: `fd` is the platform-owned sparse backing file and remains open for the
+            // platform's lifetime. Growing an unlinked sparse file allocates no data blocks until
+            // a mapped page is written.
+            if unsafe { libc::ftruncate(fd, file_len) } != 0 {
+                return Err(AllocationError::OutOfMemory);
+            }
+            self.next_file_offset = next_file_offset;
+            existing.extend(additions);
+            existing.sort_by_key(|extent| extent.logical_range.start);
+        }
+
+        let mut result = alloc::vec::Vec::new();
+        for extent in existing.iter() {
+            let start = extent.logical_range.start.max(logical_range.start);
+            let end = extent.logical_range.end.min(logical_range.end);
+            if start < end {
+                result.push((
+                    start..end,
+                    extent.file_offset + (start - extent.logical_range.start),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    fn gaps_excluding(
+        requested: core::ops::Range<usize>,
+        mut covered: alloc::vec::Vec<core::ops::Range<usize>>,
+    ) -> alloc::vec::Vec<core::ops::Range<usize>> {
+        covered.sort_by_key(|range| range.start);
+        let mut gaps = alloc::vec::Vec::new();
+        let mut cursor = requested.start;
+        for range in covered {
+            if range.end <= cursor {
+                continue;
+            }
+            if range.start >= requested.end {
+                break;
+            }
+            if range.start > cursor {
+                gaps.push(cursor..range.start.min(requested.end));
+            }
+            cursor = cursor.max(range.end).min(requested.end);
+            if cursor == requested.end {
+                break;
+            }
+        }
+        if cursor < requested.end {
+            gaps.push(cursor..requested.end);
+        }
+        gaps
+    }
+
+    fn uninitialized_ranges(
+        &self,
+        backing_identity: usize,
+        requested: core::ops::Range<usize>,
+    ) -> alloc::vec::Vec<core::ops::Range<usize>> {
+        Self::gaps_excluding(
+            requested,
+            self.initialized
+                .get(&backing_identity)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn claimable_initialization_ranges(
+        &self,
+        backing_identity: usize,
+        requested: core::ops::Range<usize>,
+    ) -> alloc::vec::Vec<core::ops::Range<usize>> {
+        let mut covered = self
+            .initialized
+            .get(&backing_identity)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(initializing) = self.initializing.get(&backing_identity) {
+            covered.extend(initializing.iter().cloned());
+        }
+        Self::gaps_excluding(requested, covered)
+    }
+
+    fn insert_merged_range(
+        ranges: &mut alloc::collections::BTreeMap<usize, alloc::vec::Vec<core::ops::Range<usize>>>,
+        backing_identity: usize,
+        new_range: core::ops::Range<usize>,
+    ) {
+        let ranges = ranges.entry(backing_identity).or_default();
+        ranges.push(new_range);
+        ranges.sort_by_key(|range| range.start);
+        let old = core::mem::take(ranges);
+        for range in old {
+            if let Some(last) = ranges.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                ranges.push(range);
+            }
+        }
+    }
+
+    fn mark_initialized(
+        &mut self,
+        backing_identity: usize,
+        initialized_range: core::ops::Range<usize>,
+    ) {
+        Self::insert_merged_range(&mut self.initialized, backing_identity, initialized_range);
+    }
+
+    fn mark_initializing(
+        &mut self,
+        backing_identity: usize,
+        initializing_range: core::ops::Range<usize>,
+    ) {
+        Self::insert_merged_range(&mut self.initializing, backing_identity, initializing_range);
+    }
+
+    fn finish_initializing(&mut self, backing_identity: usize, finished: &core::ops::Range<usize>) {
+        let Some(ranges) = self.initializing.get_mut(&backing_identity) else {
+            return;
+        };
+        let old = core::mem::take(ranges);
+        for range in old {
+            if range.end <= finished.start || range.start >= finished.end {
+                ranges.push(range);
+                continue;
+            }
+            if range.start < finished.start {
+                ranges.push(range.start..finished.start);
+            }
+            if range.end > finished.end {
+                ranges.push(finished.end..range.end);
+            }
+        }
+        if ranges.is_empty() {
+            self.initializing.remove(&backing_identity);
+        }
+    }
+
+    fn initialization_in_progress(
+        &self,
+        backing_identity: usize,
+        range: &core::ops::Range<usize>,
+    ) -> bool {
+        self.initializing
+            .get(&backing_identity)
+            .is_some_and(|ranges| {
+                ranges.iter().any(|initializing| {
+                    initializing.start < range.end && range.start < initializing.end
+                })
+            })
+    }
+
+    fn existing_extents(
+        &self,
+        backing_identity: usize,
+        logical_range: &core::ops::Range<usize>,
+    ) -> alloc::vec::Vec<(core::ops::Range<usize>, usize)> {
+        let mut result = alloc::vec::Vec::new();
+        let Some(extents) = self.backings.get(&backing_identity) else {
+            return result;
+        };
+        for extent in extents {
+            let start = extent.logical_range.start.max(logical_range.start);
+            let end = extent.logical_range.end.min(logical_range.end);
+            if start < end {
+                result.push((
+                    start..end,
+                    extent.file_offset + (start - extent.logical_range.start),
+                ));
+            }
+        }
+        result
+    }
+
+    fn forget_aliases(&mut self, removed: &core::ops::Range<usize>) {
+        let old = core::mem::take(&mut self.aliases);
+        for alias in old {
+            if alias.virtual_range.end <= removed.start || alias.virtual_range.start >= removed.end
+            {
+                self.aliases.push(alias);
+                continue;
+            }
+            if alias.virtual_range.start < removed.start {
+                self.aliases.push(SharedPageAlias {
+                    virtual_range: alias.virtual_range.start..removed.start,
+                    backing_identity: alias.backing_identity,
+                    backing_offset: alias.backing_offset,
+                });
+            }
+            if alias.virtual_range.end > removed.end {
+                self.aliases.push(SharedPageAlias {
+                    virtual_range: removed.end..alias.virtual_range.end,
+                    backing_identity: alias.backing_identity,
+                    backing_offset: alias.backing_offset
+                        + (removed.end - alias.virtual_range.start),
+                });
+            }
+        }
+    }
+}
+
+fn create_shared_page_file() -> OwnedFd {
+    let mut path = *b"/private/tmp/litebox-shared-pages.XXXXXX\0";
+    // SAFETY: `path` is a writable, NUL-terminated mkstemp template with six trailing X bytes.
+    let fd = unsafe { libc::mkstemp(path.as_mut_ptr().cast::<libc::c_char>()) };
+    assert!(
+        fd >= 0,
+        "failed to create shared-page backing file: {}",
+        std::io::Error::last_os_error()
+    );
+    // The descriptor, not the pathname, is the durable capability. Unlink before Seatbelt is
+    // installed so no guest operation can name or reopen the host object.
+    // SAFETY: `path` is still the NUL-terminated path mkstemp filled in.
+    let unlink_result = unsafe { libc::unlink(path.as_ptr().cast::<libc::c_char>()) };
+    if unlink_result != 0 {
+        // SAFETY: `fd` was returned by mkstemp and has not been transferred into OwnedFd yet.
+        unsafe { libc::close(fd) };
+        panic!(
+            "failed to unlink shared-page backing file: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: ownership of this newly opened descriptor transfers exactly once.
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+fn pread_all(
+    fd: libc::c_int,
+    mut data: &mut [u8],
+    mut offset: usize,
+) -> Result<(), SharedPageIoError> {
+    while !data.is_empty() {
+        let file_offset =
+            libc::off_t::try_from(offset).map_err(|_| SharedPageIoError::OutOfRange)?;
+        // SAFETY: `data` is writable for its complete length and `fd` remains open.
+        let result = unsafe {
+            libc::pread(
+                fd,
+                data.as_mut_ptr().cast::<libc::c_void>(),
+                data.len(),
+                file_offset,
+            )
+        };
+        if result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SharedPageIoError::Io);
+        }
+        let count = usize::try_from(result).map_err(|_| SharedPageIoError::Io)?;
+        if count == 0 {
+            return Err(SharedPageIoError::Io);
+        }
+        offset = offset
+            .checked_add(count)
+            .ok_or(SharedPageIoError::OutOfRange)?;
+        data = &mut data[count..];
+    }
+    Ok(())
+}
+
+fn pwrite_all(
+    fd: libc::c_int,
+    mut data: &[u8],
+    mut offset: usize,
+) -> Result<(), SharedPageIoError> {
+    while !data.is_empty() {
+        let file_offset =
+            libc::off_t::try_from(offset).map_err(|_| SharedPageIoError::OutOfRange)?;
+        // SAFETY: `data` is readable for its complete length and `fd` remains open.
+        let result = unsafe {
+            libc::pwrite(
+                fd,
+                data.as_ptr().cast::<libc::c_void>(),
+                data.len(),
+                file_offset,
+            )
+        };
+        if result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SharedPageIoError::Io);
+        }
+        let count = usize::try_from(result).map_err(|_| SharedPageIoError::Io)?;
+        if count == 0 {
+            return Err(SharedPageIoError::Io);
+        }
+        offset = offset
+            .checked_add(count)
+            .ok_or(SharedPageIoError::OutOfRange)?;
+        data = &data[count..];
+    }
+    Ok(())
 }
 
 impl core::fmt::Debug for MacOsUserland {
@@ -200,6 +604,9 @@ impl MacOsUserland {
             stdin_held_open: core::sync::atomic::AtomicBool::new(hold_stdin_open),
             stdout_lock: std::sync::Mutex::new(()),
             stderr_lock: std::sync::Mutex::new(()),
+            shared_page_file: create_shared_page_file(),
+            shared_page_registry: std::sync::Mutex::new(SharedPageRegistry::default()),
+            shared_page_init_condvar: Condvar::new(),
             tun,
             cow_regions: std::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         };
@@ -549,13 +956,14 @@ fn allocate_jit_pages(
         });
     }
 
-    let must_be_exact = fixed_address_behavior == FixedAddressBehavior::NoReplace;
+    let must_reserve = fixed_address_behavior == FixedAddressBehavior::NoReplace;
     let needs_correction = fixed_address_behavior == FixedAddressBehavior::Hint && {
         let start = kernel_chosen as usize;
         let end = start + suggested_range.len();
         start < GUEST_ADDR_MIN || end > GUEST_ADDR_MAX
     };
-    let reserved = if must_be_exact || needs_correction {
+    let fixed_mode_requires_remap = fixed_address_behavior != FixedAddressBehavior::Hint;
+    let reserved = if must_reserve || needs_correction {
         // `remap_to_fixed`'s `VM_FLAGS_OVERWRITE` silently replaces whatever
         // already occupies the destination, so `NoReplace` has to check
         // first -- exactly like the non-JIT path does with a plain
@@ -563,7 +971,7 @@ fn allocate_jit_pages(
         // destination until the remap overwrites it.
         match reserve_fixed(suggested_range) {
             Ok(()) => true,
-            Err(e) if must_be_exact => {
+            Err(e) if must_reserve => {
                 // SAFETY: `kernel_chosen` is the mapping just created above,
                 // still solely owned by this function.
                 unsafe { libc::munmap(kernel_chosen, suggested_range.len()) };
@@ -583,8 +991,9 @@ fn allocate_jit_pages(
     } else {
         false
     };
+    let must_remap = fixed_mode_requires_remap || reserved;
 
-    if !reserved {
+    if !must_remap {
         return Ok(kernel_chosen);
     }
 
@@ -608,7 +1017,9 @@ fn allocate_jit_pages(
     match remap_result {
         Ok(()) => Ok(suggested_range.start as *mut libc::c_void),
         Err(e) => {
-            release_reservation(suggested_range);
+            if reserved {
+                release_reservation(suggested_range);
+            }
             Err(match e {
                 ReservationError::AddressInUse => AllocationError::AddressInUse,
                 ReservationError::OutOfMemory => AllocationError::OutOfMemory,
@@ -1127,6 +1538,343 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
+    fn allocate_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        suggested_range: core::ops::Range<usize>,
+        initial_permissions: MemoryRegionPermissions,
+        _can_grow_down: bool,
+        populate_pages_immediately: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+        if !suggested_range.start.is_multiple_of(ALIGN)
+            || !suggested_range.len().is_multiple_of(ALIGN)
+            || !backing_offset.is_multiple_of(ALIGN)
+        {
+            return Err(AllocationError::Unaligned);
+        }
+        let logical_end = backing_offset
+            .checked_add(suggested_range.len())
+            .ok_or(AllocationError::OutOfMemory)?;
+        let logical_range = backing_offset..logical_end;
+
+        let mut registry = self.shared_page_registry.lock().unwrap();
+        let extents = registry.ensure_extents(
+            self.shared_page_file.as_raw_fd(),
+            backing_identity,
+            logical_range.clone(),
+        )?;
+
+        // Reserve one contiguous destination first. Each sparse-file extent can then replace its
+        // matching subrange with MAP_FIXED without a gap being claimed by an unrelated host mmap.
+        let target_start = match fixed_address_behavior {
+            FixedAddressBehavior::Hint => {
+                // SAFETY: this is a temporary anonymous reservation at an advisory address.
+                let reservation = unsafe {
+                    libc::mmap(
+                        suggested_range.start as *mut libc::c_void,
+                        suggested_range.len(),
+                        libc::PROT_NONE,
+                        libc::MAP_PRIVATE | libc::MAP_ANON,
+                        -1,
+                        0,
+                    )
+                };
+                if reservation == libc::MAP_FAILED {
+                    return Err(AllocationError::OutOfMemory);
+                }
+                let start = reservation as usize;
+                let end = start
+                    .checked_add(suggested_range.len())
+                    .ok_or(AllocationError::OutOfMemory)?;
+                if start < GUEST_ADDR_MIN || end > GUEST_ADDR_MAX {
+                    // SAFETY: `reservation` is the temporary mapping just created above.
+                    unsafe { libc::munmap(reservation, suggested_range.len()) };
+                    reserve_fixed(&suggested_range).map_err(|error| match error {
+                        ReservationError::AddressInUse => AllocationError::AddressInUse,
+                        ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+                    })?;
+                    suggested_range.start
+                } else {
+                    start
+                }
+            }
+            FixedAddressBehavior::NoReplace => {
+                reserve_fixed(&suggested_range).map_err(|error| match error {
+                    ReservationError::AddressInUse => AllocationError::AddressInUse,
+                    ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+                })?;
+                suggested_range.start
+            }
+            FixedAddressBehavior::Replace => suggested_range.start,
+        };
+        let target_range = target_start..target_start + suggested_range.len();
+
+        for (extent_range, file_offset) in extents {
+            let virtual_start = target_start + (extent_range.start - backing_offset);
+            let offset =
+                libc::off_t::try_from(file_offset).map_err(|_| AllocationError::OutOfMemory)?;
+            // SAFETY: the sparse file is live for the platform lifetime, this extent lies within
+            // its ftruncate'd length, and the complete destination was reserved above (or the
+            // caller explicitly requested replacement).
+            let ptr = unsafe {
+                libc::mmap(
+                    virtual_start as *mut libc::c_void,
+                    extent_range.len(),
+                    prot_flags(initial_permissions),
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    self.shared_page_file.as_raw_fd(),
+                    offset,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                // Drop both already-installed extents and any remainder of the reservation. For a
+                // replacing mmap Linux likewise cannot promise restoration after a partial host
+                // failure; for Hint/NoReplace this simply restores the range to being free.
+                // SAFETY: `target_range` is the mapping/reservation owned by this operation.
+                unsafe {
+                    libc::munmap(target_range.start as *mut libc::c_void, target_range.len())
+                };
+                return Err(match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINVAL) => AllocationError::Unaligned,
+                    _ => AllocationError::OutOfMemory,
+                });
+            }
+            debug_assert_eq!(ptr as usize, virtual_start);
+        }
+
+        registry.forget_aliases(&target_range);
+        registry.aliases.push(SharedPageAlias {
+            virtual_range: target_range.clone(),
+            backing_identity,
+            backing_offset,
+        });
+        drop(registry);
+
+        if populate_pages_immediately {
+            // SAFETY: the complete destination is now mapped.
+            unsafe {
+                libc::madvise(
+                    target_range.start as *mut libc::c_void,
+                    target_range.len(),
+                    libc::MADV_WILLNEED,
+                )
+            };
+        }
+
+        Ok(UserMutPtr::from_ptr(target_range.start as *mut u8))
+    }
+
+    fn initialize_shared_pages<E>(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        length: usize,
+        mut initialize: impl FnMut(core::ops::Range<usize>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let requested = backing_offset
+            ..backing_offset
+                .checked_add(length)
+                .expect("validated shared mapping range cannot overflow");
+        loop {
+            let mut registry = self.shared_page_registry.lock().unwrap();
+            if registry
+                .uninitialized_ranges(backing_identity, requested.clone())
+                .is_empty()
+            {
+                return Ok(());
+            }
+            let Some(claim) = registry
+                .claimable_initialization_ranges(backing_identity, requested.clone())
+                .into_iter()
+                .next()
+            else {
+                // Every missing byte is being initialized by another mapping. Wait without holding
+                // the registry, then re-derive the gaps; a failed peer leaves them claimable again.
+                registry = self.shared_page_init_condvar.wait(registry).unwrap();
+                drop(registry);
+                continue;
+            };
+            registry.mark_initializing(backing_identity, claim.clone());
+            drop(registry);
+
+            let relative = (claim.start - backing_offset)..(claim.end - backing_offset);
+            let result = initialize(relative);
+
+            let mut registry = self.shared_page_registry.lock().unwrap();
+            registry.finish_initializing(backing_identity, &claim);
+            if result.is_ok() {
+                registry.mark_initialized(backing_identity, claim);
+            }
+            self.shared_page_init_condvar.notify_all();
+            drop(registry);
+            result?;
+        }
+    }
+
+    fn read_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        data: &mut [u8],
+    ) -> Result<(), SharedPageIoError> {
+        let end = backing_offset
+            .checked_add(data.len())
+            .ok_or(SharedPageIoError::OutOfRange)?;
+        let requested = backing_offset..end;
+        let mut registry = self.shared_page_registry.lock().unwrap();
+        while registry.initialization_in_progress(backing_identity, &requested) {
+            registry = self.shared_page_init_condvar.wait(registry).unwrap();
+        }
+        let initialized = registry
+            .initialized
+            .get(&backing_identity)
+            .cloned()
+            .unwrap_or_default();
+        let extents = registry.existing_extents(backing_identity, &requested);
+        for (extent, file_offset) in extents {
+            for initialized_range in &initialized {
+                let start = extent.start.max(initialized_range.start);
+                let end = extent.end.min(initialized_range.end);
+                if start >= end {
+                    continue;
+                }
+                let output_start = start - backing_offset;
+                let physical_start = file_offset + (start - extent.start);
+                pread_all(
+                    self.shared_page_file.as_raw_fd(),
+                    &mut data[output_start..output_start + (end - start)],
+                    physical_start,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        data: &[u8],
+    ) -> Result<(), SharedPageIoError> {
+        let end = backing_offset
+            .checked_add(data.len())
+            .ok_or(SharedPageIoError::OutOfRange)?;
+        let requested = backing_offset..end;
+        let mut registry = self.shared_page_registry.lock().unwrap();
+        while registry.initialization_in_progress(backing_identity, &requested) {
+            registry = self.shared_page_init_condvar.wait(registry).unwrap();
+        }
+        let extents = registry.existing_extents(backing_identity, &requested);
+        for (extent, file_offset) in extents {
+            let input_start = extent.start - backing_offset;
+            pwrite_all(
+                self.shared_page_file.as_raw_fd(),
+                &data[input_start..input_start + extent.len()],
+                file_offset,
+            )?;
+            registry.mark_initialized(backing_identity, extent);
+        }
+        Ok(())
+    }
+
+    fn zero_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_range: core::ops::Range<usize>,
+    ) -> Result<(), SharedPageIoError> {
+        if backing_range.is_empty() {
+            return Ok(());
+        }
+        let mut registry = self.shared_page_registry.lock().unwrap();
+        while registry.initialization_in_progress(backing_identity, &backing_range) {
+            registry = self.shared_page_init_condvar.wait(registry).unwrap();
+        }
+        let extents = registry.existing_extents(backing_identity, &backing_range);
+        let zeroes = [0u8; 16384];
+        for (extent, file_offset) in extents {
+            let mut written = 0;
+            while written < extent.len() {
+                let count = (extent.len() - written).min(zeroes.len());
+                pwrite_all(
+                    self.shared_page_file.as_raw_fd(),
+                    &zeroes[..count],
+                    file_offset + written,
+                )?;
+                written += count;
+            }
+            registry.mark_initialized(backing_identity, extent);
+        }
+        Ok(())
+    }
+
+    unsafe fn remap_shared_pages(
+        &self,
+        backing_identity: usize,
+        backing_offset: usize,
+        old_range: core::ops::Range<usize>,
+        new_range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+        if !old_range.start.is_multiple_of(ALIGN)
+            || !old_range.len().is_multiple_of(ALIGN)
+            || !new_range.start.is_multiple_of(ALIGN)
+            || !new_range.len().is_multiple_of(ALIGN)
+            || !backing_offset.is_multiple_of(ALIGN)
+        {
+            return Err(RemapError::Unaligned);
+        }
+        if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
+            return Err(RemapError::Overlapping);
+        }
+        if new_range.len() < old_range.len() {
+            return Err(RemapError::OutOfMemory);
+        }
+
+        let new_ptr =
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::allocate_shared_pages(
+                self,
+                backing_identity,
+                backing_offset,
+                new_range.clone(),
+                permissions,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace,
+            )
+            .map_err(|error| match error {
+                AllocationError::OutOfMemory => RemapError::OutOfMemory,
+                AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
+                    RemapError::AlreadyAllocated
+                }
+                AllocationError::Unaligned => RemapError::Unaligned,
+                AllocationError::BelowMinAddress
+                | AllocationError::AboveMaxAddress
+                | AllocationError::AddressPartiallyInUse => RemapError::OutOfMemory,
+                _ => RemapError::OutOfMemory,
+            })?;
+
+        // The destination already aliases the same physical bytes, so no copy is required.
+        // SAFETY: forwarded caller guarantee; the source is no longer needed after this move.
+        if unsafe {
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::deallocate_pages(
+                self, old_range,
+            )
+        }
+        .is_err()
+        {
+            // SAFETY: `new_range` was allocated solely by this operation and has not escaped.
+            let _ = unsafe {
+                <Self as litebox::platform::PageManagementProvider<ALIGN>>::deallocate_pages(
+                    self, new_range,
+                )
+            };
+            return Err(RemapError::AlreadyUnallocated);
+        }
+        Ok(new_ptr)
+    }
+
     unsafe fn deallocate_pages(
         &self,
         range: core::ops::Range<usize>,
@@ -1137,6 +1885,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // SAFETY: the caller guarantees the range is no longer in use.
         let rc = unsafe { libc::munmap(range.start as *mut libc::c_void, range.len()) };
         if rc == 0 {
+            self.shared_page_registry
+                .lock()
+                .unwrap()
+                .forget_aliases(&range);
             // Drop any JIT-region registration for this address so a later,
             // unrelated mapping at the same address is not mistaken for JIT by
             // the fault handler.
@@ -1364,6 +2116,9 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 
     fn wake_many(&self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
         // `ulock` can wake exactly one waiter or all of them, with nothing in
         // between, so anything above one wakes all. The trait permits this: a
         // wake is allowed to be spurious, and the return value is allowed to be
@@ -1626,19 +2381,16 @@ fn spawn_stdin_pump_thread(platform: &'static MacOsUserland) {
 impl MacOsUserland {
     /// Deliver `bytes` to the guest's stdin as if they had been typed on the host terminal:
     /// pushed through the same pump `spawn_stdin_pump_thread` feeds, so blocking reads,
-    /// non-blocking reads, and poll/select observers all see them identically. Blocks briefly
-    /// (1ms backoff) when the ring is full, exactly like the host pump does.
-    pub fn inject_stdin(&self, bytes: &[u8]) {
-        let mut data = bytes;
-        while !data.is_empty() {
-            let pushed = self.stdin_pump.push(data);
+    /// non-blocking reads, and poll/select observers all see them identically. This producer is
+    /// deliberately non-blocking: when the guest has stopped draining stdin and the ring is full,
+    /// the complete terminal sequence is dropped rather than stalling the input-client reader or
+    /// exposing a truncated escape sequence. Returns whether the bytes were accepted.
+    pub fn inject_stdin(&self, bytes: &[u8]) -> bool {
+        let accepted = self.stdin_pump.try_push_all(bytes);
+        if accepted && !bytes.is_empty() {
             self.notify_stdin_doorbell();
-            if pushed == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            data = &data[pushed..];
         }
+        accepted
     }
 
     /// Wakes any thread parked in `StdioProvider::read_from_stdin`'s blocking wait.

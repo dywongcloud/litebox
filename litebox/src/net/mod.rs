@@ -43,6 +43,18 @@ const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 /// back into the interface's own receive path (see [`phy`]).
 const LOOPBACK_IP_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
+/// Internal guest endpoint for the bounded ICMP echo bridge used by rootless macOS networking.
+///
+/// This is not a general raw-packet interface: the Linux shim frames only IPv4 Echo Requests for
+/// this endpoint, and the macOS runner validates them again before using its unprivileged ping
+/// socket.
+#[doc(hidden)]
+pub const ICMP_ECHO_PROXY_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3130);
+
+/// IPv4 destination prefix carried on internal ICMP echo proxy datagrams.
+#[doc(hidden)]
+pub const ICMP_ECHO_PROXY_PREFIX_LEN: usize = 4;
+
 /// Maximum size of rx/tx buffers for sockets
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 

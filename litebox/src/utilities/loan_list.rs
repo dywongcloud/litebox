@@ -103,14 +103,30 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
     ///
     /// Panics if the entry is already inserted into a list.
     pub fn insert(self: Pin<&mut Self>, list: &'a LoanList<Platform, T>) {
-        assert!(
-            self.node
-                .data
-                .current_list
-                .load(Ordering::Relaxed)
-                .is_null(),
-            "self is already inserted"
-        );
+        loop {
+            assert!(
+                self.node
+                    .data
+                    .current_list
+                    .load(Ordering::Acquire)
+                    .is_null(),
+                "self is already inserted"
+            );
+            if EntryState(
+                self.node
+                    .data
+                    .state
+                    .underlying_atomic()
+                    .load(Ordering::Acquire),
+            ) != EntryState::REMOVED_WAKING
+            {
+                break;
+            }
+            // A prior loan holder has cleared `current_list` but retains one final access to the
+            // node. Wait for its final `REMOVED` publication before reusing the intrusive links or
+            // state; otherwise that publication could overwrite this insertion.
+            core::hint::spin_loop();
+        }
 
         // SAFETY: there are no other concurrent references to `self`'s pinned fields; nothing
         // else can observe `node` until `insert_node` links it into `list`'s chain below.
@@ -125,7 +141,6 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
     /// completes and the entry is fully returned.
     ///
     /// If the entry is not currently inserted, this method does nothing.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn remove(self: Pin<&mut Self>) {
         remove_node_dynamic(&self.node);
     }
@@ -167,6 +182,14 @@ fn remove_node_dynamic<Platform: RawSyncPrimitivesProvider, T>(
     // strictly after) a `state` transition away from `INSERTED`/`LOANED`, so once this observes
     // null there's nothing further to race against.
     if node.data.current_list.load(Ordering::Acquire).is_null() {
+        // `REMOVED_WAKING` means the loan holder has cleared `current_list` but still has one final
+        // access to the node. Do not let the owner deallocate it until the final `REMOVED` release
+        // publication. Other null states are either never-inserted or already fully removed.
+        while EntryState(node.data.state.underlying_atomic().load(Ordering::Acquire))
+            == EntryState::REMOVED_WAKING
+        {
+            core::hint::spin_loop();
+        }
         return;
     }
     loop {
@@ -209,12 +232,14 @@ fn remove_node_dynamic<Platform: RawSyncPrimitivesProvider, T>(
                 // outlives every entry that can reference it.
                 let list: &LoanList<Platform, T> = unsafe { &*list_ptr };
                 let mut guard = list.0.lock();
-                if EntryState(node.data.state.underlying_atomic().load(Ordering::Relaxed))
+                if EntryState(node.data.state.underlying_atomic().load(Ordering::Acquire))
                     != EntryState::INSERTED
+                    || node.data.current_list.load(Ordering::Acquire) != list_ptr
                 {
-                    // Raced with a concurrent removal/requeue of this same node out of this same
-                    // list between our lock-free peek and taking the lock. Loop around and
-                    // re-resolve the current list from scratch.
+                    // Raced with a concurrent removal/requeue of this same node between our
+                    // lock-free peek and taking the lock. The state can cycle back to `INSERTED`
+                    // after an A -> B requeue, so state alone is insufficient: the node must still
+                    // name the exact list whose lock we hold.
                     continue;
                 }
                 // Still genuinely a member of `list`'s chain: nothing else can have changed that
@@ -224,7 +249,7 @@ fn remove_node_dynamic<Platform: RawSyncPrimitivesProvider, T>(
                 drop(guard);
                 node.data
                     .current_list
-                    .store(core::ptr::null_mut(), Ordering::Relaxed);
+                    .store(core::ptr::null_mut(), Ordering::Release);
                 return;
             }
             Ok(EntryState::LOANED) | Err(EntryState::REMOVED_WAKING) => break,
@@ -318,7 +343,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
         mut f: impl FnMut(&T) -> ControlFlow<bool, bool>,
     ) -> ExtractIf<Platform, T> {
         let mut this = self.0.lock();
-        let mut removed = LinkedList::new();
+        // Construct the returned owner before the first predicate call. If the predicate (or an
+        // invariant check on a later node) unwinds after earlier nodes were extracted, this local's
+        // `Drop` finalizes those loans and wakes any owner that is already waiting for them.
+        let mut extracted = ExtractIf {
+            head: core::ptr::null(),
+        };
+        let mut extracted_tail: *const Node<EntryData<Platform, T>> = core::ptr::null();
         let mut current = this.head;
         while !current.is_null() {
             let entry = unsafe { &*current };
@@ -341,16 +372,23 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                     .store(EntryState::LOANED.0, Ordering::Relaxed);
                 unsafe {
                     this.remove(entry);
-                    removed.push_back(entry);
+                    // The source list is circular, while `ExtractIf` is a null-terminated chain.
+                    // All operations after the predicate returns are infallible, so the node becomes
+                    // reachable from `extracted` before another unwind point can occur.
+                    (*entry.ptrs.get()).next = core::ptr::null();
+                    if extracted_tail.is_null() {
+                        extracted.head = entry;
+                    } else {
+                        (*(*extracted_tail).ptrs.get()).next = entry;
+                    }
+                    extracted_tail = entry;
                 }
             }
             if r.is_break() {
                 break;
             }
         }
-        ExtractIf {
-            head: unsafe { removed.into_head() },
-        }
+        extracted
     }
 }
 
@@ -530,14 +568,14 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanedEntry<Platform, T> {
                 // `target` can ever observe the node linked in -- and finalize as an ordinary
                 // removal instead, exactly as `Drop` would.
                 unsafe { list.remove(node) };
-                drop(list);
-                node.data
-                    .current_list
-                    .store(core::ptr::null_mut(), Ordering::Relaxed);
                 node.data
                     .state
                     .underlying_atomic()
                     .store(EntryState::REMOVED_WAKING.0, Ordering::Relaxed);
+                node.data
+                    .current_list
+                    .store(core::ptr::null_mut(), Ordering::Release);
+                drop(list);
                 node.data.state.wake_one();
                 node.data
                     .state
@@ -554,40 +592,27 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for LoanedEntry<Platform, T> {
         let entry = unsafe { &*self.entry };
         let state = entry.data.state.underlying_atomic();
         let v = state.fetch_update(
-            Ordering::Release,
+            Ordering::AcqRel,
             Ordering::Acquire,
             |state| match EntryState(state) {
-                EntryState::LOANED => Some(EntryState::REMOVED.0),
-                EntryState::LOANED_OWNER_WAITING => None,
+                EntryState::LOANED | EntryState::LOANED_OWNER_WAITING => {
+                    Some(EntryState::REMOVED_WAKING.0)
+                }
                 _ => panic!("invalid state in removed entry drop: {state}"),
             },
         );
         match v.map(EntryState).map_err(EntryState) {
-            Ok(EntryState::LOANED) => {
+            Ok(old @ (EntryState::LOANED | EntryState::LOANED_OWNER_WAITING)) => {
+                // `REMOVED_WAKING` was published before this final node access. An owner that
+                // races from here either spins on that state or was already waiting and is woken
+                // below; neither can deallocate the node until the final `REMOVED` store.
                 entry
                     .data
                     .current_list
-                    .store(core::ptr::null_mut(), Ordering::Relaxed);
-            }
-            Err(EntryState::LOANED_OWNER_WAITING) => {
-                // Tell the loaner that a wake is coming, wake up the loaner,
-                // then update the state one last time--after this, the entry
-                // could be reused and can no longer be accessed. The loaner
-                // will spin waiting for this final state change.
-                //
-                // FUTURE: consider adding a `RawMutex` trait method to perform
-                // a set and a wake in one operation to avoid the loaner needing
-                // to spin. Existing platforms could easily support this.
-                entry
-                    .data
-                    .current_list
-                    .store(core::ptr::null_mut(), Ordering::Relaxed);
-                entry
-                    .data
-                    .state
-                    .underlying_atomic()
-                    .store(EntryState::REMOVED_WAKING.0, Ordering::Relaxed);
-                entry.data.state.wake_one();
+                    .store(core::ptr::null_mut(), Ordering::Release);
+                if old == EntryState::LOANED_OWNER_WAITING {
+                    entry.data.state.wake_one();
+                }
                 entry
                     .data
                     .state
@@ -678,22 +703,6 @@ impl<T> LinkedList<T> {
                     self.head = next;
                 }
             }
-        }
-    }
-
-    /// Converts the list into a singly-linked list by null-terminating it, returning
-    /// the head pointer.
-    unsafe fn into_head(self) -> *const Node<T> {
-        if self.is_empty() {
-            ptr::null()
-        } else {
-            let head = self.head;
-            // Null-terminate the list.
-            unsafe {
-                let tail = (*(*head).ptrs.get()).prev;
-                (*(*tail).ptrs.get()).next = core::ptr::null();
-            }
-            head
         }
     }
 }

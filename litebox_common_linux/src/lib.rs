@@ -1091,6 +1091,8 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    RETOPTS = 7,
+    RECVTTL = 12,
 }
 
 #[repr(u32)]
@@ -1728,7 +1730,7 @@ pub struct RobustListHead {
     /// the relative position of the futex field to examine. This way
     /// we keep userspace flexible, to freely shape its data-structure,
     /// without hardcoding any particular offset into the kernel.
-    pub futex_offset: usize,
+    pub futex_offset: isize,
     /// The death of the thread may race with userspace setting
     /// up a lock's links. So to handle this race, userspace first
     /// sets this field to the address of the to-be-taken lock,
@@ -2139,6 +2141,7 @@ pub enum FutexOperation {
     Requeue = 3,
     CmpRequeue = 4,
     WaitBitset = 9,
+    WakeBitset = 10,
 }
 
 bitflags::bitflags! {
@@ -2176,6 +2179,12 @@ pub enum FutexArgs {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
         count: u32,
+    },
+    WakeBitset {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        count: u32,
+        bitmask: u32,
     },
     /// `FUTEX_REQUEUE`: wake up to `num_to_wake` waiters on `addr`, then move up to
     /// `num_to_requeue` of the *remaining* waiters on `addr` onto `addr2`'s wait queue, without
@@ -2439,6 +2448,66 @@ impl ShutdownHow {
     }
 }
 
+/// Flags accepted by `inotify_init1(2)`.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct InotifyInitFlags(u32);
+
+bitflags::bitflags! {
+    impl InotifyInitFlags: u32 {
+        const NONBLOCK = 0x0000_0800;
+        const CLOEXEC = 0x0008_0000;
+    }
+}
+
+/// Event-selection and behavior flags accepted by `inotify_add_watch(2)`.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct InotifyMask(u32);
+
+bitflags::bitflags! {
+    impl InotifyMask: u32 {
+        const ACCESS = 0x0000_0001;
+        const MODIFY = 0x0000_0002;
+        const ATTRIB = 0x0000_0004;
+        const CLOSE_WRITE = 0x0000_0008;
+        const CLOSE_NOWRITE = 0x0000_0010;
+        const OPEN = 0x0000_0020;
+        const MOVED_FROM = 0x0000_0040;
+        const MOVED_TO = 0x0000_0080;
+        const CREATE = 0x0000_0100;
+        const DELETE = 0x0000_0200;
+        const DELETE_SELF = 0x0000_0400;
+        const MOVE_SELF = 0x0000_0800;
+        const UNMOUNT = 0x0000_2000;
+        const Q_OVERFLOW = 0x0000_4000;
+        const IGNORED = 0x0000_8000;
+        const ONLYDIR = 0x0100_0000;
+        const DONT_FOLLOW = 0x0200_0000;
+        const EXCL_UNLINK = 0x0400_0000;
+        const MASK_CREATE = 0x1000_0000;
+        const MASK_ADD = 0x2000_0000;
+        const ISDIR = 0x4000_0000;
+        const ONESHOT = 0x8000_0000;
+    }
+}
+
+impl InotifyMask {
+    pub const CLOSE: Self = Self::CLOSE_WRITE.union(Self::CLOSE_NOWRITE);
+    pub const MOVE: Self = Self::MOVED_FROM.union(Self::MOVED_TO);
+    pub const ALL_EVENTS: Self = Self::from_bits_retain(0x0000_0fff);
+}
+
+/// Fixed header of one variable-length inotify queue record.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct InotifyEvent {
+    pub wd: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    pub len: u32,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -2486,6 +2555,9 @@ pub enum SyscallRequest {
     },
     Chdir {
         pathname: UserPtr<c_char>,
+    },
+    Fchdir {
+        fd: i32,
     },
     Mmap {
         addr: usize,
@@ -3229,6 +3301,7 @@ impl SyscallRequest {
             },
             Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
                 length,
@@ -3834,26 +3907,46 @@ impl SyscallRequest {
                 flags,
                 count: val,
             },
-            FutexOperation::Requeue => FutexArgs::Requeue {
+            FutexOperation::WakeBitset => FutexArgs::WakeBitset {
                 addr,
                 flags,
-                num_to_wake: val,
-                // ABI quirk: for `FUTEX_REQUEUE`, argument slot 3 (`WAIT`'s `timeout` pointer)
-                // is instead a plain integer, `num_to_requeue` -- not read via `time_param`/
-                // `sys_req_ptr` at all. See `man 2 futex`.
-                num_to_requeue: ctx.sys_req_arg(3),
-                addr2: ctx.sys_req_ptr(4),
+                count: val,
+                bitmask: ctx.sys_req_arg(5),
             },
-            FutexOperation::CmpRequeue => FutexArgs::CmpRequeue {
-                addr,
-                flags,
-                num_to_wake: val,
-                // Same ABI quirk as `FUTEX_REQUEUE`: argument slot 3 is the plain integer
-                // `num_to_requeue`, not a `timeout` pointer. See `man 2 futex`.
-                num_to_requeue: ctx.sys_req_arg(3),
-                addr2: ctx.sys_req_ptr(4),
-                expected_value: ctx.sys_req_arg(5),
-            },
+            FutexOperation::Requeue => {
+                let num_to_requeue: u32 = ctx.sys_req_arg(3);
+                // Linux's requeue quotas are `int`, despite occupying raw register-sized syscall
+                // slots. Negative values are rejected before comparing or mutating either queue.
+                if val > i32::MAX as u32 || num_to_requeue > i32::MAX as u32 {
+                    return Err(errno::Errno::EINVAL);
+                }
+                FutexArgs::Requeue {
+                    addr,
+                    flags,
+                    num_to_wake: val,
+                    // ABI quirk: for `FUTEX_REQUEUE`, argument slot 3 (`WAIT`'s `timeout` pointer)
+                    // is instead a plain integer, `num_to_requeue` -- not read via `time_param`/
+                    // `sys_req_ptr` at all. See `man 2 futex`.
+                    num_to_requeue,
+                    addr2: ctx.sys_req_ptr(4),
+                }
+            }
+            FutexOperation::CmpRequeue => {
+                let num_to_requeue: u32 = ctx.sys_req_arg(3);
+                if val > i32::MAX as u32 || num_to_requeue > i32::MAX as u32 {
+                    return Err(errno::Errno::EINVAL);
+                }
+                FutexArgs::CmpRequeue {
+                    addr,
+                    flags,
+                    num_to_wake: val,
+                    // Same ABI quirk as `FUTEX_REQUEUE`: argument slot 3 is the plain integer
+                    // `num_to_requeue`, not a `timeout` pointer. See `man 2 futex`.
+                    num_to_requeue,
+                    addr2: ctx.sys_req_ptr(4),
+                    expected_value: ctx.sys_req_arg(5),
+                }
+            }
         };
         Ok(SyscallRequest::Futex { args })
     }

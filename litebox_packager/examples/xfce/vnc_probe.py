@@ -7,7 +7,7 @@ just enough of RFB 3.3-3.8 (server-chosen version, no-auth or VNC-auth-less
 setups only -- litebox's --vnc server requires no password) to:
 
   1. Request an incremental FramebufferUpdate over one fixed pixel region
-     and return a hash of the returned pixel bytes.
+     and return a hash of that region's pixel bytes.
   2. Optionally send a synthetic PointerEvent (button click or move) first.
 
 Exit code 0 with a hash line on stdout means the round trip completed within
@@ -27,6 +27,7 @@ import hashlib
 import socket
 import struct
 import sys
+import time
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -39,7 +40,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
-def rfb_handshake(sock: socket.socket) -> None:
+def rfb_handshake(sock: socket.socket) -> tuple[int, int, int]:
     # ProtocolVersion: server sends "RFB 00x.00y\n" (12 bytes).
     server_version = recv_exact(sock, 12)
     if not server_version.startswith(b"RFB "):
@@ -73,14 +74,18 @@ def rfb_handshake(sock: socket.socket) -> None:
                 reason = recv_exact(sock, reason_len)
                 raise ConnectionError(f"RFB auth failed: {reason!r}")
 
-    # ClientInit: non-shared (exclusive) so we don't disturb the real VNC
-    # viewer's session state any more than a synthetic click already does.
+    # ClientInit: shared session so the probe does not disconnect a real viewer.
     sock.sendall(bytes([1]))
 
     # ServerInit: width(2) height(2) pixel-format(16) name-length(4) name(...)
     fixed = recv_exact(sock, 2 + 2 + 16 + 4)
+    framebuffer_width, framebuffer_height = struct.unpack(">HH", fixed[:4])
+    bits_per_pixel = fixed[4]
+    if bits_per_pixel == 0 or bits_per_pixel % 8 != 0:
+        raise ConnectionError(f"unsupported bits-per-pixel {bits_per_pixel}")
     name_len = struct.unpack(">I", fixed[20:24])[0]
     recv_exact(sock, name_len)
+    return framebuffer_width, framebuffer_height, bits_per_pixel // 8
 
 
 def send_pointer_event(sock: socket.socket, x: int, y: int, button_mask: int) -> None:
@@ -89,7 +94,13 @@ def send_pointer_event(sock: socket.socket, x: int, y: int, button_mask: int) ->
 
 
 def request_framebuffer_region(
-    sock: socket.socket, x: int, y: int, w: int, h: int, timeout: float
+    sock: socket.socket,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    bytes_per_pixel: int,
+    timeout: float,
 ) -> bytes:
     # FramebufferUpdateRequest: type(1)=3, incremental(1)=0, x(2) y(2) w(2) h(2)
     sock.sendall(struct.pack(">BBHHHH", 3, 0, x, y, w, h))
@@ -101,16 +112,39 @@ def request_framebuffer_region(
     recv_exact(sock, 1)  # padding
     num_rects = struct.unpack(">H", recv_exact(sock, 2))[0]
 
-    pixels = bytearray()
+    # Servers may legally return rectangles larger than the requested region. LiteBox currently
+    # returns the whole framebuffer, so crop each raw rectangle by its response coordinates rather
+    # than hashing cursor movement or unrelated repaints elsewhere on screen.
+    pixels = bytearray(w * h * bytes_per_pixel)
+    covered = bytearray(w * h)
     for _ in range(num_rects):
         hdr = recv_exact(sock, 12)  # x,y,w,h,encoding
-        rw, rh, encoding = struct.unpack(">HHi", hdr[4:12])
+        rx, ry, rw, rh, encoding = struct.unpack(">HHHHi", hdr)
         if encoding != 0:
             raise ConnectionError(f"unsupported encoding {encoding} (want Raw=0)")
-        # litebox_rfb's ServerInit pixel-format is assumed 32bpp (bytes-per-pixel=4),
-        # matching litebox_rfb's framebuffer adapter (RGBX/BGRX host framebuffer).
-        rect_bytes = recv_exact(sock, rw * rh * 4)
-        pixels += rect_bytes
+        rect_bytes = recv_exact(sock, rw * rh * bytes_per_pixel)
+
+        left = max(x, rx)
+        top = max(y, ry)
+        right = min(x + w, rx + rw)
+        bottom = min(y + h, ry + rh)
+        if left >= right or top >= bottom:
+            continue
+
+        copy_width = right - left
+        copy_bytes = copy_width * bytes_per_pixel
+        for row in range(top, bottom):
+            src = ((row - ry) * rw + left - rx) * bytes_per_pixel
+            dst = ((row - y) * w + left - x) * bytes_per_pixel
+            pixels[dst : dst + copy_bytes] = rect_bytes[src : src + copy_bytes]
+            coverage_row = (row - y) * w + left - x
+            covered[coverage_row : coverage_row + copy_width] = b"\x01" * copy_width
+
+    if not all(covered):
+        missing = covered.count(0)
+        raise ConnectionError(
+            f"FramebufferUpdate did not cover requested region ({missing} pixels missing)"
+        )
     return bytes(pixels)
 
 
@@ -130,15 +164,39 @@ def main() -> int:
     try:
         with socket.create_connection((args.host, args.port), timeout=args.timeout) as sock:
             sock.settimeout(args.timeout)
-            rfb_handshake(sock)
+            framebuffer_width, framebuffer_height, bytes_per_pixel = rfb_handshake(sock)
+            if (
+                args.x < 0
+                or args.y < 0
+                or args.w <= 0
+                or args.h <= 0
+                or args.x + args.w > framebuffer_width
+                or args.y + args.h > framebuffer_height
+            ):
+                raise ValueError(
+                    f"region {args.x},{args.y} {args.w}x{args.h} exceeds "
+                    f"framebuffer {framebuffer_width}x{framebuffer_height}"
+                )
             if args.click is not None:
                 cx, cy = args.click
+                if not (0 <= cx < framebuffer_width and 0 <= cy < framebuffer_height):
+                    raise ValueError(
+                        f"click {cx},{cy} exceeds framebuffer "
+                        f"{framebuffer_width}x{framebuffer_height}"
+                    )
                 send_pointer_event(sock, cx, cy, button_mask=1)  # press
+                time.sleep(0.05)
                 send_pointer_event(sock, cx, cy, button_mask=0)  # release
             pixels = request_framebuffer_region(
-                sock, args.x, args.y, args.w, args.h, args.timeout
+                sock,
+                args.x,
+                args.y,
+                args.w,
+                args.h,
+                bytes_per_pixel,
+                args.timeout,
             )
-    except (OSError, ConnectionError, struct.error) as exc:
+    except (OSError, ConnectionError, ValueError, struct.error) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         return 1
 

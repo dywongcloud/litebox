@@ -5,9 +5,9 @@
 
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
-    fs::{Mode, OFlags},
+    fs::{AccessCredentials, FileStatus},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    utils::{ReinterpretSignedExt, TruncateExt},
+    utils::TruncateExt,
 };
 use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
 use thiserror::Error;
@@ -34,20 +34,41 @@ use crate::{ShimFS, ShimPlatform, Task};
 struct ElfFile<'a, Platform: ShimPlatform, FS: ShimFS> {
     task: &'a Task<Platform, FS>,
     fd: i32,
+    status: FileStatus,
     load_high: bool,
 }
 
 impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfFile<'a, Platform, FS> {
     fn new(task: &'a Task<Platform, FS>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
-        let fd = task
-            .sys_open(path, OFlags::RDONLY, Mode::empty())?
-            .reinterpret_as_signed();
-        Ok(ElfFile {
+        let credentials = task.credentials.borrow().clone();
+        let access = AccessCredentials::new(
+            credentials.euid,
+            credentials.egid,
+            credentials.supplementary_groups(),
+        );
+        let files = task.files.borrow();
+        let (fd, status) = files.fs.open_executable_as(access, path)?;
+        let fd = files.insert_raw_fd(fd).map_err(|fd| {
+            let _ = files.fs.close(&fd);
+            Errno::EMFILE
+        })?;
+        let fd = i32::try_from(fd).expect("RLIMIT_NOFILE keeps guest descriptors within i32");
+        Ok(Self {
             task,
             fd,
+            status,
             load_high: false,
         })
     }
+}
+
+pub(crate) fn read_executable_header<Platform: ShimPlatform, FS: ShimFS>(
+    task: &Task<Platform, FS>,
+    path: impl litebox::path::Arg,
+    header: &mut [u8],
+) -> Result<usize, Errno> {
+    let file = ElfFile::new(task, path)?;
+    task.sys_read(file.fd, header, Some(0))
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for ElfFile<'_, Platform, FS> {
@@ -273,6 +294,10 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         };
 
         Ok(Self { path, main, interp })
+    }
+
+    pub(crate) fn main_status(&self) -> &FileStatus {
+        &self.main.file.status
     }
 
     /// Load an ELF file and prepare the stack for the new process.

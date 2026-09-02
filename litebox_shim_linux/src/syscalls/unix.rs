@@ -22,13 +22,13 @@ use litebox::{
         wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
-    fs::{Mode, OFlags, errors::OpenError},
+    fs::{AccessCredentials, Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
-    SocketOptionName, Ucred, errno::Errno,
+    ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionName,
+    Ucred, errno::Errno,
 };
 
 use crate::{
@@ -228,20 +228,25 @@ impl UnixSocketAddr {
         match self {
             UnixSocketAddr::Path(path) => {
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
-                let file = task
-                    .files
-                    .borrow()
-                    .fs
-                    .open(path.as_str(), OFlags::RDWR, unix_socket_file_mode())
+                let credential_snapshot = task.credentials.borrow().clone();
+                let credentials = AccessCredentials::new(
+                    credential_snapshot.euid,
+                    credential_snapshot.egid,
+                    credential_snapshot.supplementary_groups(),
+                );
+                let fs = task.files.borrow().fs.clone();
+                let file = fs
+                    .open_as(
+                        credentials,
+                        path.as_str(),
+                        OFlags::RDWR,
+                        unix_socket_file_mode(),
+                    )
                     .map_err(|err| match err {
                         OpenError::AlreadyExists => Errno::EADDRINUSE,
                         other => Errno::from(other),
                     })?;
-                Ok(UnixBoundSocketAddr::Path((
-                    path,
-                    file,
-                    task.files.borrow().fs.clone(),
-                )))
+                Ok(UnixBoundSocketAddr::Path((path, file, fs)))
             }
             UnixSocketAddr::Abstract(data) => Ok(UnixBoundSocketAddr::Abstract(data)),
             // Nothing legitimately connects to an unnamed address.
@@ -284,11 +289,16 @@ impl UnixSocketAddr {
         match self {
             UnixSocketAddr::Path(path) => {
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
-                let file = task
-                    .files
-                    .borrow()
-                    .fs
-                    .open(
+                let credential_snapshot = task.credentials.borrow().clone();
+                let credentials = AccessCredentials::new(
+                    credential_snapshot.euid,
+                    credential_snapshot.egid,
+                    credential_snapshot.supplementary_groups(),
+                );
+                let fs = task.files.borrow().fs.clone();
+                let file = fs
+                    .open_as(
+                        credentials,
                         path.as_str(),
                         OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
                         unix_socket_file_mode(),
@@ -297,10 +307,7 @@ impl UnixSocketAddr {
                         OpenError::AlreadyExists => Errno::EADDRINUSE,
                         other => Errno::from(other),
                     })?;
-                Ok((
-                    UnixBoundSocketAddr::Path((path, file, task.files.borrow().fs.clone())),
-                    None,
-                ))
+                Ok((UnixBoundSocketAddr::Path((path, file, fs)), None))
             }
             UnixSocketAddr::Abstract(data) => {
                 let reservation =
@@ -1240,6 +1247,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             }
         });
     }
+
+    fn unregister_observer(&self, observer: Weak<dyn litebox::event::observer::Observer<Events>>) {
+        self.with_state_ref(|state| match state {
+            UnixStreamState::Init(init) => init.pollee.unregister_observer(observer),
+            UnixStreamState::Listen(listen) => {
+                listen.backlog.pollee.unregister_observer(observer);
+            }
+            UnixStreamState::Connected(connect) => {
+                connect.pollee.unregister_observer(observer);
+            }
+        });
+    }
+
     fn check_io_events(&self) -> Events {
         self.with_state_ref(|state| match state {
             UnixStreamState::Init(init) => {
@@ -1941,9 +1961,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
 
         match optname {
-            SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => Err(Errno::EOPNOTSUPP),
-            },
+            SocketOptionName::IP(_) => Err(Errno::EOPNOTSUPP),
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
                 SocketOption::RCVTIMEO
@@ -1998,9 +2016,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
 
         let val: u32 = match optname {
-            SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => return Err(Errno::EOPNOTSUPP),
-            },
+            SocketOptionName::IP(_) => return Err(Errno::EOPNOTSUPP),
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`
                 SocketOption::RCVTIMEO
@@ -2061,6 +2077,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> IOPollable for UnixSocket<Platform, FS>
                     .read()
                     .pollee
                     .register_observer(observer, mask);
+            }
+        }
+    }
+
+    fn unregister_observer(&self, observer: Weak<dyn litebox::event::observer::Observer<Events>>) {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => {
+                stream.unregister_observer(observer);
+            }
+            UnixSocketInner::Datagram(datagram) => {
+                datagram.inner.read().pollee.unregister_observer(observer);
             }
         }
     }
