@@ -233,6 +233,49 @@ come from outside, both by nature rather than by omission: `RUN` executes
 programs from the image itself and needs root for `chroot`, and creating a
 network device needs `CAP_NET_ADMIN`.
 
+### RUN commands and root privilege
+
+`RUN` instructions require root because they execute inside a chroot of the
+in-progress rootfs during build time. On macOS (including Apple Silicon), even
+with `sudo`, chroot has restrictions. For rootless testing and macOS ARM
+compatibility, create Dockerfiles without `RUN` instructions:
+
+```dockerfile
+# ✓ Works rootless (macOS ARM compatible)
+FROM alpine:latest
+COPY myapp /app/
+CMD ["/app/myapp"]
+```
+
+```dockerfile
+# ✗ Requires root during build
+FROM alpine:latest
+RUN apk add --no-cache curl
+CMD ["/bin/curl"]
+```
+
+To use `RUN`, invoke boxer with `sudo`:
+```sh
+sudo ./target/release/boxer build -o app.box.wasm -f Dockerfile
+```
+
+Multi-stage builds work fine without `RUN`:
+```dockerfile
+# Build stage on your build host
+FROM golang:latest as builder
+WORKDIR /build
+COPY . .
+# RUN go build -o app    # Not supported in boxer build
+
+# Runtime stage (rootless)
+FROM alpine:latest
+COPY --from=builder /build/app /app/
+ENTRYPOINT ["/app"]
+```
+
+Build the builder stage on your host machine (with `go build`), then use
+`COPY --from=...` to bring the artifact into the runtime stage.
+
 ## Dockerfile support
 
 `Containerfile` and `Dockerfile` are the same language here; with no source

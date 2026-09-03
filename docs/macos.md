@@ -160,6 +160,31 @@ maintained by the hardware.
 The host reserves `SIGUSR2` for interrupting a thread out of guest execution;
 Darwin has no realtime signals to take it from instead.
 
+### Boxer build (Dockerfile RUN commands)
+
+Boxer's `RUN` instruction executes inside a `chroot` during the build phase,
+which requires root privilege. On macOS, even with `sudo`, `chroot` has
+restrictions. For **rootless builds on macOS ARM**, omit `RUN` commands:
+
+```dockerfile
+# ✓ Works rootless on macOS ARM
+FROM alpine:latest
+CMD ["/bin/echo", "hello"]
+```
+
+```dockerfile
+# ✗ Requires root (`sudo boxer build ...`)
+FROM alpine:latest
+RUN apk add --no-cache curl   # chroot requires root
+```
+
+For package installation and build steps that need `RUN`, either:
+- Build with `sudo`: `sudo boxer build -o app.box.wasm -f Dockerfile`
+- Use multi-stage builds: compile on your build host (with full toolchain),
+  then use `COPY --from=...` to bring artifacts into a rootless runtime stage
+
+See `examples/macos-arm-test/` for a complete working example.
+
 ## Remaining work
 
 See also [`docs/roadmap.md`](./roadmap.md) for this and everything else
