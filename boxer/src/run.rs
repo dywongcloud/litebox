@@ -263,9 +263,15 @@ pub fn run(
         meta.working_dir.as_deref(),
         NativeNet {
             tun_device: tun_device.as_deref(),
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            ))]
             guest_ip,
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "macos", target_arch = "aarch64")
+            ))]
             host_ip,
         },
     )
@@ -303,9 +309,15 @@ fn effective_argv(meta: &BoxMeta, extra_args: &[String]) -> anyhow::Result<Vec<S
 /// `run_native` takes one struct instead of three separate scalars.
 struct NativeNet<'a> {
     tun_device: Option<&'a str>,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     guest_ip: std::net::Ipv4Addr,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     host_ip: std::net::Ipv4Addr,
 }
 
@@ -382,6 +394,8 @@ fn run_native(
         unstable: true,
         initial_files: tar_file.path().to_path_buf(),
         tun_device_name: net.tun_device.map(String::from),
+        net_guest_ip: Some(net.guest_ip),
+        net_host_ip: Some(net.host_ip),
     };
     litebox_runner_linux_on_macos_userland::run(cli)
 }

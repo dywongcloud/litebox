@@ -98,6 +98,42 @@ fn parse_utun_unit(name: &str) -> Option<u32> {
     name.strip_prefix("utun")?.parse().ok()
 }
 
+/// Give `device` the address `host_ip` and bring it up.
+///
+/// Unlike Linux's persistent `ip tuntap`-created TUN devices (which `boxer`
+/// creates and addresses once, ahead of time, then merely attaches to), a
+/// `utun` interface exists only while this process holds its control socket
+/// open -- there is no separate device to pre-configure. So the address has
+/// to be set here, immediately after [`open_utun`] succeeds, from inside the
+/// same process, using the same `src == dst` trick Linux's point-to-point
+/// TUN needs a netmask to avoid: `ifconfig utunN host_ip host_ip netmask
+/// 255.255.255.0` makes the interface route the whole /24 rather than only a
+/// single peer address, matching what `boxer run`'s `--net-host-ip` and the
+/// guest's own `--net-guest-ip` expect to route through.
+///
+/// Shells out to `ifconfig` rather than the raw `SIOCAIFADDR`/`ifaliasreq`
+/// ioctl BSD point-to-point interfaces need: fewer platform-specific struct
+/// layouts to get exactly right for a call this infrequent.
+///
+/// # Errors
+///
+/// Returns the underlying error if `ifconfig` cannot be spawned or exits
+/// non-zero -- most often because the process is not root.
+pub(crate) fn configure_utun_address(device: &str, host_ip: std::net::Ipv4Addr) -> io::Result<()> {
+    let netmask = "255.255.255.0";
+    let output = std::process::Command::new("ifconfig")
+        .args([device, "inet", &host_ip.to_string(), &host_ip.to_string()])
+        .args(["netmask", netmask, "up"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "ifconfig {device} inet {host_ip} {host_ip} netmask {netmask} up failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// The address-family header `utun` puts in front of every packet, in network
 /// byte order.
 fn address_family_header(packet: &[u8]) -> [u8; 4] {

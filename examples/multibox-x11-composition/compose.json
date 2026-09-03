@@ -5,7 +5,7 @@
       "box": "images/x11server.box.wasm",
       "net_host_ip": "10.90.0.1",
       "net_guest_ip": "10.90.0.2",
-      "tun_device": "tun90",
+      "tun_device": "utun90",
       "env": {
         "BIND_IP": "${x11server.guest_ip}"
       }
@@ -15,7 +15,7 @@
       "box": "images/app.box.wasm",
       "net_host_ip": "10.90.1.1",
       "net_guest_ip": "10.90.1.2",
-      "tun_device": "tun91",
+      "tun_device": "utun91",
       "depends_on": ["x11server"],
       "ready_delay_ms": 1500,
       "env": {
@@ -27,7 +27,7 @@
       "box": "images/vncbridge.box.wasm",
       "net_host_ip": "10.90.2.1",
       "net_guest_ip": "10.90.2.2",
-      "tun_device": "tun92",
+      "tun_device": "utun92",
       "depends_on": ["x11server"],
       "ready_delay_ms": 1500,
       "env": {

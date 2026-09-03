@@ -143,19 +143,36 @@ impl MacOsUserland {
     /// `tun_device_name` optionally names a `utun` interface (such as `"utun3"`)
     /// to connect guest networking to; networking is disabled when it is `None`.
     ///
+    /// `host_ip`, when given alongside `tun_device_name`, is assigned to the
+    /// `utun` interface itself (with a /24 netmask) immediately after it is
+    /// opened -- a `utun` device has no separate persistent existence to
+    /// pre-configure the way a Linux TUN device does (see
+    /// `litebox_platform_macos_userland::net::configure_utun_address`), so
+    /// this is the only place its address can be set. Ignored when
+    /// `tun_device_name` is `None`.
+    ///
     /// # Panics
     ///
-    /// Panics if the requested `utun` device cannot be opened, if the fault
-    /// handlers that make guest-memory accesses fallible cannot be installed,
-    /// or if the guest thread-pointer TSD slot the rewriter's `Host::MacOs`
-    /// gates have baked in cannot be reserved (see `reserve_guest_tpidr_tsd_slot`).
-    pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+    /// Panics if the requested `utun` device cannot be opened or addressed,
+    /// if the fault handlers that make guest-memory accesses fallible cannot
+    /// be installed, or if the guest thread-pointer TSD slot the rewriter's
+    /// `Host::MacOs` gates have baked in cannot be reserved (see
+    /// `reserve_guest_tpidr_tsd_slot`).
+    pub fn new(
+        tun_device_name: Option<&str>,
+        host_ip: Option<std::net::Ipv4Addr>,
+    ) -> &'static Self {
         install_fault_handlers();
         install_async_signal_handlers();
         reserve_guest_tpidr_tsd_slot();
 
         let tun = tun_device_name.map(|name| {
-            net::open_utun(name).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
+            let fd = net::open_utun(name).unwrap_or_else(|e| panic!("failed to open {name}: {e}"));
+            if let Some(host_ip) = host_ip {
+                net::configure_utun_address(name, host_ip)
+                    .unwrap_or_else(|e| panic!("failed to address {name} as {host_ip}: {e}"));
+            }
+            fd
         });
 
         let platform = Self {

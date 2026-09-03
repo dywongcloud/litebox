@@ -10,7 +10,10 @@
 //! box under the litebox sandbox on a matching host. See `docs/boxer.md`.
 
 mod boxfmt;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 mod compose;
 mod dockerfile;
 mod publish;
@@ -49,8 +52,10 @@ enum Cli {
     Run {
         /// Path to the .box.wasm artifact.
         box_path: PathBuf,
-        /// Attach the workload to this TUN device so its ports are reachable
-        /// (see litebox_platform_linux_userland/scripts/tun-setup.sh).
+        /// Attach the workload to this TUN device so its ports are reachable.
+        /// boxer creates and addresses the device itself (needs root/
+        /// CAP_NET_ADMIN): any name on Linux, or a `utun<N>` name on macOS
+        /// (`utun` interfaces exist only by that naming scheme).
         #[arg(long = "net", value_name = "TUN_DEVICE")]
         net: Option<String>,
         /// Host-side address of the --net device (the guest's gateway).
@@ -184,16 +189,22 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn compose_command(config: &std::path::Path) -> anyhow::Result<()> {
     compose::up(config)
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 fn compose_command(_config: &std::path::Path) -> anyhow::Result<()> {
     bail!(
-        "boxer compose needs the x86_64 Linux native runner, the same \
-         requirement as boxer run"
+        "boxer compose needs a native runner (x86_64 Linux or aarch64 macOS), \
+         the same requirement as boxer run"
     );
 }
 

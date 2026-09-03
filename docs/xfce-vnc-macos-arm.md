@@ -57,47 +57,52 @@ Traditional X11 uses Unix domain sockets in `/tmp/.X11-unix/`. LiteBox on macOS 
 
 ## Composition Configuration
 
-Example `compose.json`:
+Example `compose.json`, matching the actual `boxer compose` schema
+(`InstanceConfig` in `boxer/src/compose.rs`) and the real, tested config at
+`examples/multibox-x11-composition/compose.json`:
 
 ```json
 {
-  "version": "1.0",
   "instances": [
     {
       "name": "x11server",
-      "image": "x11server.box.wasm",
+      "box": "images/x11server.box.wasm",
+      "net_host_ip": "10.90.0.1",
       "net_guest_ip": "10.90.0.2",
-      "wait_for_port": 6000,
-      "env": {
-        "LISTEN_IP": "0.0.0.0",
-        "LISTEN_PORT": "6000"
-      }
+      "tun_device": "utun90",
+      "env": { "BIND_IP": "${x11server.guest_ip}" }
     },
     {
       "name": "app",
-      "image": "app.box.wasm",
+      "box": "images/app.box.wasm",
+      "net_host_ip": "10.90.1.1",
       "net_guest_ip": "10.90.1.2",
+      "tun_device": "utun91",
       "depends_on": ["x11server"],
-      "env": {
-        "DISPLAY": "${x11server.guest_ip}:0"
-      }
+      "env": { "DISPLAY": "${x11server.guest_ip}:0" }
     },
     {
       "name": "vncbridge",
-      "image": "vncbridge.box.wasm",
+      "box": "images/vncbridge.box.wasm",
+      "net_host_ip": "10.90.2.1",
       "net_guest_ip": "10.90.2.2",
+      "tun_device": "utun92",
       "depends_on": ["x11server"],
       "env": {
-        "X11_HOST": "${x11server.guest_ip}",
-        "X11_DISPLAY": "0"
+        "DISPLAY": "${x11server.guest_ip}:0",
+        "BIND_IP": "${vncbridge.guest_ip}"
       },
-      "publish_ports": [
-        "5900:5900/tcp"
-      ]
+      "publish": ["5900:5900"]
     }
   ]
 }
 ```
+
+`tun_device` is optional (auto-derived as `utun9<n>` if omitted), but note
+the naming constraint: Linux's `ip tuntap` accepts any name, while macOS's
+`utun` interfaces only ever exist as `utun<unit>` (see
+`litebox_platform_macos_userland::net`) -- `utun90`/`utun91`/`utun92` here
+satisfies both, so the same config runs unmodified on either host.
 
 ### Environment Variable Templating
 
@@ -200,16 +205,29 @@ RFB 003.008
 | No fork() | Pre-start all services |
 | Single guest thread per box | Use separate boxes for concurrent tasks |
 
-### Verified Capabilities
+### Capability status
 
-- [x] Direct aarch64 instruction execution (no emulation)
-- [x] Memory isolation via Mach VM
-- [x] TUN-based inter-box networking
-- [x] Port publishing from guest to host
-- [x] Environment variable injection
-- [x] Graceful startup/shutdown
-- [x] Multiple isolated instances simultaneously
-- [x] Real-time pixel-level rendering over VNC
+The full composition (X11 server + app + VNC bridge, `boxer compose`) is
+verified end-to-end on x86_64 Linux, the platform this was actually built
+and tested against -- see `examples/multibox-x11-composition/README.md`.
+The pieces specific to macOS ARM (native `boxer run`/`boxer compose`, guest
+stdio forwarding, `utun` device creation and addressing) are implemented
+and type-check against the real `aarch64-apple-darwin` target, but this
+development environment has no macOS ARM hardware to run them on, so the
+macOS-specific path itself is untested on real hardware. Treat "should
+work" and "does work" as distinct until someone runs it on an actual Mac.
+
+- [x] Direct aarch64 instruction execution (no emulation) -- implemented
+- [x] Memory isolation via Mach VM -- implemented
+- [x] `utun`-based inter-box networking, including IP address assignment --
+      implemented (`litebox_platform_macos_userland::net::configure_utun_address`)
+- [x] Port publishing from guest to host -- implemented (platform-agnostic,
+      shared with the verified Linux path)
+- [x] Environment variable injection -- implemented (shared with Linux)
+- [x] Graceful startup/shutdown -- implemented (shared with Linux)
+- [x] Multiple isolated instances simultaneously -- implemented
+- [ ] Real-time pixel-level rendering over VNC on real macOS ARM hardware --
+      verified on Linux only; not yet run on a Mac
 
 ### Known Limitations
 

@@ -46,7 +46,7 @@ struct InstanceConfig {
     /// Guest-side TUN address. Auto-allocated (`10.90.<n>.2`, paired with
     /// `net_host_ip`) if omitted.
     net_guest_ip: Option<Ipv4Addr>,
-    /// TUN device name. Auto-derived (`bxc<n>`) if omitted.
+    /// TUN device name. Auto-derived (`utun9<n>`) if omitted.
     tun_device: Option<String>,
     /// Names of instances that must be started (and given
     /// `ready_delay_ms` to come up) before this one starts.
@@ -241,10 +241,17 @@ fn resolve_addresses(instances: &[InstanceConfig]) -> anyhow::Result<HashMap<Str
                 inst.name
             ),
         };
+        // "utunNN" rather than an arbitrary name: Linux accepts any ASCII
+        // name for `ip tuntap add`, but macOS's `utun` interfaces are only
+        // ever named `utun<unit>` (see `litebox_platform_macos_userland::net`),
+        // so an auto-derived name has to satisfy both to work on either
+        // native runner without the compose config itself being
+        // platform-specific. Offset by 90 to stay clear of the low utun
+        // units macOS's own VPN/Wi-Fi/Handoff services commonly hold.
         let tun_device = inst
             .tun_device
             .clone()
-            .unwrap_or_else(|| format!("bxc{index}"));
+            .unwrap_or_else(|| format!("utun{}", 90 + index));
 
         resolved.insert(
             inst.name.clone(),
