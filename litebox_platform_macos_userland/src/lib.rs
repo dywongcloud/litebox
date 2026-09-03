@@ -45,7 +45,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
-use std::io::{IsTerminal as _, Write};
+use std::io::IsTerminal as _;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use litebox::platform::page_mgmt::{

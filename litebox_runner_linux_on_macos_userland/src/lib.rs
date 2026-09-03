@@ -14,6 +14,7 @@ extern crate alloc;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_macos_userland::MacOsUserland as Platform;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 /// Run Linux programs with LiteBox on unmodified macOS.
