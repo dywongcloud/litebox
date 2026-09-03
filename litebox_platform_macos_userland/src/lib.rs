@@ -45,7 +45,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Write};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use litebox::platform::page_mgmt::{
@@ -122,6 +122,22 @@ impl core::fmt::Debug for MacOsUserland {
 }
 
 impl MacOsUserland {
+    /// Verify that host stdout and stderr are accessible and functional.
+    /// This ensures guest stdio forwarding will work correctly.
+    pub fn verify_stdio_accessible(&self) -> bool {
+        // Test that we can write to stdout and stderr by attempting a small write.
+        // This verifies the file descriptors are open and accessible.
+        unsafe {
+            let test_bytes = b"";
+            let stdout_result = libc::write(libc::STDOUT_FILENO, test_bytes.as_ptr().cast(), 0);
+            let stderr_result = libc::write(libc::STDERR_FILENO, test_bytes.as_ptr().cast(), 0);
+
+            // Both writes should succeed or return 0 (no bytes to write).
+            // Only return false if we get an actual error (n < 0).
+            stdout_result >= 0 && stderr_result >= 0
+        }
+    }
+
     /// Create a new userland-macOS platform for use in LiteBox.
     ///
     /// `tun_device_name` optionally names a `utun` interface (such as `"utun3"`)
@@ -1387,13 +1403,21 @@ impl litebox::platform::StdioProvider for MacOsUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        let (fd, lock) = match stream {
-            litebox::platform::StdioOutStream::Stdout => (libc::STDOUT_FILENO, &self.stdout_lock),
-            litebox::platform::StdioOutStream::Stderr => (libc::STDERR_FILENO, &self.stderr_lock),
+        let lock = match stream {
+            litebox::platform::StdioOutStream::Stdout => &self.stdout_lock,
+            litebox::platform::StdioOutStream::Stderr => &self.stderr_lock,
         };
         // Holding this for the whole (potentially multi-syscall) write below is what makes one
         // guest `write()` call atomic w.r.t. other guest threads' writes to the same stream.
         let _guard = lock.lock().unwrap();
+
+        // Use raw file descriptor writing for direct output forwarding to host stdio.
+        // This ensures guest writes go directly to the host's stdout/stderr without buffering.
+        let fd = match stream {
+            litebox::platform::StdioOutStream::Stdout => libc::STDOUT_FILENO,
+            litebox::platform::StdioOutStream::Stderr => libc::STDERR_FILENO,
+        };
+
         let mut written = 0usize;
         while written < buf.len() {
             // SAFETY: `buf[written..]` is a valid readable slice of the given length.

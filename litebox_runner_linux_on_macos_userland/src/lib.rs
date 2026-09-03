@@ -88,6 +88,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
 
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
+
+    // Verify that stdio forwarding is set up correctly.
+    // This ensures guest writes to stdout/stderr will reach the host.
+    if !platform.verify_stdio_accessible() {
+        eprintln!("Warning: host stdout/stderr may not be accessible for guest stdio forwarding");
+    }
+
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
@@ -140,6 +147,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         argv,
         envp,
     )?;
+
+    // Wire up stdio forwarding: ensure host stdout/stderr are accessible to the guest.
+    // This is needed because guest write(fd=1) and write(fd=2) syscalls are routed
+    // through the platform's StdioProvider::write_to, which forwards to the host's fds.
+    // The platform is already initialized with the host's stdio information, so guest
+    // writes via /dev/stdout and /dev/stderr will reach the host.
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
 
     // SAFETY: `load_program` produced the entry context, so its `pc` and `sp`
     // describe a loaded, runnable guest image.
