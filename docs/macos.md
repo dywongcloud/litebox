@@ -197,6 +197,13 @@ See also [`docs/roadmap.md`](./roadmap.md) for this and everything else
 outstanding across the tree, grouped by how much verification each item
 needs before it can land.
 
+### Known gaps in macOS ARM execution
+
+- **Guest stdout/stderr not forwarded:** The native runner (`litebox_runner_linux_on_macos_userland`)
+  executes guest processes but does not connect their stdout/stderr to the host.
+  Guest output is lost. Workaround: use WASM workloads (WASI stdio works), or
+  build on Linux for full stdio support.
+
 Guest entry itself -- the context switch into guest code and back -- **is now
 implemented and tested on real hardware** (`litebox_platform_macos_userland::guest`;
 see [Guest entry](#guest-entry-implemented) below). What is left before an

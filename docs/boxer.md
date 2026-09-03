@@ -223,6 +223,13 @@ environment and the host's stdio -- but no filesystem and no network, because
 a box does not yet describe those capabilities and granting them silently
 would be worse than refusing.
 
+**Note on macOS ARM:** The native runner (`litebox_runner_linux_on_macos_userland`)
+does not currently forward guest stdout/stderr to the host. Guest processes run
+but their output is not visible. This is a known gap; the runner executes the
+guest but doesn't wire up file descriptor 1/2 (stdout/stderr) to the host. Use
+WASM workloads on macOS ARM as a workaround (WASI stdio works), or build boxes
+on Linux where stdio forwarding is fully functional.
+
 ## What boxer needs from the host
 
 Nothing but a kernel. Image pulls, layer decompression, Dockerfile
