@@ -263,6 +263,7 @@ dependencies = [
  "flate2",
  "libc",
  "litebox_packager",
+ "litebox_runner_linux_on_macos_userland",
  "litebox_runner_linux_userland",
  "litebox_syscall_rewriter",
  "oci-spec",
