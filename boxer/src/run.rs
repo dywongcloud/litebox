@@ -263,7 +263,9 @@ pub fn run(
         meta.working_dir.as_deref(),
         NativeNet {
             tun_device: tun_device.as_deref(),
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             guest_ip,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             host_ip,
         },
     )
@@ -301,7 +303,9 @@ fn effective_argv(meta: &BoxMeta, extra_args: &[String]) -> anyhow::Result<Vec<S
 /// `run_native` takes one struct instead of three separate scalars.
 struct NativeNet<'a> {
     tun_device: Option<&'a str>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     guest_ip: std::net::Ipv4Addr,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     host_ip: std::net::Ipv4Addr,
 }
 
