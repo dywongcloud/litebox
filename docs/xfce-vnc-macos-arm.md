@@ -162,8 +162,19 @@ ENTRYPOINT ["xclock", "-display", "${DISPLAY}"]
 
 ## Running the Composition
 
+Two macOS-specific prerequisites, both easy to miss because each fails deep
+inside a spawned instance rather than at the compose command itself:
+
 ```bash
-boxer compose compose.json
+# 1. Sign for MAP_JIT. Apple Silicon refuses executable guest mappings unless
+#    the binary carries com.apple.security.cs.allow-jit, and `cargo build`
+#    drops the signature -- so re-run this after every build. Without it the
+#    guest dies with "Memory mapping error / EPERM". See docs/macos.md.
+litebox_platform_macos_userland/scripts/codesign-jit.sh target/release/boxer
+
+# 2. Run as root: creating a `utun` interface needs it, and without it the
+#    guest dies with "failed to open utun90: Operation not permitted".
+sudo ./target/release/boxer compose compose.json
 ```
 
 This:

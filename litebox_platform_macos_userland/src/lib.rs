@@ -335,6 +335,26 @@ pub unsafe fn jit_write_protect(executable: bool) {
     unsafe { darwin::pthread_jit_write_protect_np(libc::c_int::from(executable)) }
 }
 
+/// Explain an EPERM from a `MAP_JIT` mapping, once per process.
+///
+/// The `AllocationError` this accompanies can only say "out of memory", and
+/// the guest-side failure it turns into ("failed to load the ELF file:
+/// Memory mapping error") names neither `MAP_JIT` nor the signature that is
+/// actually missing.
+fn report_missing_jit_entitlement() {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        eprintln!(
+            "litebox: mmap(MAP_JIT) was refused with EPERM. Apple Silicon \
+             allows executable guest mappings only to a process signed with \
+             the com.apple.security.cs.allow-jit entitlement, and `cargo \
+             build` writes an unsigned binary. Ad-hoc sign it (re-run after \
+             every build):\n  \
+             litebox_platform_macos_userland/scripts/codesign-jit.sh <binary>"
+        );
+    });
+}
+
 /// Mirrors `<MacOsUserland as PageManagementProvider<ALIGN>>::TASK_ADDR_MIN`
 /// (the trait impl's associated const is defined in terms of this, not the
 /// other way around) so free functions outside that `impl` block --
@@ -398,6 +418,17 @@ fn allocate_jit_pages(
     if kernel_chosen == libc::MAP_FAILED {
         return Err(match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::EINVAL) => AllocationError::Unaligned,
+            // A well-formed `MAP_JIT` request does not otherwise get EPERM:
+            // Apple Silicon refuses it to any process whose signature lacks
+            // `com.apple.security.cs.allow-jit`, which is every unsigned
+            // `cargo build` binary. The error this returns says only
+            // "out of memory", so name the real cause once, here, rather
+            // than leaving it to be rediscovered from an EPERM deep in a
+            // guest ELF load.
+            Some(libc::EPERM) => {
+                report_missing_jit_entitlement();
+                AllocationError::OutOfMemory
+            }
             _ => AllocationError::OutOfMemory,
         });
     }

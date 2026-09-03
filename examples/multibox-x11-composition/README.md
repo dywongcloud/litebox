@@ -95,7 +95,15 @@ cargo build --release --target aarch64-unknown-linux-musl
 python3 build-images.py                 # -> images/{x11server,app,vncbridge}.box.wasm (arm64)
 cd ../..
 cargo build --release -p boxer
-./target/release/boxer compose examples/multibox-x11-composition/compose.json
+
+# Every executable guest mapping goes through MAP_JIT, which Apple Silicon
+# refuses unless the binary's signature carries com.apple.security.cs.allow-jit
+# ("Memory mapping error / EPERM" at guest load time otherwise). `cargo build`
+# drops the signature, so re-run this after every build. See docs/macos.md.
+litebox_platform_macos_userland/scripts/codesign-jit.sh target/release/boxer
+
+# Creating the utun devices needs root, so compose runs under sudo.
+sudo ./target/release/boxer compose examples/multibox-x11-composition/compose.json
 ```
 
 In another terminal, once the log shows `composition up, press Ctrl+C to

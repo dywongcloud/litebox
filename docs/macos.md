@@ -67,15 +67,24 @@ refuses to add `PROT_EXEC` to anything that was ever writable. The supported
 escape hatch is `MAP_JIT`, which the platform passes whenever a mapping requests
 `EXEC`. Using it has two consequences:
 
-1. **The JIT entitlement is only load-bearing under the Hardened Runtime.**
-   Per Apple's own documentation, `com.apple.security.cs.allow-jit` is required
-   only when a binary has the Hardened Runtime enabled (`codesign --options
-   runtime`, which in turn is what notarization requires); without it,
-   `MAP_JIT` works with or without the entitlement present. The command below
-   ad-hoc-signs with the entitlement anyway -- it costs nothing and future-proofs
-   a later `--options runtime`, notarized build -- but for local development
-   outside Gatekeeper, neither the entitlement nor notarization is actually
-   required for `MAP_JIT` itself to work. Create an entitlements file:
+1. **The JIT entitlement is required, and signing is not optional.** On Apple
+   Silicon the kernel refuses `MAP_JIT` to a process whose signature does not
+   carry `com.apple.security.cs.allow-jit`, Hardened Runtime or not. An
+   unsigned `cargo build` binary therefore dies the first time a guest mapping
+   asks for `EXEC`:
+
+   ```
+   Error: failed to load the ELF file
+   Caused by:
+       0: Memory mapping error
+       1: EPERM: Operation not permitted
+   ```
+
+   Ad-hoc signing with the entitlement is enough (no developer account, no
+   notarization). `cargo build` writes a fresh unsigned binary every time, so
+   this has to be re-run after **every** build, not once at setup.
+   `litebox_platform_macos_userland/scripts/codesign-jit.sh <binary>` does it;
+   it signs with `scripts/litebox.entitlements`:
 
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>
@@ -89,11 +98,18 @@ escape hatch is `MAP_JIT`, which the platform passes whenever a mapping requests
    </plist>
    ```
 
-   and sign the runner with it:
+   so these are equivalent:
 
    ```sh
-   codesign --sign - --entitlements litebox.entitlements --force <binary>
+   litebox_platform_macos_userland/scripts/codesign-jit.sh target/release/boxer
+   # or, by hand:
+   codesign --sign - \
+     --entitlements litebox_platform_macos_userland/scripts/litebox.entitlements \
+     --force target/release/boxer
    ```
+
+   `boxer compose` re-execs the same binary for each instance, so signing the
+   one `boxer` covers the children it spawns.
 
 2. **Writes must be bracketed.** A `MAP_JIT` mapping is writable *or* executable
    per thread, never both. The platform exposes this through
