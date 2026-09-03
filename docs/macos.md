@@ -160,30 +160,36 @@ maintained by the hardware.
 The host reserves `SIGUSR2` for interrupting a thread out of guest execution;
 Darwin has no realtime signals to take it from instead.
 
-### Boxer build (Dockerfile RUN commands)
+### Boxer build (Dockerfile RUN commands) — not supported on macOS
 
-Boxer's `RUN` instruction executes inside a `chroot` during the build phase,
-which requires root privilege. On macOS, even with `sudo`, `chroot` has
-restrictions. For **rootless builds on macOS ARM**, omit `RUN` commands:
+Boxer's `RUN` instruction **cannot execute on macOS**, even with `sudo` or root.
+The macOS kernel cannot directly execute Linux ELF binaries. RUN uses chroot to
+change the root filesystem view, but the kernel remains macOS. When attempting
+to execute `/bin/sh` (a Linux binary), the kernel rejects it with `Exec format
+error (os error 8)`.
 
+**Workarounds for macOS ARM:**
+
+1. **Omit RUN commands** (simplest, for testing):
 ```dockerfile
-# ✓ Works rootless on macOS ARM
 FROM alpine:latest
 CMD ["/bin/echo", "hello"]
 ```
 
-```dockerfile
-# ✗ Requires root (`sudo boxer build ...`)
-FROM alpine:latest
-RUN apk add --no-cache curl   # chroot requires root
+2. **Use multi-stage builds** (for production):
+   - Compile on Linux or your build host (with full toolchain)
+   - Use `COPY --from=...` to bring pre-built artifacts
+   - Runtime stage (running on macOS ARM) has no `RUN`
+
+3. **If RUN is needed**: Build on Linux, transfer artifact to macOS
+```bash
+# On Linux:
+boxer build -o app.box.wasm -f Dockerfile
+# Transfer to macOS and run:
+./target/release/boxer run app.box.wasm
 ```
 
-For package installation and build steps that need `RUN`, either:
-- Build with `sudo`: `sudo boxer build -o app.box.wasm -f Dockerfile`
-- Use multi-stage builds: compile on your build host (with full toolchain),
-  then use `COPY --from=...` to bring artifacts into a rootless runtime stage
-
-See `examples/macos-arm-test/` for a complete working example.
+See `examples/macos-arm-test/` and `docs/boxer.md` for details.
 
 ## Remaining work
 

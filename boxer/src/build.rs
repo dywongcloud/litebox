@@ -1059,9 +1059,15 @@ fn run_in_chroot(
     }
 
     let status = command_builder.status().with_context(|| {
+        let platform_note = if cfg!(target_os = "macos") {
+            " On macOS, RUN cannot execute Linux binaries even with sudo/root: \
+             the host kernel cannot run Linux ELF binaries. \
+             Use a Dockerfile without RUN (FROM + CMD only), or build on Linux."
+        } else {
+            " chroot requires root privileges. Run with sudo if needed."
+        };
         format!(
-            "RUN failed to start {program} (chroot requires root; \
-             the command must exist inside the image)"
+            "RUN failed to start {program} ({program} not executable or not found in rootfs).{platform_note}"
         )
     })?;
 

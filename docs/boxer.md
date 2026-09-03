@@ -233,12 +233,18 @@ come from outside, both by nature rather than by omission: `RUN` executes
 programs from the image itself and needs root for `chroot`, and creating a
 network device needs `CAP_NET_ADMIN`.
 
-### RUN commands and root privilege
+### RUN commands and platform limitations
 
 `RUN` instructions require root because they execute inside a chroot of the
-in-progress rootfs during build time. On macOS (including Apple Silicon), even
-with `sudo`, chroot has restrictions. For rootless testing and macOS ARM
-compatibility, create Dockerfiles without `RUN` instructions:
+in-progress rootfs during build time. On macOS (including Apple Silicon), `RUN`
+**cannot work at all**, even with `sudo` or root privilege: the macOS kernel
+cannot execute Linux ELF binaries directly, regardless of how the filesystem is
+configured. A chroot changes the root filesystem view only; the kernel remains
+macOS. When boxer tries to execute `/bin/sh` (a Linux binary) inside the
+chroot, the macOS kernel rejects it with "Exec format error".
+
+For rootless testing and macOS ARM compatibility, create Dockerfiles without
+`RUN` instructions:
 
 ```dockerfile
 # ✓ Works rootless (macOS ARM compatible)
@@ -254,9 +260,15 @@ RUN apk add --no-cache curl
 CMD ["/bin/curl"]
 ```
 
-To use `RUN`, invoke boxer with `sudo`:
+**Note:** `sudo` does **not** help on macOS; the limitation is the kernel's inability
+to execute Linux binaries, not a privilege issue. RUN only works on Linux hosts.
+If you need `RUN` commands, build on a Linux machine and transfer the `.box.wasm`
+artifact to macOS for execution:
 ```sh
-sudo ./target/release/boxer build -o app.box.wasm -f Dockerfile
+# On Linux host (with full toolchain):
+boxer build -o app.box.wasm -f Dockerfile
+# Transfer to macOS ARM and run:
+./target/release/boxer run app.box.wasm
 ```
 
 Multi-stage builds work fine without `RUN`:
