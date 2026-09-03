@@ -3319,6 +3319,7 @@ impl SyscallRequest {
                     args: ctx.sys_req_ptr(0),
                 }
             }
+            #[cfg(target_os = "linux")]
             Sysno::fork => SyscallRequest::Fork,
             Sysno::set_robust_list => {
                 if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead>() {
