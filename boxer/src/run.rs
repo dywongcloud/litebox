@@ -347,7 +347,42 @@ fn run_native(
     litebox_runner_linux_userland::run(cli)
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_native(
+    parsed: &ParsedBox,
+    program: String,
+    args: Vec<String>,
+    env: &[String],
+    _working_dir: Option<&str>,
+    net: NativeNet<'_>,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    // The runner requires a .tar suffix.
+    let mut tar_file = tempfile::Builder::new()
+        .suffix(".tar")
+        .tempfile()
+        .context("failed to create temp tar")?;
+    tar_file
+        .write_all(&parsed.rootfs_tar)
+        .context("failed to write rootfs tar")?;
+    tar_file.flush()?;
+
+    let mut program_and_arguments = vec![program];
+    program_and_arguments.extend(args);
+
+    let cli = litebox_runner_linux_on_macos_userland::CliArgs {
+        program_and_arguments,
+        environment_variables: env.to_vec(),
+        forward_environment_variables: false,
+        unstable: true,
+        initial_files: tar_file.path().to_path_buf(),
+        tun_device_name: net.tun_device.map(String::from),
+    };
+    litebox_runner_linux_on_macos_userland::run(cli)
+}
+
+#[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
 fn run_native(
     _parsed: &ParsedBox,
     _program: String,
@@ -357,9 +392,7 @@ fn run_native(
     _net: NativeNet<'_>,
 ) -> anyhow::Result<()> {
     bail!(
-        "running boxes natively is supported on x86_64 Linux hosts today; \
-         on macOS use litebox_runner_linux_on_macos_userland with the extracted rootfs tar \
-         (`boxer inspect` shows the box contents)"
+        "running boxes natively is supported on x86_64 Linux and aarch64 macOS hosts only"
     );
 }
 
