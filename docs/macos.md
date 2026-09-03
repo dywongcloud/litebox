@@ -60,6 +60,27 @@ The practical consequence is that guest images must be position-independent, or
 linked above 4 GiB. An `ET_EXEC` binary linked at the customary `0x400000`
 cannot be loaded at its preferred address on this host.
 
+The mapping is refused with `AllocationError::BelowMinAddress`, which reaches
+the guest as a bare `EPERM`:
+
+```
+Error: failed to load the ELF file
+Caused by:
+    0: Memory mapping error
+    1: EPERM: Operation not permitted
+```
+
+Linux has no such floor, so the same binary loads there and this only shows up
+on a Mac. Check a guest binary with `readelf -h` (want `DYN`, not `EXEC`).
+Rust's own musl linking produces a static-PIE, but an external
+`*-linux-musl-gcc` linker driver -- what a Mac cross-build typically uses --
+defaults to non-PIE. Force it:
+
+```sh
+RUSTFLAGS="-C relocation-model=pic -C link-arg=-static-pie" \
+  cargo build --release --target aarch64-unknown-linux-musl
+```
+
 ### W^X, `MAP_JIT`, and code signing
 
 macOS refuses to make anonymous memory executable through the ordinary path, and

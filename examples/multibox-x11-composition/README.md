@@ -91,7 +91,16 @@ export AR_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-ar
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
 
 cd examples/multibox-x11-composition
-cargo build --release --target aarch64-unknown-linux-musl
+
+# static-PIE, not the default non-PIE an external *-linux-musl-gcc linker
+# driver produces: an arm64 Mach-O process reserves the first 4 GiB as
+# __PAGEZERO, so a fixed-address ET_EXEC guest cannot be mapped there and
+# dies as "Memory mapping error: EPERM". build-images.py refuses an ET_EXEC
+# for an arm64 box rather than let it fail at run time.
+RUSTFLAGS="-C relocation-model=pic -C link-arg=-static-pie" \
+  cargo build --release --target aarch64-unknown-linux-musl
+readelf -h target/aarch64-unknown-linux-musl/release/x11-server | grep Type:  # want DYN
+
 python3 build-images.py                 # -> images/{x11server,app,vncbridge}.box.wasm (arm64)
 cd ../..
 cargo build --release -p boxer

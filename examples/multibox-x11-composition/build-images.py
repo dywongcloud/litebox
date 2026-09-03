@@ -81,10 +81,60 @@ def build_box(archive_dir, output_box):
     subprocess.run([BOXER, "build", "--archive", archive_dir, "-o", output_box, "-v"], check=True)
 
 
+# ELF header offsets (64-bit, little-endian), enough to read e_type without a
+# parsing dependency.
+_ELF_TYPE_OFFSET = 16
+_ET_EXEC = 2
+_ET_DYN = 3
+# An arm64 Mach-O process reserves [0, 4 GiB) as __PAGEZERO, so this is the
+# lowest address a guest mapping can occupy on macOS ARM
+# (MacOsUserland's TASK_ADDR_MIN).
+_MACOS_TASK_ADDR_MIN = 0x1_0000_0000
+
+
+def check_loadable(path):
+    """Refuse a guest binary macOS ARM could never map.
+
+    A non-PIE ET_EXEC has to load at its recorded p_vaddr. Static musl links
+    those low (0x400000 and friends), which is inside macOS's __PAGEZERO --
+    the mapping is refused with BelowMinAddress and the guest dies as
+    "failed to load the ELF file: Memory mapping error: EPERM", naming
+    neither the address nor the fix. Linux has no such floor, so the same
+    binary loads there and the problem only shows up on a Mac.
+
+    Rust's own musl linking produces a static-PIE (ET_DYN), which is free to
+    land anywhere; an external `*-linux-musl-gcc` linker driver defaults to
+    non-PIE instead, which is how a Mac cross-build ends up here.
+    """
+    with open(path, "rb") as f:
+        header = f.read(18)
+    if len(header) < 18 or header[:4] != b"\x7fELF":
+        sys.exit(f"{path} is not an ELF file")
+    e_type = int.from_bytes(header[_ELF_TYPE_OFFSET:_ELF_TYPE_OFFSET + 2], "little")
+    if e_type == _ET_DYN:
+        return
+    if e_type != _ET_EXEC:
+        sys.exit(f"{path}: unexpected ELF type {e_type}; expected a PIE (ET_DYN)")
+    if OCI_ARCH != "arm64":
+        # Linux has no __PAGEZERO floor, so a fixed low load address is fine.
+        return
+    sys.exit(
+        f"{path} is a non-PIE executable (ET_EXEC), which macOS ARM cannot load:\n"
+        f"  a fixed load address below {_MACOS_TASK_ADDR_MIN:#x} lands in the 4 GiB\n"
+        f"  __PAGEZERO an arm64 Mach-O process reserves, and the guest fails with\n"
+        f'  "failed to load the ELF file: Memory mapping error: EPERM".\n'
+        f"Rebuild it as a static-PIE, e.g.\n"
+        f'  RUSTFLAGS="-C relocation-model=pic -C link-arg=-static-pie" \\\n'
+        f"    cargo build --release --target {RUST_TARGET}\n"
+        f"(see docs/macos.md's __PAGEZERO section)"
+    )
+
+
 def build_static_bin_box(binary_name, out_name, env, exposed_ports):
     target_bin = os.path.join(HERE, "target", RUST_TARGET, "release", binary_name)
     if not os.path.exists(target_bin):
         sys.exit(f"missing {target_bin}; run cargo build --release --target {RUST_TARGET} first")
+    check_loadable(target_bin)
     with tempfile.TemporaryDirectory() as tmp:
         rootfs = os.path.join(tmp, "rootfs")
         os.makedirs(rootfs + "/bin", exist_ok=True)

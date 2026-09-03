@@ -176,14 +176,34 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let program = shim.load_program(
-        initial_file_system,
-        platform.init_task(),
-        prog_path,
-        "/",
-        argv,
-        envp,
-    )?;
+    let program = shim
+        .load_program(
+            initial_file_system,
+            platform.init_task(),
+            prog_path,
+            "/",
+            argv,
+            envp,
+        )
+        .map_err(|e| {
+            // A non-PIE `ET_EXEC` guest must load at its recorded p_vaddr,
+            // and static musl links those low (0x400000 and friends) --
+            // inside the 4 GiB `__PAGEZERO` an arm64 Mach-O process
+            // reserves. The mapping is refused with `BelowMinAddress`,
+            // which reaches the guest as a bare `EPERM` naming neither the
+            // address nor the fix, and the same binary loads fine on Linux
+            // (no such floor), so the cause is easy to miss here.
+            anyhow!(
+                "{e}\n\nnote: on Apple Silicon a guest image must be \
+                 position-independent -- the first 4 GiB is __PAGEZERO, so a \
+                 non-PIE ET_EXEC linked below it cannot be mapped and fails \
+                 exactly this way. Check with `readelf -h <binary>` (want \
+                 \"DYN\", not \"EXEC\"); if it is EXEC, rebuild it as a \
+                 static-PIE:\n  RUSTFLAGS=\"-C relocation-model=pic -C \
+                 link-arg=-static-pie\" cargo build --release --target \
+                 aarch64-unknown-linux-musl\nSee docs/macos.md."
+            )
+        })?;
 
     // Wire up stdio forwarding: ensure host stdout/stderr are accessible to the guest.
     // This is needed because guest write(fd=1) and write(fd=2) syscalls are routed
