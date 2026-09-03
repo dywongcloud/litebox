@@ -43,5 +43,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 wasmtime = { version = "37", default-features = false, features = ["cranelift", "runtime", "std"] }
 wasmtime-wasi = { version = "37", default-features = false, features = ["p1"] }
 
+# Native box execution on macOS ARM64 uses the macOS-specific runner.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+litebox_runner_linux_on_macos_userland = { version = "0.1.0", path = "../litebox_runner_linux_on_macos_userland" }
+
 [lints]
 workspace = true
