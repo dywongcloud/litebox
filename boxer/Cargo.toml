@@ -44,8 +44,11 @@ wasmtime = { version = "37", default-features = false, features = ["cranelift", 
 wasmtime-wasi = { version = "37", default-features = false, features = ["p1"] }
 
 # Native box execution on macOS ARM64 uses the macOS-specific runner.
+# Wasm workload execution also supported via embedded wasmtime.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 litebox_runner_linux_on_macos_userland = { version = "0.1.0", path = "../litebox_runner_linux_on_macos_userland" }
+wasmtime = { version = "37", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "37", default-features = false, features = ["p1"] }
 
 [lints]
 workspace = true

@@ -452,13 +452,62 @@ fn run_wasm_workload(program_bytes: &[u8], argv: &[String], env: &[String]) -> a
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_wasm_workload(program_bytes: &[u8], argv: &[String], env: &[String]) -> anyhow::Result<()> {
+    use wasmtime::{Config, Engine, Linker, Module, Store};
+    use wasmtime_wasi::WasiCtxBuilder;
+    use wasmtime_wasi::p1::{self, WasiP1Ctx};
+
+    let mut config = Config::new();
+    config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
+    let engine = Engine::new(&config).context("failed to start the embedded wasm engine")?;
+    let module = Module::from_binary(&engine, program_bytes)
+        .context("the box workload is not a valid wasm module")?;
+
+    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
+    p1::add_to_linker_sync(&mut linker, |ctx: &mut WasiP1Ctx| ctx)
+        .context("failed to provide WASI to the workload")?;
+
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.inherit_stdio().args(argv);
+    for pair in env {
+        if let Some((key, value)) = pair.split_once('=') {
+            wasi.env(key, value);
+        }
+    }
+    let mut store = Store::new(&engine, wasi.build_p1());
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .context("failed to instantiate the wasm workload")?;
+    let start = instance
+        .get_typed_func::<(), ()>(&mut store, "_start")
+        .context("the wasm workload exports no _start; it is a library, not a command")?;
+
+    match start.call(&mut store, ()) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // A WASI command that calls proc_exit unwinds with an exit status
+            // rather than a trap; a zero status is a normal return.
+            if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                let status: i32 = exit.0;
+                if status == 0 {
+                    return Ok(());
+                }
+                bail!("wasm workload exited with status {status}");
+            }
+            Err(e).context("the wasm workload trapped")
+        }
+    }
+}
+
+#[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
 fn run_wasm_workload(
     _program_bytes: &[u8],
     _argv: &[String],
     _env: &[String],
 ) -> anyhow::Result<()> {
-    bail!("running a wasm workload needs the x86_64 Linux build of boxer")
+    bail!("running a wasm workload is supported on x86_64 Linux and aarch64 macOS hosts only")
 }
 
 fn parse_box_file(path: &Path) -> anyhow::Result<ParsedBox> {
