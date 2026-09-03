@@ -299,10 +299,11 @@ fn substitute_template(value: &str, resolved: &HashMap<String, Resolved>) -> any
 }
 
 /// Best-effort: a composition needs the host to route between each
-/// instance's own `/24`, which requires `net.ipv4.ip_forward=1`. Not fatal
+/// instance's own `/24`, which requires IP forwarding to be on. Not fatal
 /// if this can't be set (already on, or not root) -- the actual `boxer run`
 /// TUN/publish calls surface the real failure if routing genuinely doesn't
 /// work.
+#[cfg(target_os = "linux")]
 fn ensure_ip_forwarding() {
     const PATH: &str = "/proc/sys/net/ipv4/ip_forward";
     match std::fs::read_to_string(PATH) {
@@ -314,6 +315,41 @@ fn ensure_ip_forwarding() {
                  cross-instance routing may fail unless it is already on"
             ),
         },
+    }
+}
+
+/// macOS has no `/proc`; the equivalent knob is the `net.inet.ip.forwarding`
+/// sysctl, set via the `sysctl` binary rather than a raw syscall (no `libc`
+/// wrapper for the BSD sysctl MIB by name is worth adding for one best-effort
+/// call). Same not-fatal semantics as the Linux path.
+#[cfg(target_os = "macos")]
+fn ensure_ip_forwarding() {
+    const NAME: &str = "net.inet.ip.forwarding";
+    let current = std::process::Command::new("sysctl")
+        .args(["-n", NAME])
+        .output();
+    if let Ok(out) = &current
+        && out.status.success()
+        && String::from_utf8_lossy(&out.stdout).trim() == "1"
+    {
+        return;
+    }
+    match std::process::Command::new("sysctl")
+        .args(["-w", &format!("{NAME}=1")])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            eprintln!("boxer compose: enabled IP forwarding ({NAME})");
+        }
+        Ok(out) => eprintln!(
+            "boxer compose: warning: could not enable IP forwarding ({}); \
+             cross-instance routing may fail unless it is already on",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!(
+            "boxer compose: warning: could not enable IP forwarding ({e}); \
+             cross-instance routing may fail unless it is already on"
+        ),
     }
 }
 
