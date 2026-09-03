@@ -12,6 +12,7 @@ deliberately never have -- see the README for the full story.)
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,22 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOXER = os.path.join(HERE, "..", "..", "target", "release", "boxer")
 OUT_DIR = os.path.join(HERE, "images")
+
+# `boxer build --archive` (no --platform) targets the host platform by
+# default and refuses an archive whose declared config.json architecture
+# doesn't match it (litebox_packager::oci::verify_config_architecture). So
+# the guest binaries and the OCI architecture baked into each box must both
+# track whatever machine is actually running this script -- x86_64 Linux or
+# Apple Silicon macOS (the only two `boxer run` natively supports).
+_HOST_MACHINE = platform.machine()
+if _HOST_MACHINE in ("arm64", "aarch64"):
+    RUST_TARGET = "aarch64-unknown-linux-musl"
+    OCI_ARCH = "arm64"
+elif _HOST_MACHINE in ("x86_64", "amd64"):
+    RUST_TARGET = "x86_64-unknown-linux-musl"
+    OCI_ARCH = "amd64"
+else:
+    sys.exit(f"unsupported host architecture {_HOST_MACHINE!r}: boxer runs natively on x86_64 Linux and aarch64 macOS only")
 
 
 def copy_real(src, dst):
@@ -40,7 +57,7 @@ def write_box_archive(rootfs_dir, entrypoint, cmd, env, exposed_ports, out_archi
         diff_id = "sha256:" + hashlib.sha256(f.read()).hexdigest()
 
     config = {
-        "architecture": "amd64",
+        "architecture": OCI_ARCH,
         "os": "linux",
         "config": {
             "Env": env,
@@ -65,9 +82,9 @@ def build_box(archive_dir, output_box):
 
 
 def build_static_bin_box(binary_name, out_name, env, exposed_ports):
-    target_bin = os.path.join(HERE, "target", "x86_64-unknown-linux-musl", "release", binary_name)
+    target_bin = os.path.join(HERE, "target", RUST_TARGET, "release", binary_name)
     if not os.path.exists(target_bin):
-        sys.exit(f"missing {target_bin}; run cargo build --release --target x86_64-unknown-linux-musl first")
+        sys.exit(f"missing {target_bin}; run cargo build --release --target {RUST_TARGET} first")
     with tempfile.TemporaryDirectory() as tmp:
         rootfs = os.path.join(tmp, "rootfs")
         os.makedirs(rootfs + "/bin", exist_ok=True)

@@ -224,11 +224,9 @@ a box does not yet describe those capabilities and granting them silently
 would be worse than refusing.
 
 **Note on macOS ARM:** The native runner (`litebox_runner_linux_on_macos_userland`)
-does not currently forward guest stdout/stderr to the host. Guest processes run
-but their output is not visible. This is a known gap; the runner executes the
-guest but doesn't wire up file descriptor 1/2 (stdout/stderr) to the host. Use
-WASM workloads on macOS ARM as a workaround (WASI stdio works), or build boxes
-on Linux where stdio forwarding is fully functional.
+forwards guest stdout/stderr to the host: guest `write(fd=1)`/`write(fd=2)`
+syscalls are routed through the platform's `StdioProvider`, which writes
+directly to the host's fds via `libc::write()`.
 
 ## What boxer needs from the host
 

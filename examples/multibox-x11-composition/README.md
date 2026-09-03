@@ -58,10 +58,41 @@ working today, not an aspirational design.
 
 ## Running it
 
+`boxer run` natively supports two host platforms: x86_64 Linux and Apple
+Silicon (aarch64) macOS -- and it refuses to run a box whose baked-in
+architecture doesn't match the host. `build-images.py` detects which one
+it's running on and cross-compiles/tags accordingly, so the same commands
+work on both; only the guest target triple differs.
+
+On x86_64 Linux:
+
 ```sh
 cd examples/multibox-x11-composition
+rustup target add x86_64-unknown-linux-musl   # once
 cargo build --release --target x86_64-unknown-linux-musl
 python3 build-images.py                 # -> images/{x11server,app,vncbridge}.box.wasm
+cd ../..
+cargo build --release -p boxer
+./target/release/boxer compose examples/multibox-x11-composition/compose.json
+```
+
+On Apple Silicon macOS, the guest binaries still have to be real `aarch64-
+unknown-linux-musl` ELF (litebox runs guest instructions natively, with no
+emulation -- see `litebox_runner_linux_on_macos_userland`'s module docs).
+macOS's own `cc`/`ld64` cannot produce Linux ELF output, so cross-linking
+needs an actual `aarch64-unknown-linux-musl` toolchain; a maintained,
+Docker-free one is available via Homebrew:
+
+```sh
+brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+rustup target add aarch64-unknown-linux-musl   # once
+export CC_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-gcc
+export AR_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-ar
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
+
+cd examples/multibox-x11-composition
+cargo build --release --target aarch64-unknown-linux-musl
+python3 build-images.py                 # -> images/{x11server,app,vncbridge}.box.wasm (arm64)
 cd ../..
 cargo build --release -p boxer
 ./target/release/boxer compose examples/multibox-x11-composition/compose.json
@@ -97,7 +128,7 @@ The `graphics_demo` binary showcases the rasterizer with animated patterns:
 
 ```sh
 cd examples/multibox-x11-composition
-cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target <x86_64-unknown-linux-musl or aarch64-unknown-linux-musl>  # see "Running it" above
 python3 build-images.py                 # includes graphics_demo.box.wasm
 cd ../..
 cargo build --release -p boxer
