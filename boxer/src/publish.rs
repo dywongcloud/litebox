@@ -17,7 +17,10 @@
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 // Only the linux+x86_64 forwarding paths name the enum directly.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 use std::net::SocketAddr;
 
 use anyhow::{Context, bail};
@@ -121,7 +124,10 @@ impl PortMapping {
 
 /// A running set of published ports. Dropping it stops accepting; connections
 /// already in flight end with the process.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 pub struct PublishedPorts {
     _runtime: tokio::runtime::Runtime,
 }
@@ -129,7 +135,10 @@ pub struct PublishedPorts {
 /// Bind every mapping on the host and forward accepted connections to the
 /// guest. Binding happens before this returns, so a port that is already in
 /// use is reported before the workload starts rather than racing it.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 pub fn publish(
     mappings: &[PortMapping],
     verbose: bool,
@@ -152,7 +161,10 @@ pub fn publish(
 }
 
 /// Bind a host TCP listener and forward each accepted connection to the guest.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn publish_tcp(
     runtime: &tokio::runtime::Runtime,
     mapping: PortMapping,
@@ -214,7 +226,10 @@ fn publish_tcp(
 /// (possibly spoofed) source addresses cannot exhaust sockets between reaps.
 /// Idle entries are reclaimed continuously (see [`UDP_CLIENT_IDLE_TIMEOUT`]),
 /// so this bounds live clients, not the number ever seen.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 const MAX_UDP_CLIENTS: usize = 1024;
 
 /// How long a UDP client entry may sit idle -- no datagram in either direction
@@ -223,16 +238,25 @@ const MAX_UDP_CLIENTS: usize = 1024;
 /// long-running relay would leak a socket, task, and buffer per distinct source
 /// address forever (a well-behaved DNS resolver alone cycles through thousands
 /// of ephemeral source ports).
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 const UDP_CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// How often the relay sweeps its client table for idle entries.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 const UDP_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Bind a host UDP socket and relay datagrams to the guest, one guest-side
 /// socket per client source address so replies route back to the right client.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn publish_udp(
     runtime: &tokio::runtime::Runtime,
     mapping: PortMapping,
@@ -362,10 +386,16 @@ fn publish_udp(
     Ok(())
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 pub struct PublishedPorts;
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 pub fn publish(
     _mappings: &[PortMapping],
     _verbose: bool,

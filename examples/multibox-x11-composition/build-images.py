@@ -102,9 +102,16 @@ def check_loadable(path):
     neither the address nor the fix. Linux has no such floor, so the same
     binary loads there and the problem only shows up on a Mac.
 
-    Rust's own musl linking produces a static-PIE (ET_DYN), which is free to
-    land anywhere; an external `*-linux-musl-gcc` linker driver defaults to
-    non-PIE instead, which is how a Mac cross-build ends up here.
+    This project's own .cargo/config.toml already forces a genuinely
+    self-relocating static-PIE build for this target (see its comment, and
+    litebox_platform_macos_userland/scripts/aarch64-musl-static-pie-linker.sh
+    for why a plain `-C link-args=-static-pie` alone is not enough -- it gets
+    the ET_DYN file type right while still linking the wrong, non-self-
+    relocating crt1.o, which then segfaults at guest startup instead of
+    failing the check below). A binary reaching this check as ET_EXEC means
+    something bypassed that config -- most commonly a
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER env var, which overrides
+    it.
     """
     with open(path, "rb") as f:
         header = f.read(18)
@@ -123,10 +130,11 @@ def check_loadable(path):
         f"  a fixed load address below {_MACOS_TASK_ADDR_MIN:#x} lands in the 4 GiB\n"
         f"  __PAGEZERO an arm64 Mach-O process reserves, and the guest fails with\n"
         f'  "failed to load the ELF file: Memory mapping error: EPERM".\n'
-        f"Rebuild it as a static-PIE, e.g.\n"
-        f'  RUSTFLAGS="-C relocation-model=pic -C link-arg=-static-pie" \\\n'
-        f"    cargo build --release --target {RUST_TARGET}\n"
-        f"(see docs/macos.md's __PAGEZERO section)"
+        f"A plain `cargo build --release --target {RUST_TARGET}` should already\n"
+        f"produce a static-PIE binary via this directory's own .cargo/config.toml --\n"
+        f"if you got ET_EXEC anyway, check for a\n"
+        f"CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER env var overriding it\n"
+        f"(see docs/macos.md's __PAGEZERO section)."
     )
 
 

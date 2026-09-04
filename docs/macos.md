@@ -80,28 +80,11 @@ linker wrapper that substitutes the one object file that needs to differ
 toolchain-archaeology. Wire it into the guest project's own
 `.cargo/config.toml` rather than passing flags by hand on every build; see
 `examples/multibox-x11-composition/.cargo/config.toml` for the reference
-setup this project actually runs and verifies against.
-
-The mapping is refused with `AllocationError::BelowMinAddress`, which reaches
-the guest as a bare `EPERM`:
-
-```
-Error: failed to load the ELF file
-Caused by:
-    0: Memory mapping error
-    1: EPERM: Operation not permitted
-```
-
-Linux has no such floor, so the same binary loads there and this only shows up
-on a Mac. Check a guest binary with `readelf -h` (want `DYN`, not `EXEC`).
-Rust's own musl linking produces a static-PIE, but an external
-`*-linux-musl-gcc` linker driver -- what a Mac cross-build typically uses --
-defaults to non-PIE. Force it:
-
-```sh
-RUSTFLAGS="-C relocation-model=pic -C link-arg=-static-pie" \
-  cargo build --release --target aarch64-unknown-linux-musl
-```
+setup this project actually runs and verifies against. Check a guest binary
+with `readelf -h` (want `DYN`, not `EXEC`) or `file` (want "pie executable,
+... static-pie linked") -- but note neither alone proves the binary actually
+self-relocates; only running it does (see the script's comment for how a
+broken build fools both checks).
 
 ### W^X, `MAP_JIT`, and code signing
 

@@ -198,10 +198,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                  position-independent -- the first 4 GiB is __PAGEZERO, so a \
                  non-PIE ET_EXEC linked below it cannot be mapped and fails \
                  exactly this way. Check with `readelf -h <binary>` (want \
-                 \"DYN\", not \"EXEC\"); if it is EXEC, rebuild it as a \
-                 static-PIE:\n  RUSTFLAGS=\"-C relocation-model=pic -C \
-                 link-arg=-static-pie\" cargo build --release --target \
-                 aarch64-unknown-linux-musl\nSee docs/macos.md."
+                 \"DYN\", not \"EXEC\") or `file` (want \"pie executable, \
+                 ... static-pie linked\"); neither alone proves the binary \
+                 actually self-relocates, only running it does -- see \
+                 litebox_platform_macos_userland/scripts/\
+                 aarch64-musl-static-pie-linker.sh, wired into a guest \
+                 project's own .cargo/config.toml, for how this project \
+                 builds a genuinely working static-PIE guest (a bare \
+                 `-C link-args=-static-pie` produces the right file type \
+                 while still crashing at guest startup). See docs/macos.md."
             )
         })?;
 

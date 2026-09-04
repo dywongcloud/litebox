@@ -49,6 +49,9 @@ wasmtime-wasi = { version = "37", default-features = false, features = ["p1"] }
 litebox_runner_linux_on_macos_userland = { version = "0.1.0", path = "../litebox_runner_linux_on_macos_userland" }
 wasmtime = { version = "37", default-features = false, features = ["cranelift", "runtime", "std"] }
 wasmtime-wasi = { version = "37", default-features = false, features = ["p1"] }
+# Used by `publish.rs`'s host-side TCP/UDP forwarding, which is plain tokio
+# networking with nothing Linux-specific in it -- see `publish.rs`'s own gate.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
 
 [lints]
 workspace = true
