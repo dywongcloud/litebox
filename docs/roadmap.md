@@ -118,6 +118,41 @@ subsystem.
   this platform is at risk of this gap, unreliably** -- not just one that
   unusually happens to touch `TPIDR_EL0`, and not reliably enough to call
   "working" until the key is read at runtime instead of baked in.
+
+  **Correction, traced further this session: "the key is read at runtime
+  instead of baked in" is not what's missing -- that part already works.**
+  `MacOsUserland::get_guest_tp_slot_offset` calls
+  `guest_tp_slot_byte_offset()`, which computes the offset from the *actual*
+  `pthread_key_create` key this process got (`guest_tp_tsd_key() *
+  size_of::<usize>()`), not the baked constant; `litebox_shim_linux`'s ELF
+  loader threads that real value into the trampoline header at load time
+  (`ElfFile::new` → `parse_trampoline` → `load_trampoline`'s
+  `mem.write(slot, &offset.to_ne_bytes())`). Every gate the rewriter actually
+  patched reads its anchor from that header at guest-run time, so it sees the
+  real key regardless of what got baked at package time -- the "read
+  at runtime instead of baked in" fix described above is already landed and
+  wired correctly, verified by tracing the full call chain, not by rerunning
+  the failing case. Given that, a *patched* `MSR`/`MRS TPIDR_EL0` gate cannot
+  be what's segfaulting on the real key. The far more likely explanation,
+  unverified but consistent with everything observed: the AOT rewriter's
+  static scan for `MSR`/`MRS TPIDR_EL0` instructions to patch (see
+  `litebox_syscall_rewriter::arm64`) misses at least one occurrence inside
+  musl's own crt startup (`_dlstart_c`, the self-relocation phase a
+  static-PIE binary runs before `main` -- see `docs/macos.md`'s "The first 4
+  GiB is unusable" for why static-PIE is required here at all), leaving it
+  touching the *real* hardware `TPIDR_EL0` directly and unpatched -- which
+  XNU is independently confirmed (same doc, hardware probe on Apple M3 Pro)
+  to repurpose for its own bookkeeping, landing on exactly the kind of small,
+  wrong address a raw, unpatched read/write there would crash on. This is
+  plausible specifically because this session is the *first* time any
+  static-PIE guest has ever been rewritten and run on this platform --  every
+  prior guest was `ET_EXEC` (rewriter well-exercised against that shape) or
+  never got far enough to reach musl's own TLS bootstrap at all (the earlier
+  bugs in this file blocked that). Confirming this needs disassembling a
+  rewritten static-PIE guest's own crt startup code and diffing against
+  what the rewriter's scanner actually patched -- not done this session, out
+  of time budget; recorded here as the concrete next step rather than
+  re-describing the coin-flip symptom above as the root cause.
 * **The platform's *own* per-thread context-switch bookkeeping** —
   REATTEMPTED and correctly deferred rather than force-implemented. A separate
   problem from the rewriter's guest slot above. Studying
