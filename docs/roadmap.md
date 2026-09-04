@@ -133,26 +133,52 @@ subsystem.
   at runtime instead of baked in" fix described above is already landed and
   wired correctly, verified by tracing the full call chain, not by rerunning
   the failing case. Given that, a *patched* `MSR`/`MRS TPIDR_EL0` gate cannot
-  be what's segfaulting on the real key. The far more likely explanation,
-  unverified but consistent with everything observed: the AOT rewriter's
-  static scan for `MSR`/`MRS TPIDR_EL0` instructions to patch (see
-  `litebox_syscall_rewriter::arm64`) misses at least one occurrence inside
-  musl's own crt startup (`_dlstart_c`, the self-relocation phase a
-  static-PIE binary runs before `main` -- see `docs/macos.md`'s "The first 4
-  GiB is unusable" for why static-PIE is required here at all), leaving it
-  touching the *real* hardware `TPIDR_EL0` directly and unpatched -- which
-  XNU is independently confirmed (same doc, hardware probe on Apple M3 Pro)
-  to repurpose for its own bookkeeping, landing on exactly the kind of small,
-  wrong address a raw, unpatched read/write there would crash on. This is
-  plausible specifically because this session is the *first* time any
-  static-PIE guest has ever been rewritten and run on this platform --  every
-  prior guest was `ET_EXEC` (rewriter well-exercised against that shape) or
-  never got far enough to reach musl's own TLS bootstrap at all (the earlier
-  bugs in this file blocked that). Confirming this needs disassembling a
-  rewritten static-PIE guest's own crt startup code and diffing against
-  what the rewriter's scanner actually patched -- not done this session, out
-  of time budget; recorded here as the concrete next step rather than
-  re-describing the coin-flip symptom above as the root cause.
+  be what's segfaulting on the real key.
+
+  **Second correction, same session: the "AOT rewriter misses an unpatched
+  occurrence" hypothesis this paragraph previously offered is also wrong --
+  checked directly, not left as a guess.** Built a standalone tool
+  (`litebox_packager::rewrite_elf_for(data, path, EM_AARCH64, Host::MacOs,
+  true)` invoked outside the packaging pipeline, dumping the rewritten ELF to
+  a plain file) and scanned every 4-byte-aligned word in a rewritten
+  `x11-server` for the exact instruction encodings
+  `litebox_syscall_rewriter::arm64` itself defines
+  (`MSR_TPIDR_EL0_MASK`/`_BITS`, `MRS_TPIDR_EL0_MASK`/`_BITS`): zero matches,
+  anywhere in the file. Every raw `TPIDR_EL0` touch was found and patched --
+  the earlier live crash trace showing `mrs x16, TPIDR_EL0` (the wrong,
+  Host::Linux-style register) was from a build made *before* this session's
+  `--rewrite-host` default fix (`docs/macos.md`'s entry above), not evidence
+  of anything still broken today. Also confirmed the *correct*
+  `Host::MacOs` pattern (`MRS_TPIDRRO_EL0_BITS`) is present -- 35 occurrences
+  -- and disassembled one with `capstone`: `mrs x8, tpidrro_el0` followed by
+  `ldr x8, [x8, x16]`, where `x16` was itself just loaded via `ldr x16,
+  #<trampoline+8>` -- a genuine memory load of the offset, not a baked
+  immediate, and `<trampoline+8>` matches
+  `litebox_common_linux::loader::TRAMPOLINE_GUEST_TP_SLOT_OFFSET` (`8`)
+  exactly. Every piece of this mechanism -- correct register, correct
+  patching, correct memory-indirect offset read, correct header slot address
+  -- checks out under direct inspection.
+
+  **So the mechanism is structurally sound and the live crash (`boxer run`
+  on this exact rewritten box, same session, same key mismatch: 259 actual
+  vs. 256 baked) is still real and still unexplained.** Either the loader's
+  `load_trampoline` write of the real offset into that header slot isn't
+  actually landing at runtime for some reason not yet identified, or the
+  crash has nothing to do with `TPIDR_EL0` at all and only coincided with
+  the slot-mismatch warning by observation bias. Getting a live disassembly
+  of the actual faulting instruction to settle this needs `lldb` attached to
+  the guest process at the moment of the fault; this session's sudo access
+  is scoped to running `boxer run`/`boxer compose` directly (see the
+  `NOPASSWD` entry this session added), which `sudo lldb -- boxer run ...`
+  cannot use (sudoers matches the exact command invoked, and that command
+  would be `lldb`, not `boxer`) -- and no macOS crash report was generated
+  to inspect after the fact either (litebox's own `SIGSEGV` handler catches
+  the fault and exits cleanly before the OS reporter would see it). Widening
+  that `NOPASSWD` rule to cover `lldb` attached to a `boxer`-spawned guest,
+  or adding a way to dump the faulting register state from inside litebox's
+  own fault handler, is the concrete next step -- not another guess at what
+  the rewriter might have missed, since direct inspection now rules that
+  out specifically.
 * **The platform's *own* per-thread context-switch bookkeeping** —
   REATTEMPTED and correctly deferred rather than force-implemented. A separate
   problem from the rewriter's guest slot above. Studying
