@@ -113,7 +113,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let tar_data = std::fs::read(tar_file)
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
 
-    let platform = Platform::new(cli_args.tun_device_name.as_deref(), cli_args.net_host_ip);
+    let platform = Platform::new(
+        cli_args.tun_device_name.as_deref(),
+        cli_args.net_host_ip,
+        cli_args.net_guest_ip,
+    );
 
     // Verify that stdio forwarding is set up correctly.
     // This ensures guest writes to stdout/stderr will reach the host.
@@ -217,6 +221,35 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // writes via /dev/stdout and /dev/stderr will reach the host.
     std::io::stdout().flush().ok();
     std::io::stderr().flush().ok();
+
+    // Nothing drives `Net`'s smoltcp interface unless something calls
+    // `perform_network_interaction()` in a loop (see its own doc comment:
+    // "This function should be invoked in a loop, based on the returned
+    // advice"). `litebox_runner_linux_userland` does this on a dedicated
+    // host thread; this runner never did, on any platform it targets, which
+    // silently made the entire `utun` device a dead end -- confirmed on real
+    // hardware: correct interface config (point-to-point peer address,
+    // `netstat -nr`), correct routing, `net.inet.ip.forwarding=1`, and still
+    // not one packet ever reached this platform's own
+    // `IPInterfaceProvider::send_ip_packet`/`receive_ip_packet` (checked
+    // directly, not inferred from a hang), for either a host-to-guest
+    // connection or a guest connecting to another guest through the host
+    // kernel -- because nothing had ever asked `Net` to look at the `utun`
+    // fd at all. Unlike the Linux runner, this platform has no
+    // `wait_on_tun`-style efficient blocking wait yet, so this loop plain
+    // polls; correctness first, since without it there is no networking on
+    // macOS ARM whatsoever, guest-to-guest or host-published.
+    if cli_args.tun_device_name.is_some() {
+        let shim = shim.clone();
+        std::thread::spawn(move || {
+            loop {
+                let advice = shim.perform_network_interaction();
+                if !advice.call_again_immediately() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        });
+    }
 
     // SAFETY: `load_program` produced the entry context, so its `pc` and `sp`
     // describe a loaded, runnable guest image.

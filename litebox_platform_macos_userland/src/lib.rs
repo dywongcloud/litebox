@@ -143,13 +143,22 @@ impl MacOsUserland {
     /// `tun_device_name` optionally names a `utun` interface (such as `"utun3"`)
     /// to connect guest networking to; networking is disabled when it is `None`.
     ///
-    /// `host_ip`, when given alongside `tun_device_name`, is assigned to the
-    /// `utun` interface itself (with a /24 netmask) immediately after it is
-    /// opened -- a `utun` device has no separate persistent existence to
-    /// pre-configure the way a Linux TUN device does (see
+    /// `host_ip` and `guest_ip`, when given alongside `tun_device_name`, are
+    /// assigned to the `utun` interface itself as its point-to-point local
+    /// and peer addresses, immediately after it is opened -- a `utun` device
+    /// has no separate persistent existence to pre-configure the way a Linux
+    /// TUN device does (see
     /// `litebox_platform_macos_userland::net::configure_utun_address`), so
-    /// this is the only place its address can be set. Ignored when
-    /// `tun_device_name` is `None`.
+    /// this is the only place its address can be set. `guest_ip` (not
+    /// `host_ip` again) as the peer is load-bearing: a point-to-point `utun`
+    /// interface only ever routes to its one configured peer address at the
+    /// kernel level, regardless of any broader route table entry, so the
+    /// device is only ever going to be able to reach the one guest it is
+    /// dedicated to anyway -- confirmed on real hardware that configuring
+    /// the peer as `host_ip` (so the "peer" is really just the interface
+    /// talking to itself) leaves the actual guest address completely
+    /// unreachable, even after separately adding a matching network route.
+    /// Ignored when `tun_device_name` is `None`.
     ///
     /// # Panics
     ///
@@ -161,6 +170,7 @@ impl MacOsUserland {
     pub fn new(
         tun_device_name: Option<&str>,
         host_ip: Option<std::net::Ipv4Addr>,
+        guest_ip: Option<std::net::Ipv4Addr>,
     ) -> &'static Self {
         install_fault_handlers();
         install_async_signal_handlers();
@@ -168,9 +178,10 @@ impl MacOsUserland {
 
         let tun = tun_device_name.map(|name| {
             let fd = net::open_utun(name).unwrap_or_else(|e| panic!("failed to open {name}: {e}"));
-            if let Some(host_ip) = host_ip {
-                net::configure_utun_address(name, host_ip)
-                    .unwrap_or_else(|e| panic!("failed to address {name} as {host_ip}: {e}"));
+            if let (Some(host_ip), Some(guest_ip)) = (host_ip, guest_ip) {
+                net::configure_utun_address(name, host_ip, guest_ip).unwrap_or_else(|e| {
+                    panic!("failed to address {name} as {host_ip} -> {guest_ip}: {e}")
+                });
             }
             fd
         });

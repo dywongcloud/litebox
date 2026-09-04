@@ -98,18 +98,38 @@ fn parse_utun_unit(name: &str) -> Option<u32> {
     name.strip_prefix("utun")?.parse().ok()
 }
 
-/// Give `device` the address `host_ip` and bring it up.
+/// Give `device` the point-to-point address pair `host_ip -> guest_ip` and
+/// bring it up.
 ///
 /// Unlike Linux's persistent `ip tuntap`-created TUN devices (which `boxer`
 /// creates and addresses once, ahead of time, then merely attaches to), a
 /// `utun` interface exists only while this process holds its control socket
 /// open -- there is no separate device to pre-configure. So the address has
 /// to be set here, immediately after [`open_utun`] succeeds, from inside the
-/// same process, using the same `src == dst` trick Linux's point-to-point
-/// TUN needs a netmask to avoid: `ifconfig utunN host_ip host_ip netmask
-/// 255.255.255.0` makes the interface route the whole /24 rather than only a
-/// single peer address, matching what `boxer run`'s `--net-host-ip` and the
-/// guest's own `--net-guest-ip` expect to route through.
+/// same process.
+///
+/// `guest_ip` as the peer (not `host_ip` again with a `/24` netmask, tried
+/// first) is load-bearing, not a style choice -- **confirmed on real Apple
+/// Silicon hardware**: a point-to-point `utun` interface only ever routes to
+/// its one configured peer address at the kernel level, no matter what a
+/// broader route table entry says. `ifconfig utunN host_ip host_ip netmask
+/// 255.255.255.0` looks like it should cover the whole `/24` (`netstat -nr`
+/// shows the interface `UP` with the right local address), and manually
+/// adding a matching `route add -net ... -interface utunN` on top makes the
+/// routing table agree, but the guest's own address (`--net-guest-ip`,
+/// always a different host on the same `/24`, never `host_ip` itself)
+/// stayed completely unreachable regardless -- not even a raw ICMP ping got
+/// a reply. The failure is silent besides: a TCP connect that hangs until
+/// it times out, not an immediate, loud refusal, so it reads as an
+/// application-level hang (`boxer run --publish`'s forwarder connecting to
+/// the guest, or `boxer compose` routing one guest to another through the
+/// host kernel) rather than the network layer never having delivered
+/// anything. Since each `utun` device here is dedicated to exactly one
+/// guest anyway (never a real multi-host subnet), a plain point-to-point
+/// pair is both the correct fix and simpler than the netmask/route
+/// workaround it replaces: no netmask, no separate route command, and the
+/// kernel auto-installs a working host route to `guest_ip` from the
+/// `ifconfig` call alone.
 ///
 /// Shells out to `ifconfig` rather than the raw `SIOCAIFADDR`/`ifaliasreq`
 /// ioctl BSD point-to-point interfaces need: fewer platform-specific struct
@@ -119,15 +139,23 @@ fn parse_utun_unit(name: &str) -> Option<u32> {
 ///
 /// Returns the underlying error if `ifconfig` cannot be spawned or exits
 /// non-zero -- most often because the process is not root.
-pub(crate) fn configure_utun_address(device: &str, host_ip: std::net::Ipv4Addr) -> io::Result<()> {
-    let netmask = "255.255.255.0";
+pub(crate) fn configure_utun_address(
+    device: &str,
+    host_ip: std::net::Ipv4Addr,
+    guest_ip: std::net::Ipv4Addr,
+) -> io::Result<()> {
     let output = std::process::Command::new("ifconfig")
-        .args([device, "inet", &host_ip.to_string(), &host_ip.to_string()])
-        .args(["netmask", netmask, "up"])
+        .args([
+            device,
+            "inet",
+            &host_ip.to_string(),
+            &guest_ip.to_string(),
+            "up",
+        ])
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "ifconfig {device} inet {host_ip} {host_ip} netmask {netmask} up failed: {}",
+            "ifconfig {device} inet {host_ip} {guest_ip} up failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }

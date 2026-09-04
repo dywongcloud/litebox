@@ -241,6 +241,29 @@ needs before it can land.
 
 ### Known gaps in macOS ARM execution
 
+- **Nothing drove the network stack at all -- fixed.** `litebox::net::Net::perform_network_interaction`'s
+  own doc comment says it "should be invoked in a loop, based on the returned
+  advice"; `litebox_runner_linux_userland` does this on a dedicated host
+  thread, but `litebox_runner_linux_on_macos_userland` never called it
+  anywhere, on any platform this runner targets. This was invisible until
+  this session, because it was also the first time two guests on this
+  platform ran long enough to attempt real networking between them (every
+  guest before now either failed to load at all, or was itself the only
+  guest running). Confirmed on real hardware with direct instrumentation of
+  `IPInterfaceProvider::send_ip_packet`/`receive_ip_packet` (not inferred
+  from a hang): zero calls, ever, in either direction, for a host connecting
+  to a published port, a host connecting straight to a guest's `utun`
+  address, or one guest connecting to another through the host kernel --
+  despite correct interface configuration, correct routing, and
+  `net.inet.ip.forwarding=1`. Fixed by spawning a background thread that
+  calls `perform_network_interaction()` in a loop whenever a `utun` device
+  is configured, mirroring the Linux runner's shape; unlike Linux this
+  platform has no `wait_on_tun`-style efficient blocking wait yet, so it
+  plain polls (a fixed 1ms sleep when there's nothing to do immediately) --
+  correctness first, since without any of this there was no networking on
+  macOS ARM whatsoever. **Not yet re-verified end to end after this fix**
+  (see the caveat this whole entry is nested under); the diagnosis is
+  hardware-confirmed, this specific fix is not yet.
 - **Guest stdout/stderr not forwarded:** The native runner (`litebox_runner_linux_on_macos_userland`)
   executes guest processes but does not connect their stdout/stderr to the host.
   Guest output is lost. Workaround: use WASM workloads (WASI stdio works), or
