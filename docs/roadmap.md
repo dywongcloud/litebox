@@ -179,6 +179,79 @@ subsystem.
   own fault handler, is the concrete next step -- not another guess at what
   the rewriter might have missed, since direct inspection now rules that
   out specifically.
+
+  **Third correction, same session: the live fault has nothing to do with
+  `TPIDR_EL0`/TSD at all -- it's musl's static-PIE self-relocation applying a
+  zero load bias.** Took the second concrete next step above (dumping the
+  faulting register state from litebox's own fault handler, via temporary
+  `libc::write(2, ...)` instrumentation in the `guest::GUEST_OWNS_CPU` branch
+  of `fault_handler`, `litebox_platform_macos_userland/src/lib.rs` -- added,
+  used, and cleanly reverted this session; `git diff` on that file is empty)
+  instead of chasing `lldb`/sudoers scope. The captured live crash: `pc =
+  0x103a933f8`, `far = 0x81468`, `esr = 0x92000046` (a data abort, write),
+  `x0 = 0x81468`. Disassembling the code at `pc` (via the standalone
+  `litebox_packager::rewrite_elf_for` tool described above, applied to the
+  same `x11-server` binary) shows:
+
+  ```
+  mov x4, x0
+  adrp x0, #0x103acf000
+  mov x2, #0
+  ldr x0, [x0, #0xec8]
+  str x19, [x0]        <-- faults here, writing through x0 = 0x81468
+  ldr x3, [x19, x2, lsl #3]
+  add x2, x2, #1
+  cbnz x3, ...
+  ```
+
+  This is musl's `environ = envp` bootstrap in `__libc_start_main`/`_start_c`
+  (the `str` writing the incoming `envp` pointer into the global `environ`
+  slot), not TLS/TSD setup at all -- matching a pattern seen earlier in this
+  same session before the other fixes landed, previously misattributed.
+  Cross-referencing the *original*, unrewritten `x11-server` ELF's
+  `.rela.dyn` table (`DT_RELA` at vaddr `0x2b0`, 573 entries, `entsize 24`)
+  turns up the exact relocation this load is meant to have already resolved:
+  `r_offset = 0x7fec8`, `r_type = 1027` (`R_AARCH64_RELATIVE`), `r_addend =
+  0x81468` -- `0x7fec8` is exactly the `adrp`-page (`0x103acf000` relative to
+  the load base) plus the `#0xec8` immediate above, so this is unambiguously
+  *that* GOT slot. `R_AARCH64_RELATIVE`'s defined semantics are `*(base +
+  r_offset) = base + r_addend`; the value musl's own self-relocation loop
+  should have already written there, before `main` ever runs, is `base_addr +
+  0x81468`. The value actually read back at the fault is the bare addend,
+  `0x81468`, completely unrelocated -- i.e. **musl's static-PIE self-relocation
+  computed and applied a load bias of exactly zero to this (and by
+  construction, likely every) `R_AARCH64_RELATIVE` entry**, even though the
+  surrounding code is demonstrably executing at the real, correct, high load
+  address (`pc` and the `adrp` target both sit at `0x103a...`/`0x103ac...`,
+  nowhere near a zero-based image) -- so this is not a case of the whole
+  binary accidentally running unrelocated. The same unmodified binary was
+  independently confirmed (earlier this session, via `podman run --platform
+  linux/arm64`) to self-relocate correctly under a real, unmodified Linux
+  kernel, so this is not a defect in the binary or in musl's relocation logic
+  in general -- it reproduces specifically when run under litebox on macOS
+  ARM.
+
+  This conclusively rules out both prior hypotheses in this item (missing
+  runtime-offset wiring; an AOT-rewriter-missed `TPIDR_EL0` gate) as the
+  cause of *this* crash -- neither touches `.rela.dyn` processing at all --
+  and narrows the open question to a different, more fundamental mechanism:
+  why musl's own `_dlstart_c`/self-relocation bias computation (which is
+  ordinarily just "the runtime load address minus the linked base address,"
+  read via a PC-relative address-of-self trick before any relocation has run)
+  comes out as zero specifically under litebox's guest-entry path, despite
+  litebox's own segment placement and the guest's subsequent execution both
+  being at the correct address. Candidates not yet checked: whether
+  `litebox_common_linux::loader`'s auxv (`AT_PHDR`/`AT_BASE`/`AT_ENTRY`/
+  `AT_PHNUM`) or initial register state (`sp`, `pc`) at guest entry differs
+  from what a real Linux kernel hands a static-PIE `_start` in some way this
+  bias computation depends on; and whether `MacOsUserland`'s guest-entry
+  context switch clobbers or fails to set up something musl's self-relocation
+  code reads before it has any other means of establishing its own load
+  address. This is the concrete next step, and is more precise than -- and
+  supersedes -- the `TPIDR_EL0`/TSD framing the rest of this item is written
+  in: the guest's TLS/TSD bootstrap is never reached at all while its own
+  `environ` setup, running moments earlier, is already faulting on unrelocated
+  GOT data.
 * **The platform's *own* per-thread context-switch bookkeeping** —
   REATTEMPTED and correctly deferred rather than force-implemented. A separate
   problem from the rewriter's guest slot above. Studying
