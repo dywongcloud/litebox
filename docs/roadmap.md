@@ -989,6 +989,46 @@ Known gaps a real guest hits now:
      it if confirmed, remains follow-up work -- separate from, and no longer
      entangled with, `macos-guest-tp-runtime-offset`.
 
+  3. **A plausibly-related, but distinctly different-shaped, intermittent
+     macOS ARM guest crash: `examples/multibox-x11-composition`'s `x11server`
+     box exiting with `SIGSEGV` (exit status 11) during otherwise-normal
+     `boxer compose` operation** -- observed once live (user report: crash
+     landed right as `vncbridge`, the third box in the composition, opened
+     its connection to an already-running, already-serving `x11server`), not
+     yet reproduced despite trying: 18 fresh `boxer compose` runs of the
+     exact same three-box composition (8 at idle, 10 more under artificial
+     CPU load from several background `yes` processes, meant to widen
+     whatever timing window the crash needs) all completed cleanly. Unlike
+     Bug B above, this is not necessarily simultaneous guest *launches* --
+     `x11server` was already up and had already served one client
+     (`app`) for several frames before the crash, so if this is the same
+     underlying "Darwin's memory subsystem does not behave the same under
+     concurrent load" category, the trigger here would be concurrent *guest
+     execution* (three separate `boxer run` processes live at once, one
+     actively handling a new inbound TCP connection while another
+     periodically writes to it) rather than concurrent *startup*. Read
+     `examples/multibox-x11-composition/src/bin/x11_server.rs` in full
+     looking for an application-level cause first: it is ordinary safe Rust
+     with no `unsafe` blocks, and its cooperative-multiplexing accept/read
+     loop (`main`) has no logic that should segfault a well-behaved process
+     (worst case, malformed input could panic on an out-of-bounds slice in
+     `handle_request`, which is a real robustness gap worth hardening
+     separately, but a Rust panic is not what `exit status: 11` reports).
+     That, plus the resemblance to Bug B's already-documented signature,
+     makes a platform-level cause more likely than an x11_server.rs bug, but
+     this is not confirmed -- no fault-handler trace was captured for an
+     actual occurrence (this session's `NOPASSWD` sudoers scope covers only
+     `boxer run`/`boxer compose` invoked directly, not
+     `sudo env LITEBOX_LOG=trace boxer ...`, which sudo's own environment
+     policy on this host rejects: "sorry, you are not allowed to set the
+     following environment variables: LITEBOX_LOG"). Widening that sudoers
+     rule (or reaching the trace-gated logging some other way -- e.g. baking
+     a default `LITEBOX_LOG` into the boxes' own environment temporarily)
+     is the concrete next step if this needs to be chased further; until
+     then, treat it as rare (didn't recur in 18 attempts) and mention to
+     users that a `boxer compose` exit naming one instance dead is worth a
+     plain retry before assuming a real regression.
+
   Reproduced and verified with the real `litebox_packager --oci-image
   public.ecr.aws/docker/library/alpine:latest` / `busybox pwd` pipeline
   (`docker.io`'s auth endpoint was unreachable from this host, as in the

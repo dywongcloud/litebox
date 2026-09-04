@@ -168,6 +168,13 @@ off first; otherwise point any VNC viewer at 5901.
 Ctrl+C the `boxer compose` process to tear the whole composition down
 cleanly.
 
+On macOS ARM, rarely, `boxer compose` may report `Error: instance
+'x11server' exited on its own (exit status: 11)` -- an intermittent guest
+crash, not yet root-caused, tracked in `docs/roadmap.md`'s guest-thread-
+pointer item (its third correction). It did not reproduce across 18
+back-to-back attempts while investigating it; if you hit it, just run
+`boxer compose` again.
+
 ## Graphics demo
 
 The graphics library (`src/graphics.rs`) provides a simple software-rasterizer
