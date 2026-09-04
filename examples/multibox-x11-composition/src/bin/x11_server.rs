@@ -85,48 +85,37 @@ impl Framebuffer {
     }
 }
 
-/// Read exactly `len` bytes, retrying on `WouldBlock`/`Interrupted` -- a
-/// real EAGAIN was observed here under litebox's guest TCP stack even on a
-/// nominally-blocking socket, so this must not treat it as fatal.
-fn read_exact(stream: &mut TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    let mut filled = 0;
-    while filled < len {
-        match stream.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed mid-read",
-                ));
-            }
-            Ok(n) => filled += n,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(buf)
-}
-
 fn pad4(n: usize) -> usize {
     (4 - (n % 4)) % 4
 }
 
-/// Consume and reply to the X11 connection setup handshake.
-fn do_setup(stream: &mut TcpStream, width: u16, height: u16) -> std::io::Result<()> {
-    // Fixed 12-byte prefix: byte-order(1) unused(1) major(2) minor(2)
-    // auth-name-len(2) auth-data-len(2) unused(2). byte-order (head[0]) is
-    // echoed back implicitly by us always speaking little-endian.
-    let head = read_exact(stream, 12)?;
-    let auth_name_len = u16::from_le_bytes([head[6], head[7]]) as usize;
-    let auth_data_len = u16::from_le_bytes([head[8], head[9]]) as usize;
-    read_exact(stream, auth_name_len + pad4(auth_name_len))?;
-    read_exact(stream, auth_data_len + pad4(auth_data_len))?;
+/// How many bytes of `buf` the connection-setup request occupies (fixed
+/// 12-byte prefix -- byte-order(1) unused(1) major(2) minor(2)
+/// auth-name-len(2) auth-data-len(2) unused(2) -- plus the padded auth name
+/// and data, whose contents nothing here uses), or `None` if `buf` doesn't
+/// hold that many bytes yet.
+///
+/// Never blocks to get more: `main`'s single guest thread cooperatively
+/// multiplexes every connected client (macOS ARM supports exactly one guest
+/// thread today, see `litebox_platform_macos_userland::guest`, so the
+/// one-thread-per-client model this demo used until now -- fine on
+/// Linux -- panics there on a second concurrent client), so parsing can only
+/// ever act on bytes that have already arrived.
+fn setup_request_len(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let auth_name_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+    let auth_data_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;
+    let total = 12 + auth_name_len + pad4(auth_name_len) + auth_data_len + pad4(auth_data_len);
+    (buf.len() >= total).then_some(total)
+}
 
+/// Reply to the X11 connection setup handshake. The request itself
+/// (`setup_request_len` bytes, already consumed by the caller) carries
+/// nothing this server needs -- every client here always gets the same
+/// screen/vendor info back.
+fn write_setup_reply(stream: &mut TcpStream, width: u16, height: u16) -> std::io::Result<()> {
     let vendor = b"litebox-compose-demo-x11-server";
     let mut body = Vec::new();
     body.extend_from_slice(&0u32.to_le_bytes()); // release-number
@@ -191,76 +180,87 @@ fn do_setup(stream: &mut TcpStream, width: u16, height: u16) -> std::io::Result<
     x11proto::write_all_retrying(stream, &body)
 }
 
-fn serve_client(mut stream: TcpStream, fb: Arc<Mutex<Framebuffer>>) -> std::io::Result<()> {
-    let (width, height) = {
-        let fb = fb.lock().unwrap();
-        (fb.width, fb.height)
-    };
-    do_setup(&mut stream, width, height)?;
-    eprintln!("x11-server: client {:?} setup complete", stream.peer_addr());
+/// One request's total byte length (4-byte header + body), or `None` if
+/// `buf` doesn't hold that many bytes yet. Same never-block constraint as
+/// `setup_request_len`.
+fn request_len(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let len_words = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+    let total = len_words * 4;
+    (buf.len() >= total).then_some(total)
+}
 
-    loop {
-        let mut head = [0u8; 4];
-        if stream.read_exact(&mut head).is_err() {
-            eprintln!("x11-server: client {:?} disconnected", stream.peer_addr());
-            return Ok(());
+/// Handle one already-fully-received request (`request_len` bytes: 4-byte
+/// header, `opcode` is its first byte, `body` is everything after it).
+fn handle_request(
+    fb: &Arc<Mutex<Framebuffer>>,
+    stream: &mut TcpStream,
+    opcode: u8,
+    body: &[u8],
+) -> std::io::Result<()> {
+    match opcode {
+        55 => {
+            // CreateGC: cid(4) drawable(4) value-mask(4) values...
+            let cid = u32::from_le_bytes(body[0..4].try_into().unwrap());
+            let mask = u32::from_le_bytes(body[8..12].try_into().unwrap());
+            // Only GCForeground (bit 0x04) is honored; find its slot by
+            // counting set bits below it among the handled ones we care
+            // about -- since we only ever look at foreground, and it is
+            // the only bit these demo clients ever set, its value is
+            // simply the first value word when present.
+            if mask & 0x0000_0004 != 0 {
+                let foreground = u32::from_le_bytes(body[12..16].try_into().unwrap());
+                fb.lock().unwrap().gcs.insert(cid, foreground);
+            }
         }
-        let opcode = head[0];
-        let len_words = u16::from_le_bytes([head[2], head[3]]) as usize;
-        let body_len = len_words.saturating_sub(1) * 4;
-        let body = read_exact(&mut stream, body_len)?;
+        70 => {
+            // PolyFillRectangle: drawable(4) gc(4) then 8-byte rects.
+            let gc = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            let mut off = 8;
+            while off + 8 <= body.len() {
+                let x = i16::from_le_bytes(body[off..off + 2].try_into().unwrap());
+                let y = i16::from_le_bytes(body[off + 2..off + 4].try_into().unwrap());
+                let w = u16::from_le_bytes(body[off + 4..off + 6].try_into().unwrap());
+                let h = u16::from_le_bytes(body[off + 6..off + 8].try_into().unwrap());
+                fb.lock().unwrap().fill_rect(gc, i32::from(x), i32::from(y), w, h);
+                off += 8;
+            }
+        }
+        73 => {
+            // GetImage: drawable(4) x(2) y(2) w(2) h(2) plane-mask(4).
+            let x = i16::from_le_bytes(body[4..6].try_into().unwrap());
+            let y = i16::from_le_bytes(body[6..8].try_into().unwrap());
+            let w = u16::from_le_bytes(body[8..10].try_into().unwrap());
+            let h = u16::from_le_bytes(body[10..12].try_into().unwrap());
+            let pixels = fb.lock().unwrap().get_image(i32::from(x), i32::from(y), w, h);
 
-        match opcode {
-            55 => {
-                // CreateGC: cid(4) drawable(4) value-mask(4) values...
-                let cid = u32::from_le_bytes(body[0..4].try_into().unwrap());
-                let mask = u32::from_le_bytes(body[8..12].try_into().unwrap());
-                // Only GCForeground (bit 0x04) is honored; find its slot by
-                // counting set bits below it among the handled ones we care
-                // about -- since we only ever look at foreground, and it is
-                // the only bit these demo clients ever set, its value is
-                // simply the first value word when present.
-                if mask & 0x0000_0004 != 0 {
-                    let foreground = u32::from_le_bytes(body[12..16].try_into().unwrap());
-                    fb.lock().unwrap().gcs.insert(cid, foreground);
-                }
-            }
-            70 => {
-                // PolyFillRectangle: drawable(4) gc(4) then 8-byte rects.
-                let gc = u32::from_le_bytes(body[4..8].try_into().unwrap());
-                let mut off = 8;
-                while off + 8 <= body.len() {
-                    let x = i16::from_le_bytes(body[off..off + 2].try_into().unwrap());
-                    let y = i16::from_le_bytes(body[off + 2..off + 4].try_into().unwrap());
-                    let w = u16::from_le_bytes(body[off + 4..off + 6].try_into().unwrap());
-                    let h = u16::from_le_bytes(body[off + 6..off + 8].try_into().unwrap());
-                    fb.lock().unwrap().fill_rect(gc, i32::from(x), i32::from(y), w, h);
-                    off += 8;
-                }
-            }
-            73 => {
-                // GetImage: drawable(4) x(2) y(2) w(2) h(2) plane-mask(4).
-                let x = i16::from_le_bytes(body[4..6].try_into().unwrap());
-                let y = i16::from_le_bytes(body[6..8].try_into().unwrap());
-                let w = u16::from_le_bytes(body[8..10].try_into().unwrap());
-                let h = u16::from_le_bytes(body[10..12].try_into().unwrap());
-                let pixels = fb.lock().unwrap().get_image(i32::from(x), i32::from(y), w, h);
-
-                let mut reply = Vec::with_capacity(32 + pixels.len());
-                reply.push(1); // reply
-                reply.push(24); // depth
-                reply.extend_from_slice(&0u16.to_le_bytes()); // sequence number
-                reply.extend_from_slice(&((pixels.len() / 4) as u32).to_le_bytes());
-                reply.extend_from_slice(&1u32.to_le_bytes()); // visual
-                reply.extend_from_slice(&[0u8; 20]); // unused pad to 32 bytes
-                reply.extend_from_slice(&pixels);
-                x11proto::write_all_retrying(&mut stream, &reply)?;
-            }
-            other => {
-                eprintln!("x11-server: ignoring unsupported opcode {other}");
-            }
+            let mut reply = Vec::with_capacity(32 + pixels.len());
+            reply.push(1); // reply
+            reply.push(24); // depth
+            reply.extend_from_slice(&0u16.to_le_bytes()); // sequence number
+            reply.extend_from_slice(&((pixels.len() / 4) as u32).to_le_bytes());
+            reply.extend_from_slice(&1u32.to_le_bytes()); // visual
+            reply.extend_from_slice(&[0u8; 20]); // unused pad to 32 bytes
+            reply.extend_from_slice(&pixels);
+            x11proto::write_all_retrying(stream, &reply)?;
+        }
+        other => {
+            eprintln!("x11-server: ignoring unsupported opcode {other}");
         }
     }
+    Ok(())
+}
+
+/// One connected client's cooperative-multiplexing state: everything
+/// received but not yet parsed into a complete setup request or protocol
+/// request, and whether the setup handshake has completed.
+struct Client {
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    buf: Vec<u8>,
+    setup_done: bool,
 }
 
 fn main() {
@@ -278,19 +278,98 @@ fn main() {
     eprintln!("x11-server: binding {bind_ip}:6000");
     let fb = Arc::new(Mutex::new(Framebuffer::new(width, height)));
     let listener = TcpListener::bind((bind_ip.as_str(), 6000)).expect("bind :6000 failed");
+    listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking failed");
     eprintln!("x11-server: listening on {bind_ip}:6000, screen {width}x{height}, root=0x{ROOT_WINDOW:x}");
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
-                let fb = Arc::clone(&fb);
-                std::thread::spawn(move || {
-                    if let Err(e) = serve_client(stream, fb) {
-                        eprintln!("x11-server: client session ended: {e}");
-                    }
+    // Cooperative multiplexing across every connected client (app, and
+    // separately vnc-bridge, both stay connected for the composition's whole
+    // lifetime) on this single loop -- macOS ARM supports exactly one guest
+    // thread today (see `litebox_platform_macos_userland::guest`), so the
+    // one-thread-per-client model this used until now panicked there the
+    // moment a second client connected.
+    let mut clients: Vec<Client> = Vec::new();
+    let mut scratch = [0u8; 4096];
+    loop {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                stream
+                    .set_nonblocking(true)
+                    .expect("set_nonblocking failed");
+                eprintln!("x11-server: client {peer:?} connected");
+                clients.push(Client {
+                    stream,
+                    peer,
+                    buf: Vec::new(),
+                    setup_done: false,
                 });
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => eprintln!("x11-server: accept failed: {e}"),
+        }
+
+        let mut any_progress = false;
+        let mut i = 0;
+        while i < clients.len() {
+            let mut remove = false;
+            {
+                let client = &mut clients[i];
+                match client.stream.read(&mut scratch) {
+                    Ok(0) => {
+                        eprintln!("x11-server: client {:?} disconnected", client.peer);
+                        remove = true;
+                    }
+                    Ok(n) => {
+                        client.buf.extend_from_slice(&scratch[..n]);
+                        any_progress = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        eprintln!("x11-server: client {:?} read error: {e}", client.peer);
+                        remove = true;
+                    }
+                }
+
+                while !remove {
+                    if !client.setup_done {
+                        let Some(consumed) = setup_request_len(&client.buf) else {
+                            break;
+                        };
+                        client.buf.drain(..consumed);
+                        if let Err(e) = write_setup_reply(&mut client.stream, width, height) {
+                            eprintln!("x11-server: client {:?} setup write failed: {e}", client.peer);
+                            remove = true;
+                            break;
+                        }
+                        client.setup_done = true;
+                        eprintln!("x11-server: client {:?} setup complete", client.peer);
+                        any_progress = true;
+                        continue;
+                    }
+                    let Some(total) = request_len(&client.buf) else {
+                        break;
+                    };
+                    let request: Vec<u8> = client.buf.drain(..total).collect();
+                    if let Err(e) =
+                        handle_request(&fb, &mut client.stream, request[0], &request[4..])
+                    {
+                        eprintln!("x11-server: client {:?} request failed: {e}", client.peer);
+                        remove = true;
+                        break;
+                    }
+                    any_progress = true;
+                }
+            }
+            if remove {
+                clients.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        if !any_progress {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 }
