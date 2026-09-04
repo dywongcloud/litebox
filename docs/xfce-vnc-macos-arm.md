@@ -268,7 +268,22 @@ never what was breaking this composition.
 
 - No fork() - each box is single-threaded
 - No hardlinks/symlinks in guest filesystem
-- Large TCP payloads (tens of KB) across two-hop routed connections can have gaps (workaround: chunk writes)
+- Large TCP payloads (tens of KB) across two-hop routed connections can have
+  gaps; chunking the write (see `x11proto::write_all_retrying`,
+  `CHUNK_SIZE = 256`) is a real, verified workaround at the sizes this
+  example actually sends (a 160x120x32bpp framebuffer, 75 KB) -- but it is
+  not a fix at every size. Confirmed live this session: bumping
+  `multibox-x11-composition`'s `x11server` to 320x240 (300 KB per
+  framebuffer, same chunked-write code path) reproducibly times out
+  mid-transfer and takes the whole composition down (`vnc-bridge: client
+  session ended: Broken pipe`, then `x11server` itself exits with SIGSEGV,
+  exit status 11) -- a real, more serious failure mode than a data gap, not
+  yet root-caused. Stay at the demo's existing 160x120 framebuffer size
+  (`SCREEN_WIDTH`/`SCREEN_HEIGHT` in `build-images.py`) until this is
+  investigated; do not raise it to make output more visible -- see
+  `x11_app.rs`'s fill-rectangle sizing (covers 90% of the canvas, not the
+  resolution) for how visibility was improved instead, at zero payload-size
+  cost.
 - Xvfb not supported (syscall gaps)
 - Guest always runs as uid 1000 (non-root)
 

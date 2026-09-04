@@ -142,6 +142,15 @@ pixel at center (80,60): R=0x11 G=0xcc B=0x66
 RESULT: PASS -- VNC end-to-end verified, real pixels from the app box visible
 ```
 
+If you connect with a real VNC viewer instead, expect to see a small
+(160x120) window that's almost entirely a dull olive-green (RGB
+`0x11,0xcc,0x66`) with a thin black margin -- not a colorful scene, and
+easy to mistake for a blank/black window at a glance if the viewer renders
+it small. That thin margin is the only black in it; if the window looks
+*entirely* black with no green at all, something is actually wrong (check
+the notes on port 5900 below, and on `boxer compose`'s own log for the box
+that's supposed to be drawing).
+
 `compose.json` publishes on host port **5901**, not the RFB-conventional
 5900, deliberately: on macOS, port 5900 is where the system's own built-in
 Screen Sharing / Remote Management service listens the moment it's enabled

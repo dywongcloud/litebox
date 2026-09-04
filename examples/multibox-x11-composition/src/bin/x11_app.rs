@@ -47,13 +47,25 @@ fn main() {
         .create_gc(conn.root, fg)
         .expect("CreateGC failed");
 
+    // Covers 90% of the canvas (a thin black margin, not a quarter-sized
+    // patch): the demo's framebuffer is deliberately tiny (160x120 -- see
+    // docs/xfce-vnc-macos-arm.md's "Known Limitations" on this platform's
+    // two-hop-routed TCP payload ceiling, which rules out just growing the
+    // resolution instead), and a small, dim rectangle against a mostly-black
+    // background at that size reads as "nothing rendered" to a real VNC
+    // viewer even though the pixels are correct -- confirmed live: a witness
+    // script sampling the known center pixel passed on every frame while a
+    // real viewer's connection looked like a black screen. Covering nearly
+    // the whole canvas costs nothing in payload size (still the same
+    // width*height*4 bytes; only which of those bytes are the fill color
+    // changes) and makes a live connection unambiguous at a glance.
     let (rw, rh) = (
-        (conn.width / 2).max(10),
-        (conn.height / 2).max(10),
+        (conn.width * 9 / 10).max(10),
+        (conn.height * 9 / 10).max(10),
     );
     let (rx, ry) = (
-        i16::try_from(conn.width / 4).unwrap_or(0),
-        i16::try_from(conn.height / 4).unwrap_or(0),
+        i16::try_from(conn.width / 20).unwrap_or(0),
+        i16::try_from(conn.height / 20).unwrap_or(0),
     );
 
     let mut tick: u64 = 0;
