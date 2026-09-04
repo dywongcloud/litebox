@@ -34,7 +34,7 @@
         "DISPLAY": "${x11server.guest_ip}:0",
         "BIND_IP": "${vncbridge.guest_ip}"
       },
-      "publish": ["5900:5900"]
+      "publish": ["5901:5900"]
     }
   ]
 }

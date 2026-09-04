@@ -15,6 +15,15 @@ mod x11proto;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
+
+/// Applied once handshake completes, for the main message loop: generous,
+/// since a real client legitimately idles between `FramebufferUpdateRequest`s
+/// and a client crash/network drop must not wedge `write_all` forever.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Applied only during the initial RFB handshake, see `handshake`'s doc
+/// comment for why this must be much shorter than `IDLE_TIMEOUT`.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn parse_display(display: &str) -> (String, u16) {
     let (host, num) = display
@@ -68,6 +77,19 @@ fn write_pixel_format(out: &mut Vec<u8>) {
 }
 
 fn handshake(stream: &mut TcpStream, width: u16, height: u16) -> std::io::Result<()> {
+    // This server is single-threaded and single-client (see module doc): the
+    // `listener.incoming()` loop in `main` cannot accept a new connection
+    // until `serve_client` returns for the current one. A stream that
+    // connects and then sends nothing -- a stale capability probe, a client
+    // that reconnects after a hiccup -- would otherwise sit on the caller's
+    // full 30s per-message timeout before the server frees up, which reads
+    // as "connects but shows nothing" to anyone trying right after. A real
+    // client completes this handshake in well under a second, so a short
+    // timeout here doesn't cost a real client anything; `serve_client`
+    // restores `IDLE_TIMEOUT` before the main loop, where waiting on the
+    // next client message is normal.
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+
     stream.write_all(b"RFB 003.008\n")?;
     let _client_version = read_exact(stream, 12)?;
 
@@ -139,6 +161,7 @@ fn handle_message(stream: &mut TcpStream, msg_type: u8) -> std::io::Result<bool>
 
 fn serve_client(mut client: TcpStream, x: &mut x11proto::Connection) -> std::io::Result<()> {
     handshake(&mut client, x.width, x.height)?;
+    client.set_read_timeout(Some(IDLE_TIMEOUT))?;
     eprintln!("vnc-bridge: client handshake complete");
 
     loop {
@@ -203,9 +226,11 @@ fn main() {
                 // A client that stops reading (crashes, network drop) would
                 // otherwise block this single-threaded server's write_all
                 // forever, wedging every future connection behind it.
-                let timeout = Some(std::time::Duration::from_secs(30));
-                let _ = client.set_read_timeout(timeout);
-                let _ = client.set_write_timeout(timeout);
+                // `handshake` (inside `serve_client`) tightens the read
+                // timeout further for the handshake itself, then widens it
+                // back to this once the client is talking normally.
+                let _ = client.set_read_timeout(Some(IDLE_TIMEOUT));
+                let _ = client.set_write_timeout(Some(IDLE_TIMEOUT));
                 if let Err(e) = serve_client(client, &mut x) {
                     eprintln!("vnc-bridge: client session ended: {e}");
                 }

@@ -130,7 +130,7 @@ In another terminal, once the log shows `composition up, press Ctrl+C to
 stop`:
 
 ```sh
-python3 examples/multibox-x11-composition/rfb_client_witness.py 127.0.0.1 5900
+python3 examples/multibox-x11-composition/rfb_client_witness.py 127.0.0.1 5901
 ```
 
 Expect:
@@ -141,6 +141,20 @@ FramebufferUpdate: 1 rect(s)
 pixel at center (80,60): R=0x11 G=0xcc B=0x66
 RESULT: PASS -- VNC end-to-end verified, real pixels from the app box visible
 ```
+
+`compose.json` publishes on host port **5901**, not the RFB-conventional
+5900, deliberately: on macOS, port 5900 is where the system's own built-in
+Screen Sharing / Remote Management service listens the moment it's enabled
+(`System Settings > General > Sharing > Screen Sharing`) -- confirmed on
+real hardware by connecting to `127.0.0.1:5900` and getting back `RFB
+003.889` (Apple's own vendor RFB variant, distinct from this demo's
+`RFB 003.008`/`litebox-compose-demo`) instead of anything this composition
+served. launchd registers that listener as a wildcard socket-activated
+service, so it can silently win the port even while `boxer compose`'s own
+forward is also up -- "the client connects but shows nothing" is what that
+looks like from a real VNC viewer (it's authenticating against your actual
+Mac, not this demo). If you'd rather use 5900 anyway, turn Screen Sharing
+off first; otherwise point any VNC viewer at 5901.
 
 Ctrl+C the `boxer compose` process to tear the whole composition down
 cleanly.
@@ -163,9 +177,10 @@ cargo build --release -p boxer
 ./target/release/boxer compose examples/multibox-x11-composition/graphics_compose.json
 ```
 
-Then connect with a VNC viewer:
+Then connect with a VNC viewer (port 5901, not 5900 -- see the note above
+about macOS's own Screen Sharing service):
 ```sh
-vncviewer 127.0.0.1:5900
+vncviewer 127.0.0.1:5901
 ```
 
 The demo renders a 320×240 framebuffer with time-animated gradients, circles,
