@@ -101,14 +101,23 @@ subsystem.
   `MSR TPIDR_EL0`/`MRS TPIDR_EL0` gate it hits (musl's own TLS bootstrap, which
   every real guest does, not just an unusual one) segfaults reading/writing
   `[TPIDRRO_EL0 + baked_slot * 8]`, because the process's actual
-  `pthread_key_create` key (261, measured) never matches
-  `MACOS_GUEST_TPIDR_TSD_SLOT` (256, baked) -- confirmed by instrumenting
-  `reserve_guest_tpidr_tsd_slot` directly and reading the mismatch it already
-  detects and warns about. So: **every real-world guest on this platform hits
-  this gap today**, not just one that unusually happens to touch `TPIDR_EL0`.
-  Until this is closed, `boxer run`/`boxer compose` on macOS ARM only works for
-  a guest binary that provably never sets up TLS -- which, for anything built
-  by a normal `libc`, means none.
+  `pthread_key_create` key (261, measured once on this session's `boxer`
+  build) doesn't match `MACOS_GUEST_TPIDR_TSD_SLOT` (256, baked) -- confirmed
+  by instrumenting `reserve_guest_tpidr_tsd_slot` directly and reading the
+  mismatch it already detects and warns about. The exact key number is
+  itself an artifact of this specific binary's static-initializer order (see
+  `reserve_guest_tpidr_tsd_slot`'s own doc comment on why it's "undocumented
+  and not stable"), so it will drift across rebuilds/toolchain versions and
+  is not worth chasing as a number -- what's durable is that it drifts *at
+  all*, since the rewriter's gates need it fixed at AOT-rewrite time. In
+  practice this makes every real guest's own TLS bootstrap a coin flip on
+  this host today, not a hard 100% failure: `boxer compose` on the
+  multibox-x11-composition example, same session, same binaries, had
+  `x11server` and `app` both reach their own `main()` (bind/connect
+  succeeded) on one run and not on others. **So: every real-world guest on
+  this platform is at risk of this gap, unreliably** -- not just one that
+  unusually happens to touch `TPIDR_EL0`, and not reliably enough to call
+  "working" until the key is read at runtime instead of baked in.
 * **The platform's *own* per-thread context-switch bookkeeping** —
   REATTEMPTED and correctly deferred rather than force-implemented. A separate
   problem from the rewriter's guest slot above. Studying

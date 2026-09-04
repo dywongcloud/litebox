@@ -251,8 +251,12 @@ the *composition* layer (networking, packaging, port publishing), not as
 - [x] Guest ELF loading on macOS ARM -- fixed this pass (static-PIE build +
       correct `--rewrite-host` default); verified via `boxer run` reaching a
       guest's own `main()` (TCP bind + listen) on real hardware
-- [ ] A guest surviving its own TLS bootstrap on macOS ARM -- blocked on the
-      `pthread_key_create` slot mismatch above; every real guest hits this
+- [ ] A guest surviving its own TLS bootstrap on macOS ARM, reliably -- at
+      risk from the `pthread_key_create` slot mismatch above on every real
+      guest, non-deterministically (the exact key drifts with the host
+      binary's own static-initializer order); observed both ways in the same
+      session -- x11server/app reached their own `main()` on one run,
+      crashed on others with identical binaries
 - [ ] Real-time pixel-level rendering over VNC on real macOS ARM hardware --
       blocked on the above; verified on Linux only
 
