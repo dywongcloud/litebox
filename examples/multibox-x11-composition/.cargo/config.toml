@@ -1,0 +1,12 @@
+# Only takes effect when building the aarch64-unknown-linux-musl TARGET,
+# i.e. when building.py's host-detection has already chosen it (see
+# build-images.py's _HOST_MACHINE check) -- which in practice today means
+# only when the build itself is running on macOS ARM. See
+# litebox_platform_macos_userland/scripts/aarch64-musl-static-pie-linker.sh
+# for the full "why": macOS ARM refuses to load a plain (ET_EXEC) guest
+# binary at all, and rustc's own crt-object selection for this target
+# doesn't produce a genuinely self-relocating static-PIE binary even when
+# asked for one, so both pieces are forced here.
+[target.aarch64-unknown-linux-musl]
+linker = "../../litebox_platform_macos_userland/scripts/aarch64-musl-static-pie-linker.sh"
+rustflags = ["-C", "link-args=-static-pie"]

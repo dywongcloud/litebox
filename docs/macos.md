@@ -58,7 +58,29 @@ unmapped and impossible to map over. `TASK_ADDR_MIN` is therefore `0x1_0000_0000
 
 The practical consequence is that guest images must be position-independent, or
 linked above 4 GiB. An `ET_EXEC` binary linked at the customary `0x400000`
-cannot be loaded at its preferred address on this host.
+cannot be loaded at its preferred address on this host -- the loader refuses it
+with `AllocationError::BelowMinAddress`, which surfaces to `boxer run` as a
+bare, unhelpful "Memory mapping error: EPERM: Operation not permitted" at ELF
+load time.
+
+For a Rust/musl guest, position-independent in practice means static-PIE
+(`ET_DYN`, self-relocating, no separate dynamic linker needed) --
+`rustc`'s own crt-object selection for `aarch64-unknown-linux-musl` does not
+reliably produce one: `-C relocation-model=pie`/`=pic` alone changes nothing
+(verified: identical output with or without it, `rustc` 1.98.1), and
+`-C link-args=-static-pie` alone does get the linker to emit `ET_DYN`, but
+still links the plain (non-self-relocating) `crt1.o` rustc always selects for
+this target -- producing a binary that *looks* like static-PIE but crashes
+immediately (confirmed via `lldb`: `SIGSEGV` inside musl's own `environ`/`argv`
+setup, dereferencing an unrelocated `.bss` pointer) on a real, unmodified
+Linux kernel too, not just under LiteBox. The fix is
+`litebox_platform_macos_userland/scripts/aarch64-musl-static-pie-linker.sh`, a
+linker wrapper that substitutes the one object file that needs to differ
+(`rcrt1.o` for `crt1.o`) -- see the script's own comment for the full
+toolchain-archaeology. Wire it into the guest project's own
+`.cargo/config.toml` rather than passing flags by hand on every build; see
+`examples/multibox-x11-composition/.cargo/config.toml` for the reference
+setup this project actually runs and verifies against.
 
 The mapping is refused with `AllocationError::BelowMinAddress`, which reaches
 the guest as a bare `EPERM`:
@@ -240,6 +262,22 @@ needs before it can land.
   executes guest processes but does not connect their stdout/stderr to the host.
   Guest output is lost. Workaround: use WASM workloads (WASI stdio works), or
   build on Linux for full stdio support.
+- **`boxer build`'s arm64 rewrite anchor now defaults correctly, but this only
+  reveals the next gap.** `--rewrite-host` used to default to `"linux"`
+  unconditionally, so an arm64 box built *on* macOS still got `Host::Linux`
+  gates -- which item 1 below establishes reliably fault the guest, since
+  `TPIDR_EL0` is repurposed by XNU and doesn't survive a context switch. Fixed:
+  the default now matches the build host, same as
+  `litebox_packager::rewrite_host` already computed it. That, plus building the
+  guest as `ET_DYN`/static-PIE ("The first 4 GiB is unusable", above -- a plain
+  `cargo build`'s `ET_EXEC` output can't load on this host at all), is enough
+  for a guest to load and start executing for the first time on real macOS ARM
+  hardware -- which immediately exercises item 1's remaining half end to end:
+  see `docs/roadmap.md`'s "Update, now exercised end to end on real hardware"
+  for the concrete `pthread_key_create` slot mismatch (261 actual vs. 256
+  baked, measured) this surfaces on the very first `MSR`/`MRS TPIDR_EL0` gate
+  -- which is to say, on every real guest's own TLS bootstrap, not an unusual
+  corner case.
 
 Guest entry itself -- the context switch into guest code and back -- **is now
 implemented and tested on real hardware** (`litebox_platform_macos_userland::guest`;

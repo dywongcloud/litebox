@@ -88,6 +88,27 @@ subsystem.
   thread's pointer into the reserved key, and a macOS runner to exercise any of
   it -- none wires `MacOsUserland` into `litebox_shim_linux` today, so this whole
   path is still unexercised end to end on hardware.
+
+  **Update, now exercised end to end on real hardware (Apple M-series, macOS
+  ARM, this project's own `boxer`):** the gap above is real and reproduces
+  exactly as predicted, now that two unrelated blockers that had prevented any
+  guest from getting this far are separately fixed (see `docs/macos.md`'s "The
+  first 4 GiB is unusable" -- a plain `cargo build` produces an `ET_EXEC`
+  binary that can't load on this host at all -- and `boxer build`'s
+  `--rewrite-host` default, which previously always anchored arm64 gates on
+  `Host::Linux` regardless of the actual build host). With both fixed, a
+  static-PIE musl guest now loads and starts executing -- and the first
+  `MSR TPIDR_EL0`/`MRS TPIDR_EL0` gate it hits (musl's own TLS bootstrap, which
+  every real guest does, not just an unusual one) segfaults reading/writing
+  `[TPIDRRO_EL0 + baked_slot * 8]`, because the process's actual
+  `pthread_key_create` key (261, measured) never matches
+  `MACOS_GUEST_TPIDR_TSD_SLOT` (256, baked) -- confirmed by instrumenting
+  `reserve_guest_tpidr_tsd_slot` directly and reading the mismatch it already
+  detects and warns about. So: **every real-world guest on this platform hits
+  this gap today**, not just one that unusually happens to touch `TPIDR_EL0`.
+  Until this is closed, `boxer run`/`boxer compose` on macOS ARM only works for
+  a guest binary that provably never sets up TLS -- which, for anything built
+  by a normal `libc`, means none.
 * **The platform's *own* per-thread context-switch bookkeeping** —
   REATTEMPTED and correctly deferred rather than force-implemented. A separate
   problem from the rewriter's guest slot above. Studying

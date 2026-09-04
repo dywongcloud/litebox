@@ -76,7 +76,19 @@ cargo build --release -p boxer
 ./target/release/boxer compose examples/multibox-x11-composition/compose.json
 ```
 
-On Apple Silicon macOS, the guest binaries still have to be real `aarch64-
+On Apple Silicon macOS, **this does not fully work end to end yet.** Real
+hardware testing found and fixed two macOS ARM packaging/build bugs that
+had prevented any guest from loading at all -- with those fixed, a guest now
+loads and starts running for the first time on this platform, but hits a
+separate, pre-existing, already-documented gap in guest thread-pointer
+support the moment it does its own TLS bootstrap (which every real guest
+does): see `docs/roadmap.md`'s guest-thread-pointer item and
+`docs/xfce-vnc-macos-arm.md`'s "Capability status" for the concrete details.
+The instructions below get you as far as `boxer run`/`boxer compose`
+correctly starting each box; the guest itself currently crashes shortly
+after.
+
+The guest binaries still have to be real `aarch64-
 unknown-linux-musl` ELF (litebox runs guest instructions natively, with no
 emulation -- see `litebox_runner_linux_on_macos_userland`'s module docs).
 macOS's own `cc`/`ld64` cannot produce Linux ELF output, so cross-linking
@@ -88,7 +100,16 @@ brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
 rustup target add aarch64-unknown-linux-musl   # once
 export CC_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-gcc
 export AR_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-ar
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
+
+# Deliberately NOT setting CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: an
+# env var of that name overrides this project's own .cargo/config.toml (see
+# .cargo/config.toml in this directory), which is what makes the guest
+# binaries self-relocating static-PIE rather than an ET_EXEC macOS ARM
+# refuses to load at all -- see docs/macos.md's "The first 4 GiB is
+# unusable". Confirmed on real hardware: setting this env var silently
+# reintroduces a SIGSEGV crash-on-startup that "file"/BuildID alone won't
+# show you (the linker still emits a static-PIE-*looking* ET_DYN, just one
+# linked against the wrong, non-self-relocating startup object).
 
 cd examples/multibox-x11-composition
 

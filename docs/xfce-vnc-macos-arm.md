@@ -219,14 +219,25 @@ RFB 003.008
 ### Capability status
 
 The full composition (X11 server + app + VNC bridge, `boxer compose`) is
-verified end-to-end on x86_64 Linux, the platform this was actually built
-and tested against -- see `examples/multibox-x11-composition/README.md`.
-The pieces specific to macOS ARM (native `boxer run`/`boxer compose`, guest
-stdio forwarding, `utun` device creation and addressing) are implemented
-and type-check against the real `aarch64-apple-darwin` target, but this
-development environment has no macOS ARM hardware to run them on, so the
-macOS-specific path itself is untested on real hardware. Treat "should
-work" and "does work" as distinct until someone runs it on an actual Mac.
+verified end-to-end on x86_64 Linux -- see
+`examples/multibox-x11-composition/README.md`. On macOS ARM, real hardware
+testing (Apple M-series) found and fixed two build/packaging bugs that had
+prevented any guest from loading at all (a plain `cargo build` produces an
+`ET_EXEC` binary macOS ARM's `__PAGEZERO` refuses to load, and `boxer
+build`'s `--rewrite-host` flag always defaulted to `"linux"` even when
+building on macOS -- see `docs/macos.md`'s "The first 4 GiB is unusable" and
+"Known gaps in macOS ARM execution"). With both fixed, a guest now loads and
+starts executing on macOS ARM for the first time -- but every real guest's
+own TLS bootstrap (musl's `_start`, which every normal `libc` runs, not an
+unusual corner case) then hits a separate, pre-existing, already-documented
+gap: `docs/roadmap.md`'s guest-thread-pointer item, whose "guest-entry side...
+still unexercised end to end on hardware" is now concretely reproduced (a
+`pthread_key_create` slot mismatch -- 261 actual vs. 256 baked, measured --
+that segfaults the guest on its first `MSR`/`MRS TPIDR_EL0`). So: **the full
+composition does not yet run end to end on macOS ARM**, and won't until that
+gap closes -- treat every checkmark below as "implemented and reachable" for
+the *composition* layer (networking, packaging, port publishing), not as
+"the demo renders pixels on a Mac today."
 
 - [x] Direct aarch64 instruction execution (no emulation) -- implemented
 - [x] Memory isolation via Mach VM -- implemented
@@ -237,8 +248,13 @@ work" and "does work" as distinct until someone runs it on an actual Mac.
 - [x] Environment variable injection -- implemented (shared with Linux)
 - [x] Graceful startup/shutdown -- implemented (shared with Linux)
 - [x] Multiple isolated instances simultaneously -- implemented
+- [x] Guest ELF loading on macOS ARM -- fixed this pass (static-PIE build +
+      correct `--rewrite-host` default); verified via `boxer run` reaching a
+      guest's own `main()` (TCP bind + listen) on real hardware
+- [ ] A guest surviving its own TLS bootstrap on macOS ARM -- blocked on the
+      `pthread_key_create` slot mismatch above; every real guest hits this
 - [ ] Real-time pixel-level rendering over VNC on real macOS ARM hardware --
-      verified on Linux only; not yet run on a Mac
+      blocked on the above; verified on Linux only
 
 ### Known Limitations
 

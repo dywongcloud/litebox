@@ -109,6 +109,18 @@ enum Cli {
     },
 }
 
+/// The `--rewrite-host` CLI default: matches `litebox_packager::rewrite_host`'s
+/// own cfg-based selection, since a `clap` `default_value` can't call that
+/// function directly (it returns `litebox_syscall_rewriter::Host`, not a CLI
+/// string, and `boxer` doesn't otherwise depend on that crate).
+const fn default_rewrite_host() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
 #[derive(clap::Args, Debug)]
 struct BuildArgs {
     /// Build from a Dockerfile or Containerfile. With no source flag at all,
@@ -147,7 +159,15 @@ struct BuildArgs {
     #[arg(short = 'o', long = "output", value_name = "PATH")]
     output: Option<PathBuf>,
     /// AArch64 syscall-rewrite anchor: the OS that will run arm64 boxes.
-    #[arg(long = "rewrite-host", value_parser = ["linux", "macos"], default_value = "linux")]
+    /// Defaults to the OS `boxer build` is itself running on -- the same
+    /// assumption `litebox_packager::rewrite_host` documents (packaging
+    /// happens on the host that will run the box in this project's usage
+    /// model). A `Host::Linux`-anchored arm64 box reliably faults the guest
+    /// on macOS the first time it is rescheduled (`TPIDR_EL0` does not
+    /// survive a context switch there), so getting this default wrong is not
+    /// a style choice: only override it when packaging for a *different*
+    /// host than the one running `boxer build`.
+    #[arg(long = "rewrite-host", value_parser = ["linux", "macos"], default_value = default_rewrite_host())]
     rewrite_host: String,
     /// Skip rewriting specific files, named by their image path inside the
     /// rootfs (e.g. /usr/bin/busybox).
