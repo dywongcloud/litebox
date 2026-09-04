@@ -138,6 +138,44 @@ def check_loadable(path):
     )
 
 
+def check_no_linker_override():
+    """A CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER env var silently wins
+    over this directory's own .cargo/config.toml `linker =` setting -- Cargo
+    always prefers the env var over a config file, undocumented in a way
+    that's easy to miss -- bypassing
+    aarch64-musl-static-pie-linker.sh's crt1.o -> rcrt1.o substitution.
+
+    This is a *worse* failure than the ET_EXEC case check_loadable() already
+    catches: the resulting binary still links and still reports ET_DYN
+    ("static-pie linked", `-C link-args=-static-pie` alone is unaffected by
+    which linker ends up invoked), so nothing in this pipeline's own checks
+    flags it -- but it silently keeps the non-self-relocating crt1.o musl
+    startup object, and the guest segfaults inside musl's own environ/argv
+    setup the instant it runs. Confirmed on real Apple Silicon hardware by
+    disassembling the actual linked entry point: with the env var set, `b
+    _start_c` in `_start` resolves to code whose first instruction is `mov
+    x2, x0` (crt1.o's non-relocating `_start_c`); with it unset, the same
+    symbol resolves to `mov x3, x0` (rcrt1.o's real, self-relocating
+    `_start_c`) -- see docs/roadmap.md's guest-thread-pointer item history.
+    """
+    var = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
+    value = os.environ.get(var)
+    if value is None or os.path.basename(value) == "aarch64-musl-static-pie-linker.sh":
+        return
+    sys.exit(
+        f"{var}={value!r} is set in this environment and overrides this\n"
+        f"directory's own .cargo/config.toml linker setting (Cargo always\n"
+        f"prefers the env var over a config file) -- the guest binaries were\n"
+        f"almost certainly built with the wrong, non-self-relocating crt1.o.\n"
+        f"The resulting ELF still reports as a valid static-PIE (ET_DYN), so\n"
+        f"nothing else in this pipeline catches it, but the guest will\n"
+        f"segfault inside musl's own environ/argv setup the instant it runs.\n"
+        f"Fix: unset {var} (or point it at\n"
+        f"litebox_platform_macos_userland/scripts/aarch64-musl-static-pie-linker.sh)\n"
+        f"and rebuild: `env -u {var} cargo build --release --target {RUST_TARGET}`."
+    )
+
+
 def build_static_bin_box(binary_name, out_name, env, exposed_ports):
     target_bin = os.path.join(HERE, "target", RUST_TARGET, "release", binary_name)
     if not os.path.exists(target_bin):
@@ -162,6 +200,8 @@ def build_static_bin_box(binary_name, out_name, env, exposed_ports):
 
 
 if __name__ == "__main__":
+    if OCI_ARCH == "arm64":
+        check_no_linker_override()
     # DISPLAY/BIND_IP are deliberately NOT baked in here -- they depend on
     # the composition's topology (which subnet each instance lands on),
     # which only `boxer compose` knows. It injects them at spawn time via

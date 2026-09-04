@@ -76,17 +76,16 @@ cargo build --release -p boxer
 ./target/release/boxer compose examples/multibox-x11-composition/compose.json
 ```
 
-On Apple Silicon macOS, **this does not fully work end to end yet.** Real
-hardware testing found and fixed two macOS ARM packaging/build bugs that
-had prevented any guest from loading at all -- with those fixed, a guest now
-loads and starts running for the first time on this platform, but hits a
-separate, pre-existing, already-documented gap in guest thread-pointer
-support the moment it does its own TLS bootstrap (which every real guest
-does): see `docs/roadmap.md`'s guest-thread-pointer item and
-`docs/xfce-vnc-macos-arm.md`'s "Capability status" for the concrete details.
-The instructions below get you as far as `boxer run`/`boxer compose`
-correctly starting each box; the guest itself currently crashes shortly
-after.
+On Apple Silicon macOS, **this works end to end**, verified on real M-series
+hardware: all three boxes up, `app` drawing frames continuously, `vncbridge`
+serving a real RFB 3.8 server, and `rfb_client_witness.py` confirming actual
+received pixel color. Getting there took fixing several real macOS ARM
+packaging/build bugs along the way -- see `docs/roadmap.md`'s guest-thread-
+pointer item for the full history, including a build-time trap that's easy to
+reintroduce by accident: read the `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_
+LINKER` warning in the instructions below *before* building, since it
+silently produces a guest that still looks like a valid static-PIE binary
+but crashes at startup on every run.
 
 The guest binaries still have to be real `aarch64-
 unknown-linux-musl` ELF (litebox runs guest instructions natively, with no

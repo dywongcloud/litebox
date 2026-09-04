@@ -252,6 +252,58 @@ subsystem.
   in: the guest's TLS/TSD bootstrap is never reached at all while its own
   `environ` setup, running moments earlier, is already faulting on unrelocated
   GOT data.
+
+  **Fourth correction, same session, root cause found and fixed: this was
+  never a litebox bug at all -- it was a build-time linker-selection bug, and
+  every "candidate not yet checked" above was on the wrong side of the
+  guest/host boundary.** Instrumented `litebox_shim_linux::loader::elf::
+  ElfLoader::load` (temporarily, cleanly reverted) to log `base_addr`,
+  `phdrs_addr`, `entry_point`, and to walk the guest's own phdrs (host-
+  readable, since guest memory is host memory on this platform) looking for
+  `PT_DYNAMIC`. Every value litebox computed was correct: `AT_PHDR` pointed at
+  the guest's real phdr table, `PT_DYNAMIC`'s `p_vaddr` was right, and the
+  `.dynamic` array's actual in-guest-memory bytes at `base_addr + p_vaddr`
+  exactly matched the file's own `DT_INIT`/`DT_FINI`/`DT_INIT_ARRAY` values --
+  proving litebox's loader, mapping, and auxv construction were never at
+  fault. That forced the question the "candidates" above hadn't yet asked:
+  was the guest binary itself genuinely self-relocating in the first place?
+  Disassembling the *actual linked* `x11-server` at its real entry point
+  showed `_start`'s branch to `_start_c` resolving to code starting `mov x2,
+  x0` -- and cross-checking byte-for-byte against both candidate crt objects
+  (`aarch64-musl-static-pie-linker.sh`'s intended `rcrt1.o`, whose real
+  `_start_c` starts `mov x3, x0`, vs. the plain, non-self-relocating `crt1.o`
+  the script exists specifically to avoid, whose `_start_c` starts `mov x2,
+  x0`) showed an exact match to the *wrong* one. The wrapper script's own
+  substitution logic was never running: this shell had a pre-existing
+  `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-
+  gcc` environment variable, which Cargo always prefers over a project's
+  `.cargo/config.toml` `linker =` key -- so `cargo build` was invoking the
+  plain toolchain linker directly, and the wrapper's `crt1.o` -> `rcrt1.o`
+  substitution (see `docs/macos.md`'s "The first 4 GiB is unusable") never
+  had a chance to run. `-C link-args=-static-pie` is unaffected by which
+  linker gets invoked, so the binary still came out `ET_DYN`/"static-pie
+  linked" -- indistinguishable from a correct build by file type alone,
+  exactly the failure mode that section already warned neither `readelf -h`
+  nor `file` can catch.
+
+  Unsetting the env var and rebuilding fixed this completely: `x11-server`
+  now reaches `main()` and binds its socket on every run (not a coin flip),
+  and the full `examples/multibox-x11-composition` composition was verified
+  end to end on this same Apple M-series hardware -- all three boxes up
+  (`x11server`, `app`, `vncbridge`), `app` drawing frames continuously,
+  `vncbridge` serving a real RFB 3.8 server, and `rfb_client_witness.py`
+  (a from-scratch RFB client, not a mock) confirming the actual received
+  pixel color matches what `app` drew, over real `utun`-routed networking.
+  `examples/multibox-x11-composition/build-images.py` now has a
+  `check_no_linker_override` pre-check that refuses to package a box while
+  this env var is set to anything but the intended wrapper script, since nothing
+  else in the pipeline (including `check_loadable`'s own `ET_DYN` check)
+  catches it. **The `macos-guest-tp-runtime-offset` gap this whole item
+  documents (the fixed-vs-runtime pthread TSD slot for an actual
+  `TPIDR_EL0`-touching guest) is still real and still unexercised -- nothing
+  in this correction touches it -- but it is no longer the reason
+  `multibox-x11-composition` fails on macOS ARM, because that composition no
+  longer fails.**
 * **The platform's *own* per-thread context-switch bookkeeping** —
   REATTEMPTED and correctly deferred rather than force-implemented. A separate
   problem from the rewriter's guest slot above. Studying

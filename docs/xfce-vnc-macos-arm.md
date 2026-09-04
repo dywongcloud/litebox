@@ -219,25 +219,29 @@ RFB 003.008
 ### Capability status
 
 The full composition (X11 server + app + VNC bridge, `boxer compose`) is
-verified end-to-end on x86_64 Linux -- see
-`examples/multibox-x11-composition/README.md`. On macOS ARM, real hardware
-testing (Apple M-series) found and fixed two build/packaging bugs that had
-prevented any guest from loading at all (a plain `cargo build` produces an
-`ET_EXEC` binary macOS ARM's `__PAGEZERO` refuses to load, and `boxer
-build`'s `--rewrite-host` flag always defaulted to `"linux"` even when
-building on macOS -- see `docs/macos.md`'s "The first 4 GiB is unusable" and
-"Known gaps in macOS ARM execution"). With both fixed, a guest now loads and
-starts executing on macOS ARM for the first time -- but every real guest's
-own TLS bootstrap (musl's `_start`, which every normal `libc` runs, not an
-unusual corner case) then hits a separate, pre-existing, already-documented
-gap: `docs/roadmap.md`'s guest-thread-pointer item, whose "guest-entry side...
-still unexercised end to end on hardware" is now concretely reproduced (a
-`pthread_key_create` slot mismatch -- 261 actual vs. 256 baked, measured --
-that segfaults the guest on its first `MSR`/`MRS TPIDR_EL0`). So: **the full
-composition does not yet run end to end on macOS ARM**, and won't until that
-gap closes -- treat every checkmark below as "implemented and reachable" for
-the *composition* layer (networking, packaging, port publishing), not as
-"the demo renders pixels on a Mac today."
+verified end-to-end on **both** x86_64 Linux and Apple Silicon macOS ARM --
+see `examples/multibox-x11-composition/README.md`. Getting the macOS ARM
+path working took several rounds of real-hardware debugging (Apple
+M-series); see `docs/roadmap.md`'s guest-thread-pointer item for the full
+history. The two build/packaging bugs found first (a plain `cargo build`
+producing an `ET_EXEC` binary macOS ARM's `__PAGEZERO` refuses to load, and
+`boxer build`'s `--rewrite-host` flag always defaulting to `"linux"` even
+when building on macOS -- see `docs/macos.md`'s "The first 4 GiB is
+unusable") got a guest loading and executing for the first time, but it then
+crashed intermittently inside musl's own crt startup. That was long
+suspected to be the separate, real `macos-guest-tp-runtime-offset` gap (a
+`pthread_key_create` TSD slot mismatch affecting any real `TPIDR_EL0`-using
+guest) -- until root-caused instead to a build-environment trap: a
+pre-existing `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER` environment
+variable was silently overriding the project's `.cargo/config.toml` linker
+setting, defeating the wrapper script that makes the guest binary genuinely
+self-relocating static-PIE. The binary still came out looking like valid
+static-PIE (`ET_DYN`, "static-pie linked") by every check that only looks at
+file type, so this was easy to miss; unsetting the env var and rebuilding
+fixed it completely. See `docs/roadmap.md` and `docs/macos.md`'s "The first 4
+GiB is unusable" for the full diagnosis. The `macos-guest-tp-runtime-offset`
+gap itself is still real for an actual `TPIDR_EL0`-touching guest, but it was
+never what was breaking this composition.
 
 - [x] Direct aarch64 instruction execution (no emulation) -- implemented
 - [x] Memory isolation via Mach VM -- implemented
@@ -248,17 +252,17 @@ the *composition* layer (networking, packaging, port publishing), not as
 - [x] Environment variable injection -- implemented (shared with Linux)
 - [x] Graceful startup/shutdown -- implemented (shared with Linux)
 - [x] Multiple isolated instances simultaneously -- implemented
-- [x] Guest ELF loading on macOS ARM -- fixed this pass (static-PIE build +
-      correct `--rewrite-host` default); verified via `boxer run` reaching a
-      guest's own `main()` (TCP bind + listen) on real hardware
-- [ ] A guest surviving its own TLS bootstrap on macOS ARM, reliably -- at
-      risk from the `pthread_key_create` slot mismatch above on every real
-      guest, non-deterministically (the exact key drifts with the host
-      binary's own static-initializer order); observed both ways in the same
-      session -- x11server/app reached their own `main()` on one run,
-      crashed on others with identical binaries
-- [ ] Real-time pixel-level rendering over VNC on real macOS ARM hardware --
-      blocked on the above; verified on Linux only
+- [x] Guest ELF loading on macOS ARM -- verified via `boxer run` reaching a
+      guest's own `main()` (TCP bind + listen) on real hardware, reliably
+      (not a coin flip) once genuinely self-relocating static-PIE binaries
+      are actually being linked
+- [x] A guest surviving its own TLS bootstrap on macOS ARM, reliably --
+      verified across repeated runs once the linker-shadowing bug above was
+      fixed
+- [x] Real-time pixel-level rendering over VNC on real macOS ARM hardware --
+      verified with `rfb_client_witness.py` against a live `boxer compose`
+      run: real pixels drawn by `app` visible through `vncbridge`'s RFB
+      server
 
 ### Known Limitations
 

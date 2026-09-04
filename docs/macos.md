@@ -86,6 +86,37 @@ with `readelf -h` (want `DYN`, not `EXEC`) or `file` (want "pie executable,
 self-relocates; only running it does (see the script's comment for how a
 broken build fools both checks).
 
+**A pre-existing `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER` environment
+variable silently defeats this wrapper, and is easy to have without
+realizing it.** Cargo always prefers a `CARGO_TARGET_<triple>_LINKER`
+environment variable over the matching `.cargo/config.toml` `linker =` key --
+intentional Cargo behavior, not a bug, but an easy trap here since nothing
+about invoking `cargo build` announces that a shell-level env var (set by a
+toolchain installer's shell hook, a devcontainer, an earlier `export`, etc.)
+is quietly overriding a project's own config. When it does, `aarch64-unknown-
+linux-musl-gcc` gets invoked directly -- the wrapper, and its `crt1.o` ->
+`rcrt1.o` substitution, never runs. The resulting binary is *not* caught by
+either check above: `-C link-args=-static-pie` is unaffected by which linker
+ends up invoked, so the file still comes out `ET_DYN`/"static-pie linked" --
+it just silently keeps the non-self-relocating `crt1.o`, and crashes exactly
+as described above the instant it runs. This was found, root-caused, and
+fixed on real Apple Silicon hardware this way: a guest that reached its own
+`main()` intermittently (coin-flip, varying by rebuild) was long attributed to
+the separate, real `macos-guest-tp-runtime-offset` gap in `docs/roadmap.md`
+-- until fault-handler register capture plus a byte-level disassembly
+comparison against both candidate `rcrt1.o`/`crt1.o` objects showed the
+*linked* entry code was byte-for-byte the non-relocating `crt1.o`'s
+`_start_c` (`mov x2, x0` as its first instruction) rather than `rcrt1.o`'s
+(`mov x3, x0`) -- while this shell's own `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_
+MUSL_LINKER` env var, set to plain `aarch64-unknown-linux-musl-gcc`, was
+confirmed to be the reason. Unsetting it and rebuilding fixed the crash
+completely, verified end to end (`boxer compose` on
+`examples/multibox-x11-composition`, all three boxes, a real external VNC
+client receiving real pixels). `examples/multibox-x11-composition/
+build-images.py` now checks for this specific env var and refuses to package
+a box while it's set to anything but the wrapper script, since nothing else
+in the pipeline catches it.
+
 ### W^X, `MAP_JIT`, and code signing
 
 macOS refuses to make anonymous memory executable through the ordinary path, and
