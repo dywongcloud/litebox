@@ -991,43 +991,97 @@ Known gaps a real guest hits now:
 
   3. **A plausibly-related, but distinctly different-shaped, intermittent
      macOS ARM guest crash: `examples/multibox-x11-composition`'s `x11server`
-     box exiting with `SIGSEGV` (exit status 11) during otherwise-normal
-     `boxer compose` operation** -- observed once live (user report: crash
+     box exiting with `SIGSEGV` while otherwise operating normally** --
+     observed live (user report and one independent reproduction: crash
      landed right as `vncbridge`, the third box in the composition, opened
-     its connection to an already-running, already-serving `x11server`), not
-     yet reproduced despite trying: 18 fresh `boxer compose` runs of the
-     exact same three-box composition (8 at idle, 10 more under artificial
-     CPU load from several background `yes` processes, meant to widen
-     whatever timing window the crash needs) all completed cleanly. Unlike
-     Bug B above, this is not necessarily simultaneous guest *launches* --
-     `x11server` was already up and had already served one client
-     (`app`) for several frames before the crash, so if this is the same
-     underlying "Darwin's memory subsystem does not behave the same under
-     concurrent load" category, the trigger here would be concurrent *guest
-     execution* (three separate `boxer run` processes live at once, one
-     actively handling a new inbound TCP connection while another
-     periodically writes to it) rather than concurrent *startup*. Read
-     `examples/multibox-x11-composition/src/bin/x11_server.rs` in full
+     its connection to an already-running, already-serving `x11server`).
+     Unlike Bug B above, this is not simultaneous guest *launches* --
+     `x11server` was already up and had already served one client (`app`)
+     for several frames before the crash, so if this is the same underlying
+     "Darwin's memory subsystem does not behave the same under concurrent
+     load" category, the trigger here would be concurrent *guest execution*
+     (three separate `boxer run` processes live at once, one actively
+     handling a new inbound TCP connection while another periodically writes
+     to it) rather than concurrent *startup*.
+
+     **What `boxer compose`'s own reported "(exit status: 11)" actually
+     means, traced precisely rather than assumed:** `wait_until_interrupted_
+     or_child_exit` (`boxer/src/compose.rs`) formats a real
+     `std::process::ExitStatus` via `{status}` -- Rust's own `Display` for
+     that type prints `"signal: N"` for a process killed by a raw Unix
+     signal, and `"exit status: N"` only for a normal `WIFEXITED` termination
+     with code `N`. The observed text is the latter, so the `boxer run`
+     *host* process for `x11server` did not itself receive a raw SIGSEGV --
+     it exited normally, deliberately, with code 11. Tracing where that
+     code comes from: `litebox_shim_linux::syscalls::signal::process_signals`
+     (`litebox_shim_linux/src/syscalls/signal/mod.rs`), on a fatal
+     signal with default disposition, logs `"fatal signal: terminating
+     task"` and calls `self.exit_group(ExitStatus::Signal(signal))`; that
+     `ExitStatus::Signal` variant is encoded as `signal.as_i32() + 256`
+     (`litebox_shim_linux/src/lib.rs`) -- a `wait()`-status-style scheme for
+     internal bookkeeping -- and a host process's real exit code is always
+     truncated to its low 8 bits by the OS, so `11 + 256 = 267` becomes
+     exactly `11` by the time anything sees it. This match is exact, and no
+     other code path in the tree produces a matching encoding, so: **this
+     confirms the `x11server` *guest* program itself received a genuine
+     SIGSEGV**, delivered and then fatally handled through litebox's own
+     Linux-signal-emulation layer -- not a host-level litebox crash, and not
+     an application-level Rust panic (a panic doesn't produce `WIFEXITED`
+     code 11 either).
+
+     Read `examples/multibox-x11-composition/src/bin/x11_server.rs` in full
      looking for an application-level cause first: it is ordinary safe Rust
-     with no `unsafe` blocks, and its cooperative-multiplexing accept/read
-     loop (`main`) has no logic that should segfault a well-behaved process
-     (worst case, malformed input could panic on an out-of-bounds slice in
-     `handle_request`, which is a real robustness gap worth hardening
-     separately, but a Rust panic is not what `exit status: 11` reports).
+     with no `unsafe` blocks, no recursion, and no large stack allocations,
+     and its cooperative-multiplexing accept/read loop (`main`) has no logic
+     that should segfault a well-behaved process (worst case, malformed
+     input could panic on an out-of-bounds slice in `handle_request`, which
+     is a real robustness gap worth hardening separately, but is not this).
      That, plus the resemblance to Bug B's already-documented signature,
-     makes a platform-level cause more likely than an x11_server.rs bug, but
-     this is not confirmed -- no fault-handler trace was captured for an
-     actual occurrence (this session's `NOPASSWD` sudoers scope covers only
-     `boxer run`/`boxer compose` invoked directly, not
-     `sudo env LITEBOX_LOG=trace boxer ...`, which sudo's own environment
-     policy on this host rejects: "sorry, you are not allowed to set the
-     following environment variables: LITEBOX_LOG"). Widening that sudoers
-     rule (or reaching the trace-gated logging some other way -- e.g. baking
-     a default `LITEBOX_LOG` into the boxes' own environment temporarily)
-     is the concrete next step if this needs to be chased further; until
-     then, treat it as rare (didn't recur in 18 attempts) and mention to
-     users that a `boxer compose` exit naming one instance dead is worth a
-     plain retry before assuming a real regression.
+     makes a platform-level cause in litebox's own macOS ARM guest execution
+     (most likely somewhere in its non-blocking-socket/`accept`/`read`
+     syscall handling, the one thing `x11_server.rs` exercises that neither
+     `x11-app` nor `vnc-bridge` do) far more likely than an x11_server.rs
+     bug -- but the exact mechanism is still not confirmed.
+
+     Reproducing it precisely enough to get a fault-handler trace turned out
+     to be its own obstacle, not just a rare-event problem. A tighter
+     compose config (`ready_delay_ms` cut from 1500 to 100, so `app` and
+     `vncbridge` race `x11server`'s startup harder) plus background CPU load
+     did reproduce it once more (2 confirmed occurrences total, both this
+     exact "second client connecting into an already-serving x11server"
+     shape) out of roughly 17 clean attempts -- but two different follow-up
+     instrumentation passes aimed at capturing more detail, 40 attempts
+     each (80 total), reproduced *zero* further occurrences: first, adding
+     `eprintln!` diagnostics directly to `x11_server.rs`'s hot accept/read
+     loop (each call is a real guest `write` syscall through litebox's own
+     shim, expensive enough to plausibly perturb whatever narrow timing
+     window this race needs); then, suspecting exactly that, a second pass
+     instrumented `litebox_platform_macos_userland::fault_handler`'s
+     `guest::GUEST_OWNS_CPU` branch directly instead (a raw host-side
+     `libc::write`, no guest syscall at all, so it can only cost anything at
+     the instant a fault is already happening) -- and *that* didn't
+     reproduce it either. Both instrumentation passes were reverted cleanly
+     after (`git diff` empty on both files); neither is present in the tree.
+     Given the second, near-zero-overhead approach still suppressed it, the
+     honest read is that this race's window is either genuinely narrow
+     (small-sample variance from ~17 clean attempts is also a real
+     possibility -- 80 zero-hit instrumented attempts is suggestive, not
+     conclusive) or sensitive to something instrumentation changes beyond
+     raw per-call overhead (process/thread scheduling from the rebuild
+     itself, e.g.). `LITEBOX_LOG=trace` would settle this cleanly by
+     reaching `guest::prepare_exception_delivery`'s own permanent,
+     trace-gated PC/ESR/FAR logging without adding any new instrumentation
+     at all, but this session's `NOPASSWD` sudoers scope covers only
+     `boxer run`/`boxer compose` invoked directly -- `sudo LITEBOX_LOG=trace
+     boxer ...` on top of it is rejected outright by this host's sudo policy
+     ("sorry, you are not allowed to set the following environment
+     variables: LITEBOX_LOG"), and an already-exported shell `LITEBOX_LOG`
+     is stripped the same way (confirmed, not assumed). Widening that
+     sudoers rule is the concrete next step if this needs to be chased
+     further; until then, treat it as rare (2 confirmed occurrences across
+     well over 100 total `boxer compose` invocations this investigation) and
+     tell users that a `boxer compose` exit naming one instance dead is
+     worth a plain retry before assuming a real regression.
 
   Reproduced and verified with the real `litebox_packager --oci-image
   public.ecr.aws/docker/library/alpine:latest` / `busybox pwd` pipeline
