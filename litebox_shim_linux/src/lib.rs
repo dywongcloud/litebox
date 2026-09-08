@@ -1254,9 +1254,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 new_size,
                 flags,
                 new_addr,
-            } => self
-                .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
-                .map(|ptr| ptr.as_usize()),
+            } => {
+                // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
+                // `Task::touches_another_process`'s doc comment. This was the last
+                // unguarded hole, and the one that actually reproduced live: a
+                // node process walks a descending run of what it believes are its
+                // own adjacent pages with `mremap(addr, 1 page -> 2 pages, 0)` and
+                // takes the first success. On real Linux those neighbours are its
+                // own (a process's successive mmaps are contiguous) and a foreign
+                // address is unmappable, so the loop only ever sees success or
+                // ENOMEM. Under one shared address space the neighbour is another
+                // process's live page; the grow "succeeded", `record_mapped` handed
+                // that page to the caller, and the caller's exit unmapped it under
+                // its real owner -- a translation fault in musl's malloc for the
+                // victim, several seconds later. ENOMEM rather than EFAULT on
+                // purpose: it is the answer the same loop already gets for a page
+                // of its own that cannot grow in place, so it keeps walking to
+                // pages it really owns instead of aborting on an error real Linux
+                // never produces for a valid pointer.
+                let foreign_old = self.touches_another_process(old_addr.as_usize(), old_size);
+                let foreign_new = flags.contains(litebox_common_linux::MRemapFlags::MREMAP_FIXED)
+                    && self.touches_another_process(new_addr, new_size);
+                if foreign_old || foreign_new {
+                    Err(Errno::ENOMEM)
+                } else {
+                    self.sys_mremap(old_addr, old_size, new_size, flags, new_addr)
+                        .map(|ptr| ptr.as_usize())
+                }
+            }
             SyscallRequest::Munmap { addr, length } => {
                 // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
                 // `Task::touches_another_process`'s doc comment. Real Linux's own `munmap` is a
