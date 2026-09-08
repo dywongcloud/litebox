@@ -52,7 +52,7 @@ impl Task {
         reason = "self was used by the old platform-threaded logging API"
     )]
     pub fn sys_panic(&self, code: usize) -> usize {
-        litebox_util_log::error!(code:% = format_args!("{:#x}", code); "TA panic");
+        litebox_util_log::error!(code:x; "TA panic");
 
         // Return TARGET_DEAD to match OP-TEE OS behavior
         litebox_common_optee::TeeResult::TargetDead as usize

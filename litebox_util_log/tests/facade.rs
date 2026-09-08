@@ -45,6 +45,82 @@ fn test_log_macro_with_kv() {
 }
 
 #[test]
+fn test_log_macro_with_kv_hex() {
+    struct NonCopy(u64);
+    impl core::fmt::LowerHex for NonCopy {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            core::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+
+    let value = 0x2a_u32;
+    log!(Level::Info, value:x; "hex capture shorthand");
+    log!(Level::Info, addr:x = 0xdead_beef_u64; "hex capture with explicit value");
+    log!(Level::Info, addr:x = value + 1; "hex capture with expression value");
+
+    let flags = 0xff_u8;
+    log!(Level::Info, flags:x, count:? = 100, name:% = "test"; "hex mixed with other captures");
+
+    error!(value:x; "hex via error");
+    warn!(value:x; "hex via warn");
+    info!(value:x; "hex via info");
+    debug!(value:x; "hex via debug");
+    trace!(value:x; "hex via trace");
+
+    // `:x` borrows its value like every other capture mode; a non-Copy value
+    // must remain usable after being logged.
+    let non_copy = NonCopy(0x1234);
+    log!(Level::Info, non_copy:x; "hex shorthand borrows");
+    log!(Level::Info, again:x = non_copy; "hex explicit value borrows");
+    assert_eq!(non_copy.0, 0x1234);
+}
+
+#[test]
+fn test_span_macros_with_hex() {
+    let addr = 0x1000_usize;
+    let _guard = span!(Level::Info, "hex_span", addr:x);
+    let _guard = span!(Level::Info, "hex_span_explicit", addr:x = addr + 0x20, len:? = 4);
+    let _i = info_span!("hex_info_span", addr:x);
+}
+
+/// End-to-end check that `:x` renders as `0x`-prefixed lowercase hex.
+///
+/// Only runs when the `log` backend is active (with `backend_tracing`
+/// enabled the macros route to `tracing` and no `log` logger sees events).
+#[test]
+#[cfg(all(feature = "backend_log", not(feature = "backend_tracing")))]
+fn test_hex_capture_renders_prefixed_lowercase() {
+    use std::sync::Mutex;
+
+    struct CaptureLogger(Mutex<String>);
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            litebox_util_log::format_record(&mut *self.0.lock().unwrap(), record).unwrap();
+        }
+        fn flush(&self) {}
+    }
+
+    let logger: &'static CaptureLogger =
+        Box::leak(Box::new(CaptureLogger(Mutex::new(String::new()))));
+    log::set_logger(logger).expect("no other test installs a logger");
+    log::set_max_level(log::LevelFilter::Info);
+
+    let addr = 0xBEEF_usize;
+    info!(addr:x, value:x = 0x2a_u32; "hex render");
+
+    let output = logger.0.lock().unwrap();
+    assert!(
+        output.contains("addr=0xbeef"),
+        "unexpected output: {output}"
+    );
+    assert!(output.contains("value=0x2a"), "unexpected output: {output}");
+}
+
+#[test]
 #[cfg(feature = "kv_std")]
 fn test_log_macro_with_kv_err() {
     let error = "something went wrong";
@@ -163,6 +239,12 @@ fn instrumented_with_explicit_capture_modes(a: i32, b: &str) {
     let _ = (a, b);
 }
 
+#[instrument(level = debug, fields(addr:x, len:?, base:x = 0x1000_usize))]
+fn instrumented_with_hex_fields(addr: usize, len: usize) {
+    debug!("hex capture mode");
+    let _ = (addr, len);
+}
+
 #[derive(Debug)]
 struct TestStruct {
     value: i32,
@@ -190,6 +272,7 @@ fn test_instrument() {
     instrumented_with_custom_name();
     assert_eq!(instrumented_returning_value(21), 42);
     instrumented_with_explicit_capture_modes(42, "hello");
+    instrumented_with_hex_fields(0xdead_beef, 16);
     nested();
     TestStruct { value: 7 }.instrumented_method();
 }

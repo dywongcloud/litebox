@@ -45,6 +45,7 @@ enum CaptureSource {
 enum CaptureMode {
     Debug,
     Display,
+    Hex,
 }
 
 impl Parse for CapturedArg {
@@ -73,11 +74,12 @@ impl Parse for CapturedArg {
                 match ident.to_string().as_str() {
                     "debug" => Some(CaptureMode::Debug),
                     "display" => Some(CaptureMode::Display),
+                    "x" => Some(CaptureMode::Hex),
                     other => {
                         return Err(syn::Error::new(
                             ident.span(),
                             format!(
-                                "unknown capture mode `{other}`, expected `?`, `%`, `debug`, or `display`"
+                                "unknown capture mode `{other}`, expected `?`, `%`, `x`, `debug`, or `display`"
                             ),
                         ));
                     }
@@ -198,8 +200,8 @@ impl Parse for InstrumentArgs {
 ///   only the listed fields are captured; unlisted arguments (including `self` and its fields) are
 ///   ignored. Each entry has the form `key [':' mode] ['=' expr]`:
 ///   - `key` is an ident, `self`, or `self.field`.
-///   - `mode` is `?`/`debug` for `Debug` or `%`/`display` for `Display`
-///     (defaults to `Debug`).
+///   - `mode` is `?`/`debug` for `Debug`, `%`/`display` for `Display`, or
+///     `x` for `0x`-prefixed lowercase hexadecimal (defaults to `Debug`).
 ///   - When `= expr` is omitted the value is inferred from `key`: a plain
 ///     ident reads the same-named fn argument, `self.field` reads that field,
 ///     and `self` captures `&self` under the span key `self_`.
@@ -337,6 +339,7 @@ fn instrument_impl(args: InstrumentArgs, mut input_fn: ItemFn) -> TokenStream2 {
                 let mode_token = match arg.capture_mode.unwrap_or(CaptureMode::Debug) {
                     CaptureMode::Debug => quote! { :? },
                     CaptureMode::Display => quote! { :% },
+                    CaptureMode::Hex => quote! { :x },
                 };
                 if let Some(expr) = &arg.value_expr {
                     // Explicit `key [mode] = expr`
