@@ -3863,17 +3863,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &(addr..end),
         );
         if !hits.is_empty() {
-            // Permanent diagnostic aid, not a temporary probe: firing here is rare (a real
-            // cross-process overlap on an ordinary syscall) and worth a permanent record when it
-            // does. Confirmed 2026-09-08: across repeated live reproductions of the concurrent
-            // multi-`node`-process SIGSEGV this guard was added for, it never fired once, ruling
-            // out an ordinary explicit-address `munmap`/`mprotect`/`mmap(MAP_FIXED)` collision as
-            // that crash's mechanism -- the guard stays in as a real, independently-justified
-            // safety net regardless (see this function's own doc comment), not because it was
-            // shown to fix that specific bug.
-            litebox_util_log::error!(
+            // History: the `munmap`/`mprotect`/`mmap(MAP_FIXED)` callers never hit this during
+            // the concurrent multi-`node` SIGSEGV reproductions; the `mremap` caller (added
+            // last) is the one that did, and adding it took the crash from ~1 in 3 launches to
+            // 0 in 64 processes (2026-09-08). It fires constantly and legitimately: musl
+            // mallocng's descending in-place `mremap` probe walks foreign pages ~600 times per
+            // `node` process, so a concurrent launch produces tens of thousands of refusals.
+            // `debug` keeps the record available for per-victim page-lifecycle tracing without
+            // drowning the default log.
+            litebox_util_log::debug!(
                 pid:? = self.pid, addr:? = addr, end:? = end, hits:? = hits;
-                "diag: touches_another_process fired on an ordinary syscall"
+                "touches_another_process: refusing ordinary syscall on another live process's range"
             );
         }
         !hits.is_empty()
