@@ -1545,9 +1545,30 @@ impl HvfBackend {
             u64::from(snapshot.regime.mair_attr0),
         );
         let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let lane_count = parallelism
+        // `LITEBOX_HVF_LANES=<n>` caps the vCPU lane pool below the host's
+        // parallelism. A diagnostic knob, not a tuning one: a single lane
+        // serializes all guest execution, which is the cleanest way to tell
+        // a genuine multi-core race (vanishes at 1) from a timing-independent
+        // bug (persists at 1) without touching any other code path. Values
+        // outside [1, parallelism] are clamped; unparsable values are ignored
+        // with a warning rather than refusing to start.
+        let requested_lanes = std::env::var("LITEBOX_HVF_LANES")
+            .ok()
+            .and_then(|raw| match raw.trim().parse::<usize>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    litebox_util_log::warn!(raw:? = raw; "LITEBOX_HVF_LANES is not a number; ignoring");
+                    None
+                }
+            })
+            .map(|n| n.clamp(1, parallelism.max(1)));
+        let lane_count = requested_lanes
+            .unwrap_or(parallelism)
             .max(1)
             .min(usize::try_from(registry.capacity()).unwrap_or(1));
+        if requested_lanes.is_some() {
+            litebox_util_log::warn!(lane_count, parallelism; "LITEBOX_HVF_LANES override in effect");
+        }
         let mut lanes = Vec::new();
         lanes
             .try_reserve_exact(lane_count)
