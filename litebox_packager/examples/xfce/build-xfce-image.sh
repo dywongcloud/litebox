@@ -5,13 +5,34 @@
 
 # Builds the x18-safe Alpine package overlay, applies it to the XFCE image,
 # packages the local rootfs for litebox, and appends the synthetic fbdev sysfs
-# link Xorg's fbdevhw probe requires.
+# link Xorg's fbdevhw probe requires plus the world-writable sticky /dev/shm
+# Chromium's shared-memory path expects (a build container's /dev is a
+# host-managed tmpfs, so the Containerfile cannot provision it).
+#
+# With `--hvf` as the first argument the x18 pipeline is skipped entirely:
+# Containerfile.hvf installs STOCK Alpine packages (plus doas/sudo for the
+# uid-1000 desktop user) and litebox_packager runs with --no-rewrite-all, so
+# the result targets the Hypervisor.framework backend (`--hvf`), whose EL1
+# monitor preserves x18 architecturally and needs no rewriting at all.
+#
+# Usage: build-xfce-image.sh [--hvf] [OUTPUT_TAR]
+#   OUTPUT_TAR  default: /tmp/litebox-xfce.tar (/tmp/litebox-hvf-xfce.tar
+#               with --hvf)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-OUTPUT="${1:-/tmp/litebox-xfce.tar}"
+HVF_MODE=false
+if [ "${1:-}" = --hvf ]; then
+    HVF_MODE=true
+    shift
+fi
+if [ "$HVF_MODE" = true ]; then
+    OUTPUT="${1:-/tmp/litebox-hvf-xfce.tar}"
+else
+    OUTPUT="${1:-/tmp/litebox-xfce.tar}"
+fi
 OUTPUT="${OUTPUT%/}"
 [ -n "$OUTPUT" ] && [ "$OUTPUT" != / ] || { echo "invalid output path: $OUTPUT" >&2; exit 1; }
 OUTPUT_NAME="$(basename "$OUTPUT")"
@@ -30,7 +51,11 @@ STAGING_OUTPUT=""
 X18_REPO="${LITEBOX_X18_DESKTOP_REPO:-$HOME/.cache/litebox/x18-desktop-repo}"
 MUSL_X18_CACHE="${LITEBOX_MUSL_X18_CACHE:-$HOME/.cache/litebox/musl-x18-fixed}"
 ALPINE_BRANCH="${LITEBOX_ALPINE_BRANCH:-3.24-stable}"
-IMAGE_TAG="${LITEBOX_XFCE_IMAGE_TAG:-localhost/litebox-xfce-x18:3.24}"
+if [ "$HVF_MODE" = true ]; then
+    IMAGE_TAG="${LITEBOX_XFCE_IMAGE_TAG:-localhost/litebox-xfce-hvf:3.24}"
+else
+    IMAGE_TAG="${LITEBOX_XFCE_IMAGE_TAG:-localhost/litebox-xfce-x18:3.24}"
+fi
 [[ "$ALPINE_BRANCH" =~ ^[0-9]+\.[0-9]+-stable$ ]] || {
     echo "invalid Alpine branch: $ALPINE_BRANCH" >&2
     exit 1
@@ -197,40 +222,48 @@ else
     BASE_IMAGE="${BASE_IMAGE_INPUT}@${repo_digest##*@}"
 fi
 
-APORTS_COMMIT="${LITEBOX_APORTS_COMMIT:-013edf8b29199933e8ea34dde460b5584b979042}"
-[[ "$APORTS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
-    echo "invalid immutable aports commit for $ALPINE_BRANCH" >&2
-    exit 1
-}
-X18_RECIPE_SHA256="$(shasum -a 256 \
-    "$REPO_ROOT/litebox_packager/scripts/build-x18-desktop-repo.sh" | cut -d' ' -f1)"
-
-LITEBOX_ALPINE_BASE_IMAGE="$BASE_IMAGE" \
-LITEBOX_APORTS_COMMIT="$APORTS_COMMIT" \
-    "$REPO_ROOT/litebox_packager/scripts/build-x18-desktop-repo.sh" \
-    "$ALPINE_BRANCH" "$X18_REPO"
-X18_REPO="$(cd "$X18_REPO" && pwd -P)" || {
-    echo "x18 repository generation is unavailable: $X18_REPO" >&2
-    exit 1
-}
-LITEBOX_ALPINE_BASE_IMAGE="$BASE_IMAGE" \
-LITEBOX_APORTS_COMMIT="$APORTS_COMMIT" \
-    "$REPO_ROOT/litebox_packager/scripts/build-musl-x18-fixed.sh" \
-    "$ALPINE_BRANCH" "$MUSL_X18_CACHE" "$X18_REPO"
-
 WORKDIR="$(mktemp -d)"
-cp "$SCRIPT_DIR/Containerfile" "$SCRIPT_DIR/panel.xml" "$SCRIPT_DIR/xorg.conf" \
+cp "$SCRIPT_DIR/panel.xml" "$SCRIPT_DIR/xorg.conf" \
     "$SCRIPT_DIR/resolv.conf" "$SCRIPT_DIR/start-desktop.sh" "$WORKDIR/"
-mkdir -p "$WORKDIR/x18repo"
-cp -R "$X18_REPO/." "$WORKDIR/x18repo"
+BUILD_ARGS=(--build-arg "LITEBOX_ALPINE_BASE_IMAGE=$BASE_IMAGE")
+if [ "$HVF_MODE" = true ]; then
+    cp "$SCRIPT_DIR/Containerfile.hvf" "$WORKDIR/Containerfile"
+else
+    APORTS_COMMIT="${LITEBOX_APORTS_COMMIT:-013edf8b29199933e8ea34dde460b5584b979042}"
+    [[ "$APORTS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "invalid immutable aports commit for $ALPINE_BRANCH" >&2
+        exit 1
+    }
+    X18_RECIPE_SHA256="$(shasum -a 256 \
+        "$REPO_ROOT/litebox_packager/scripts/build-x18-desktop-repo.sh" | cut -d' ' -f1)"
+
+    LITEBOX_ALPINE_BASE_IMAGE="$BASE_IMAGE" \
+    LITEBOX_APORTS_COMMIT="$APORTS_COMMIT" \
+        "$REPO_ROOT/litebox_packager/scripts/build-x18-desktop-repo.sh" \
+        "$ALPINE_BRANCH" "$X18_REPO"
+    X18_REPO="$(cd "$X18_REPO" && pwd -P)" || {
+        echo "x18 repository generation is unavailable: $X18_REPO" >&2
+        exit 1
+    }
+    LITEBOX_ALPINE_BASE_IMAGE="$BASE_IMAGE" \
+    LITEBOX_APORTS_COMMIT="$APORTS_COMMIT" \
+        "$REPO_ROOT/litebox_packager/scripts/build-musl-x18-fixed.sh" \
+        "$ALPINE_BRANCH" "$MUSL_X18_CACHE" "$X18_REPO"
+
+    cp "$SCRIPT_DIR/Containerfile" "$WORKDIR/"
+    mkdir -p "$WORKDIR/x18repo"
+    cp -R "$X18_REPO/." "$WORKDIR/x18repo"
+    BUILD_ARGS+=(
+        --build-arg "LITEBOX_ALPINE_BRANCH=$ALPINE_BRANCH"
+        --build-arg "LITEBOX_APORTS_COMMIT=$APORTS_COMMIT"
+        --build-arg "LITEBOX_X18_RECIPE_SHA256=$X18_RECIPE_SHA256"
+    )
+fi
 
 IMAGE_ID_FILE="$WORKDIR/image.iid"
 "$CONTAINER_ENGINE" build --platform linux/arm64 \
     --iidfile "$IMAGE_ID_FILE" \
-    --build-arg "LITEBOX_ALPINE_BASE_IMAGE=$BASE_IMAGE" \
-    --build-arg "LITEBOX_ALPINE_BRANCH=$ALPINE_BRANCH" \
-    --build-arg "LITEBOX_APORTS_COMMIT=$APORTS_COMMIT" \
-    --build-arg "LITEBOX_X18_RECIPE_SHA256=$X18_RECIPE_SHA256" \
+    "${BUILD_ARGS[@]}" \
     -t "$IMAGE_TAG" "$WORKDIR"
 
 image_id_raw=""
@@ -251,127 +284,203 @@ image_arch="$($CONTAINER_ENGINE image inspect --format '{{.Architecture}}' "$IMA
     exit 1
 }
 
-loader_hash="$($CONTAINER_ENGINE run --rm --platform linux/arm64 "$IMAGE_ID" \
-    sha256sum /lib/ld-musl-aarch64.so.1 | cut -d' ' -f1)"
-image_musl_pkgver="$($CONTAINER_ENGINE run --rm --platform linux/arm64 "$IMAGE_ID" \
-    sh -c 'apk info --installed -v musl | sed -n "s/^musl-//p"')"
-[[ "$loader_hash" =~ ^[0-9a-f]{64}$ ]] && [ -n "$image_musl_pkgver" ] || {
-    echo "failed to read the built image musl identity" >&2
-    exit 1
-}
-musl_manifest="$MUSL_X18_CACHE/${loader_hash}.v2.meta"
-[ -s "$musl_manifest" ] || {
-    echo "missing recipe-v2 musl manifest for built image loader: $musl_manifest" >&2
-    exit 1
-}
-expected_musl_keys='aports_commit arch base_image musl_pkgver patched_sha256 payload recipe size stock_sha256 '
-actual_musl_keys="$(cut -d= -f1 "$musl_manifest" | LC_ALL=C sort | tr '\n' ' ')"
-[ "$actual_musl_keys" = "$expected_musl_keys" ] || {
-    echo "invalid recipe-v2 musl metadata fields: $musl_manifest" >&2
-    exit 1
-}
-musl_value() { sed -n "s/^$1=//p" "$musl_manifest"; }
-[ "$(musl_value recipe)" = 2 ]
-[ "$(musl_value stock_sha256)" = "$loader_hash" ]
-[ "$(musl_value musl_pkgver)" = "$image_musl_pkgver" ]
-[ "$(musl_value arch)" = aarch64 ]
-[ "$(musl_value base_image)" = "$BASE_IMAGE" ]
-[ "$(musl_value aports_commit)" = "$APORTS_COMMIT" ]
-patched_hash="$(musl_value patched_sha256)"
-[[ "$patched_hash" =~ ^[0-9a-f]{64}$ ]] && [ "$patched_hash" != "$loader_hash" ] || {
-    echo "invalid patched musl hash in $musl_manifest" >&2
-    exit 1
-}
-payload_name="${loader_hash}.v2.${patched_hash}.so"
-[ "$(musl_value payload)" = "$payload_name" ]
-payload_path="$MUSL_X18_CACHE/$payload_name"
-[ -f "$payload_path" ]
-payload_size="$(wc -c < "$payload_path" | tr -d '[:space:]')"
-[ "$payload_size" = "$(musl_value size)" ]
-[ "$(shasum -a 256 "$payload_path" | cut -d' ' -f1)" = "$patched_hash" ]
+if [ "$HVF_MODE" = false ]; then
+    loader_hash="$($CONTAINER_ENGINE run --rm --platform linux/arm64 "$IMAGE_ID" \
+        sha256sum /lib/ld-musl-aarch64.so.1 | cut -d' ' -f1)"
+    image_musl_pkgver="$($CONTAINER_ENGINE run --rm --platform linux/arm64 "$IMAGE_ID" \
+        sh -c 'apk info --installed -v musl | sed -n "s/^musl-//p"')"
+    [[ "$loader_hash" =~ ^[0-9a-f]{64}$ ]] && [ -n "$image_musl_pkgver" ] || {
+        echo "failed to read the built image musl identity" >&2
+        exit 1
+    }
+    musl_manifest="$MUSL_X18_CACHE/${loader_hash}.v2.meta"
+    [ -s "$musl_manifest" ] || {
+        echo "missing recipe-v2 musl manifest for built image loader: $musl_manifest" >&2
+        exit 1
+    }
+    expected_musl_keys='aports_commit arch base_image musl_pkgver patched_sha256 payload recipe size stock_sha256 '
+    actual_musl_keys="$(cut -d= -f1 "$musl_manifest" | LC_ALL=C sort | tr '\n' ' ')"
+    [ "$actual_musl_keys" = "$expected_musl_keys" ] || {
+        echo "invalid recipe-v2 musl metadata fields: $musl_manifest" >&2
+        exit 1
+    }
+    musl_value() { sed -n "s/^$1=//p" "$musl_manifest"; }
+    [ "$(musl_value recipe)" = 2 ]
+    [ "$(musl_value stock_sha256)" = "$loader_hash" ]
+    [ "$(musl_value musl_pkgver)" = "$image_musl_pkgver" ]
+    [ "$(musl_value arch)" = aarch64 ]
+    [ "$(musl_value base_image)" = "$BASE_IMAGE" ]
+    [ "$(musl_value aports_commit)" = "$APORTS_COMMIT" ]
+    patched_hash="$(musl_value patched_sha256)"
+    [[ "$patched_hash" =~ ^[0-9a-f]{64}$ ]] && [ "$patched_hash" != "$loader_hash" ] || {
+        echo "invalid patched musl hash in $musl_manifest" >&2
+        exit 1
+    }
+    payload_name="${loader_hash}.v2.${patched_hash}.so"
+    [ "$(musl_value payload)" = "$payload_name" ]
+    payload_path="$MUSL_X18_CACHE/$payload_name"
+    [ -f "$payload_path" ]
+    payload_size="$(wc -c < "$payload_path" | tr -d '[:space:]')"
+    [ "$payload_size" = "$(musl_value size)" ]
+    [ "$(shasum -a 256 "$payload_path" | cut -d' ' -f1)" = "$patched_hash" ]
+fi
 
+# --no-rewrite-all (HVF) disables both the syscall rewriter and the x18 musl
+# substitution, so the packaged tar carries the stock bytes, uid/gid and mode
+# bits of the exported rootfs unchanged.
+PACKAGER_ARGS=(--oci-rootfs-tar /dev/stdin -o "$STAGING_OUTPUT")
+[ "$HVF_MODE" = false ] || PACKAGER_ARGS+=(--no-rewrite-all)
 CONTAINER_ID="$($CONTAINER_ENGINE create "$IMAGE_ID")"
-"$CONTAINER_ENGINE" export "$CONTAINER_ID" | \
-    LITEBOX_MUSL_X18_CACHE="$MUSL_X18_CACHE" \
-    LITEBOX_REQUIRE_MUSL_X18=1 \
-    cargo run --release --manifest-path "$REPO_ROOT/Cargo.toml" \
-        -p litebox_packager -- \
-        --oci-rootfs-tar /dev/stdin -o "$STAGING_OUTPUT"
+"$CONTAINER_ENGINE" export "$CONTAINER_ID" | (
+    if [ "$HVF_MODE" = false ]; then
+        export LITEBOX_MUSL_X18_CACHE="$MUSL_X18_CACHE" LITEBOX_REQUIRE_MUSL_X18=1
+    fi
+    exec cargo run --release --manifest-path "$REPO_ROOT/Cargo.toml" \
+        -p litebox_packager -- "${PACKAGER_ARGS[@]}"
+)
 "$CONTAINER_ENGINE" rm "$CONTAINER_ID" >/dev/null
 CONTAINER_ID=""
 
-# Verify every ELF the live smoke test actually loads is x18-clean, scanned
-# from the PACKAGED tar (post litebox_packager, which substitutes a
-# -ffixed-x18 musl from its content-addressed cache when available -- see
-# litebox_packager/src/musl_x18.rs), not the pre-packaging podman image:
-# scanning the podman image would report musl's original x18 count even
-# after the packager has already replaced it, since substitution happens
-# during packaging, not before. binutils' readelf/objdump aren't reliably
-# present on a macOS host, so the scan runs inside a scratch Alpine
-# container fed the packaged tar directly, mirroring the closure walk
-# already used above for the pre-packaging gate. The desktop entry binaries
-# start-desktop.sh execs are scanned with their full recursive NEEDED closure;
-# Chromium and its set-ID sandbox helper are scanned directly, while its cold
-# codec/GPU dependencies remain outside the about:blank smoke path.
-# Scanning the whole image's 348 installed packages (measured live: the
-# xfce4 metapackage pulls in a stock closure roughly 4x DEFAULT_PACKAGES's
-# ~80 rebuilt origins -- webkit2gtk, ffmpeg's codec stack, poppler -- none
-# of it reachable from the desktop/terminal/VNC path) would fail on
-# hundreds of thousands of residual x18 refs in code nothing here ever
-# executes. This mirrors the roadmap's own accepted precedent: partial x18
-# coverage shrinks the corruption surface rather than eliminating it:
-# everything actually on the smoke-test's live call path is held to the
-# zero-residual bar; unreached stock libraries are not.
-SCAN_CONTAINER="litebox-x18-scan-$$"
-"$CONTAINER_ENGINE" run -d --name "$SCAN_CONTAINER" --platform linux/arm64 \
-    "$BASE_IMAGE" sleep 300 >/dev/null
-scan_cleanup() { "$CONTAINER_ENGINE" rm -f "$SCAN_CONTAINER" >/dev/null 2>&1 || true; }
-trap 'scan_cleanup; cleanup' EXIT
-"$CONTAINER_ENGINE" exec "$SCAN_CONTAINER" mkdir -p /scan
-"$CONTAINER_ENGINE" cp "$STAGING_OUTPUT" "$SCAN_CONTAINER:/scan.tar"
-# shellcheck disable=SC2016
-if ! "$CONTAINER_ENGINE" exec "$SCAN_CONTAINER" sh -c '
-    set -e
-    apk add --no-cache binutils tar > /dev/null 2>&1
-    tar -xf /scan.tar -C /scan
-    seen=""
-    queue="/scan/usr/libexec/Xorg /scan/usr/bin/dbus-daemon /scan/usr/bin/xfwm4 /scan/usr/bin/xfdesktop /scan/usr/bin/xfce4-panel /scan/usr/bin/xfce4-terminal /scan/usr/bin/xterm"
-    while [ -n "$queue" ]; do
-        next=""
-        for f in $queue; do
-            case " $seen " in *" $f "*) continue;; esac
-            seen="$seen $f"
-            [ -f "$f" ] || continue
-            for d in $(readelf -d "$f" 2>/dev/null | grep NEEDED | sed "s/.*\[\(.*\)\]/\1/"); do
-                found=$(find /scan/usr/lib /scan/lib -name "$d" 2>/dev/null | head -1)
-                [ -n "$found" ] || continue
-                case " $seen " in *" $found "*) ;; *) next="$next $found";; esac
+if [ "$HVF_MODE" = true ]; then
+    # The stock image is only useful if the privilege-escalation helpers reach
+    # the tar with their root-owned setuid bits and the uid-1000 desktop
+    # account intact; refuse to publish otherwise.
+    python3 - "$STAGING_OUTPUT" <<'PY'
+import sys
+import tarfile
+
+path = sys.argv[1]
+expected = {
+    "usr/bin/doas": 0o4755,
+    "usr/bin/sudo": 0o4755,
+    "bin/bbsuid": 0o4111,
+    "usr/lib/chromium/chrome-sandbox": 0o4755,
+    "etc/doas.d/litebox.conf": 0o600,
+    "etc/sudoers.d/litebox": 0o440,
+}
+launcher_name = "usr/lib/chromium/chromium-launcher.sh"
+launcher_stale = b"stat -c %u -L ${XDG_CONFIG_HOME:-${HOME}}"
+launcher_patched = b'stat -Lc %u "${XDG_CONFIG_HOME:-${HOME:-/root}}"'
+with tarfile.open(path, "r") as archive:
+    members = {member.name.rstrip("/"): member for member in archive.getmembers()}
+    passwd = members.get("etc/passwd")
+    if passwd is None or not passwd.isfile():
+        raise SystemExit("etc/passwd is missing from the packaged tar")
+    entries = archive.extractfile(passwd).read().splitlines()
+    if not any(line.split(b":")[2:3] == [b"1000"] for line in entries):
+        raise SystemExit("etc/passwd has no uid-1000 desktop account")
+    for name, mode in expected.items():
+        member = members.get(name)
+        if member is None or not member.isfile():
+            raise SystemExit(f"{name} is missing from the packaged tar")
+        actual = member.mode & 0o7777
+        if actual != mode or member.uid != 0 or member.gid != 0:
+            raise SystemExit(
+                f"{name}: mode={oct(actual)} uid={member.uid} gid={member.gid}, "
+                f"expected mode={oct(mode)} root:root")
+        print(f"{name}: mode={oct(actual)} uid=0 gid=0 -> OK", file=sys.stderr)
+    # Time zone provisioning: tzdata plus /etc/localtime -> UTC as a symlink
+    # (Containerfile.hvf), packaged as a real symlink and a non-empty TZif.
+    localtime = members.get("etc/localtime")
+    if localtime is None or not localtime.issym():
+        raise SystemExit("etc/localtime is missing or not a symlink in the packaged tar")
+    if localtime.linkname != "/usr/share/zoneinfo/UTC":
+        raise SystemExit(f"etc/localtime -> {localtime.linkname}, expected /usr/share/zoneinfo/UTC")
+    utc = members.get("usr/share/zoneinfo/UTC")
+    if utc is None or not utc.isfile() or utc.size == 0:
+        raise SystemExit("usr/share/zoneinfo/UTC is missing or empty in the packaged tar")
+    if not archive.extractfile(utc).read(4) == b"TZif":
+        raise SystemExit("usr/share/zoneinfo/UTC is not a TZif file")
+    print("etc/localtime -> /usr/share/zoneinfo/UTC (TZif) -> OK", file=sys.stderr)
+    tmp = members.get("tmp")
+    if tmp is None or not tmp.isdir() or tmp.mode & 0o7777 != 0o1777:
+        raise SystemExit("tmp is missing or not a 1777 directory in the packaged tar")
+    print("tmp: mode=0o1777 -> OK", file=sys.stderr)
+    # The HOME-less root path of the Chromium wrapper (Containerfile.hvf).
+    launcher = members.get(launcher_name)
+    if launcher is None or not launcher.isfile():
+        raise SystemExit(f"{launcher_name} is missing from the packaged tar")
+    content = archive.extractfile(launcher).read()
+    if launcher_stale in content or launcher_patched not in content:
+        raise SystemExit(f"{launcher_name} does not carry the HOME-less root stat fix")
+    if b"no-sandbox" in content:
+        raise SystemExit(f"{launcher_name} must not introduce --no-sandbox")
+    print(f"{launcher_name}: HOME-less root stat fix present -> OK", file=sys.stderr)
+PY
+else
+    # Verify every ELF the live smoke test actually loads is x18-clean, scanned
+    # from the PACKAGED tar (post litebox_packager, which substitutes a
+    # -ffixed-x18 musl from its content-addressed cache when available -- see
+    # litebox_packager/src/musl_x18.rs), not the pre-packaging podman image:
+    # scanning the podman image would report musl's original x18 count even
+    # after the packager has already replaced it, since substitution happens
+    # during packaging, not before. binutils' readelf/objdump aren't reliably
+    # present on a macOS host, so the scan runs inside a scratch Alpine
+    # container fed the packaged tar directly, mirroring the closure walk
+    # already used above for the pre-packaging gate. The desktop entry binaries
+    # start-desktop.sh execs are scanned with their full recursive NEEDED closure;
+    # Chromium and its set-ID sandbox helper are scanned directly, while its cold
+    # codec/GPU dependencies remain outside the about:blank smoke path.
+    # Scanning the whole image's 348 installed packages (measured live: the
+    # xfce4 metapackage pulls in a stock closure roughly 4x DEFAULT_PACKAGES's
+    # ~80 rebuilt origins -- webkit2gtk, ffmpeg's codec stack, poppler -- none
+    # of it reachable from the desktop/terminal/VNC path) would fail on
+    # hundreds of thousands of residual x18 refs in code nothing here ever
+    # executes. This mirrors the roadmap's own accepted precedent: partial x18
+    # coverage shrinks the corruption surface rather than eliminating it:
+    # everything actually on the smoke-test's live call path is held to the
+    # zero-residual bar; unreached stock libraries are not.
+    SCAN_CONTAINER="litebox-x18-scan-$$"
+    "$CONTAINER_ENGINE" run -d --name "$SCAN_CONTAINER" --platform linux/arm64 \
+        "$BASE_IMAGE" sleep 300 >/dev/null
+    scan_cleanup() { "$CONTAINER_ENGINE" rm -f "$SCAN_CONTAINER" >/dev/null 2>&1 || true; }
+    trap 'scan_cleanup; cleanup' EXIT
+    "$CONTAINER_ENGINE" exec "$SCAN_CONTAINER" mkdir -p /scan
+    "$CONTAINER_ENGINE" cp "$STAGING_OUTPUT" "$SCAN_CONTAINER:/scan.tar"
+    # shellcheck disable=SC2016
+    if ! "$CONTAINER_ENGINE" exec "$SCAN_CONTAINER" sh -c '
+        set -e
+        apk add --no-cache binutils tar > /dev/null 2>&1
+        tar -xf /scan.tar -C /scan
+        seen=""
+        queue="/scan/usr/libexec/Xorg /scan/usr/bin/dbus-daemon /scan/usr/bin/xfwm4 /scan/usr/bin/xfdesktop /scan/usr/bin/xfce4-panel /scan/usr/bin/xfce4-terminal /scan/usr/bin/xterm"
+        while [ -n "$queue" ]; do
+            next=""
+            for f in $queue; do
+                case " $seen " in *" $f "*) continue;; esac
+                seen="$seen $f"
+                [ -f "$f" ] || continue
+                for d in $(readelf -d "$f" 2>/dev/null | grep NEEDED | sed "s/.*\[\(.*\)\]/\1/"); do
+                    found=$(find /scan/usr/lib /scan/lib -name "$d" 2>/dev/null | head -1)
+                    [ -n "$found" ] || continue
+                    case " $seen " in *" $found "*) ;; *) next="$next $found";; esac
+                done
             done
+            queue="$next"
         done
-        queue="$next"
-    done
-    # Chromium itself is rebuilt with x18 reserved and must pass the same
-    # zero-residual gate. Its deliberately cold codec/GPU dependency graph
-    # remains outside the painted about:blank smoke path, like the other
-    # installed-but-unreached media packages documented above.
-    seen="$seen /scan/usr/lib/chromium/chromium /scan/usr/lib/chromium/chrome-sandbox"
-    total=0
-    for file in $seen; do
-        readelf -h "$file" > /dev/null 2>&1 || continue
-        n=$(objdump -d "$file" 2>/dev/null | grep -oE "\b[wx]18\b" | wc -l)
-        if [ "$n" -gt 0 ]; then
-            echo "  residual x18 refs: ${file#/scan/} ($n)"
-            total=$((total + n))
-        fi
-    done
-    echo "total residual x18 register references across the live smoke-test closure: $total"
-    [ "$total" -eq 0 ]
-'; then
-    echo "the desktop/terminal closure or Chromium payload still contains x18 instructions; patch the named assembly/build path" >&2
-    exit 1
+        # Chromium itself is rebuilt with x18 reserved and must pass the same
+        # zero-residual gate. Its deliberately cold codec/GPU dependency graph
+        # remains outside the painted about:blank smoke path, like the other
+        # installed-but-unreached media packages documented above.
+        seen="$seen /scan/usr/lib/chromium/chromium /scan/usr/lib/chromium/chrome-sandbox"
+        total=0
+        for file in $seen; do
+            readelf -h "$file" > /dev/null 2>&1 || continue
+            n=$(objdump -d "$file" 2>/dev/null | grep -oE "\b[wx]18\b" | wc -l)
+            if [ "$n" -gt 0 ]; then
+                echo "  residual x18 refs: ${file#/scan/} ($n)"
+                total=$((total + n))
+            fi
+        done
+        echo "total residual x18 register references across the live smoke-test closure: $total"
+        [ "$total" -eq 0 ]
+    '; then
+        echo "the desktop/terminal closure or Chromium payload still contains x18 instructions; patch the named assembly/build path" >&2
+        exit 1
+    fi
+    scan_cleanup
+    trap cleanup EXIT
 fi
-scan_cleanup
-trap cleanup EXIT
 
 python3 - "$STAGING_OUTPUT" <<'PY'
 import sys
@@ -379,24 +488,32 @@ import tarfile
 
 path = sys.argv[1]
 directories = [
-    "sys",
-    "sys/class",
-    "sys/class/graphics",
-    "sys/class/graphics/fb0",
-    "sys/class/graphics/fb0/device",
-    "sys/bus",
-    "sys/bus/platform",
+    ("sys", 0o755),
+    ("sys/class", 0o755),
+    ("sys/class/graphics", 0o755),
+    ("sys/class/graphics/fb0", 0o755),
+    ("sys/class/graphics/fb0/device", 0o755),
+    ("sys/bus", 0o755),
+    ("sys/bus/platform", 0o755),
+    # POSIX shared memory: Chromium's browser and renderer processes open
+    # /dev/shm for SharedMemory when --disable-dev-shm-usage is absent. The
+    # shim mounts its device table at /dev but lets a tar directory under it
+    # show through (witnessed live: uid 1000 can create files in it), so the
+    # sticky world-writable directory is appended here. A build container's
+    # /dev is a host-managed tmpfs, so the Containerfile cannot provide it.
+    ("dev", 0o755),
+    ("dev/shm", 0o1777),
 ]
 link = "sys/class/graphics/fb0/device/subsystem"
 
 with tarfile.open(path, "a", format=tarfile.USTAR_FORMAT) as archive:
     existing = {member.name.rstrip("/") for member in archive.getmembers()}
-    for name in directories:
+    for name, mode in directories:
         if name in existing:
             continue
         info = tarfile.TarInfo(name)
         info.type = tarfile.DIRTYPE
-        info.mode = 0o755
+        info.mode = mode
         archive.addfile(info)
     if link not in existing:
         info = tarfile.TarInfo(link)
@@ -404,6 +521,15 @@ with tarfile.open(path, "a", format=tarfile.USTAR_FORMAT) as archive:
         info.mode = 0o777
         info.linkname = "../../../../bus/platform"
         archive.addfile(info)
+
+with tarfile.open(path, "r") as archive:
+    members = {member.name.rstrip("/"): member for member in archive.getmembers()}
+    shm = members.get("dev/shm")
+    if shm is None or not shm.isdir() or shm.mode & 0o7777 != 0o1777:
+        raise SystemExit("dev/shm is missing or not a 1777 directory in the packaged tar")
+    if members.get(link) is None or not members[link].issym():
+        raise SystemExit(f"{link} is missing or not a symlink in the packaged tar")
+    print("dev/shm: mode=0o1777 -> OK", file=sys.stderr)
 PY
 
 python3 - "$STAGING_OUTPUT" "$OUTPUT" <<'PY'
@@ -432,8 +558,10 @@ os.unlink(staging)
 PY
 STAGING_OWNED=false
 
+RUNNER_FLAGS='--unstable --guest-root'
+[ "$HVF_MODE" = false ] || RUNNER_FLAGS='--unstable --hvf --guest-root --net-proxy'
 printf '\nBuilt %s\n\n' "$OUTPUT"
 printf 'Run:\n  cargo run --release -p litebox_runner_linux_on_macos_userland -- \\\n'
-printf '    --unstable --guest-root --initial-files %q --vnc-web 6080 -- \\\n' "$OUTPUT"
+printf '    %s --initial-files %q --vnc-web 6080 -- \\\n' "$RUNNER_FLAGS" "$OUTPUT"
 printf '    /usr/bin/start-desktop.sh\n\n'
 printf 'Open http://127.0.0.1:6080/\n'

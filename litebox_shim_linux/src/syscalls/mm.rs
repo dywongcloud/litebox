@@ -1150,7 +1150,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         result
     }
 
-    /// Handle syscall `madvise`
+    /// Handle syscall `madvise`.
+    ///
+    /// Every advice value returns to the guest: what the page manager cannot honour is
+    /// logged (once per advice, see `log_unsupported!`) and refused with `EINVAL`, and a
+    /// pure hint is accepted as the no-op it is on Linux. `MADV_WIPEONFORK` marks the range
+    /// in the shared page manager; the child-side zeroing is `PageManager::wipe_on_fork_child`,
+    /// run by the fork hand-off after the parent has copied its own image out.
     #[inline]
     pub(crate) fn sys_madvise(
         &self,
@@ -1158,6 +1164,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
+        use litebox_common_linux::mm::{MadviseSupport, madvise_support};
+        match madvise_support(&advice) {
+            MadviseSupport::Implemented => {}
+            MadviseSupport::AdvisoryNoop => {
+                litebox_util_log::trace!(
+                    pid:? = self.pid, addr:? = addr.as_usize(), len:? = len, advice:? = advice;
+                    "madvise hint accepted as a no-op"
+                );
+            }
+            MadviseSupport::Unsupported => {
+                log_unsupported!("madvise({advice:?}) is not supported; returning EINVAL");
+            }
+        }
         litebox_common_linux::mm::sys_madvise(&self.global.pm, addr, len, advice)
     }
 

@@ -266,8 +266,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::private::Sealed for FileS
     ) -> Result<(), UnlinkError> {
         let staging_path = self.absolute_path(staging_path)?;
         let mut root = self.root.write();
-        let (parent, entry) =
-            root.parent_and_entry_as(&staging_path, AccessCredentials::root())?;
+        let (parent, entry) = root.parent_and_entry_as(&staging_path, AccessCredentials::root())?;
         let parent = parent.map(|(_, directory)| directory);
         let Some(Entry::File(_)) = entry else {
             return match entry {
@@ -440,8 +439,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
         owner: UserInfo,
     ) -> Result<FileFd<Platform>, OpenError> {
         let mut root = self.root.write();
-        let (parent, entry) =
-            root.parent_and_entry_as(&path, AccessCredentials::root())?;
+        let (parent, entry) = root.parent_and_entry_as(&path, AccessCredentials::root())?;
         let Some((_, parent)) = parent else {
             return Err(OpenError::AlreadyExists);
         };
@@ -557,7 +555,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 );
                 assert!(old.is_none());
                 let entry = Entry::File(Arc::new(sync::RwLock::new(FileX {
-                    perms: Permissions { mode, userinfo: owner },
+                    perms: Permissions {
+                        mode,
+                        userinfo: owner,
+                    },
                     data: Vec::new().into(),
                     unique_id: self.fresh_id(),
                     atime: Timestamp::default(),
@@ -635,14 +636,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                         path_only,
                     })
             }
-            Entry::Dir(dir) => self
-                .litebox
-                .descriptor_table_mut()
-                .insert(Descriptor::Dir {
-                    dir: dir.clone(),
-                    position: Arc::new(sync::Mutex::new(0)),
-                    path_only,
-                }),
+            Entry::Dir(dir) => self.litebox.descriptor_table_mut().insert(Descriptor::Dir {
+                dir: dir.clone(),
+                position: Arc::new(sync::Mutex::new(0)),
+                path_only,
+            }),
             Entry::SymLink(link) if path_only => {
                 if flags.contains(OFlags::DIRECTORY) {
                     return Err(OpenError::PathError(PathError::ComponentNotADirectory));
@@ -1811,9 +1809,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                     alloc::borrow::Cow::Owned(_) => None,
                 }
             }
-            Descriptor::File { .. }
-            | Descriptor::Dir { .. }
-            | Descriptor::SymLink { .. } => None,
+            Descriptor::File { .. } | Descriptor::Dir { .. } | Descriptor::SymLink { .. } => None,
         }
     }
 }

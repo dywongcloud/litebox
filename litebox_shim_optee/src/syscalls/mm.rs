@@ -31,6 +31,7 @@ impl Task {
             prot,
             flags,
             false,
+            None,
             op,
         )
         .map(UserPtrMut::to_platform_ptr::<Platform>)

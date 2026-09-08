@@ -8,7 +8,7 @@
 use crate::{ShimFS, ShimPlatform, Task};
 use litebox::{platform::Instant as _, utils::TruncateExt as _};
 use litebox_common_linux::errno::Errno;
-use litebox_common_linux::user_pointers::UserPtrMut;
+use litebox_common_linux::user_pointers::{UserPtr, UserPtrMut};
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `getrandom`.
@@ -183,6 +183,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
+    }
+
+    /// Handle syscall `capset`.
+    ///
+    /// LiteBox doesn't support capabilities (see `sys_capget`): every process
+    /// is reported as holding an empty capability set, so this only accepts
+    /// a request that is consistent with that -- an unversioned/empty
+    /// request, or an explicit request for the empty set (effective,
+    /// permitted, and inheritable all zero, which is exactly what a
+    /// `setpriv --reuid`/`--regid` privilege drop asks for after
+    /// `PR_SET_KEEPCAPS`: it is not trying to grant itself anything, only
+    /// making the subsequent uid/gid change not silently clear a
+    /// permitted set that -- here -- was already empty). A request for any
+    /// actual capability bit is refused with `EPERM`, matching the real
+    /// kernel's response to a process trying to set a capability it does
+    /// not already hold.
+    pub(crate) fn sys_capset(
+        &self,
+        header: UserPtr<litebox_common_linux::CapHeader>,
+        data: Option<UserPtr<litebox_common_linux::CapData>>,
+    ) -> Result<(), Errno> {
+        let hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        match hdr.version {
+            _LINUX_CAPABILITY_VERSION_1 | _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {}
+            _ => return Err(Errno::EINVAL),
+        }
+        let Some(data_ptr) = data else {
+            return Ok(());
+        };
+        let requested = data_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        if requested.effective != 0 || requested.permitted != 0 || requested.inheritable != 0 {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
     }
 }
 

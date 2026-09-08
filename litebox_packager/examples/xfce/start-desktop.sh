@@ -93,7 +93,7 @@ cp /etc/xdg/litebox/xfce4-panel.xml "$panel_staging"
 chmod 600 "$panel_staging"
 mv "$panel_staging" "$panel_config"
 
-for log_name in xorg.log xorg.err dbus.err xfwm4.log xfsettingsd.log \
+for log_name in xorg.log xorg.err dbus.err xfconfd.log xfwm4.log xfsettingsd.log \
     xfdesktop.log xfce4-panel.log thunar.log xterm.log chromium.log
 do
     : > "$LOG_DIR/$log_name"
@@ -151,6 +151,32 @@ run_user dbus-update-activation-environment \
     XDG_CURRENT_DESKTOP XDG_DATA_DIRS XDG_DATA_HOME XDG_MENU_PREFIX \
     XDG_RUNTIME_DIR XDG_SESSION_DESKTOP XDG_SESSION_TYPE
 
+# D-Bus service activation (the org.xfce.Xfconf.service file that would
+# otherwise auto-spawn xfconfd on its first request) requires this shim's
+# `kill` on a live guest PID to actually reach that process instead of
+# reporting `ESRCH`, which does not work yet -- live-verified: a bare
+# `xfconf-query` call against the activation path leaves libdbus/GIO with
+# no usable proxy (`G_IS_DBUS_PROXY` assertion failures) and `xfconf-query`
+# exits nonzero, which -- combined with `set -eu` -- kills this whole
+# script before any XFCE component runs. Starting xfconfd directly,
+# ahead of any `xfconf-query` call, sidesteps activation entirely and is
+# live-verified to work identically to how a real desktop session's
+# xfconfd would already be running by this point.
+XFCONFD_LOG="$LOG_DIR/xfconfd.log"
+run_user /usr/lib/xfce4/xfconf/xfconfd >"$XFCONFD_LOG" 2>&1 &
+xfconfd_pid=$!
+
+i=0
+while ! run_user xfconf-query -l >/dev/null 2>&1; do
+    require_alive xfconfd "$xfconfd_pid" "$XFCONFD_LOG"
+    i=$((i + 1))
+    if [ "$i" -ge 40 ]; then
+        print_log xfconfd.log "$XFCONFD_LOG" >&2
+        fail "xfconfd readiness timed out"
+    fi
+    "$CONTROL_BUSYBOX" sleep 0.25
+done
+
 set_xfconf() {
     channel="$1"
     property="$2"
@@ -187,6 +213,18 @@ xfsettingsd_pid=$!
 "$CONTROL_BUSYBOX" sleep 1
 require_alive xfsettingsd "$xfsettingsd_pid" "$XFSETTINGSD_LOG"
 
+# Thunar must start BEFORE xfdesktop: xfdesktop (file icons enabled above)
+# D-Bus-activates org.xfce.FileManager1 at startup, and with activation working
+# in this shim the activated Thunar instance owns the session name first, so a
+# later `thunar` would do the standard single-instance handoff and exit 0 --
+# which require_alive would then misread as a crash ("Thunar FAILED"). Owning
+# the name first makes xfdesktop talk to this instance instead of spawning one.
+THUNAR_LOG="$LOG_DIR/thunar.log"
+run_user thunar "$HOME" >"$THUNAR_LOG" 2>&1 &
+thunar_pid=$!
+"$CONTROL_BUSYBOX" sleep 2
+require_alive Thunar "$thunar_pid" "$THUNAR_LOG"
+
 XFDESKTOP_LOG="$LOG_DIR/xfdesktop.log"
 run_user xfdesktop >"$XFDESKTOP_LOG" 2>&1 &
 xfdesktop_pid=$!
@@ -200,12 +238,6 @@ panel_pid=$!
 require_alive xfce4-panel "$panel_pid" "$PANEL_LOG"
 require_alive Xorg "$xorg_pid" "$XORG_ERR"
 
-THUNAR_LOG="$LOG_DIR/thunar.log"
-run_user thunar "$HOME" >"$THUNAR_LOG" 2>&1 &
-thunar_pid=$!
-"$CONTROL_BUSYBOX" sleep 2
-require_alive Thunar "$thunar_pid" "$THUNAR_LOG"
-
 XTERM_LOG="$LOG_DIR/xterm.log"
 run_user xterm -geometry 80x24+360+320 -title "LiteBox Terminal" -e /bin/sh \
     >"$XTERM_LOG" 2>&1 &
@@ -213,24 +245,38 @@ xterm_pid=$!
 "$CONTROL_BUSYBOX" sleep 2
 require_alive xterm "$xterm_pid" "$XTERM_LOG"
 
+# Chromium is disabled on this shared, persistent desktop. Two of its three
+# known host-crashing contributing causes are fixed and verified (the HVF
+# AddressOverlap escalation, and excessive SharedAddressSpace family churn on
+# every fork), but the underlying bug they were feeding -- a musl fork()
+# struct-pthread memory corruption -- is still open, and was observed live
+# taking down the ENTIRE runner process (not just Chromium's own window)
+# after extended real desktop use: this platform runs every guest process in
+# one flat, shared address space, so a long-lived process (this desktop's own
+# init/heartbeat shell) has far more exposure to a stray corrupting write
+# than a short-lived test does. Do not re-enable this launcher until that
+# bug itself is fixed -- see memory litebox-chromium-zygote-fork-corruption.md
+# (PRD row musl-fork-struct-pthread-corruption-residual). Chromium testing
+# continues in throwaway, disposable guest instances only, and the safe
+# chromium.conf flags below are pre-staged for whenever it is re-enabled.
+mkdir -p /home/litebox/.config /home/litebox/.cache
+chown -R litebox:litebox /home/litebox 2>/dev/null
+mkdir -p /etc/chromium
+cat > /etc/chromium/chromium.conf <<'CHROMIUMCONF'
+# Default settings for chromium. This file is sourced by /bin/sh from
+# the chromium launcher.
+CHROMIUM_FLAGS="--ozone-platform-hint=auto --disable-gpu --disable-gpu-compositing --js-flags=--no-short-builtin-calls --no-first-run --no-default-browser-check"
+CHROMIUMCONF
+cat > /usr/lib/chromium/chromium-launcher.sh <<'CHROMIUMLAUNCHER'
+#!/bin/sh
+echo "Chromium is temporarily disabled on this desktop: a memory-corruption bug can still crash the whole session given enough runtime." >&2
+echo "See memory litebox-chromium-zygote-fork-corruption.md." >&2
+exit 1
+CHROMIUMLAUNCHER
+chmod +x /usr/lib/chromium/chromium-launcher.sh
+
 CHROMIUM_LOG="$LOG_DIR/chromium.log"
-run_user /bin/sh -c '
-    uid=$(/bin/busybox id -u)
-    gid=$(/bin/busybox id -g)
-    if [ "$uid:$gid" != "1000:1000" ]; then
-        printf "refusing Chromium identity %s:%s\n" "$uid" "$gid" >&2
-        exit 126
-    fi
-    exec /usr/bin/chromium-browser \
-        --disable-gpu \
-        --disable-dev-shm-usage \
-        --no-first-run \
-        --no-default-browser-check \
-        about:blank
-' >"$CHROMIUM_LOG" 2>&1 &
-chromium_pid=$!
-"$CONTROL_BUSYBOX" sleep 5
-require_alive Chromium "$chromium_pid" "$CHROMIUM_LOG"
+printf 'Chromium launcher disabled: a memory-corruption bug can still crash the whole desktop given enough runtime (observed live). See memory litebox-chromium-zygote-fork-corruption.md.\n' > "$CHROMIUM_LOG" 2>&1
 
 print_log xorg.err "$XORG_ERR"
 print_log xorg.log "$XORG_LOG"
@@ -247,6 +293,14 @@ printf '%s\n' "DESKTOP UP"
 while :; do
     if ! "$CONTROL_BUSYBOX" sleep 5; then
         printf '%s\n' "heartbeat: degraded-delay private BusyBox sleep failed; continuing checks" >&2
+    fi
+    # Source-fix assertion, never a boot gate: after any package activity (APK's
+    # BusyBox trigger re-runs `/bin/busybox --install -s`), the stock PATH-resolved
+    # applet link must still execute. The private control binary above keeps this
+    # loop alive; this line keeps a namespace regression loudly visible in the
+    # runner log instead of letting the private path mask it.
+    if ! sleep 0 2>/dev/null; then
+        printf '%s\n' "heartbeat: NAMESPACE REGRESSION: PATH-resolved 'sleep 0' failed (BusyBox applet link broken after package activity)" >&2
     fi
     require_alive Xorg "$xorg_pid" "$XORG_ERR"
     if run_user xset q >/dev/null 2>&1; then

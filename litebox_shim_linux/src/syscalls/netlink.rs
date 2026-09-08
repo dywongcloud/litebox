@@ -14,8 +14,10 @@
 //! We model a fixed interface table -- loopback (`lo`, 127.0.0.1/8) plus the one
 //! synthetic interface LiteBox's `smoltcp` stack answers on (`eth0`, matching the
 //! runner's `INTERFACE_IP_ADDR`) -- and synthesise the two dumps as canned
-//! netlink messages. It is request/response only: a `send` records the dump the
-//! matching `recv`s will drain. No real link/addr state ever changes.
+//! netlink messages, plus the `RTM_GETROUTE` dump `ip route` asks for (the
+//! default route via the gateway and the connected `/24`). It is
+//! request/response only: a `send` records the dump the matching `recv`s will
+//! drain. No real link/addr/route state ever changes.
 
 use alloc::vec::Vec;
 
@@ -39,6 +41,7 @@ pub(crate) struct NetlinkSocket<Platform: RawSyncPrimitivesProvider> {
     pending: Mutex<Platform, Vec<u8>>,
     pollee: Pollee<Platform>,
     interface_addr: [u8; 4],
+    gateway_addr: [u8; 4],
 }
 
 // rtnetlink constants (see `linux/rtnetlink.h`, `linux/netlink.h`, `linux/if.h`).
@@ -47,10 +50,27 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
 const NLM_F_MULTI: u16 = 2;
 
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
+
+// Routing-table constants (`linux/rtnetlink.h`).
+const RT_TABLE_MAIN: u8 = 254;
+const RTPROT_KERNEL: u8 = 2;
+const RTPROT_BOOT: u8 = 3;
+const RTN_UNICAST: u8 = 1;
+const RT_SCOPE_LINK: u8 = 253;
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PREFSRC: u16 = 7;
+const RTA_TABLE: u16 = 15;
+/// `eth0`'s interface index in the link dump below.
+const ETH_IFINDEX: u32 = 2;
 
 const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
@@ -173,12 +193,62 @@ fn build_addr_dump(out: &mut Vec<u8>, seq: u32, eth_addr: [u8; 4]) {
     push_msg(out, NLMSG_DONE, seq, &0i32.to_ne_bytes());
 }
 
+fn rtmsg(dst_len: u8, protocol: u8, scope: u8) -> Vec<u8> {
+    // rtm_family, rtm_dst_len, rtm_src_len, rtm_tos, rtm_table, rtm_protocol, rtm_scope,
+    // rtm_type, rtm_flags
+    let mut b = Vec::from([
+        AF_INET,
+        dst_len,
+        0,
+        0,
+        RT_TABLE_MAIN,
+        protocol,
+        scope,
+        RTN_UNICAST,
+    ]);
+    b.extend_from_slice(&0u32.to_ne_bytes());
+    b
+}
+
+/// Build the `RTM_GETROUTE` reply: the two IPv4 routes smoltcp actually uses -- the default
+/// route via the gateway, and the connected `/24` the interface address lives in -- then
+/// `NLMSG_DONE`. Only the main table exists, and only IPv4 (a dump asking for `AF_INET6` gets
+/// an empty answer).
+fn build_route_dump(out: &mut Vec<u8>, seq: u32, eth_addr: [u8; 4], gateway: [u8; 4]) {
+    // default via <gateway> dev eth0
+    let mut body = rtmsg(0, RTPROT_BOOT, RT_SCOPE_UNIVERSE);
+    push_attr(
+        &mut body,
+        RTA_TABLE,
+        &u32::from(RT_TABLE_MAIN).to_ne_bytes(),
+    );
+    push_attr(&mut body, RTA_GATEWAY, &gateway);
+    push_attr(&mut body, RTA_OIF, &ETH_IFINDEX.to_ne_bytes());
+    push_msg(out, RTM_NEWROUTE, seq, &body);
+
+    // <interface>/24 dev eth0 proto kernel scope link src <interface>
+    let subnet = [eth_addr[0], eth_addr[1], eth_addr[2], 0];
+    let mut body = rtmsg(24, RTPROT_KERNEL, RT_SCOPE_LINK);
+    push_attr(
+        &mut body,
+        RTA_TABLE,
+        &u32::from(RT_TABLE_MAIN).to_ne_bytes(),
+    );
+    push_attr(&mut body, RTA_DST, &subnet);
+    push_attr(&mut body, RTA_OIF, &ETH_IFINDEX.to_ne_bytes());
+    push_attr(&mut body, RTA_PREFSRC, &eth_addr);
+    push_msg(out, RTM_NEWROUTE, seq, &body);
+
+    push_msg(out, NLMSG_DONE, seq, &0i32.to_ne_bytes());
+}
+
 impl<Platform: ShimPlatform> NetlinkSocket<Platform> {
-    pub(crate) fn new(interface_ip: core::net::Ipv4Addr) -> Self {
+    pub(crate) fn new(interface_ip: core::net::Ipv4Addr, gateway_ip: core::net::Ipv4Addr) -> Self {
         Self {
             pending: Mutex::new(Vec::new()),
             pollee: Pollee::new(),
             interface_addr: interface_ip.octets(),
+            gateway_addr: gateway_ip.octets(),
         }
     }
 
@@ -194,9 +264,14 @@ impl<Platform: ShimPlatform> NetlinkSocket<Platform> {
             let nlmsg_type = u16::from_ne_bytes([req[off + 4], req[off + 5]]);
             let seq =
                 u32::from_ne_bytes([req[off + 8], req[off + 9], req[off + 10], req[off + 11]]);
+            // The request family (`rtgenmsg`/`rtmsg` both start with it) follows the header.
+            let family = req.get(off + 16).copied().unwrap_or(AF_UNSPEC);
             match nlmsg_type {
                 RTM_GETLINK => build_link_dump(&mut out, seq),
                 RTM_GETADDR => build_addr_dump(&mut out, seq, self.interface_addr),
+                RTM_GETROUTE if family != AF_INET6 => {
+                    build_route_dump(&mut out, seq, self.interface_addr, self.gateway_addr);
+                }
                 // Any other request type: reply with a bare DONE so the caller's
                 // dump loop terminates instead of hanging.
                 _ => push_msg(&mut out, NLMSG_DONE, seq, &0i32.to_ne_bytes()),

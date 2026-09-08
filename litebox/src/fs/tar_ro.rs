@@ -477,6 +477,10 @@ impl TarIndex {
         let mut leaves: Vec<(String, IndexedChild, UserInfo)> = Vec::new();
         let mut explicit_dirs: Vec<(String, Mode, UserInfo)> = Vec::new();
         let mut seen_paths: HashMap<String, ()> = HashMap::new();
+        // Regular files by normalized path, so a ustar hard-link record (typeflag `'1'`,
+        // whose `linkname` names an earlier regular entry) aliases the same payload,
+        // mode, owner and inode under its second name instead of being dropped.
+        let mut files_by_path: HashMap<String, usize> = HashMap::new();
 
         // Use one raw-header pass for every supported type. The high-level
         // `TarArchiveRef::entries()` iterator intentionally skips links and
@@ -494,7 +498,9 @@ impl TarIndex {
             if !entry_type.is_regular_file()
                 && !matches!(
                     entry_type,
-                    tar_no_std::TypeFlag::SYMTYPE | tar_no_std::TypeFlag::DIRTYPE
+                    tar_no_std::TypeFlag::SYMTYPE
+                        | tar_no_std::TypeFlag::DIRTYPE
+                        | tar_no_std::TypeFlag::LINK
                 )
             {
                 continue;
@@ -521,6 +527,7 @@ impl TarIndex {
                     owner,
                     node_info: inode_allocator.next(),
                 });
+                files_by_path.insert(path.clone(), file_idx);
                 leaves.push((path, IndexedChild::File(file_idx), owner));
                 continue;
             }
@@ -539,6 +546,27 @@ impl TarIndex {
                 tar_no_std::TypeFlag::DIRTYPE => {
                     let mode = mode_of_modeflags(hdr.mode.to_flags().unwrap());
                     explicit_dirs.push((path, mode, owner));
+                }
+                tar_no_std::TypeFlag::LINK => {
+                    // ustar guarantees the linked-to entry was archived earlier. A record
+                    // whose target is not an earlier regular file (a forward reference, a
+                    // link to a directory or symlink, or a truncated archive) is dropped
+                    // with a warning rather than aborting the whole index.
+                    let target = normalize_tar_path(hdr.linkname.as_str().unwrap_or(""));
+                    match files_by_path.get(&target) {
+                        Some(&file_idx) => {
+                            files_by_path.insert(path.clone(), file_idx);
+                            leaves.push((path, IndexedChild::File(file_idx), owner));
+                        }
+                        None => {
+                            litebox_util_log::warn!(
+                                path:% = path,
+                                target:% = target;
+                                "tar hard link does not name an earlier regular file; entry dropped"
+                            );
+                            seen_paths.remove(&path);
+                        }
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -643,18 +671,25 @@ fn ensure_indexed_dir(
 fn tar_header_path(header: &tar_no_std::PosixHeader) -> Option<String> {
     let name = header.name.as_str().ok()?;
     let prefix = header.prefix.as_str().ok()?;
-    let mut path = if prefix.is_empty() {
+    let path = if prefix.is_empty() {
         String::from(name)
     } else {
         alloc::format!("{prefix}/{name}")
     };
-    if let Some(stripped) = path.strip_prefix("./") {
-        path = String::from(stripped);
-    }
-    while path.ends_with('/') {
-        path.pop();
-    }
+    let path = normalize_tar_path(&path);
     (!path.is_empty()).then_some(path)
+}
+
+/// The archive-relative spelling every index key uses: no leading `./` or `/`, no trailing
+/// `/`. Applied to entry names and to hard-link targets alike so the two can be compared.
+fn normalize_tar_path(raw: &str) -> String {
+    let mut path = raw;
+    while let Some(stripped) = path.strip_prefix("./") {
+        path = stripped;
+    }
+    let path = path.trim_start_matches('/');
+    let path = path.trim_end_matches('/');
+    String::from(path)
 }
 
 const DEFAULT_DIR_MODE: Mode =

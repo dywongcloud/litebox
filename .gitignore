@@ -213,3 +213,15 @@ dev_bench/unixbench/*.zip
 
 # XFCE demo watchdog's runtime logs (watch-desktop.sh)
 litebox_packager/examples/xfce/watchdog-logs/
+
+# HVF-desktop APK provenance manifest: manifest.json (the actual
+# committed provenance record -- name/version/SHA-256 per package, base
+# image digest, repository index hashes/signing keys) is small and
+# tracked; the content-addressed .apk cache it describes is large
+# (hundreds of MB) and fully regenerable byte-for-byte by re-running
+# litebox_packager/scripts/capture-alpine-apk-manifest.sh against the
+# same manifest, so only the cache payload is excluded here.
+litebox_packager/manifests/*/apks/
+
+# gm/agentplug harness runtime spool (dispatch outputs, regenerated every session)
+.agentplug/

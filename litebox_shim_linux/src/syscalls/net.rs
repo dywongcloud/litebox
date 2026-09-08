@@ -199,6 +199,9 @@ pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,
     pub(super) broadcast: bool,
+    /// `SO_PASSCRED`: deliver the sender's `SCM_CREDENTIALS` with every
+    /// `recvmsg`. Only `AF_UNIX` sockets honour it.
+    pub(super) pass_cred: bool,
     pub(super) receive_ipv4_returned_options: bool,
     pub(super) receive_ipv4_ttl: bool,
     /// Receiving timeout, None (default value) means no timeout
@@ -230,6 +233,47 @@ impl<Platform: ShimPlatform> Clone for SocketProxy<Platform> {
 pub(super) enum SocketOptionValue {
     Timeout(Option<core::time::Duration>),
     U32(u32),
+}
+
+/// What one receive delivered: the data length plus the ancillary payload a `recvmsg`
+/// turns into control messages.
+struct Received<Platform: ShimPlatform, FS: ShimFS> {
+    size: usize,
+    /// Descriptors transferred with the data (`SCM_RIGHTS`).
+    rights: alloc::vec::Vec<TransferredFd<Platform, FS>>,
+    /// The sender's credentials (`SCM_CREDENTIALS`), present only when the receiving
+    /// `AF_UNIX` socket has `SO_PASSCRED` set.
+    credentials: Option<litebox_common_linux::Ucred>,
+}
+
+/// Appends one control message to `control` the way Linux's `put_cmsg` fills a user buffer
+/// of `capacity` bytes: a header that no longer fits is dropped, a payload that no longer
+/// fits is cut short (its `cmsg_len` says how much was written), and the cursor advances by
+/// `CMSG_SPACE` or to the end of the buffer, whichever comes first. Returns whether anything
+/// was truncated (`MSG_CTRUNC`).
+fn put_cmsg(
+    control: &mut alloc::vec::Vec<u8>,
+    capacity: usize,
+    level: u32,
+    cmsg_type: u32,
+    data: &[u8],
+) -> bool {
+    const CMSG_HEADER_LEN: usize = size_of::<usize>() + 2 * size_of::<u32>();
+    let start = control.len();
+    let remaining = capacity.saturating_sub(start);
+    if remaining < CMSG_HEADER_LEN {
+        return true;
+    }
+    let cmsg_len = CMSG_HEADER_LEN + data.len();
+    let truncated = remaining < cmsg_len;
+    let write_len = cmsg_len.min(remaining);
+    control.extend_from_slice(&write_len.to_ne_bytes());
+    control.extend_from_slice(&level.to_ne_bytes());
+    control.extend_from_slice(&cmsg_type.to_ne_bytes());
+    control.extend_from_slice(&data[..write_len - CMSG_HEADER_LEN]);
+    let cmsg_space = (cmsg_len + size_of::<usize>() - 1) & !(size_of::<usize>() - 1);
+    control.resize(start + cmsg_space.min(remaining), 0);
+    truncated
 }
 
 /// Socket-related implementation. Currently these methods are on `GlobalState`
@@ -492,6 +536,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     return Err(Errno::ENOPROTOOPT);
                 }
+                // Credentials passing exists only for AF_UNIX sockets here.
+                SocketOption::PASSCRED => {
+                    log_unsupported!("setsockopt(SO_PASSCRED) on an inet socket");
+                    return Err(Errno::EOPNOTSUPP);
+                }
             },
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
@@ -663,6 +712,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     litebox::net::SOCKET_BUFFER_SIZE.trunc()
                 }
                 SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
+                SocketOption::PASSCRED => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::TCP(tcpopt) => {
                 match tcpopt {
@@ -796,6 +846,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
             return Err(Errno::ECONNREFUSED);
         }
+        if let SocketAddr::V4(peer) = sockaddr {
+            let ip = *peer.ip();
+            let socket_type = self.get_socket_type(fd)?;
+            let so_broadcast = self.with_socket_options(fd, |opt| opt.broadcast);
+            let net = self.net.lock();
+            // Non-unicast destinations. Nothing behind the interface answers a broadcast,
+            // multicast or link-local SYN (the platform side forwards unicast only), so the
+            // call would sit out the whole connect timeout. Linux refuses these up front:
+            // `tcp_v4_connect` reports a broadcast/multicast route as `ENETUNREACH`, and a UDP
+            // `connect` to a broadcast address needs `SO_BROADCAST` (`EACCES`); UDP multicast
+            // and link-local are allowed and simply go nowhere here.
+            let broadcast = ip == Ipv4Addr::BROADCAST || net.is_directed_broadcast(ip);
+            if broadcast || ip.is_multicast() || ip.is_link_local() {
+                match socket_type {
+                    SockType::Stream => return Err(Errno::ENETUNREACH),
+                    _ if broadcast && !so_broadcast => return Err(Errno::EACCES),
+                    _ => {}
+                }
+            }
+            // Without an external interface (no `utun` on macOS) a SYN to anything but the
+            // guest's own addresses is silently dropped, so the connect would only ever end in
+            // the caller's timeout. Report the missing route immediately, as Linux does.
+            if !net.is_local_ip(ip) && !net.external_interface_available() {
+                return Err(Errno::ENETUNREACH);
+            }
+        }
         let mut check_progress = false;
         cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),
@@ -877,6 +953,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         };
         let proxy = self.get_proxy(fd)?;
 
+        // A datagram to a broadcast address needs `SO_BROADCAST`, as on Linux (`EACCES`).
+        if let (NetworkProxy::Datagram(_), Some(SocketAddr::V4(dest))) =
+            (proxy.as_ref(), wire_sockaddr)
+        {
+            let ip = *dest.ip();
+            if ip.octets()[3] == 255
+                && (ip == Ipv4Addr::BROADCAST || self.net.lock().is_directed_broadcast(ip))
+                && !self.with_socket_options(fd, |opt| opt.broadcast)
+            {
+                return Err(Errno::EACCES);
+            }
+        }
+
         // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
         // UDP socket implicitly binds it to an ephemeral port before sending).
         // This is mostly lock-free: we only take the network lock if we need to allocate a port.
@@ -928,27 +1017,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
-        let is_empty_stream = guest_len == 0 && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
+        let is_stream = matches!(proxy.as_ref(), NetworkProxy::Stream(_));
+        let is_empty_stream = guest_len == 0 && is_stream;
 
-        cx.with_timeout(timeout)
-            .wait_on_events(
+        // A blocking stream send returns only once every byte is queued (Linux `tcp_sendmsg`
+        // loops, sleeping on send space): a short count comes back only when `SO_SNDTIMEO`
+        // or a signal cuts the wait after some bytes went in. Non-blocking and datagram sends
+        // are a single attempt.
+        let mut written = 0usize;
+        loop {
+            let chunk = &wire_buf[written..];
+            let attempt = cx.with_timeout(timeout).wait_on_events(
                 is_nonblock,
                 Events::OUT,
                 |observer, filter| {
                     proxy.register_observer(observer, filter);
                     Ok(())
                 },
-                || match proxy.try_write(wire_buf, new_flags, wire_sockaddr) {
-                    Ok(n) if framed.is_some() && n == wire_buf.len() => Ok(guest_len),
+                || match proxy.try_write(chunk, new_flags, wire_sockaddr) {
+                    Ok(n) if framed.is_some() && n == chunk.len() => Ok(guest_len),
                     Ok(_) if framed.is_some() => Err(TryOpError::Other(Errno::EIO)),
                     Ok(0) if guest_len == 0 => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
+                    // No room in the socket's send buffer: a blocking send waits for the
+                    // network worker to drain it (bounded by `SO_SNDTIMEO`); only `O_NONBLOCK`
+                    // / `MSG_DONTWAIT` turn this into `EAGAIN`, as on Linux.
+                    Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
-            )
-            .map_err(Errno::from)
+            );
+            match attempt {
+                Ok(n) => {
+                    written += n;
+                    if written >= wire_buf.len() || is_nonblock || !is_stream || framed.is_some()
+                    {
+                        return Ok(written);
+                    }
+                }
+                Err(_) if written > 0 => return Ok(written),
+                // `SO_SNDTIMEO` ran out with nothing sent: Linux reports `EAGAIN`
+                // (`sk_stream_wait_memory`), keeping `ETIMEDOUT` for the connection itself.
+                Err(TryOpError::WaitError(WaitError::TimedOut)) => return Err(Errno::EAGAIN),
+                Err(e) => return Err(Errno::from(e)),
+            }
+        }
     }
 
     /// Receive data via socket channel (lock-free path).
@@ -1066,7 +1180,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
                 },
             )
-            .map_err(Errno::from)
+            .map_err(|err| match err {
+                // `SO_RCVTIMEO` ran out: Linux reports `EAGAIN` (`sock_rcvtimeo`), not `ETIMEDOUT`.
+                TryOpError::WaitError(WaitError::TimedOut) => Errno::EAGAIN,
+                err => Errno::from(err),
+            })
     }
 
     fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
@@ -1254,8 +1372,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // `os.networkInterfaces()`. `ty` (SOCK_RAW/SOCK_DGRAM) and `protocol`
                 // (NETLINK_ROUTE) are accepted without distinction -- no real link or
                 // address state is ever touched; see `crate::syscalls::netlink`.
-                let interface_ip = self.global.net.lock().interface_ip();
-                let socket = crate::syscalls::netlink::NetlinkSocket::new(interface_ip);
+                let (interface_ip, gateway_ip) = {
+                    let net = self.global.net.lock();
+                    (net.interface_ip(), net.gateway_ip())
+                };
+                let socket = crate::syscalls::netlink::NetlinkSocket::new(interface_ip, gateway_ip);
                 let mut status = OFlags::RDWR;
                 status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
                 let mut descriptors = self.global.litebox.descriptor_table_mut();
@@ -1789,6 +1910,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         msg: &litebox_common_linux::UserMsgHdr,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
+        // A netlink socket takes `sendmsg` exactly like `sendto`: iproute2/busybox `ip`'s
+        // `rtnl_talk` (`ip route get`) sends with a `sockaddr_nl` name, which the inet
+        // address parse below rejects as `EAFNOSUPPORT`, so it is answered first.
+        if self.netlink_fd(sockfd).is_some() {
+            let data = if msg.msg_iovlen == 0 {
+                alloc::vec::Vec::new()
+            } else {
+                let iovs = msg
+                    .msg_iov
+                    .to_owned_slice::<Platform>(msg.msg_iovlen)
+                    .ok_or(Errno::EFAULT)?;
+                copy_iovs_to_vec::<Platform>(&iovs)?
+            };
+            return self
+                .netlink_send(sockfd, &data)
+                .unwrap_or(Err(Errno::EBADF));
+        }
         let msg_name = msg.msg_name;
         let sock_addr = if msg_name.as_usize() != 0 {
             Some(read_sockaddr_from_user::<Platform>(
@@ -1801,7 +1939,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let msg_control = msg.msg_control;
         let msg_controllen = msg.msg_controllen;
         let mut rights = alloc::vec::Vec::new();
-        let mut has_credentials = false;
+        // An explicit `SCM_CREDENTIALS` the sender attached (at most one), validated below
+        // the way Linux's `scm_check_creds` does: an unprivileged sender may only claim its
+        // own process id and one of its real/effective/saved ids.
+        let mut credentials: Option<litebox_common_linux::Ucred> = None;
         if msg_controllen != 0 {
             const SOL_SOCKET: u32 = 1;
             const SCM_RIGHTS: u32 = 1;
@@ -1864,7 +2005,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                     }
                     (SOL_SOCKET, SCM_CREDENTIALS) => {
-                        if has_credentials || data.len() != size_of::<litebox_common_linux::Ucred>()
+                        if credentials.is_some()
+                            || data.len() != size_of::<litebox_common_linux::Ucred>()
                         {
                             return Err(Errno::EINVAL);
                         }
@@ -1873,14 +2015,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             uid: read_u32(data, size_of::<u32>())?,
                             gid: read_u32(data, 2 * size_of::<u32>())?,
                         };
-                        let credentials = self.credentials.borrow();
-                        if supplied.pid != self.pid.cast_unsigned()
-                            || supplied.uid != credentials.euid
-                            || supplied.gid != credentials.egid
-                        {
+                        let own = self.credentials.borrow();
+                        let uid_ok = [own.uid, own.euid, own.suid].contains(&supplied.uid);
+                        let gid_ok = [own.gid, own.egid, own.sgid].contains(&supplied.gid);
+                        if supplied.pid != self.pid.cast_unsigned() || !uid_ok || !gid_ok {
                             return Err(Errno::EPERM);
                         }
-                        has_credentials = true;
+                        credentials = Some(supplied);
                     }
                     _ => return Err(Errno::EINVAL),
                 }
@@ -1912,7 +2053,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &self.global,
             sockfd,
             |fd| {
-                if has_credentials || !rights.borrow().as_ref().unwrap().is_empty() {
+                if credentials.is_some() || !rights.borrow().as_ref().unwrap().is_empty() {
                     return Err(Errno::EINVAL);
                 }
                 let sock_addr = sock_addr
@@ -1935,6 +2076,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     flags,
                     unix_addr,
                     rights.borrow_mut().take().unwrap(),
+                    credentials,
                 )
             },
         );
@@ -2058,23 +2200,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
         self.do_recvfrom_with_rights(sockfd, buf, flags, source_addr)
-            .map(|(size, _)| size)
+            .map(|received| received.size)
     }
 
+    /// Receives into `buf` together with the ancillary payload a `recvmsg` would deliver:
+    /// the transferred descriptors (`SCM_RIGHTS`) and, when the receiving `AF_UNIX` socket
+    /// has `SO_PASSCRED` set, the sender's `SCM_CREDENTIALS`.
     fn do_recvfrom_with_rights(
         &self,
         sockfd: u32,
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
-    ) -> Result<(usize, alloc::vec::Vec<TransferredFd<Platform, FS>>), Errno> {
+    ) -> Result<Received<Platform, FS>, Errno> {
         if let Some(res) = self.netlink_recv(sockfd, buf) {
-            return res.map(|size| (size, alloc::vec::Vec::new()));
+            return res.map(|size| Received {
+                size,
+                rights: alloc::vec::Vec::new(),
+                credentials: None,
+            });
         }
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
-        let (size, addr, rights) = {
+        let (received, addr) = {
             // We need to do this cell dance because otherwise Rust can't recognize that the two
             // closures are mutually exclusive.
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
@@ -2091,7 +2240,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Inet);
-                    Ok((size, src_addr, alloc::vec::Vec::new()))
+                    Ok((
+                        Received {
+                            size,
+                            rights: alloc::vec::Vec::new(),
+                            credentials: None,
+                        },
+                        src_addr,
+                    ))
                 },
                 |entry| {
                     let mut addr = None;
@@ -2102,7 +2258,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         if want_source { Some(&mut addr) } else { None },
                     )?;
                     let src_addr = addr.map(SocketAddress::Unix);
-                    Ok((result.size, src_addr, result.rights))
+                    Ok((
+                        Received {
+                            size: result.size,
+                            rights: result.rights,
+                            credentials: result.credentials,
+                        },
+                        src_addr,
+                    ))
                 },
             )?
         };
@@ -2110,7 +2273,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
             *source_addr = Some(addr);
         }
-        Ok((size, rights))
+        Ok(received)
     }
 
     /// Handle syscall `recvmsg`
@@ -2141,6 +2304,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<usize, Errno> {
         const SOL_SOCKET: u32 = 1;
         const SCM_RIGHTS: u32 = 1;
+        const SCM_CREDENTIALS: u32 = 2;
         const CMSG_HEADER_LEN: usize = size_of::<usize>() + 2 * size_of::<u32>();
 
         let msg = msg_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
@@ -2176,7 +2340,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map_err(|_| Errno::ENOMEM)?;
         buffer.resize(total_iov_capacity, 0);
         let recv_buf = &mut buffer[..];
-        let (size, rights) = self.do_recvfrom_with_rights(
+        let Received {
+            size,
+            rights,
+            credentials,
+        } = self.do_recvfrom_with_rights(
             sockfd,
             recv_buf,
             flags.difference(ReceiveFlags::CMSG_CLOEXEC),
@@ -2249,8 +2417,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         }
 
+        // Ancillary data, in the order Linux's `scm_recv` emits it: SCM_CREDENTIALS (only
+        // when the receiving socket has SO_PASSCRED) first, then SCM_RIGHTS. Each control
+        // message consumes CMSG_SPACE of the caller's buffer; whatever no longer fits is
+        // truncated (descriptors that don't fit are closed, not installed) and reported
+        // through MSG_CTRUNC. A null control pointer offers no space at all.
+        let control_capacity = if msg_control.as_usize() == 0 {
+            0
+        } else {
+            msg_controllen
+        };
+        let mut control = alloc::vec::Vec::new();
+        if let Some(ucred) = credentials {
+            let mut payload = [0u8; 3 * size_of::<u32>()];
+            payload[..4].copy_from_slice(&ucred.pid.to_ne_bytes());
+            payload[4..8].copy_from_slice(&ucred.uid.to_ne_bytes());
+            payload[8..].copy_from_slice(&ucred.gid.to_ne_bytes());
+            litebox_util_log::trace!(
+                sockfd,
+                sender_pid = ucred.pid,
+                sender_uid = ucred.uid,
+                sender_gid = ucred.gid,
+                control_capacity;
+                "recvmsg: delivering SCM_CREDENTIALS"
+            );
+            if put_cmsg(
+                &mut control,
+                control_capacity,
+                SOL_SOCKET,
+                SCM_CREDENTIALS,
+                &payload,
+            ) {
+                ret_flags.insert(ReceiveFlags::CTRUNC);
+            }
+        }
+
         let rights_count = rights.len();
-        let max_control_fds = msg_controllen
+        let max_control_fds = control_capacity
+            .saturating_sub(control.len())
             .checked_sub(CMSG_HEADER_LEN)
             .map_or(0, |space| space / size_of::<i32>());
         let cloexec = flags.contains(ReceiveFlags::CMSG_CLOEXEC);
@@ -2276,26 +2480,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if installed.len() < rights_count {
             ret_flags.insert(ReceiveFlags::CTRUNC);
         }
-
-        let control_len = if installed.is_empty() {
-            0
-        } else {
-            let payload_len = installed.len() * size_of::<i32>();
-            let cmsg_len = CMSG_HEADER_LEN + payload_len;
-            let cmsg_space = (cmsg_len + size_of::<usize>() - 1) & !(size_of::<usize>() - 1);
-            let write_len = msg_controllen.min(cmsg_space);
-            let mut control = alloc::vec![0u8; write_len];
-            control[..size_of::<usize>()].copy_from_slice(&cmsg_len.to_ne_bytes());
-            let level_offset = size_of::<usize>();
-            let type_offset = level_offset + size_of::<u32>();
-            control[level_offset..level_offset + size_of::<u32>()]
-                .copy_from_slice(&SOL_SOCKET.to_ne_bytes());
-            control[type_offset..type_offset + size_of::<u32>()]
-                .copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
-            for (index, (_, guest_fd)) in installed.iter().enumerate() {
-                let offset = CMSG_HEADER_LEN + index * size_of::<i32>();
-                control[offset..offset + size_of::<i32>()].copy_from_slice(&guest_fd.to_ne_bytes());
+        if !installed.is_empty() {
+            let mut payload = alloc::vec::Vec::with_capacity(installed.len() * size_of::<i32>());
+            for (_, guest_fd) in &installed {
+                payload.extend_from_slice(&guest_fd.to_ne_bytes());
             }
+            if put_cmsg(
+                &mut control,
+                control_capacity,
+                SOL_SOCKET,
+                SCM_RIGHTS,
+                &payload,
+            ) {
+                ret_flags.insert(ReceiveFlags::CTRUNC);
+            }
+        }
+
+        let control_len = control.len();
+        if control_len != 0 {
             let control_ptr = UserPtrMut::<u8>::from_usize(msg_control.as_usize());
             if control_ptr
                 .write_slice_at_offset::<Platform>(0, &control)
@@ -2306,8 +2508,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 return Err(Errno::EFAULT);
             }
-            write_len
-        };
+        }
 
         let controllen_offset =
             core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_controllen);
@@ -2601,10 +2802,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |_fd| {
-                ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
-                log_unsupported!("shutdown on inet socket");
-                Err(Errno::EOPNOTSUPP)
+            |fd| {
+                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                self.global
+                    .net
+                    .lock()
+                    .shutdown(fd, how.is_shutdown_read(), how.is_shutdown_write())
+                    .map_err(|err| match err {
+                        litebox::net::ShutdownError::InvalidFd => Errno::EBADF,
+                        litebox::net::ShutdownError::NotConnected => Errno::ENOTCONN,
+                        // `ShutdownError` is `#[non_exhaustive]`; both declared variants are
+                        // matched above.
+                        _ => Errno::EINVAL,
+                    })
             },
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;

@@ -1,0 +1,133 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+# Stock (non-rewritten) Alpine XFCE + Chromium desktop for the macOS
+# Hypervisor.framework backend (`--hvf`); built by `build-xfce-image.sh --hvf`.
+# Unlike the sibling Containerfile nothing here is rebuilt with x18 reserved:
+# the HVF monitor preserves x18 architecturally, so upstream Alpine packages
+# run unchanged, and litebox_packager is invoked with --no-rewrite-all, which
+# keeps every tar mode bit -- including the setuid bits doas, sudo, bbsuid and
+# chrome-sandbox rely on -- byte-for-byte.
+
+ARG LITEBOX_ALPINE_BASE_IMAGE=alpine:3.24
+FROM ${LITEBOX_ALPINE_BASE_IMAGE}
+
+RUN apk add --no-cache --upgrade \
+        apk-tools \
+        adwaita-xfce-icon-theme busybox-suid chromium dbus dbus-x11 doas \
+        duktape-libs font-cursor-misc font-dejavu font-misc-misc setpriv sudo \
+        thunar tzdata xf86-input-evdev xf86-video-fbdev \
+        xfce4-panel xfce4-settings xfce4-terminal xfdesktop xfwm4 \
+        xclock xeyes xmessage xorg-server xrandr xset xterm \
+    && fc-cache -f \
+    && mkdir -p /etc/X11
+
+# Chromium (through ICU) and glib resolve the local time zone from
+# /etc/localtime and /usr/share/zoneinfo; without tzdata every guest process
+# probes both and gets ENOENT (chromium-sigtrap diagnosis, runC: `openat
+# /etc/localtime -> ENOENT`, `openat /usr/share/zoneinfo -> ENOENT`). Pin the
+# image to UTC as a symlink -- ICU derives the zone name from the link target
+# when TZ is unset -- plus the Debian-style /etc/timezone for readers of that
+# file. /tmp must stay world-writable with the sticky bit for Chromium's
+# per-user socket and profile scratch directories (Alpine ships it 1777;
+# assert rather than trust). /dev/shm cannot be provisioned here: /dev inside
+# the build container is a host-managed tmpfs that never reaches the image
+# layer, so build-xfce-image.sh appends the 1777 `dev/shm` entry to the
+# packaged tar instead.
+RUN set -eux; \
+    [ -s /usr/share/zoneinfo/UTC ]; \
+    ln -sfn /usr/share/zoneinfo/UTC /etc/localtime; \
+    printf 'UTC\n' > /etc/timezone; \
+    [ "$(readlink /etc/localtime)" = /usr/share/zoneinfo/UTC ]; \
+    [ "$(env -u TZ date +%Z)" = UTC ]; \
+    [ "$(TZ=America/Los_Angeles date +%Z)" != UTC ]; \
+    chmod 1777 /tmp; \
+    [ "$(stat -c %a /tmp)" = 1777 ]
+
+# The desktop session runs as uid/gid 1000 (start-desktop.sh drops to it with
+# setpriv). Grant that user passwordless root through both doas and sudo so
+# `doas apk add ...` / `sudo apk add ...` work from the desktop terminal:
+#  - doas: `keepenv` passes the runner-provided proxy environment through.
+#  - sudo: env_reset would strip the proxy variables, so keep them explicitly;
+#    `!use_pty` because the shim's pty path for sudo still hangs.
+# Both paths are exercised as the litebox user right here, so a rootfs in
+# which either one is broken is never exported.
+RUN set -eux; \
+    addgroup -S -g 1000 litebox; \
+    adduser -S -D -H -u 1000 -G litebox -s /bin/sh litebox; \
+    [ "$(id -u litebox)" = 1000 ]; \
+    [ "$(id -g litebox)" = 1000 ]; \
+    mkdir -p /etc/doas.d /etc/sudoers.d; \
+    printf '%s\n' 'permit nopass keepenv litebox as root' > /etc/doas.d/litebox.conf; \
+    chown root:root /etc/doas.d/litebox.conf; \
+    chmod 0600 /etc/doas.d/litebox.conf; \
+    doas -C /etc/doas.d/litebox.conf; \
+    printf '%s\n' \
+        'Defaults !use_pty' \
+        'Defaults env_keep += "http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY"' \
+        'litebox ALL=(ALL:ALL) NOPASSWD: ALL' \
+        > /etc/sudoers.d/litebox; \
+    chown root:root /etc/sudoers.d/litebox; \
+    chmod 0440 /etc/sudoers.d/litebox; \
+    visudo -c -q; \
+    for helper in /usr/bin/doas:4755 /usr/bin/sudo:4755 /bin/bbsuid:4111 \
+        /usr/lib/chromium/chrome-sandbox:4755; do \
+        path=${helper%:*}; \
+        [ -f "$path" ] && [ ! -L "$path" ]; \
+        [ "$(stat -c '%u:%g' "$path")" = 0:0 ]; \
+        [ "$(stat -c '%a' "$path")" = "${helper#*:}" ]; \
+    done; \
+    printf '%s\n' '#!/bin/sh' 'echo "$http_proxy"' > /tmp/echo-proxy; \
+    chmod 0755 /tmp/echo-proxy; \
+    [ "$(su -s /bin/sh litebox -c 'doas id -u')" = 0 ]; \
+    [ "$(su -s /bin/sh litebox -c 'sudo -n id -u')" = 0 ]; \
+    [ "$(su -s /bin/sh litebox -c 'http_proxy=probe doas /tmp/echo-proxy')" = probe ]; \
+    [ "$(su -s /bin/sh litebox -c 'http_proxy=probe sudo -n /tmp/echo-proxy')" = probe ]; \
+    rm -f /tmp/echo-proxy
+
+# /usr/bin/chromium-browser -> chromium-launcher.sh probes the owner of
+# ${XDG_CONFIG_HOME:-${HOME}} when it runs as root. The runner starts guests
+# with HOME unset, so as root the probe degenerated to `stat -c %u -L` with no
+# operand: busybox stat printed its usage text on stderr and the test fell
+# through unevaluated. Default HOME to /root in both places the wrapper reads
+# it and quote the expansions; the wrapper's behaviour is otherwise unchanged
+# (root with a root-owned config dir gets an explicit --user-data-dir, nothing
+# else is added, and no sandbox switch is ever introduced). busybox stat
+# accepts -L combined with -c (verified live under the shim). The patch is an
+# exact-line rewrite that fails the build if the upstream wrapper changes, and
+# both the uid-1000 and the HOME-less root paths are exercised right here.
+RUN set -eux; \
+    launcher=/usr/lib/chromium/chromium-launcher.sh; \
+    old_test='if [ $(id -u) -eq 0 ] && [ $(stat -c %u -L ${XDG_CONFIG_HOME:-${HOME}}) -eq 0 ]; then'; \
+    new_test='if [ "$(id -u)" -eq 0 ] && [ "$(stat -Lc %u "${XDG_CONFIG_HOME:-${HOME:-/root}}" 2>/dev/null)" = 0 ]; then'; \
+    old_dir='  CHROMIUM_FLAGS="--user-data-dir=${XDG_CONFIG_HOME:-"$HOME"/.config}/chromium $CHROMIUM_FLAGS"'; \
+    new_dir='  CHROMIUM_FLAGS="--user-data-dir=${XDG_CONFIG_HOME:-"${HOME:-/root}"/.config}/chromium $CHROMIUM_FLAGS"'; \
+    [ -f "$launcher" ] && [ ! -L "$launcher" ]; \
+    [ "$(grep -cF -- "$old_test" "$launcher")" = 1 ]; \
+    [ "$(grep -cF -- "$old_dir" "$launcher")" = 1 ]; \
+    awk -v old_test="$old_test" -v new_test="$new_test" \
+        -v old_dir="$old_dir" -v new_dir="$new_dir" \
+        '{ if ($0 == old_test) print new_test; \
+           else if ($0 == old_dir) print new_dir; \
+           else print }' "$launcher" > "$launcher.litebox"; \
+    sh -n "$launcher.litebox"; \
+    [ "$(grep -cF -- "$new_test" "$launcher.litebox")" = 1 ]; \
+    [ "$(grep -cF -- "$new_dir" "$launcher.litebox")" = 1 ]; \
+    [ "$(grep -c -- 'no-sandbox' "$launcher.litebox")" = 0 ]; \
+    [ "$(wc -l < "$launcher")" = "$(wc -l < "$launcher.litebox")" ]; \
+    cat "$launcher.litebox" > "$launcher"; \
+    rm -f "$launcher.litebox"; \
+    chown root:root "$launcher"; \
+    chmod 0755 "$launcher"; \
+    out="$(su -s /bin/sh litebox -c 'env -u HOME /usr/bin/chromium-browser --version' 2>&1)"; \
+    case "$out" in "Chromium "*) ;; *) echo "uid-1000 wrapper: $out" >&2; exit 1;; esac; \
+    case "$out" in *Usage:*) exit 1;; esac; \
+    out="$(env -u HOME /usr/bin/chromium-browser --version 2>&1)"; \
+    case "$out" in "Chromium "*) ;; *) echo "root wrapper: $out" >&2; exit 1;; esac; \
+    case "$out" in *Usage:*) exit 1;; esac
+
+COPY xorg.conf /etc/X11/xorg.conf
+COPY panel.xml /etc/xdg/litebox/xfce4-panel.xml
+COPY resolv.conf /etc/resolv.conf
+COPY start-desktop.sh /usr/bin/start-desktop.sh
+RUN chmod 0755 /usr/bin/start-desktop.sh

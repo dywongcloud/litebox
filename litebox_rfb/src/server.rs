@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use std::io;
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::proto::{self, PixelFormat};
 
@@ -198,12 +199,90 @@ impl ShutdownHandle {
     }
 }
 
-/// Interval between unsolicited `FramebufferUpdate` pushes to a connected client. RFB is
-/// technically pull-based (the client sends `FramebufferUpdateRequest`), but every real client
-/// sends one immediately after `SetEncodings` and again immediately upon receiving each update
-/// (`incremental=1`), so pushing on a fixed timer is equivalent in practice to answering those
-/// requests promptly and is far simpler than tracking per-client request/incremental state.
-const UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Minimum interval between two framebuffer snapshots taken for one client: the cap on the update
+/// rate a client can pull (20 Hz), and the poll period while a client's outstanding
+/// `FramebufferUpdateRequest` waits for the screen to change.
+const UPDATE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Height of the full-width bands the framebuffer is diffed in. An incremental update carries only
+/// the bands that changed since the previous update to that client, merged into one Raw rectangle
+/// per run of adjacent dirty bands.
+const BAND_ROWS: u16 = 32;
+
+/// One client's outstanding `FramebufferUpdateRequest` state, shared between the reader thread
+/// that records requests and the update thread that answers them.
+///
+/// Updates are sent only while a request is outstanding (RFC 6143 §7.5.3). Every real client
+/// re-requests immediately after consuming an update, so this is RFB's own flow control: a client
+/// has at most one update in flight, a slow client never accumulates a backlog of stale frames,
+/// and each update is built from the newest frame at the moment the client is ready for it
+/// (intermediate frames are simply never captured). One client's pace affects nobody else --
+/// each connection has its own reader and update thread and its own snapshot.
+struct UpdateRequest {
+    state: Mutex<RequestState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct RequestState {
+    /// Bumped by every request, so the update thread can tell whether the request it just
+    /// answered is still the newest or a further one arrived while it was writing.
+    seq: u64,
+    /// A request has arrived and not yet been answered.
+    pending: bool,
+    /// The outstanding request (or one coalesced into it) had `incremental = 0`: answer with the
+    /// whole framebuffer rather than only the bands that changed.
+    full: bool,
+    /// The reader thread is done; the update thread must exit.
+    stop: bool,
+}
+
+impl UpdateRequest {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RequestState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RequestState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn request(&self, full: bool) {
+        let mut state = self.lock();
+        state.seq += 1;
+        state.pending = true;
+        state.full |= full;
+        self.changed.notify_one();
+    }
+
+    fn stop(&self) {
+        self.lock().stop = true;
+        self.changed.notify_all();
+    }
+
+    /// Blocks until a request is outstanding, returning its sequence number and whether it wants
+    /// the whole framebuffer; `None` once stopped.
+    fn wait(&self) -> Option<(u64, bool)> {
+        let state = self
+            .changed
+            .wait_while(self.lock(), |state| !state.pending && !state.stop)
+            .unwrap_or_else(PoisonError::into_inner);
+        (!state.stop).then_some((state.seq, state.full))
+    }
+
+    /// Marks request `seq` answered. A request that arrived after `seq` was taken stays
+    /// outstanding: the client asked again after this update was already being built, and
+    /// dropping that request would leave it waiting forever.
+    fn answered(&self, seq: u64) {
+        let mut state = self.lock();
+        if state.seq == seq {
+            state.pending = false;
+            state.full = false;
+        }
+    }
+}
 
 fn serve_client<F: FramebufferSource>(
     mut stream: TcpStream,
@@ -218,48 +297,138 @@ fn serve_client<F: FramebufferSource>(
     stream.set_nodelay(true)?;
     handshake(&mut stream)?;
 
-    // A second thread on the same connection pushes framebuffer updates on a timer while this
-    // (the original) thread blocks reading client input -- RFB is bidirectional on one TCP
+    // A second thread on the same connection writes framebuffer updates while this (the
+    // original) thread blocks reading client input -- RFB is bidirectional on one TCP
     // connection, and cloning a `TcpStream` yields an independent handle to the same underlying
     // socket, safe to read/write from different threads concurrently.
     let mut write_stream = stream.try_clone()?;
+    // Bounds how long a client that stops draining its socket (zero TCP receive window, no
+    // RST) can pin the update thread inside a blocking write: without this, that thread -- and
+    // the fd it holds -- leaks for the life of the process instead of tearing the connection
+    // down. Generous relative to `UPDATE_INTERVAL` since it only fires for a genuinely stalled
+    // peer, matching the web viewer's own write timeout (`web.rs`'s `WsWriter`).
+    write_stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let (width, height) = framebuffer.dimensions();
     write_server_init(&mut stream, width, height)?;
     let input_client = InputClient::connect(&**on_input);
 
-    let pusher_shutdown_flag = Arc::new(AtomicBool::new(false));
-    let pusher_stop = Arc::clone(&pusher_shutdown_flag);
+    let requests = Arc::new(UpdateRequest::new());
     let pusher = {
         let framebuffer = Arc::clone(framebuffer);
+        let requests = Arc::clone(&requests);
         std::thread::spawn(move || {
-            let mut pixels = Vec::new();
-            while !pusher_stop.load(Ordering::Relaxed) {
-                std::thread::sleep(UPDATE_INTERVAL);
-                if pusher_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                // Dimensions are re-read every tick so a mid-session `FBIOPUT_VSCREENINFO`
-                // resize is picked up without a dedicated notification channel; the client sees
-                // it as an ordinary FramebufferUpdate whose rectangle now covers the new size
-                // (real RFB has no in-band "the size changed" message in this server's scope --
-                // `DesktopSize` pseudo-encoding is out of scope, see the module doc comment).
-                let (width, height) = framebuffer.dimensions();
-                framebuffer.snapshot_into(&mut pixels);
-                if write_framebuffer_update(&mut write_stream, width, height, &pixels).is_err() {
-                    break;
-                }
+            if serve_updates(&mut write_stream, &*framebuffer, &requests).is_err() {
+                // Wake the reader thread out of its blocking read so the connection tears down
+                // promptly instead of lingering until the peer notices.
+                let _ = write_stream.shutdown(std::net::Shutdown::Both);
             }
         })
     };
 
-    let result = read_client_loop(&mut stream, &input_client, shutdown);
+    let result = read_client_loop(&mut stream, &input_client, &requests, shutdown);
     // Release this client's held input before waiting for the framebuffer pusher. Its socket write
     // may still be blocked or timing out after the reader observed disconnect.
     drop(input_client);
 
-    pusher_shutdown_flag.store(true, Ordering::Relaxed);
+    requests.stop();
     let _ = pusher.join();
     result
+}
+
+/// Answers a client's `FramebufferUpdateRequest`s until stopped or the socket fails. See
+/// [`UpdateRequest`] for the flow-control contract.
+fn serve_updates(
+    stream: &mut TcpStream,
+    framebuffer: &impl FramebufferSource,
+    requests: &UpdateRequest,
+) -> io::Result<()> {
+    let mut current = Vec::new();
+    // Pixels of the last update written to this client (empty until the first), so that an
+    // incremental update carries only the bands that changed since then.
+    let mut sent = Vec::new();
+    let mut sent_dims = (0u16, 0u16);
+    let mut last_snapshot: Option<Instant> = None;
+    let mut message = Vec::new();
+    while let Some((seq, full)) = requests.wait() {
+        if let Some(at) = last_snapshot {
+            std::thread::sleep(UPDATE_INTERVAL.saturating_sub(at.elapsed()));
+        }
+        // Dimensions are re-read every time so a mid-session `FBIOPUT_VSCREENINFO` resize is
+        // picked up without a dedicated notification channel; the client sees it as an ordinary
+        // full FramebufferUpdate whose rectangle now covers the new size (`DesktopSize`
+        // pseudo-encoding is out of scope, see the module doc comment).
+        let dims = framebuffer.dimensions();
+        framebuffer.snapshot_into(&mut current);
+        last_snapshot = Some(Instant::now());
+        let stride = usize::from(dims.0) * 4;
+        let rows = current
+            .len()
+            .checked_div(stride)
+            .map_or(0, |rows| u16::try_from(rows).unwrap_or(u16::MAX).min(dims.1));
+        let full = full || dims != sent_dims || current.len() != sent.len();
+        let rects = if rows == 0 {
+            Vec::new()
+        } else if full {
+            vec![(0, rows)]
+        } else {
+            dirty_bands(&sent, &current, stride, rows)
+        };
+        if rects.is_empty() && !full {
+            // Nothing changed: the request stays outstanding and is re-evaluated next tick.
+            continue;
+        }
+        encode_framebuffer_update(&mut message, dims.0, stride, &current, &rects);
+        stream.write_all(&message)?;
+        stream.flush()?;
+        std::mem::swap(&mut sent, &mut current);
+        sent_dims = dims;
+        requests.answered(seq);
+    }
+    Ok(())
+}
+
+/// The `(y, height)` runs of adjacent [`BAND_ROWS`]-row bands whose pixels differ between
+/// `sent` and `current` (both `rows * stride` bytes).
+fn dirty_bands(sent: &[u8], current: &[u8], stride: usize, rows: u16) -> Vec<(u16, u16)> {
+    let mut runs: Vec<(u16, u16)> = Vec::new();
+    let mut y = 0u16;
+    while y < rows {
+        let height = BAND_ROWS.min(rows - y);
+        let bytes = usize::from(y) * stride..usize::from(y + height) * stride;
+        if sent[bytes.clone()] != current[bytes] {
+            match runs.last_mut() {
+                Some((run_y, run_height)) if *run_y + *run_height == y => *run_height += height,
+                _ => runs.push((y, height)),
+            }
+        }
+        y += height;
+    }
+    runs
+}
+
+/// RFC 6143 §7.6.1: one `FramebufferUpdate` message with one full-width Raw rectangle per
+/// `(y, height)` entry of `rects`, assembled into `out` so the whole update leaves in one write.
+fn encode_framebuffer_update(
+    out: &mut Vec<u8>,
+    width: u16,
+    stride: usize,
+    pixels: &[u8],
+    rects: &[(u16, u16)],
+) {
+    out.clear();
+    out.extend_from_slice(&[proto::SERVER_FRAMEBUFFER_UPDATE, 0 /* padding */]);
+    // Dirty runs are separated by clean bands, so there are at most `u16::MAX / BAND_ROWS / 2`
+    // of them: the count always fits.
+    out.extend_from_slice(&u16::try_from(rects.len()).unwrap_or(u16::MAX).to_be_bytes());
+    for &(y, height) in rects {
+        // Rectangle header: x, y, width, height, encoding-type.
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&proto::ENCODING_RAW.to_be_bytes());
+        out.extend_from_slice(&pixels[usize::from(y) * stride..usize::from(y + height) * stride]);
+    }
 }
 
 /// RFC 6143 §7.1: version negotiation, security handshake (`None` only), `ClientInit`.
@@ -305,31 +474,12 @@ fn write_server_init(stream: &mut impl io::Write, width: u16, height: u16) -> io
     stream.flush()
 }
 
-/// RFC 6143 §7.6.1: one `FramebufferUpdate` message, one rectangle covering the whole
-/// framebuffer, Raw encoding.
-fn write_framebuffer_update(
-    stream: &mut impl io::Write,
-    width: u16,
-    height: u16,
-    pixels: &[u8],
-) -> io::Result<()> {
-    stream.write_all(&[proto::SERVER_FRAMEBUFFER_UPDATE, 0 /* padding */])?;
-    stream.write_all(&1u16.to_be_bytes())?; // number-of-rectangles
-    // Rectangle header: x, y, width, height, encoding-type.
-    stream.write_all(&0u16.to_be_bytes())?;
-    stream.write_all(&0u16.to_be_bytes())?;
-    stream.write_all(&width.to_be_bytes())?;
-    stream.write_all(&height.to_be_bytes())?;
-    stream.write_all(&proto::ENCODING_RAW.to_be_bytes())?;
-    stream.write_all(pixels)?;
-    stream.flush()
-}
-
 /// Reads and dispatches client-to-server messages until the connection closes or a fatal I/O
 /// error occurs. RFC 6143 §7.5.
 fn read_client_loop(
     stream: &mut impl io::Read,
     input_client: &InputClient<'_>,
+    requests: &UpdateRequest,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let mut msg_type = [0u8; 1];
@@ -355,9 +505,12 @@ fn read_client_loop(
                 proto::skip(stream, usize::from(count) * 4)?; // each encoding is an i32
             }
             proto::CLIENT_FRAMEBUFFER_UPDATE_REQUEST => {
-                // incremental(1) + x,y,w,h (u16 each) -- ignored; this server pushes on a fixed
-                // timer instead of tracking per-client request state (see `UPDATE_INTERVAL`).
-                proto::skip(stream, 1 + 2 + 2 + 2 + 2)?;
+                let mut incremental = [0u8; 1];
+                stream.read_exact(&mut incremental)?;
+                // x,y,w,h (u16 each) -- ignored: updates always cover full-width bands, which a
+                // client must tolerate (§7.5.3 lets a server send more than the requested area).
+                proto::skip(stream, 2 + 2 + 2 + 2)?;
+                requests.request(incremental[0] == 0);
             }
             proto::CLIENT_KEY_EVENT => {
                 let mut down_byte = [0u8; 1];

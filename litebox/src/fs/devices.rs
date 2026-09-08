@@ -44,6 +44,10 @@ const URANDOM_BLOCK_SIZE: usize = 0x1000;
 pub const FB_MAJOR: usize = 29;
 /// Block size for /dev/fb0
 const FB_BLOCK_SIZE: usize = 0x1000;
+/// `/dev/tty`'s major device number, matching real Linux's `TTYAUX_MAJOR` (minor 0 is
+/// `/dev/tty`). Public so the shim's `sys_ioctl` can recognize the controlling-terminal alias
+/// by its `rdev`, the same way it recognizes the stdio devices by theirs.
+pub const TTYAUX_MAJOR: usize = 5;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -80,6 +84,14 @@ const FB0_NODE_INFO: NodeInfo = NodeInfo {
     ino: 10,
     rdev: core::num::NonZeroUsize::new(FB_MAJOR << 8), // | minor 0
 };
+/// Node info for `/dev/tty`: the host stdio terminal under the name every CLI that wants "the
+/// terminal, whatever stdin/stdout are redirected to" opens. A process with a controlling
+/// pseudoterminal never reaches this node -- the shim aliases `/dev/tty` to its pty slave first.
+const TTY_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 11,
+    rdev: core::num::NonZeroUsize::new(TTYAUX_MAJOR << 8), // | minor 0
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
@@ -89,6 +101,7 @@ enum Device {
     Null,
     URandom,
     Fb0,
+    Tty,
 }
 
 impl Device {
@@ -99,6 +112,7 @@ impl Device {
         ("null", Device::Null),
         ("urandom", Device::URandom),
         ("fb0", Device::Fb0),
+        ("tty", Device::Tty),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
@@ -150,6 +164,17 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: FB0_NODE_INFO,
                 blksize: FB_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
+            },
+            Device::Tty => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: TTY_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
                 atime: Timestamp::default(),
                 mtime: Timestamp::default(),
                 ctime: Timestamp::default(),
@@ -332,7 +357,7 @@ where
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin => self
+            Device::Stdin | Device::Tty => self
                 .litebox
                 .x
                 .platform
@@ -357,7 +382,7 @@ where
         let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
-            Device::Stdout => crate::platform::StdioOutStream::Stdout,
+            Device::Stdout | Device::Tty => crate::platform::StdioOutStream::Stdout,
             Device::Stderr => crate::platform::StdioOutStream::Stderr,
             Device::Null | Device::URandom => {
                 // /dev/null discards data: report as if written fully
@@ -388,7 +413,9 @@ where
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin | Device::Stdout | Device::Stderr => SeekBehavior::NonSeekable,
+            Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty => {
+                SeekBehavior::NonSeekable
+            }
             Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
             // Real position tracking: a plain `cp /dev/fb0 snapshot` (sequential reads with no
             // explicit offset) must advance through the whole pixel store, and `FBIOPAN_DISPLAY`

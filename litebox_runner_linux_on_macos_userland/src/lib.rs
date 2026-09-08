@@ -45,6 +45,14 @@ impl litebox_rfb::FramebufferSource for FramebufferAdapter {
 /// The program binary and all its dependencies must be provided inside a tar
 /// archive via `--initial-files`. The program path refers to a path inside the
 /// tar archive.
+/// Published operation class exercised by `--hvf-published-panic`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum HvfPublishedPanicOperationArg {
+    Exclusive,
+    Shared,
+    ExistingVcpu,
+}
+
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CliArgs {
@@ -54,7 +62,7 @@ pub struct CliArgs {
     /// `--initial-files`. All binaries must be pre-rewritten with the syscall
     /// rewriter.
     #[arg(
-        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure"],
+        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling"],
         trailing_var_arg = true,
         value_hint = clap::ValueHint::CommandWithArguments
     )]
@@ -72,7 +80,7 @@ pub struct CliArgs {
     #[arg(
         long = "initial-files",
         value_name = "PATH_TO_TAR",
-        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure"],
+        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling"],
         value_hint = clap::ValueHint::FilePath
     )]
     pub initial_files: Option<PathBuf>,
@@ -125,6 +133,29 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub hvf_memory_failure: bool,
+    /// Prove that a callback panic remains the primary unwind payload when alias
+    /// restoration also fails, then recover the quarantined alias through
+    /// cleanup-only admission. This intentionally poisons its short-lived
+    /// diagnostic process.
+    #[arg(
+        long = "hvf-alias-panic-failure",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_alias_panic_failure: bool,
+    /// Prove that a panic after a published HVF mutation atomically poison-latches
+    /// the VM before releasing its admission. Select `exclusive`, `shared`, or
+    /// `existing-vcpu`; each invocation intentionally poisons its short-lived
+    /// diagnostic process.
+    #[arg(
+        long = "hvf-published-panic",
+        value_enum,
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_published_panic: Option<HvfPublishedPanicOperationArg>,
     /// Prove that a pending poison request rejects normal admission, waits for
     /// the in-flight owner to release, and leaves cleanup-only admission available.
     /// This intentionally poisons its short-lived diagnostic process.
@@ -154,6 +185,177 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub hvf_unmap_failure: bool,
+    /// Run the production HVF vCPU owner-lane diagnostic and exit.
+    ///
+    /// Creates a real vCPU on an owner lane, attaches it to a compact address
+    /// space, executes stock `SVC #0` code through the EL1 monitor, and
+    /// witnesses exact register/FPSIMD/TLS round-trips, resume semantics,
+    /// collective TLBI retirement, cross-thread cancellation, the virtual
+    /// timer, and zero residual vCPUs after close. The runner executable must
+    /// carry the `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-vcpu",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu_failure"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_vcpu: bool,
+    /// Run the process-terminal HVF vCPU failure witness and exit.
+    ///
+    /// Latches a raw `hv_vcpus_exit` kick on an idle vCPU so the next run
+    /// returns an unauthenticated `Canceled` exit, then proves the lane retires
+    /// the vCPU, abandons itself, poisons the process VM, is reaped with zero
+    /// residual vCPUs, and that cleanup-admitted teardown still reaches zero
+    /// address spaces. The VM stays poisoned for the rest of the process. The
+    /// runner executable must carry the `com.apple.security.hypervisor`
+    /// entitlement.
+    #[arg(
+        long = "hvf-vcpu-failure",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_vcpu_failure: bool,
+    /// Run the process-terminal HVF vCPU cleanup-custody witness and exit.
+    ///
+    /// Injects `hv_vcpu_destroy` failures for the initial destroy plus one
+    /// full retry wave, then proves the owner lane reports residual vCPUs to
+    /// close, keeps its owner thread and registry capacity alive as cleanup
+    /// custodian, and releases both only after a later wave genuinely
+    /// destroys the vCPU. Takes roughly a dozen seconds; the VM stays poisoned
+    /// for the rest of the process. The runner executable must carry the
+    /// `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-vcpu-custody",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_vcpu_custody: bool,
+    /// Run the process-terminal HVF vCPU totality/capacity-recovery witness
+    /// and exit.
+    ///
+    /// Fills a small dedicated lane's bounded command queue to exactly its
+    /// capacity, proves the `capacity + 1`th command is rejected cleanly
+    /// (`QueueOverloaded`, not a panic, hang, or silent drop) while the lane
+    /// stays live and every genuinely queued command still drains, then
+    /// injects a real Rust panic into the owner thread's command dispatch and
+    /// proves `catch_unwind` contains it: the process does not abort, the
+    /// lane is abandoned and reaped normally, and cleanup reaches exactly
+    /// zero residual lanes, vCPUs, and address spaces. The VM stays poisoned
+    /// for the rest of the process. The runner executable must carry the
+    /// `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-vcpu-totality",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_vcpu_totality: bool,
+    /// Run the mirrored host-view witness for the HVF backend and exit.
+    ///
+    /// Proves that a mirrored compact address space presents every guest page
+    /// to the host at its own address with guest permissions minus EXECUTE,
+    /// that W^X is refused, that unmapped ranges fault recoverably, that
+    /// shared backings alias, and that deferred retirements pump to zero. The
+    /// runner executable must carry the `com.apple.security.hypervisor`
+    /// entitlement.
+    #[arg(
+        long = "hvf-mirrored-view",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_mirrored_view: bool,
+    /// Run the alias-race witness for the HVF backend and exit.
+    ///
+    /// Races a raw `memcpy_fallible` reader thread -- standing in for a
+    /// Linux shim syscall's `UserPtr`/`UserPtrMut` dereference of the
+    /// mirrored guest alias, which holds no lease and runs with the owning
+    /// vCPU's `in_flight` slot already retired to zero -- against the owner
+    /// thread's repeated `unmap_range`/`map_range` on the exact same GVA,
+    /// with no synchronization between the two beyond what the mirrored
+    /// address space itself provides. Proves the racer never observes a
+    /// torn or foreign value and every fault correlates with a real unmap
+    /// window, i.e. no use-after-free, no torn read that escapes the
+    /// fallible API, and no wrong-permission access. The runner executable
+    /// must carry the `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-alias-race",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_alias_race: bool,
+    /// Execute the guest on the Hypervisor.framework backend.
+    ///
+    /// Unchanged stock AArch64 Linux binaries run at EL0 on real vCPUs: real
+    /// `SVC #0` dispatches through the EL1 monitor into the Linux shim, no
+    /// syscall rewriting is applied or expected, and `x18` is preserved. The
+    /// tar must therefore contain stock (non-rewritten) binaries. The runner
+    /// executable must carry the `com.apple.security.hypervisor` entitlement.
+    #[arg(long = "hvf", requires = "unstable", help_heading = "HVF diagnostics")]
+    pub hvf: bool,
+    /// Install the HVF backend, drop into the Seatbelt sandbox exactly as the
+    /// production runner does, then run one real `hv_vcpu_run` round-trip and
+    /// exit. Proves Hypervisor.framework calls keep working with the sandbox
+    /// installed, rather than only ever having been exercised without it.
+    /// The runner executable must carry the `com.apple.security.hypervisor`
+    /// entitlement.
+    #[arg(
+        long = "hvf-sandbox",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_lane_starvation"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_sandbox: bool,
+    /// Install the HVF backend, then prove `LANE_ACQUIRE_TIMEOUT` (60 seconds)
+    /// is a genuine bound under real starvation: every pooled vCPU lane is
+    /// occupied with a real spinning guest run, one more acquire is issued
+    /// against the exhausted pool, and the call must block for approximately
+    /// the full deadline before returning a typed timeout error rather than
+    /// hanging forever or returning early. Takes just over a minute. The
+    /// runner executable must carry the `com.apple.security.hypervisor`
+    /// entitlement.
+    #[arg(
+        long = "hvf-lane-starvation",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_lane_starvation: bool,
+    /// Install the HVF backend, then measure real wall-clock latency from a
+    /// lane being released back to the pool to a concurrently blocked
+    /// waiter waking and acquiring it, across many trials. Reports
+    /// p50/p99/max/min/mean in nanoseconds and a trend check across the
+    /// trial sequence, live evidence that the lane pool's idle wait is
+    /// genuinely bounded rather than unbounded or growing. The runner
+    /// executable must carry the `com.apple.security.hypervisor`
+    /// entitlement.
+    #[arg(
+        long = "hvf-scheduler-latency",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_scaling"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_scheduler_latency: bool,
+    /// Install the HVF backend, then measure real wall-clock scaling of
+    /// independent, non-yielding compute-bound guest threads at
+    /// concurrency 1, 2, 4, 8 (bounded by the lane pool's own size): each
+    /// worker spins an unbounded ALU loop on its own disjoint mapped page,
+    /// time-sliced by the production VTimer exactly as `run_thread` does.
+    /// Reports summed time-slice throughput and measured speedup per level
+    /// -- near-linear scaling up to the lane/core count is live evidence
+    /// that independent vCPUs make concurrent progress rather than
+    /// serializing behind a shared lock. The runner executable must carry
+    /// the `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-scheduler-scaling",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_scheduler_scaling: bool,
     /// Connect to a `utun` device with this name (e.g. `utun4`).
     ///
     /// Creating the interface needs root on this host, so the guest has no
@@ -568,6 +770,31 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         return Ok(());
     }
 
+    if cli_args.hvf_alias_panic_failure {
+        let report = litebox_platform_macos_userland::hvf_alias_panic_failure_probe()
+            .map_err(|error| anyhow!("HVF alias-panic recovery failed: {error}"))?;
+        println!("HVF alias-panic recovery passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if let Some(operation) = cli_args.hvf_published_panic {
+        let operation = match operation {
+            HvfPublishedPanicOperationArg::Exclusive => {
+                litebox_platform_macos_userland::HvfPublishedPanicOperation::Exclusive
+            }
+            HvfPublishedPanicOperationArg::Shared => {
+                litebox_platform_macos_userland::HvfPublishedPanicOperation::Shared
+            }
+            HvfPublishedPanicOperationArg::ExistingVcpu => {
+                litebox_platform_macos_userland::HvfPublishedPanicOperation::ExistingVcpu
+            }
+        };
+        let report = litebox_platform_macos_userland::hvf_published_panic_probe(operation)
+            .map_err(|error| anyhow!("HVF published-panic serialization failed: {error}"))?;
+        println!("HVF published-panic serialization passed:\n{report:#?}");
+        return Ok(());
+    }
+
     if cli_args.hvf_poison {
         let report = litebox_platform_macos_userland::hvf_poison_concurrency_probe()
             .map_err(|error| anyhow!("HVF poison serialization failed: {error}"))?;
@@ -589,6 +816,90 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         return Ok(());
     }
 
+    if cli_args.hvf_vcpu {
+        let report = litebox_platform_macos_userland::hvf_vcpu_diagnostic_probe()
+            .map_err(|error| anyhow!("HVF vCPU owner-lane diagnostic failed: {error}"))?;
+        println!("HVF vCPU owner-lane diagnostic passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_vcpu_failure {
+        let report = litebox_platform_macos_userland::hvf_vcpu_failure_probe()
+            .map_err(|error| anyhow!("HVF vCPU terminal-exit witness failed: {error}"))?;
+        println!("HVF vCPU terminal-exit witness passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_vcpu_custody {
+        let report = litebox_platform_macos_userland::hvf_vcpu_custody_probe()
+            .map_err(|error| anyhow!("HVF vCPU cleanup-custody witness failed: {error}"))?;
+        println!("HVF vCPU cleanup-custody witness passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_vcpu_totality {
+        let report =
+            litebox_platform_macos_userland::hvf_vcpu_totality_probe().map_err(|error| {
+                anyhow!("HVF vCPU totality/capacity-recovery witness failed: {error}")
+            })?;
+        println!("HVF vCPU totality/capacity-recovery witness passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_mirrored_view {
+        let report = litebox_platform_macos_userland::hvf_mirrored_view_probe()
+            .map_err(|error| anyhow!("HVF mirrored host view failed: {error}"))?;
+        println!("HVF mirrored host view passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_alias_race {
+        let report = litebox_platform_macos_userland::hvf_alias_race_probe()
+            .map_err(|error| anyhow!("HVF alias-race witness failed: {error}"))?;
+        println!("HVF alias-race witness passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_sandbox {
+        Platform::new_with_hvf(cli_args.tun_device_name.as_deref(), false)
+            .map_err(|error| anyhow!("failed to install the HVF guest backend: {error}"))?;
+        litebox_platform_macos_userland::enable_seatbelt_sandbox();
+        litebox_platform_macos_userland::hvf_sandbox_probe()
+            .map_err(|error| anyhow!("HVF-under-Seatbelt witness failed: {error}"))?;
+        println!("HVF vCPU round-trip under the Seatbelt sandbox passed");
+        return Ok(());
+    }
+
+    if cli_args.hvf_lane_starvation {
+        Platform::new_with_hvf(cli_args.tun_device_name.as_deref(), false)
+            .map_err(|error| anyhow!("failed to install the HVF guest backend: {error}"))?;
+        let report = litebox_platform_macos_userland::hvf_lane_starvation_probe()
+            .map_err(|error| anyhow!("HVF lane starvation witness failed: {error}"))?;
+        println!("HVF lane starvation witness passed:\n{report:#?}");
+        let replacement_report = litebox_platform_macos_userland::hvf_lane_replacement_probe()
+            .map_err(|error| anyhow!("HVF lane replacement witness failed: {error}"))?;
+        println!("HVF lane replacement witness passed:\n{replacement_report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_scheduler_latency {
+        Platform::new_with_hvf(cli_args.tun_device_name.as_deref(), false)
+            .map_err(|error| anyhow!("failed to install the HVF guest backend: {error}"))?;
+        let report = litebox_platform_macos_userland::hvf_scheduler_latency_probe()
+            .map_err(|error| anyhow!("HVF scheduler latency probe failed: {error}"))?;
+        println!("HVF scheduler latency probe passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_scheduler_scaling {
+        Platform::new_with_hvf(cli_args.tun_device_name.as_deref(), false)
+            .map_err(|error| anyhow!("failed to install the HVF guest backend: {error}"))?;
+        let report = litebox_platform_macos_userland::hvf_scheduler_scaling_probe()
+            .map_err(|error| anyhow!("HVF scheduler scaling probe failed: {error}"))?;
+        println!("HVF scheduler scaling probe passed:\n{report:#?}");
+        return Ok(());
+    }
+
     let tar_file = cli_args
         .initial_files
         .as_ref()
@@ -602,10 +913,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // `--vnc`/`--vnc-web` make the viewer keyboard a second stdin producer, so a
     // closed/redirected host stdin must not read as EOF to the guest (a console program
     // would exit on it).
-    let platform = Platform::new_with_options(
-        cli_args.tun_device_name.as_deref(),
-        cli_args.vnc || cli_args.vnc_web.is_some(),
-    );
+    let hold_stdin_open = cli_args.vnc || cli_args.vnc_web.is_some();
+    let platform = if cli_args.hvf {
+        Platform::new_with_hvf(cli_args.tun_device_name.as_deref(), hold_stdin_open)
+            .map_err(|error| anyhow!("failed to install the HVF guest backend: {error}"))?
+    } else {
+        Platform::new_with_options(cli_args.tun_device_name.as_deref(), hold_stdin_open)
+    };
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
@@ -749,6 +1063,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // unreadable under the sandbox) must both exist before `enable_seatbelt_sandbox*` runs;
     // the widened profile then keeps the bridge's outbound `connect`s working after.
     if cli_args.net_proxy {
+        // With no utun attached, non-proxied outbound packets otherwise have nowhere
+        // to go; the engine makes plain guest TCP/UDP work alongside the proxied
+        // services below. utun precedence is also enforced in the platform's
+        // send/receive bodies.
+        if cli_args.tun_device_name.is_none() {
+            platform.enable_nat_engine();
+        }
         let listener = shim
             .listen_in_guest(std::net::SocketAddr::from(net_proxy::PROXY_ADDR), 16)
             .map_err(|e| anyhow!("failed to start the in-guest proxy listener: {e:?}"))?;
@@ -775,9 +1096,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             addr:% = litebox::net::ICMP_ECHO_PROXY_ADDR;
             "guest ICMP echo bridge listening"
         );
+        // The addresses the shim's network was built with (`build_with_net_config` above):
+        // the DNS responder answers the guest's own host name with the interface address, and
+        // the ICMP bridge answers echoes to either address itself.
+        let interface_ip = cli_args.guest_ip.unwrap_or(litebox::net::INTERFACE_IP_ADDR);
+        let gateway_ip = cli_args.gateway_ip.unwrap_or(litebox::net::GATEWAY_IP_ADDR);
         let dns_resolvers = resolvers.clone();
-        std::thread::spawn(move || net_proxy::serve_dns(&dns_socket, dns_resolvers));
-        std::thread::spawn(move || net_proxy::serve_icmp(&icmp_socket, icmp_host));
+        std::thread::spawn(move || {
+            net_proxy::serve_dns(&dns_socket, dns_resolvers, interface_ip);
+        });
+        std::thread::spawn(move || {
+            net_proxy::serve_icmp(&icmp_socket, icmp_host, [interface_ip, gateway_ip]);
+        });
         std::thread::spawn(move || net_proxy::serve(&listener, resolvers, tls));
     }
 
@@ -790,7 +1120,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let mut guest_environment = cli_args.environment_variables.clone();
-    if cli_args.net_proxy {
+    // The loopback proxy environment was the guest's only way out when `--net-proxy` had no
+    // external path. With the rootless NAT engine (no `--tun-device-name`) the guest routes
+    // directly, exactly as on Linux; pointing every HTTP client at the proxy would only add a
+    // hop and hide the direct path from programs (Chromium, apk, wget) that honour
+    // `https_proxy`. The proxy itself keeps listening for clients that ask for it explicitly.
+    if cli_args.net_proxy && cli_args.tun_device_name.is_some() {
         const PROXY_URL: &str = "http://127.0.0.1:3128";
         for (name, value) in [
             ("http_proxy", PROXY_URL),
@@ -817,6 +1152,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 guest_environment.push(format!("{name}={value}"));
             }
         }
+    }
+    // No init or login shell ever runs in this guest to set PATH, and ash's built-in default
+    // is used for its own lookups but never exported, so a setuid helper like `doas` (which
+    // runs its target with the `PATH` it finds in the environment) sees none at all.
+    if !guest_environment
+        .iter()
+        .any(|entry| entry.split_once('=').is_some_and(|(key, _)| key == "PATH"))
+    {
+        guest_environment
+            .push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned());
     }
     let envp = guest_environment
         .iter()

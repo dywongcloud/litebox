@@ -6,12 +6,15 @@
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub mod file;
+pub(crate) mod inotify;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
 pub(crate) mod netlink;
 pub(crate) mod pipe;
 pub mod process;
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod ptrace;
 pub(crate) mod unix;
 
 pub(crate) mod signal;

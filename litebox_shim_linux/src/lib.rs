@@ -36,7 +36,8 @@ use litebox_common_linux::{
     user_pointers::{UserPtr, UserPtrMut},
 };
 
-/// On debug builds, logs that the user attempted to use an unsupported feature.
+/// Logs that the guest attempted to use an unsupported feature -- once per
+/// distinct message, in every build (see [`unsupported`]).
 // DEVNOTE: this is before the `mod` declarations so that it can be used within them.
 macro_rules! log_unsupported {
     ($($arg:tt)*) => {
@@ -115,10 +116,146 @@ impl<T> ShimPlatform for T where
 {
 }
 
-/// On debug builds, logs that the user attempted to use an unsupported feature.
+/// Logs that the guest attempted to use an unsupported feature.
+///
+/// Every build logs this, but only the first sighting of each distinct message
+/// is emitted at `warn`; repeats are counted and shown only at `trace`, next to
+/// the per-syscall trace. The previous `debug_assertions`-only gate made the
+/// whole class invisible in the release runner, which is where real guests run
+/// (a Chromium startup hit `mseal` and `prctl(PR_SET_VMA)` thousands of times
+/// with nothing logged), and an ungated per-call line at that rate would bury
+/// everything else. See [`unsupported`] for the bounded dedupe table.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
-    if cfg!(debug_assertions) {
-        litebox_util_log::warn!(feature:% = args; "unsupported");
+    let shape = unsupported::shape_of(args);
+    match unsupported::record(None, &shape) {
+        unsupported::Sighting::First => {
+            litebox_util_log::warn!(
+                feature:% = shape;
+                "unsupported (first sighting; repeats logged at trace level)"
+            );
+        }
+        unsupported::Sighting::Repeat(count) => {
+            litebox_util_log::trace!(feature:% = shape, count:? = count; "unsupported (repeat)");
+        }
+    }
+}
+
+/// A bounded, deduplicated record of the unsupported guest requests seen so
+/// far, so that release builds can report each distinct one exactly once.
+///
+/// Keyed by the syscall number (when the caller knows it) and the formatted
+/// message, which doubles as the "argument shape": `prctl(SetVma)` and
+/// `prctl(PR_SET_KEEPCAPS, 7)` are distinct rows, while the ten-thousandth
+/// `mseal` is the same row as the first. The table is fixed-size and lives in a
+/// `static` because the reporting entry points (`log_unsupported!`) have no
+/// task in scope; when it fills up (a caller formatting a pointer into the
+/// message, say), distinct-ness degrades to "one line per syscall number" via
+/// a bitmap, and to nothing at all for number-less callers -- never to a
+/// per-call flood, and never to unbounded growth.
+mod unsupported {
+    use arrayvec::{ArrayString, ArrayVec};
+    use core::fmt::Write as _;
+
+    /// Longest message kept per row; longer ones are truncated, which only
+    /// makes two long messages collide, never a lost row.
+    pub(crate) const SHAPE_LEN: usize = 96;
+    const TABLE_LEN: usize = 128;
+    /// Bits for syscall numbers `0..SYSNO_BITMAP_BITS`; the bitmap is the
+    /// overflow fallback once the row table is full.
+    const SYSNO_BITMAP_WORDS: usize = 16;
+
+    pub(crate) type Shape = ArrayString<SHAPE_LEN>;
+
+    struct Row {
+        nr: Option<usize>,
+        shape: Shape,
+        count: u64,
+    }
+
+    struct Table {
+        rows: ArrayVec<Row, TABLE_LEN>,
+        /// Syscall numbers that have had at least one line emitted after the
+        /// row table filled up.
+        overflow_seen: [u64; SYSNO_BITMAP_WORDS],
+        /// Sightings that found the table full and their number already
+        /// reported (or had no number): counted so the loss is measurable.
+        overflow_dropped: u64,
+    }
+
+    static TABLE: spin::Mutex<Table> = spin::Mutex::new(Table {
+        rows: ArrayVec::new_const(),
+        overflow_seen: [0; SYSNO_BITMAP_WORDS],
+        overflow_dropped: 0,
+    });
+
+    /// What [`record`] found: the caller logs a `First` loudly and a `Repeat`
+    /// only at trace level.
+    pub(crate) enum Sighting {
+        First,
+        Repeat(u64),
+    }
+
+    /// Format `args` into a bounded key; truncation is silent by design.
+    pub(crate) fn shape_of(args: core::fmt::Arguments<'_>) -> Shape {
+        let mut shape = Shape::new_const();
+        let _ = write!(shape, "{args}");
+        shape
+    }
+
+    /// Record one sighting of (`nr`, `shape`).
+    pub(crate) fn record(nr: Option<usize>, shape: &Shape) -> Sighting {
+        let mut table = TABLE.lock();
+        if let Some(row) = table
+            .rows
+            .iter_mut()
+            .find(|row| row.nr == nr && row.shape == *shape)
+        {
+            row.count = row.count.saturating_add(1);
+            return Sighting::Repeat(row.count);
+        }
+        if table
+            .rows
+            .try_push(Row {
+                nr,
+                shape: *shape,
+                count: 1,
+            })
+            .is_ok()
+        {
+            return Sighting::First;
+        }
+        // Table full: fall back to once-per-syscall-number.
+        if let Some(nr) = nr
+            && let Some(word) = table.overflow_seen.get_mut(nr / 64)
+        {
+            let bit = 1u64 << (nr % 64);
+            if *word & bit == 0 {
+                *word |= bit;
+                return Sighting::First;
+            }
+        }
+        table.overflow_dropped = table.overflow_dropped.saturating_add(1);
+        Sighting::Repeat(table.overflow_dropped)
+    }
+
+    /// The Linux name of syscall `nr`, from the `syscalls` crate's table, with
+    /// a local tail for numbers newer than that table (`mseal` is the one a
+    /// current Chromium probes on every large mapping).
+    pub(crate) fn syscall_name(nr: usize) -> &'static str {
+        if let Some(sysno) = ::syscalls::Sysno::new(nr) {
+            return sysno.name();
+        }
+        match nr {
+            462 => "mseal",
+            463 => "setxattrat",
+            464 => "getxattrat",
+            465 => "listxattrat",
+            466 => "removexattrat",
+            467 => "open_tree_attr",
+            468 => "file_getattr",
+            469 => "file_setattr",
+            _ => "?",
+        }
     }
 }
 
@@ -210,16 +347,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         // it is inert unless logging is enabled -- guests also take faults on
         // purpose (e.g. OpenSSL's SIGILL CPU-feature probes).
         {
-            let symbolize = |addr: usize| match self.task.find_guest_image(addr) {
+            let symbolize = |addr: usize| match self.task.symbolize_guest_address(addr) {
                 Some((path, offset)) => alloc::format!("{path}+{offset:#x}"),
                 None => alloc::format!("{addr:#x} (no image)"),
             };
             #[cfg(target_arch = "aarch64")]
-            litebox_util_log::debug!(
-                pc:% = symbolize(ctx.pc), x30:% = symbolize(ctx.regs[30]),
-                exception:? = info.exception;
-                "guest fault location"
-            );
+            {
+                litebox_util_log::debug!(
+                    pc:% = symbolize(ctx.pc), x30:% = symbolize(ctx.regs[30]),
+                    exception:? = info.exception;
+                    "guest fault location"
+                );
+                // The integer register file, so a data abort's faulting address can be
+                // reconstructed from the disassembly at `pc` (the platform's `fault_address`
+                // is not always populated).
+                let mut regs = alloc::string::String::new();
+                for (i, r) in ctx.regs.iter().enumerate() {
+                    use core::fmt::Write as _;
+                    let _ = write!(regs, "x{i}={r:#x} ");
+                }
+                litebox_util_log::debug!(
+                    sp:% = alloc::format!("{:#x}", ctx.sp), regs:% = regs;
+                    "guest fault registers"
+                );
+            }
             #[cfg(target_arch = "x86_64")]
             litebox_util_log::debug!(
                 rip:% = symbolize(ctx.rip), rsp:% = alloc::format!("{:#x}", ctx.rsp),
@@ -351,6 +502,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             pty_registry: Arc::new(syscalls::file::PtyRegistry::new()),
             guest_images: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+            loaded_images: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
             shared_file_backings: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             termios: litebox::sync::Mutex::new(litebox_common_linux::Termios::default_cooked()),
             stdio_foreground_pgid: core::sync::atomic::AtomicI32::new(0),
@@ -406,7 +558,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         } = task;
 
         let files = syscalls::file::FilesState::new(fs);
-        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+        // Actual fd-allocation ceiling stays at the hard limit regardless of the reported soft
+        // `RLIMIT_NOFILE` default (see that constant's own doc comment): a process that never
+        // calls `setrlimit` can still open as many fds as it needs, matching this shim's existing
+        // choice not to enforce rlimits, while `getrlimit`/`prlimit64` still *report* a realistic
+        // low soft default so close-every-fd-up-to-the-limit startup loops (real daemons do this,
+        // `dbus-daemon` observed live) stay fast instead of scanning up to a million fds.
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_MAX - 1);
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
@@ -435,7 +593,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                address_space: RefCell::new(None),
                 guest_sp: Cell::new(0),
             },
         };
@@ -754,6 +911,14 @@ impl ToSyscallResult for Result<u32, Errno> {
         self.map(|v| v as usize)
     }
 }
+impl ToSyscallResult for Result<i32, Errno> {
+    fn to_syscall_result(self) -> Result<usize, Errno> {
+        // `inotify_add_watch(2)`'s only current caller of this impl returns a small positive
+        // watch descriptor; the raw syscall ABI still reinterprets it as an unsigned register
+        // value exactly like every other non-negative-int-returning syscall here.
+        self.map(|v| v.reinterpret_as_unsigned() as usize)
+    }
+}
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
@@ -893,7 +1058,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // it identically on both architectures.
         #[cfg(target_arch = "aarch64")]
         let syscall_number = (ctx.syscallno as isize).reinterpret_as_unsigned();
-        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        // The decoder reports what it could not decode through the callback; keep
+        // that message out of band so the one line logged below can carry the
+        // syscall number, its name, the decoder's own description of the
+        // unsupported shape, and the errno the guest is about to see -- and so
+        // that a decode failure the decoder does *not* flag (a bare `EINVAL`
+        // for an unknown `prctl` option, say) is still visible, once.
+        let decode_note: RefCell<Option<unsupported::Shape>> = RefCell::new(None);
+        let request = SyscallRequest::try_from_raw(syscall_number, ctx, |args| {
+            *decode_note.borrow_mut() = Some(unsupported::shape_of(args));
+        });
+        let request = match request {
+            Ok(request) => {
+                if let Some(shape) = decode_note.take() {
+                    self.report_unsupported_syscall(syscall_number, shape, Ok(()));
+                }
+                request
+            }
+            Err(errno) => {
+                let shape = decode_note.take().unwrap_or_else(|| {
+                    let args = raw_syscall_args(ctx);
+                    unsupported::shape_of(format_args!(
+                        "decode failed, args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+                        args[0], args[1], args[2], args[3], args[4], args[5]
+                    ))
+                });
+                self.report_unsupported_syscall(syscall_number, shape, Err(errno));
+                return Err(errno);
+            }
+        };
         // A permanent, trace-gated record of every decoded syscall
         // (`LITEBOX_LOG=litebox_shim_linux=trace`). Off by default and a single level check when
         // it is off, but it is the only view of what a real guest is actually asking for: it is
@@ -981,6 +1174,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Chroot { path } => path
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| syscall!(sys_chroot(path))),
             SyscallRequest::Fchdir { fd } => syscall!(sys_fchdir(fd)),
             SyscallRequest::RtSigprocmask {
                 how,
@@ -1027,11 +1223,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 flags,
                 fd,
                 offset,
-            } => self
-                .sys_mmap(addr, length, prot, flags, fd, offset)
-                .map(|ptr| ptr.as_usize()),
+            } => {
+                // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
+                // `Task::touches_another_process`'s doc comment. Only `MAP_FIXED` is destructive
+                // to whatever is already there; an ordinary hinted/hint-free mapping always goes
+                // through the placement allocator, which cannot land on another process's live
+                // memory (`Vmem::reserve_external` already covers the one gap that existed there).
+                if flags.contains(litebox_common_linux::MapFlags::MAP_FIXED)
+                    && self.touches_another_process(addr, length)
+                {
+                    Err(Errno::ENOMEM)
+                } else {
+                    self.sys_mmap(addr, length, prot, flags, fd, offset)
+                        .map(|ptr| ptr.as_usize())
+                }
+            }
             SyscallRequest::Mprotect { addr, length, prot } => {
-                syscall!(sys_mprotect(addr, length, prot))
+                // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
+                // `Task::touches_another_process`'s doc comment. Mirrors real Linux's own
+                // `mprotect` response to a range that is not entirely this process's own mapping.
+                if self.touches_another_process(addr.as_usize(), length) {
+                    Err(Errno::ENOMEM)
+                } else {
+                    syscall!(sys_mprotect(addr, length, prot))
+                }
             }
             SyscallRequest::Mremap {
                 old_addr,
@@ -1042,7 +1257,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => self
                 .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
                 .map(|ptr| ptr.as_usize()),
-            SyscallRequest::Munmap { addr, length } => syscall!(sys_munmap(addr, length)),
+            SyscallRequest::Munmap { addr, length } => {
+                // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
+                // `Task::touches_another_process`'s doc comment. Real Linux's own `munmap` is a
+                // silent no-op over a range this process never had mapped; treating a range that
+                // turns out to be a stranger's memory the same way is the closest honest match --
+                // no case exists where correctly unmapping this process's own memory requires
+                // touching another process's.
+                if self.touches_another_process(addr.as_usize(), length) {
+                    Ok(0)
+                } else {
+                    syscall!(sys_munmap(addr, length))
+                }
+            }
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),
@@ -1199,7 +1426,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 sigmask,
                 sigsetsize,
             } => self.sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize),
+            // PR_SET_VMA (PartitionAlloc names every large anonymous mapping): decoded so it
+            // is visible in the syscall trace, answered EINVAL exactly like a kernel built
+            // without CONFIG_ANON_VMA_NAME -- callers already tolerate that.
+            SyscallRequest::Prctl {
+                args: litebox_common_linux::PrctlArg::SetVma {
+                    opcode, addr, len, ..
+                },
+            } => {
+                // One line per opcode, not per mapping: the per-call `addr`/`len` are
+                // already in the trace-level `syscall req=` record.
+                let _ = (addr, len);
+                log_unsupported!("prctl(PR_SET_VMA, opcode = {opcode}) -> EINVAL");
+                Err(Errno::EINVAL)
+            }
             SyscallRequest::Prctl { args } => self.sys_prctl(args),
+            // seccomp(2) and prctl(PR_SET_SECCOMP): no BPF filtering exists in the shim, so
+            // `sys_seccomp` answers an honest ENOSYS (a kernel without CONFIG_SECCOMP), never a
+            // fake success, and Chromium's layer-2 sandbox degrades instead of believing itself
+            // enforced.
+            SyscallRequest::Seccomp {
+                operation,
+                flags,
+                args,
+            } => syscall!(sys_seccomp(operation, flags, args)),
+            // mseal(2): nothing seals mappings yet; ENOSYS is what a pre-6.10 kernel says and
+            // PartitionAlloc's probe tolerates it. Decoded (rather than "unknown syscall 462")
+            // so the trace shows what was asked.
+            SyscallRequest::Mseal { addr, len, flags } => {
+                // One line per flags value, not per call (Chromium probes this on every
+                // large mapping); `addr`/`len` are in the trace-level `syscall req=` record.
+                let _ = (addr, len);
+                log_unsupported!("mseal(flags = {flags}) -> ENOSYS");
+                Err(Errno::ENOSYS)
+            }
             SyscallRequest::ArchPrctl { arg } => syscall!(sys_arch_prctl(arg)),
             SyscallRequest::Readlink {
                 pathname,
@@ -1290,6 +1550,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     syscall!(sys_openat(dirfd, path, flags, mode))
                 }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
+            SyscallRequest::Fallocate {
+                fd,
+                mode,
+                offset,
+                len,
+            } => syscall!(sys_fallocate(fd, mode, offset, len)),
+            SyscallRequest::Fadvise64 {
+                fd,
+                offset,
+                len,
+                advice,
+            } => syscall!(sys_fadvise64(fd, offset, len, advice)),
+            SyscallRequest::Preadv2 {
+                fd,
+                iovec,
+                iovcnt,
+                pos_l,
+                pos_h,
+                flags,
+            } => self.sys_preadv2(fd, iovec, iovcnt, preadv_pwritev_offset(pos_l, pos_h), flags),
+            SyscallRequest::Pwritev2 {
+                fd,
+                iovec,
+                iovcnt,
+                pos_l,
+                pos_h,
+                flags,
+            } => self.sys_pwritev2(fd, iovec, iovcnt, preadv_pwritev_offset(pos_l, pos_h), flags),
             SyscallRequest::MemfdCreate { name, flags } => name
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |name| {
@@ -1382,6 +1670,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Fchown { fd, owner, group } => {
                 syscall!(sys_fchown(fd, owner, group))
             }
+            SyscallRequest::Fsync { fd } => syscall!(sys_fsync(fd)),
             SyscallRequest::Utimensat {
                 dirfd,
                 pathname,
@@ -1479,6 +1768,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::InotifyInit1 { flags } => syscall!(sys_inotify_init1(flags)),
+            SyscallRequest::InotifyAddWatch { fd, pathname, mask } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_inotify_add_watch(fd, path, mask))
+                }),
+            SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd
@@ -1572,6 +1868,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Setresgid { rgid, egid, sgid } => {
                 syscall!(sys_setresgid(rgid, egid, sgid))
             }
+            SyscallRequest::Getresuid { ruid, euid, suid } => {
+                syscall!(sys_getresuid(ruid, euid, suid))
+            }
+            SyscallRequest::Getresgid { rgid, egid, sgid } => {
+                syscall!(sys_getresgid(rgid, egid, sgid))
+            }
             SyscallRequest::Sysinfo { buf } => {
                 let sysinfo = self.sys_sysinfo();
                 buf.write_at_offset::<Platform>(0, sysinfo)
@@ -1586,6 +1888,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .map(|()| 0)
             }
             SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
+            SyscallRequest::CapSet { header, data } => syscall!(sys_capset(header, data)),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
             }
@@ -1626,6 +1929,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
+            SyscallRequest::RtSigtimedwait {
+                set,
+                info,
+                timeout,
+                sigsetsize,
+            } => self.sys_rt_sigtimedwait(set, info, timeout, sigsetsize),
+            SyscallRequest::RtSigqueueinfo { pid, sig, info } => {
+                self.sys_rt_sigqueueinfo(pid, sig, info)
+            }
+            SyscallRequest::RtTgsigqueueinfo {
+                tgid,
+                tid,
+                sig,
+                info,
+            } => self.sys_rt_tgsigqueueinfo(tgid, tid, sig, info),
+            SyscallRequest::Getpriority { which, who } => self.sys_getpriority(which, who),
+            SyscallRequest::Setpriority {
+                which,
+                who,
+                niceval,
+            } => syscall!(sys_setpriority(which, who, niceval)),
+            SyscallRequest::Membarrier { cmd, flags, cpu_id } => {
+                self.sys_membarrier(cmd, flags, cpu_id)
+            }
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
             SyscallRequest::Pause => syscall!(sys_pause()),
@@ -1637,9 +1964,161 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 new_value,
                 old_value,
             } => syscall!(sys_setitimer(which, new_value, old_value)),
+            #[cfg(target_arch = "aarch64")]
+            SyscallRequest::Ptrace {
+                request,
+                pid,
+                addr,
+                data,
+            } => self.sys_ptrace(request, pid, addr, data),
+            #[cfg(target_arch = "x86_64")]
+            SyscallRequest::Ptrace { .. } => Err(Errno::ENOSYS),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
+            }
+        }
+    }
+}
+
+/// The six syscall arguments as the guest passed them, for naming an undecodable
+/// request by its shape when the decoder itself said nothing about it (the argument
+/// values are what tell an unknown `madvise` advice or `prctl` option apart).
+#[cfg(target_arch = "aarch64")]
+fn raw_syscall_args(ctx: &litebox_common_linux::PtRegs) -> [usize; 6] {
+    [
+        ctx.regs[0],
+        ctx.regs[1],
+        ctx.regs[2],
+        ctx.regs[3],
+        ctx.regs[4],
+        ctx.regs[5],
+    ]
+}
+#[cfg(target_arch = "x86_64")]
+fn raw_syscall_args(ctx: &litebox_common_linux::PtRegs) -> [usize; 6] {
+    [ctx.rdi, ctx.rsi, ctx.rdx, ctx.r10, ctx.r8, ctx.r9]
+}
+
+/// A guest ELF image placed by the shim's own loader -- the main executable
+/// and its `PT_INTERP` -- recorded at load time for fault symbolization.
+///
+/// Kept apart from [`syscalls::mm::GuestImage`] deliberately: that list is
+/// filled from the `mmap` path and named through the mapping fd's recorded
+/// path, but the loader opens its images with `open_executable_as` and inserts
+/// the descriptor raw, so no path ever exists for it there -- and the main
+/// executable, where an official Chromium's `NOTREACHED()` traps land, was
+/// precisely the image the fault line printed as "(no image)". Rows carry the
+/// loading pid so that a later `execve` by the same process replaces its own
+/// rows (exec replaces the whole address space); a forked child shares its
+/// parent's placement and resolves through the parent's row by address.
+pub(crate) struct LoadedImage {
+    pid: i32,
+    /// Lowest guest address covered by the image's `PT_LOAD` segments.
+    lo: usize,
+    /// One past the highest guest address covered by the image.
+    hi: usize,
+    /// The load bias: guest address minus ELF vaddr. `addr - base` is the
+    /// image-relative offset `llvm-symbolizer` resolves against the file.
+    base: usize,
+    /// The path the loader opened the image with.
+    path: alloc::string::String,
+}
+
+/// Rows kept in [`GlobalState::loaded_images`] before the oldest are dropped.
+/// Two rows per exec, so this covers thousands of short-lived processes while
+/// bounding a desktop session that forks forever.
+const LOADED_IMAGES_CAP: usize = 4096;
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Drop the loader-placed rows of this pid: an image load replaces the
+    /// whole address space, so whatever was recorded for it is gone.
+    pub(crate) fn forget_loaded_images(&self) {
+        self.global
+            .loaded_images
+            .lock()
+            .retain(|img| img.pid != self.pid);
+    }
+
+    /// Record an image the loader has just placed at bias `base`, spanning
+    /// guest addresses `lo..hi`.
+    pub(crate) fn record_loaded_image(&self, path: &str, base: usize, lo: usize, hi: usize) {
+        let mut images = self.global.loaded_images.lock();
+        if images.len() >= LOADED_IMAGES_CAP {
+            let excess = images.len() + 1 - LOADED_IMAGES_CAP;
+            images.drain(..excess);
+        }
+        images.push(LoadedImage {
+            pid: self.pid,
+            lo,
+            hi,
+            base,
+            path: alloc::string::String::from(path),
+        });
+    }
+
+    /// Name the guest ELF image containing `addr` as `(path, image-relative
+    /// offset)`. This task's own loader-placed images win (they are exact for
+    /// the live process), then any loader-placed image by address (a forked
+    /// child), then the `mmap`-recorded shared libraries, latest first.
+    pub(crate) fn symbolize_guest_address(
+        &self,
+        addr: usize,
+    ) -> Option<(alloc::string::String, usize)> {
+        {
+            let images = self.global.loaded_images.lock();
+            let contains = |img: &&LoadedImage| (img.lo..img.hi).contains(&addr);
+            let hit = images
+                .iter()
+                .rev()
+                .filter(|img| img.pid == self.pid)
+                .find(contains)
+                .or_else(|| images.iter().rev().find(contains));
+            if let Some(img) = hit {
+                return Some((img.path.clone(), addr - img.base));
+            }
+        }
+        self.find_guest_image(addr)
+    }
+
+    /// Log one undecodable syscall, once per distinct (number, shape).
+    ///
+    /// `warn` when the decoder flagged the request as unsupported or unknown,
+    /// `debug` when it merely refused the arguments (`result` is the errno the
+    /// guest gets); repeats of the same row are shown only at `trace`.
+    fn report_unsupported_syscall(
+        &self,
+        nr: usize,
+        shape: unsupported::Shape,
+        result: Result<(), Errno>,
+    ) {
+        let name = unsupported::syscall_name(nr);
+        // Only the fallback shape built in `do_syscall` starts this way; every
+        // other shape came from the decoder naming what it does not support.
+        let flagged = !shape.starts_with("decode failed");
+        let result = match result {
+            Ok(()) => "decoded",
+            Err(errno) => errno.as_str(),
+        };
+        match unsupported::record(Some(nr), &shape) {
+            unsupported::Sighting::First if flagged => {
+                litebox_util_log::warn!(
+                    nr:? = nr, name:% = name, what:% = shape, result:% = result, pid:? = self.pid;
+                    "unsupported syscall (first sighting; repeats logged at trace level)"
+                );
+            }
+            unsupported::Sighting::First => {
+                litebox_util_log::debug!(
+                    nr:? = nr, name:% = name, what:% = shape, result:% = result, pid:? = self.pid;
+                    "undecodable syscall arguments (first sighting; repeats logged at trace level)"
+                );
+            }
+            unsupported::Sighting::Repeat(count) => {
+                litebox_util_log::trace!(
+                    nr:? = nr, name:% = name, what:% = shape, result:% = result, count:? = count,
+                    pid:? = self.pid;
+                    "unsupported syscall (repeat)"
+                );
             }
         }
     }
@@ -1670,6 +2149,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// monotonically (never pruned on unmap) and survives the mapping fd's
     /// close, unlike [`Self::elf_patch_cache`]. See `Task::find_guest_image`.
     guest_images: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::mm::GuestImage>>,
+    /// Guest ELF images placed by the shim's own loader, for fault
+    /// symbolization; see [`LoadedImage`] for why these are not in
+    /// [`Self::guest_images`].
+    loaded_images: litebox::sync::Mutex<Platform, alloc::vec::Vec<LoadedImage>>,
     /// Stable shared-page identities keyed by filesystem device/inode, so aliases opened through
     /// different file descriptions still converge on one backing object.
     shared_file_backings: litebox::sync::Mutex<
@@ -1733,12 +2216,6 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform, FS>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
-    /// Set while this task shares one guest address space with other guest processes, which is
-    /// what `fork` produces here.
-    ///
-    /// See `syscalls::process::SharedAddressSpace` for why, and for the hand-off protocol that
-    /// keeps exactly one member running on the shared memory at a time.
-    address_space: RefCell<Option<syscalls::process::AddressSpaceMembership<Platform>>>,
     /// The guest stack pointer as of the most recent entry into the shim.
     ///
     /// Needed because a snapshot of this task's memory can be taken at any blocking point, not
@@ -1782,7 +2259,6 @@ mod test_utils {
                 fs: Arc::new(syscalls::file::FsState::new()).into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
-                address_space: RefCell::new(None),
                 guest_sp: Cell::new(0),
                 global: self,
             }
@@ -1808,7 +2284,6 @@ mod test_utils {
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
-                address_space: RefCell::new(None),
                 guest_sp: Cell::new(0),
             };
             Some(task)

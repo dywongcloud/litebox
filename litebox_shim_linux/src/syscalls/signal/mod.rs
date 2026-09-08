@@ -22,9 +22,11 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_common_linux::signal::{
-    MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
+    MINSIGSTKSZ, NSIG, SI_KERNEL, SI_TKILL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction,
+    SigAltStack,
     SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
+use litebox::event::wait::WaitError;
 use litebox_common_linux::{PtRegs, errno::Errno};
 
 pub(crate) struct SignalState<Platform: ShimPlatform> {
@@ -51,6 +53,13 @@ pub(crate) struct SignalState<Platform: ShimPlatform> {
     /// [`Task::restore_saved_signal_mask`] is the restore, run once signals have been processed
     /// on the way back to guest code.
     saved_blocked: Cell<Option<SigSet>>,
+    /// The set an in-progress `rt_sigtimedwait` is waiting for: Linux's `real_blocked`.
+    ///
+    /// While the wait lasts these signals count as deliverable for wakeup purposes even though
+    /// they stay in `blocked` (so a `SIG_IGN`'d member is queued rather than discarded, exactly
+    /// as `sig_ignored()` consults `real_blocked`), and the waiter dequeues them itself instead
+    /// of `process_signals`. Empty outside such a wait.
+    sigwait_set: Cell<SigSet>,
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
@@ -69,6 +78,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             }),
             last_exception: Cell::new(arch::NO_EXCEPTION),
             saved_blocked: Cell::new(None),
+            sigwait_set: Cell::new(SigSet::empty()),
         }
     }
 
@@ -94,6 +104,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             // Preserve last exception
             last_exception: self.last_exception.clone(),
             saved_blocked: Cell::new(None),
+            sigwait_set: Cell::new(SigSet::empty()),
         }
     }
 
@@ -120,6 +131,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             .into(),
             last_exception: Cell::new(arch::NO_EXCEPTION),
             saved_blocked: Cell::new(None),
+            sigwait_set: Cell::new(SigSet::empty()),
         }
     }
 
@@ -730,34 +742,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(0)
     }
 
+    /// Handle syscall `kill`, with Linux's reading of `pid`: `> 0` names one process, `0` the
+    /// caller's process group, `-1` every process but the caller (and init), and `< -1` the
+    /// process group `-pid`. A group or broadcast target reports `ESRCH` only when nothing at all
+    /// matched.
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
+        let processes = &self.global.processes;
+        let own_group = self.process().process_group_id();
+        // `pid` is `i32::MIN` only for a group nothing can be in.
+        let target_group = (pid < -1).then(|| pid.checked_neg()).flatten();
         if signal == 0 {
-            if pid == 0 || pid == self.pid || (pid > 0 && self.global.processes.is_live(pid)) {
-                return Ok(0);
-            }
-            return Err(Errno::ESRCH);
+            let exists = match pid {
+                0 => true,
+                -1 => processes.has_other_live_process(self.pid),
+                pid if pid < -1 => target_group.is_some_and(|group| {
+                    own_group == group || processes.has_process_group_member(group, self.pid)
+                }),
+                pid => pid == self.pid || processes.is_live(pid),
+            };
+            return exists.then_some(0).ok_or(Errno::ESRCH);
         }
         let signal = Signal::try_from(signal)?;
-        if pid == 0 {
-            let process_group_id = self.process().process_group_id();
-            self.send_shared_signal(signal, siginfo_kill(signal));
-            self.global.processes.send_process_group_signal(
-                process_group_id,
-                self.pid,
-                signal,
-                siginfo_kill(signal),
-            );
-            return Ok(0);
-        }
-        if pid > 0 && pid != self.pid {
-            return self
-                .global
-                .processes
-                .send_process_signal(pid, signal, siginfo_kill(signal))
-                .then_some(0)
-                .ok_or(Errno::ESRCH);
-        }
-        self.do_kill(Some(pid), None, signal.as_i32())
+        let delivered = match pid {
+            0 => {
+                self.send_shared_signal(signal, siginfo_kill(signal));
+                processes.send_process_group_signal(
+                    own_group,
+                    self.pid,
+                    signal,
+                    siginfo_kill(signal),
+                ) + 1
+            }
+            -1 => processes.send_signal_to_all_processes(self.pid, signal, siginfo_kill(signal)),
+            pid if pid < -1 => {
+                let Some(group) = target_group else {
+                    return Err(Errno::ESRCH);
+                };
+                let mut delivered = processes.send_process_group_signal(
+                    group,
+                    self.pid,
+                    signal,
+                    siginfo_kill(signal),
+                );
+                if own_group == group {
+                    self.send_shared_signal(signal, siginfo_kill(signal));
+                    delivered += 1;
+                }
+                delivered
+            }
+            pid if pid != self.pid => {
+                usize::from(processes.send_process_signal(pid, signal, siginfo_kill(signal)))
+            }
+            pid => return self.do_kill(Some(pid), None, signal.as_i32()),
+        };
+        (delivered > 0).then_some(0).ok_or(Errno::ESRCH)
     }
 
     pub(crate) fn sys_tkill(&self, tid: i32, signal: i32) -> Result<usize, Errno> {
@@ -768,11 +806,215 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_kill(Some(pid), Some(tid), signal)
     }
 
+    /// Handle syscall `rt_sigtimedwait`.
+    ///
+    /// Linux's `do_sigtimedwait`: dequeue a pending signal in `set` (thread-directed first, then
+    /// process-directed; the caller's block mask is irrelevant to the dequeue), and if none is
+    /// pending and `timeout` allows, sleep with `set` treated as unblocked until one arrives
+    /// (`EAGAIN` when the timeout runs out first, `EINTR` when a signal outside `set` wakes the
+    /// sleep instead). `SIGKILL`/`SIGSTOP` cannot be waited for. On success the signal number
+    /// is returned and its `siginfo` is copied out to `info`.
+    pub(crate) fn sys_rt_sigtimedwait(
+        &self,
+        set: Option<UserPtr<SigSet>>,
+        info: Option<UserPtrMut<Siginfo>>,
+        timeout: litebox_common_linux::TimeParam,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let mut which = set
+            .ok_or(Errno::EFAULT)?
+            .read_at_offset::<Platform>(0)
+            .ok_or(Errno::EFAULT)?;
+        which.remove(Signal::SIGKILL);
+        which.remove(Signal::SIGSTOP);
+        // Read the timeout up front: a bad pointer is `EFAULT` even when a signal is ready.
+        let timeout = timeout.read::<Platform>()?;
+        let wait_allowed = match timeout {
+            None => true,
+            Some(t) => !t.is_zero(),
+        };
+
+        if let Some((signal, siginfo)) = self.dequeue_signal_in(which) {
+            self.copy_siginfo_out(info, &siginfo)?;
+            return Ok(signal.as_i32().cast_unsigned() as usize);
+        }
+        if !wait_allowed {
+            return Err(Errno::EAGAIN);
+        }
+
+        // Sleep with `which` acting as unblocked (see `SignalState::sigwait_set`): the arrival
+        // of any member interrupts the wait through `check_for_interrupt`, as does any other
+        // deliverable signal or task teardown.
+        self.signals.sigwait_set.set(which);
+        let _restore = litebox::utils::defer(|| self.signals.sigwait_set.set(SigSet::empty()));
+        let wait_cx = self.wait_cx();
+        let wait_cx = match timeout {
+            Some(t) => wait_cx.with_timeout(t),
+            None => wait_cx,
+        };
+        let outcome = wait_cx.sleep();
+        if let Some((signal, siginfo)) = self.dequeue_signal_in(which) {
+            self.copy_siginfo_out(info, &siginfo)?;
+            return Ok(signal.as_i32().cast_unsigned() as usize);
+        }
+        match outcome {
+            WaitError::TimedOut => Err(Errno::EAGAIN),
+            WaitError::Interrupted => Err(Errno::EINTR),
+        }
+    }
+
+    /// Dequeues the first pending signal that is a member of `which`, thread-directed queue
+    /// first (a remote `tkill` is drained in), then the process-wide queue -- the order
+    /// `process_signals` uses. Ignores the block mask, like Linux's `dequeue_signal` with the
+    /// caller's mask.
+    fn dequeue_signal_in(&self, which: SigSet) -> Option<(Signal, Siginfo)> {
+        self.thread_remote()
+            .drain_remote_signals_into(&mut self.signals.pending.borrow_mut());
+        let not_wanted = !which;
+        {
+            let mut pending = self.signals.pending.borrow_mut();
+            if let Some(signal) = pending.next(not_wanted) {
+                let siginfo = pending.remove(signal);
+                return Some((signal, siginfo));
+            }
+        }
+        let mut shared = self.signals.shared_pending.lock();
+        let signal = shared.next(not_wanted)?;
+        let siginfo = shared.remove(signal);
+        Some((signal, siginfo))
+    }
+
+    fn copy_siginfo_out(
+        &self,
+        info: Option<UserPtrMut<Siginfo>>,
+        siginfo: &Siginfo,
+    ) -> Result<(), Errno> {
+        if let Some(info) = info {
+            info.write_at_offset::<Platform>(0, siginfo.clone())
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(())
+    }
+
+    /// Reads and validates the caller-supplied `siginfo` of `rt_sigqueueinfo`/
+    /// `rt_tgsigqueueinfo`: `si_signo` is forced to `sig`, and a kernel-looking `si_code`
+    /// (`>= 0`, or `SI_TKILL`) may only be sent to one's own process (`EPERM`), as Linux's
+    /// `do_rt_sigqueueinfo` checks.
+    fn read_queued_siginfo(
+        &self,
+        info: Option<UserPtr<Siginfo>>,
+        sig: i32,
+        target_pid: i32,
+    ) -> Result<Siginfo, Errno> {
+        let mut siginfo = info
+            .ok_or(Errno::EFAULT)?
+            .read_at_offset::<Platform>(0)
+            .ok_or(Errno::EFAULT)?;
+        if (siginfo.code >= 0 || siginfo.code == SI_TKILL) && target_pid != self.pid {
+            return Err(Errno::EPERM);
+        }
+        siginfo.signo = sig;
+        Ok(siginfo)
+    }
+
+    /// Handle syscall `rt_sigqueueinfo`: `kill(pid, sig)` carrying the caller's `siginfo`.
+    pub(crate) fn sys_rt_sigqueueinfo(
+        &self,
+        pid: i32,
+        sig: i32,
+        info: Option<UserPtr<Siginfo>>,
+    ) -> Result<usize, Errno> {
+        let siginfo = self.read_queued_siginfo(info, sig, pid)?;
+        if sig == 0 {
+            // Existence/permission probe only, exactly as `kill(pid, 0)`.
+            return self.sys_kill(pid, 0);
+        }
+        let signal = Signal::try_from(sig)?;
+        if pid == self.pid {
+            self.send_shared_signal(signal, siginfo);
+            return Ok(0);
+        }
+        if pid <= 0 {
+            log_unsupported!("rt_sigqueueinfo to a process group");
+            return Err(Errno::EPERM);
+        }
+        self.global
+            .processes
+            .send_process_signal(pid, signal, siginfo)
+            .then_some(0)
+            .ok_or(Errno::ESRCH)
+    }
+
+    /// Handle syscall `rt_tgsigqueueinfo`: `tgkill(tgid, tid, sig)` carrying the caller's
+    /// `siginfo` -- how crashpad's handler re-raises a crash signal with its original
+    /// `siginfo` intact.
+    pub(crate) fn sys_rt_tgsigqueueinfo(
+        &self,
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+        info: Option<UserPtr<Siginfo>>,
+    ) -> Result<usize, Errno> {
+        if tgid <= 0 || tid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        let siginfo = self.read_queued_siginfo(info, sig, tgid)?;
+        if sig == 0 {
+            return self.do_kill(Some(tgid), Some(tid), 0).or_else(|err| {
+                // `do_kill` rejects signal 0 as `EINVAL`; the probe form only needs existence.
+                if err == Errno::EINVAL {
+                    self.tgkill_target_exists(tgid, tid)
+                        .then_some(0)
+                        .ok_or(Errno::ESRCH)
+                } else {
+                    Err(err)
+                }
+            });
+        }
+        let signal = Signal::try_from(sig)?;
+        if tgid != self.pid {
+            let Some((remote, limits)) = self.global.processes.remote_thread(tgid, tid) else {
+                return Err(Errno::ESRCH);
+            };
+            remote.deliver_remote_signal(&limits, signal, siginfo);
+            return Ok(0);
+        }
+        if tid == self.tid {
+            self.send_signal(signal, siginfo);
+            return Ok(0);
+        }
+        let Some(remote) = self.process().thread_remote(tid) else {
+            return Err(Errno::ESRCH);
+        };
+        remote.deliver_remote_signal(&self.process().limits, signal, siginfo);
+        Ok(0)
+    }
+
+    fn tgkill_target_exists(&self, tgid: i32, tid: i32) -> bool {
+        if tgid == self.pid {
+            tid == self.tid || self.process().thread_remote(tid).is_some()
+        } else {
+            self.global.processes.remote_thread(tgid, tid).is_some()
+        }
+    }
+
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
-        if pid.is_some_and(|pid| pid != self.pid) {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid");
-            return Err(Errno::ESRCH);
+        if let Some(pid) = pid
+            && pid != self.pid
+        {
+            // `tgkill` at another process's thread: crashpad's handler does this to the crashed
+            // client's threads. Delivered thread-directed through that thread's remote queue,
+            // exactly as a sibling's is below.
+            let tid = tid.unwrap_or(pid);
+            let Some((remote, limits)) = self.global.processes.remote_thread(pid, tid) else {
+                return Err(Errno::ESRCH);
+            };
+            remote.deliver_remote_signal(&limits, signal, siginfo_kill(signal));
+            return Ok(0);
         }
         let Some(tid) = tid else {
             self.send_signal(signal, siginfo_kill(signal));
@@ -806,7 +1048,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn has_pending_signals(&self) -> bool {
         self.thread_remote()
             .drain_remote_signals_into(&mut self.signals.pending.borrow_mut());
-        let blocked = self.signals.blocked.get();
+        // A signal an `rt_sigtimedwait` is waiting for must wake the wait even while blocked.
+        let blocked = self.signals.blocked.get() & !self.signals.sigwait_set.get();
         let thread_pending = self.signals.pending.borrow().pending & !blocked;
         let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
         let pending = thread_pending | shared_pending;
@@ -945,8 +1188,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return false;
         }
         // Blocked signals are never ignored, since the signal handler may
-        // change by the time it is unblocked.
-        if self.signals.blocked.get().contains(signal) {
+        // change by the time it is unblocked. Nor is a signal an `rt_sigtimedwait` is
+        // waiting for (Linux checks `real_blocked` here too).
+        if (self.signals.blocked.get() | self.signals.sigwait_set.get()).contains(signal) {
             return false;
         }
         let handlers = self.signals.handlers.borrow();

@@ -263,6 +263,17 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         unsafe { self.remap_pages(old_range, new_range, permissions) }
     }
 
+    /// Whether one [`Self::update_permissions`] call may span adjacent tracked
+    /// mappings while retaining all-or-fail semantics.
+    ///
+    /// Returning `true` promises that `Err` means no part of the range changed,
+    /// and that any failure after publication terminates rather than unwinds or
+    /// returns. Providers whose native operation has reservation/backing
+    /// boundaries must retain the default and receive one region at a time.
+    fn has_transactional_permission_updates(&self) -> bool {
+        false
+    }
+
     /// Update the permissions on pages in `range` to `new_permissions`.
     ///
     /// # Safety

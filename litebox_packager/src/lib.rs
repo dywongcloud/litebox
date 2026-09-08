@@ -83,6 +83,24 @@ pub struct CliArgs {
     #[arg(long = "no-rewrite", value_name = "PATH")]
     pub no_rewrite: Vec<PathBuf>,
 
+    /// Skip the syscall rewriter entirely for every file (OCI mode) or every
+    /// discovered dependency (host mode) and emit stock bytes unchanged.
+    ///
+    /// For the macOS Hypervisor.framework backend (`--hvf`), guest `SVC #0`
+    /// dispatches through a real EL1 monitor with `x18` architecturally
+    /// preserved, so unmodified upstream Alpine binaries already run
+    /// correctly with no rewriting, no musl substitution, and no x18
+    /// reservation -- the entire point of that backend. This flag is the
+    /// packaging-side complement: it disables both `rewrite_elf` and the
+    /// `musl_x18` cache substitution unconditionally, regardless of
+    /// `--no-rewrite`'s per-path list, so a whole rootfs of hundreds of
+    /// files does not need every path enumerated individually. Do not
+    /// combine with binaries destined for the older native rewriting
+    /// backend -- those still require syscall-rewritten (and, on macOS,
+    /// x18-fixed) bytes.
+    #[arg(long = "no-rewrite-all")]
+    pub no_rewrite_all: bool,
+
     /// Print verbose output during packaging.
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
@@ -237,7 +255,7 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
                 )
             };
 
-            let rewritten = if no_rewrite.contains(real_path) {
+            let rewritten = if args.no_rewrite_all || no_rewrite.contains(real_path) {
                 if verbose {
                     eprintln!("  {} (skipped rewrite)", real_path.display());
                 }
@@ -304,7 +322,11 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
                 u64::from(metadata.gid()),
             )
         };
-        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose)?;
+        let rewritten = if args.no_rewrite_all {
+            data
+        } else {
+            rewrite_elf(&data, &inc.host_path, args.verbose)?
+        };
         if args.verbose {
             eprintln!(
                 "  including {} as {}",
@@ -402,8 +424,16 @@ fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow:
     eprintln!("Found {total_count} entries ({exec_count} executable regular files to rewrite)");
 
     // --- Phase 3: Rewrite ELFs in parallel ---
-    eprintln!("Rewriting {exec_count} executable ELF files...");
+    if args.no_rewrite_all {
+        eprintln!(
+            "Skipping the syscall rewriter for all {exec_count} executable files \
+             (--no-rewrite-all): emitting stock bytes unchanged."
+        );
+    } else {
+        eprintln!("Rewriting {exec_count} executable ELF files...");
+    }
     let verbose = args.verbose;
+    let no_rewrite_all = args.no_rewrite_all;
     let file_entries: Vec<(PathBuf, oci::RootfsEntry)> = file_map.files.into_iter().collect();
 
     let par_results: Vec<anyhow::Result<TarEntry>> = file_entries
@@ -423,7 +453,10 @@ fn package_extracted(extracted: &oci::ExtractedImage, args: &CliArgs) -> anyhow:
                 } => {
                     let data = std::fs::read(&read_path)
                         .with_context(|| format!("failed to read {}", read_path.display()))?;
-                    let data = if is_executable && !no_rewrite.contains(&read_path) {
+                    let data = if is_executable
+                        && !no_rewrite_all
+                        && !no_rewrite.contains(&read_path)
+                    {
                         rewrite_elf(&data, &read_path, verbose)?
                     } else {
                         data

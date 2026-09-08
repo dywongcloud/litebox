@@ -86,35 +86,67 @@ extern crate alloc;
 mod darwin;
 mod guest;
 mod hvf;
+mod hvf_backend;
 mod hvf_backing;
 mod hvf_memory;
+mod hvf_vcpu;
+mod hvf_vcpu_diagnostic;
+// Rootless guest NAT engine, wired into `MacOsUserland`'s
+// `IPInterfaceProvider` bodies by `enable_nat_engine`.
+mod nat;
 mod net;
 mod seatbelt;
 
+pub(crate) trait HvfCompletionCapability {
+    fn validate_hvf_completion(&self, vm: &hvf::HvfVm) -> Result<(), hvf::HvfError>;
+}
+
 pub use hvf::{
-    HvfBoundaryReport, HvfError, HvfFeatureRegister, HvfFeatureRegisters, HvfMonitor,
-    HvfSdkResidualReport, HvfSmokeCleanupFailure, HvfSmokeCleanupReport, HvfSmokeError,
-    HvfSmokeReport, HvfSmokeResidualReport, HvfSmokeResourceReport, HvfSmokeResourceState,
-    HvfStageOneRegisterReport, HvfVmReport, hvf_boundary_probe, hvf_smoke_probe,
+    HvfArchitecturalState, HvfBoundaryReport, HvfEl1State, HvfError, HvfExceptionExit,
+    HvfFeatureRegister, HvfFeatureRegisters, HvfMonitor, HvfPublishedPanicOperation,
+    HvfPublishedPanicReport, HvfSdkResidualReport, HvfSimd128, HvfSmokeCleanupFailure,
+    HvfSmokeCleanupReport, HvfSmokeError, HvfSmokeReport, HvfSmokeResidualReport,
+    HvfSmokeResourceReport, HvfSmokeResourceState, HvfStageOneRegisterReport, HvfVcpuCancellation,
+    HvfVcpuExit, HvfVmReport, hvf_boundary_probe, hvf_published_panic_probe, hvf_smoke_probe,
     hvf_smoke_retry_residual, publish_hvf_executable_bytes,
 };
+pub use hvf_backend::{
+    HvfBackendError, HvfLaneReplacementReport, HvfLaneStarvationReport, HvfSchedulerLatencyReport,
+    HvfSchedulerScalingLevel, HvfSchedulerScalingReport, hvf_lane_replacement_probe,
+    hvf_lane_starvation_probe, hvf_sandbox_probe, hvf_scheduler_latency_probe,
+    hvf_scheduler_scaling_probe,
+};
 pub use hvf_backing::{
-    HvfHostBackingError, HvfHostBackingReport, HvfHostResourceReport, hvf_host_backing_probe,
-    hvf_host_resource_report, hvf_host_retry_residual,
+    HvfHostBackingError, HvfHostBackingReport, HvfHostResourceReport,
+    hvf_host_backing_probe, hvf_host_begin_recovery_wave, hvf_host_resource_report,
+    hvf_host_retry_residual,
 };
 pub use hvf_memory::{
-    HvfAddressSpace, HvfAddressSpaceId, HvfAddressSpaceReport, HvfAsid, HvfBackingIdentity,
-    HvfClaim, HvfExecutableGeneration, HvfGuestPermissions, HvfLedgerEntry, HvfMemory,
-    HvfMemoryError,
-    HvfForkResult, HvfMemoryFailureReport, HvfMemoryLimits, HvfMemoryReport, HvfMemoryUsage,
-    HvfMutation,
-    HvfPoisonConcurrencyReport, HvfPublicationTicket, HvfQuarantineRetryReport,
-    HvfPublicationEpoch, HvfRegisterFailureReport, HvfRetirementReport, HvfRetirementTicket,
-    HvfRootGeneration, HvfSharing, HvfWriteEpoch,
+    HvfAddressSpace, HvfAddressSpaceDestroyTicket, HvfAddressSpaceId, HvfAddressSpaceReport,
+    HvfAliasPanicFailureReport, HvfAliasRaceReport, HvfAsid, HvfBackingIdentity, HvfCallbackOutput,
+    HvfClaim, HvfExecutableGeneration, HvfForkResult, HvfGuestPermissions, HvfLedgerEntry,
+    HvfMemory, HvfMemoryError, HvfMemoryFailureReport, HvfMemoryLimits, HvfMemoryReport,
+    HvfMemoryUsage, HvfMirroredViewReport, HvfMutation, HvfParticipantRecoveryReceipt,
+    HvfPoisonConcurrencyReport, HvfPublicationEpoch, HvfPublicationTicket,
+    HvfQuarantineRetryReport, HvfRangeMutation, HvfRegisterFailureReport, HvfRetirementReport,
+    HvfRetirementTicket, HvfRootGeneration, HvfSharedBackingKey, HvfSharing, HvfTlbiGeneration,
     HvfTranslationRegime, HvfUnmapFailureReport, HvfUnmapResult, HvfVcpuMemorySnapshot,
-    hvf_memory_failure_probe, hvf_memory_probe, hvf_poison_concurrency_probe,
+    HvfVcpuParticipant, HvfVcpuParticipantId, HvfVcpuRunAttachment, HvfWriteEpoch,
+    hvf_alias_panic_failure_probe, hvf_alias_race_probe, hvf_memory_failure_probe,
+    hvf_memory_probe, hvf_mirrored_view_probe, hvf_poison_concurrency_probe,
     hvf_register_failure_probe, hvf_unmap_failure_probe, with_hvf_memory_failure_probe,
     with_hvf_memory_probe,
+};
+pub use hvf_vcpu::{
+    HvfOwnerSynchronizationProof, HvfSynchronizationRequest, HvfVcpuCancellationReceipt,
+    HvfVcpuExitState, HvfVcpuLane, HvfVcpuLaneCancellation, HvfVcpuLaneCloseReport,
+    HvfVcpuLaneError, HvfVcpuLaneHandle, HvfVcpuLaneParticipantCapability, HvfVcpuRegistry,
+    HvfVcpuRunResult, HvfVtimerState,
+};
+pub use hvf_vcpu_diagnostic::{
+    HvfVcpuCustodyReport, HvfVcpuDiagnosticError, HvfVcpuDiagnosticReport, HvfVcpuFailureReport,
+    HvfVcpuTotalityReport, hvf_vcpu_custody_probe, hvf_vcpu_diagnostic_probe,
+    hvf_vcpu_failure_probe, hvf_vcpu_totality_probe,
 };
 pub use seatbelt::{enable_seatbelt_sandbox, enable_seatbelt_sandbox_with_outbound_network};
 
@@ -128,6 +160,19 @@ use darwin::{
 /// small fixed set; `SIGUSR2` is the least likely to be wanted elsewhere in a
 /// process that is already dedicating itself to hosting a sandbox.
 const INTERRUPT_SIGNAL: libc::c_int = libc::SIGUSR2;
+
+/// Serializes every native guest page-management mutation in this process.
+/// Multiple independent `MacOsUserland` instances can coexist, so neither the
+/// upper per-instance page-manager lock nor `shared_page_registry` is broad
+/// enough to make reserve/replace and MAP_JIT migration transactions exclusive.
+static NATIVE_VM_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_native_vm_mutation() -> std::sync::MutexGuard<'static, ()> {
+    match NATIVE_VM_MUTATION_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(_) => std::process::abort(),
+    }
+}
 
 /// The userland macOS platform.
 ///
@@ -168,6 +213,12 @@ pub struct MacOsUserland {
     shared_page_init_condvar: Condvar,
     /// The `utun` socket used for guest networking, if one was requested.
     tun: Option<std::os::fd::OwnedFd>,
+    /// The rootless guest NAT engine, once [`Self::enable_nat_engine`] has
+    /// installed it. Consulted by the `IPInterfaceProvider` bodies only when
+    /// no `utun` device is attached. The engine's entry points take `&mut
+    /// self`; the mutex is what makes them sound to call through the shared
+    /// platform reference.
+    nat: OnceLock<Mutex<nat::NatEngine>>,
     /// CoW-eligible memory regions registered via [`Self::register_cow_region`].
     /// Maps the start address of the static slice to the info needed to re-mmap
     /// the backing file. Mirrors `litebox_platform_linux_userland`'s identical
@@ -581,16 +632,62 @@ impl MacOsUserland {
     ///
     /// Panics under the same conditions as [`Self::new`].
     pub fn new_with_options(tun_device_name: Option<&str>, hold_stdin_open: bool) -> &'static Self {
+        Self::construct(tun_device_name, hold_stdin_open, false)
+            .unwrap_or_else(|error| panic!("failed to construct the platform: {error}"))
+    }
+
+    /// [`Self::new_with_options`] with the Hypervisor.framework guest backend
+    /// installed first: unchanged stock AArch64 Linux code then executes at
+    /// EL0 on real vCPUs (no syscall rewriting, no native `run_thread`), with
+    /// every guest mapping mirrored into the host view at its own address.
+    /// Must be called before the shim maps anything, and the executable must
+    /// carry the `com.apple.security.hypervisor` entitlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's typed error if the process VM, address space,
+    /// vCPU lanes or sigreturn trampoline cannot be established; nothing is
+    /// left half-installed.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::new`].
+    pub fn new_with_hvf(
+        tun_device_name: Option<&str>,
+        hold_stdin_open: bool,
+    ) -> Result<&'static Self, HvfBackendError> {
+        Self::construct(tun_device_name, hold_stdin_open, true)
+    }
+
+    fn construct(
+        tun_device_name: Option<&str>,
+        hold_stdin_open: bool,
+        hvf: bool,
+    ) -> Result<&'static Self, HvfBackendError> {
         install_fault_handlers();
         install_async_signal_handlers();
         reserve_guest_tpidr_tsd_slot();
+        raise_nofile_limit();
+
+        // Before the host maps are read, so the VM's own host mappings and
+        // the guest trampoline page are both reserved from the shim.
+        let backend = if hvf {
+            Some(hvf_backend::install()?)
+        } else {
+            None
+        };
 
         let tun = tun_device_name.map(|name| {
             net::open_utun(name).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
         });
 
+        let mut reserved_pages = read_memory_maps();
+        if let Some(backend) = backend {
+            reserved_pages.extend(backend.reserved_ranges());
+        }
+
         let platform = Self {
-            reserved_pages: read_memory_maps(),
+            reserved_pages,
             boot_id: OnceLock::new(),
             stdio_is_tty: [
                 std::io::stdin().is_terminal(),
@@ -608,6 +705,7 @@ impl MacOsUserland {
             shared_page_registry: std::sync::Mutex::new(SharedPageRegistry::default()),
             shared_page_init_condvar: Condvar::new(),
             tun,
+            nat: OnceLock::new(),
             cow_regions: std::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         };
 
@@ -617,7 +715,7 @@ impl MacOsUserland {
         // more, and every process-global facility is initialized only once.
         let platform: &'static Self = alloc::boxed::Box::leak(alloc::boxed::Box::new(platform));
         spawn_stdin_pump_thread(platform);
-        platform
+        Ok(platform)
     }
 
     /// Populate the root key used by [`litebox::platform::DerivedKeyProvider`].
@@ -980,13 +1078,13 @@ fn allocate_jit_pages(
                     ReservationError::OutOfMemory => AllocationError::OutOfMemory,
                 });
             }
-            // `needs_correction`: the exact candidate is refused too (see the
-            // matching comment in `allocate_pages`'s non-JIT branch) --
-            // `kernel_chosen` is the only address left to offer, out-of-range
-            // as it is; a caller that cannot use it will find out from a real
-            // fault at first access rather than this function inventing a
-            // further fallback that has never been exercised.
-            Err(_) => false,
+            Err(e) => {
+                unsafe { libc::munmap(kernel_chosen, suggested_range.len()) };
+                return Err(match e {
+                    ReservationError::AddressInUse => AllocationError::AddressInUse,
+                    ReservationError::OutOfMemory => AllocationError::OutOfMemory,
+                });
+            }
         }
     } else {
         false
@@ -1382,11 +1480,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // the host `mmap`. So a `MAP_PRIVATE` host mapping is correct here today, and stays correct
         // if a future host-level fork model needs to distinguish them: nothing below this comment
         // treats `SHARED` differently already.
+        if let Some(backend) = hvf_backend::active() {
+            return backend
+                .allocate_pages(suggested_range, initial_permissions, fixed_address_behavior)
+                .map(|start| UserMutPtr::from_ptr(start as *mut u8));
+        }
         if !suggested_range.start.is_multiple_of(ALIGN)
             || !suggested_range.len().is_multiple_of(ALIGN)
         {
             return Err(AllocationError::Unaligned);
         }
+        let _mutation = lock_native_vm_mutation();
 
         let ptr = if needs_jit(initial_permissions) {
             // See `allocate_jit_pages`: `MAP_FIXED` and `MAP_JIT` cannot be
@@ -1548,6 +1652,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend
+                .allocate_shared_pages(
+                    backing_identity,
+                    backing_offset,
+                    suggested_range,
+                    initial_permissions,
+                    fixed_address_behavior,
+                )
+                .map(|start| UserMutPtr::from_ptr(start as *mut u8));
+        }
         if !suggested_range.start.is_multiple_of(ALIGN)
             || !suggested_range.len().is_multiple_of(ALIGN)
             || !backing_offset.is_multiple_of(ALIGN)
@@ -1558,6 +1673,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             .checked_add(suggested_range.len())
             .ok_or(AllocationError::OutOfMemory)?;
         let logical_range = backing_offset..logical_end;
+        let _mutation = lock_native_vm_mutation();
 
         let mut registry = self.shared_page_registry.lock().unwrap();
         let extents = registry.ensure_extents(
@@ -1565,6 +1681,38 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             backing_identity,
             logical_range.clone(),
         )?;
+        let mut extent_plan = Vec::new();
+        extent_plan
+            .try_reserve_exact(extents.len())
+            .map_err(|_| AllocationError::OutOfMemory)?;
+        let mut planned_end = 0usize;
+        for (extent_range, file_offset) in extents {
+            let relative_start = extent_range
+                .start
+                .checked_sub(backing_offset)
+                .ok_or(AllocationError::OutOfMemory)?;
+            let relative_end = extent_range
+                .end
+                .checked_sub(backing_offset)
+                .ok_or(AllocationError::OutOfMemory)?;
+            if relative_start != planned_end
+                || relative_start >= relative_end
+                || relative_end > suggested_range.len()
+            {
+                return Err(AllocationError::OutOfMemory);
+            }
+            let offset =
+                libc::off_t::try_from(file_offset).map_err(|_| AllocationError::OutOfMemory)?;
+            planned_end = relative_end;
+            extent_plan.push((relative_start..relative_end, offset));
+        }
+        if planned_end != suggested_range.len() {
+            return Err(AllocationError::OutOfMemory);
+        }
+        registry
+            .aliases
+            .try_reserve(1)
+            .map_err(|_| AllocationError::OutOfMemory)?;
 
         // Reserve one contiguous destination first. Each sparse-file extent can then replace its
         // matching subrange with MAP_FIXED without a gap being claimed by an unrelated host mmap.
@@ -1585,9 +1733,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     return Err(AllocationError::OutOfMemory);
                 }
                 let start = reservation as usize;
-                let end = start
-                    .checked_add(suggested_range.len())
-                    .ok_or(AllocationError::OutOfMemory)?;
+                let Some(end) = start.checked_add(suggested_range.len()) else {
+                    // SAFETY: `reservation` is the temporary mapping just created above.
+                    unsafe { libc::munmap(reservation, suggested_range.len()) };
+                    return Err(AllocationError::OutOfMemory);
+                };
                 if start < GUEST_ADDR_MIN || end > GUEST_ADDR_MAX {
                     // SAFETY: `reservation` is the temporary mapping just created above.
                     unsafe { libc::munmap(reservation, suggested_range.len()) };
@@ -1609,19 +1759,26 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             }
             FixedAddressBehavior::Replace => suggested_range.start,
         };
-        let target_range = target_start..target_start + suggested_range.len();
+        let Some(target_end) = target_start.checked_add(suggested_range.len()) else {
+            if !matches!(fixed_address_behavior, FixedAddressBehavior::Replace) {
+                // SAFETY: the non-replacing paths own this complete reservation.
+                unsafe { libc::munmap(target_start as *mut libc::c_void, suggested_range.len()) };
+            }
+            return Err(AllocationError::OutOfMemory);
+        };
+        let target_range = target_start..target_end;
+        let owns_reservation = !matches!(fixed_address_behavior, FixedAddressBehavior::Replace);
+        let mut published = false;
 
-        for (extent_range, file_offset) in extents {
-            let virtual_start = target_start + (extent_range.start - backing_offset);
-            let offset =
-                libc::off_t::try_from(file_offset).map_err(|_| AllocationError::OutOfMemory)?;
+        for (relative_range, offset) in extent_plan {
+            let virtual_start = target_start + relative_range.start;
             // SAFETY: the sparse file is live for the platform lifetime, this extent lies within
             // its ftruncate'd length, and the complete destination was reserved above (or the
             // caller explicitly requested replacement).
             let ptr = unsafe {
                 libc::mmap(
                     virtual_start as *mut libc::c_void,
-                    extent_range.len(),
+                    relative_range.len(),
                     prot_flags(initial_permissions),
                     libc::MAP_SHARED | libc::MAP_FIXED,
                     self.shared_page_file.as_raw_fd(),
@@ -1629,19 +1786,29 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 )
             };
             if ptr == libc::MAP_FAILED {
-                // Drop both already-installed extents and any remainder of the reservation. For a
-                // replacing mmap Linux likewise cannot promise restoration after a partial host
-                // failure; for Hint/NoReplace this simply restores the range to being free.
-                // SAFETY: `target_range` is the mapping/reservation owned by this operation.
-                unsafe {
-                    libc::munmap(target_range.start as *mut libc::c_void, target_range.len())
-                };
-                return Err(match std::io::Error::last_os_error().raw_os_error() {
+                let error = match std::io::Error::last_os_error().raw_os_error() {
                     Some(libc::EINVAL) => AllocationError::Unaligned,
                     _ => AllocationError::OutOfMemory,
-                });
+                };
+                if published {
+                    // At least one MAP_FIXED has already replaced its destination. Returning a
+                    // recoverable error would leave the caller's VMA metadata describing bytes
+                    // that no longer exist, and the displaced mappings cannot be reconstructed.
+                    std::process::abort();
+                }
+                if owns_reservation {
+                    // SAFETY: no extent was installed, so this is still the complete temporary
+                    // reservation owned by the non-replacing operation.
+                    unsafe {
+                        libc::munmap(target_range.start as *mut libc::c_void, target_range.len())
+                    };
+                }
+                return Err(error);
             }
-            debug_assert_eq!(ptr as usize, virtual_start);
+            if ptr as usize != virtual_start {
+                std::process::abort();
+            }
+            published = true;
         }
 
         registry.forget_aliases(&target_range);
@@ -1673,6 +1840,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         length: usize,
         mut initialize: impl FnMut(core::ops::Range<usize>) -> Result<(), E>,
     ) -> Result<(), E> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend.initialize_shared_pages(
+                backing_identity,
+                backing_offset,
+                length,
+                initialize,
+            );
+        }
         let requested = backing_offset
             ..backing_offset
                 .checked_add(length)
@@ -1719,6 +1894,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         backing_offset: usize,
         data: &mut [u8],
     ) -> Result<(), SharedPageIoError> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend.read_shared_pages(backing_identity, backing_offset, data);
+        }
         let end = backing_offset
             .checked_add(data.len())
             .ok_or(SharedPageIoError::OutOfRange)?;
@@ -1758,6 +1936,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         backing_offset: usize,
         data: &[u8],
     ) -> Result<(), SharedPageIoError> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend.write_shared_pages(backing_identity, backing_offset, data);
+        }
         let end = backing_offset
             .checked_add(data.len())
             .ok_or(SharedPageIoError::OutOfRange)?;
@@ -1784,6 +1965,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         backing_identity: usize,
         backing_range: core::ops::Range<usize>,
     ) -> Result<(), SharedPageIoError> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend.zero_shared_pages(backing_identity, backing_range);
+        }
         if backing_range.is_empty() {
             return Ok(());
         }
@@ -1817,6 +2001,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         new_range: core::ops::Range<usize>,
         permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend
+                .remap_shared_pages(
+                    backing_identity,
+                    backing_offset,
+                    old_range,
+                    new_range,
+                    permissions,
+                )
+                .map(|start| UserMutPtr::from_ptr(start as *mut u8));
+        }
         if !old_range.start.is_multiple_of(ALIGN)
             || !old_range.len().is_multiple_of(ALIGN)
             || !new_range.start.is_multiple_of(ALIGN)
@@ -1879,9 +2074,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), DeallocationError> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend.deallocate_pages(range);
+        }
         if !range.start.is_multiple_of(ALIGN) || !range.len().is_multiple_of(ALIGN) {
             return Err(DeallocationError::Unaligned);
         }
+        let _mutation = lock_native_vm_mutation();
         // SAFETY: the caller guarantees the range is no longer in use.
         let rc = unsafe { libc::munmap(range.start as *mut libc::c_void, range.len()) };
         if rc == 0 {
@@ -1899,14 +2098,25 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         }
     }
 
+    fn has_transactional_permission_updates(&self) -> bool {
+        // The HVF backend either changes the complete logical range or aborts
+        // after any lower publication. Native Darwin mappings retain their
+        // per-region path because MAP_JIT migration has backing boundaries.
+        hvf_backend::active().is_some()
+    }
+
     unsafe fn update_permissions(
         &self,
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), PermissionUpdateError> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend.update_permissions(range, new_permissions);
+        }
         if !range.start.is_multiple_of(ALIGN) || !range.len().is_multiple_of(ALIGN) {
             return Err(PermissionUpdateError::Unaligned);
         }
+        let _mutation = lock_native_vm_mutation();
         // SAFETY: the caller guarantees the new permissions do not conflict with
         // any active use of the range.
         let rc = unsafe {
@@ -1940,6 +2150,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
     }
 
     unsafe fn jit_write_protect(&self, executable: bool) {
+        // Under HVF there are no `MAP_JIT` host mappings: guest-executable
+        // pages are host read-only mirrors, so there is nothing to toggle.
+        if hvf_backend::active().is_some() {
+            return;
+        }
         // SAFETY: forwarded caller guarantee; see the trait method's docs,
         // which describe exactly this platform's `MAP_JIT` semantics.
         unsafe { darwin::pthread_jit_write_protect_np(libc::c_int::from(executable)) }
@@ -1959,6 +2174,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::CowAllocationError> {
         use litebox::platform::page_mgmt::CowAllocationError;
 
+        if hvf_backend::active().is_some() {
+            // The compact HVF manager owns every backing page; the memcpy
+            // fallback path lands in it through `allocate_pages`.
+            return Err(CowAllocationError::UnsupportedSourceRegion);
+        }
         if permissions.contains(MemoryRegionPermissions::EXEC) {
             // A file-backed `PROT_EXEC` mapping on Apple Silicon must pass
             // code-signature validation, which an unsigned Linux guest image
@@ -1974,7 +2194,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         if !file_offset.is_multiple_of(ALIGN) || !suggested_start.is_multiple_of(ALIGN) {
             return Err(CowAllocationError::Unaligned);
         }
-        let mapped_range = suggested_start..suggested_start + source_data.len();
+        let Some(mapped_end) = suggested_start.checked_add(source_data.len()) else {
+            return Err(CowAllocationError::InternalFailure);
+        };
+        let mapped_range = suggested_start..mapped_end;
+        let _mutation = lock_native_vm_mutation();
 
         let reserved = fixed_address_behavior == FixedAddressBehavior::NoReplace;
         if reserved && reserve_fixed(&mapped_range).is_err() {
@@ -2249,6 +2473,9 @@ impl litebox::platform::ArchSpecificProvider for MacOsUserland {
     ) -> Result<usize, litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::TpidrEl0 => {
+                if hvf_backend::active().is_some() {
+                    return Ok(hvf_backend::thread_tpidr_el0());
+                }
                 let key = guest_tp_tsd_key()
                     .ok_or(litebox::platform::ArchSpecificError::RegisterUnsupported)?;
                 // SAFETY: `key` was reserved by `reserve_guest_tpidr_tsd_slot` via
@@ -2268,6 +2495,10 @@ impl litebox::platform::ArchSpecificProvider for MacOsUserland {
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::TpidrEl0 => {
+                if hvf_backend::active().is_some() {
+                    hvf_backend::set_thread_tpidr_el0(val);
+                    return Ok(());
+                }
                 let key = guest_tp_tsd_key()
                     .ok_or(litebox::platform::ArchSpecificError::RegisterUnsupported)?;
                 // This must land in the SAME pthread TSD slot the rewriter's
@@ -2548,6 +2779,11 @@ impl litebox::platform::StdioProvider for MacOsUserland {
 
 impl litebox::platform::SystemInfoProvider for MacOsUserland {
     fn get_syscall_entry_point(&self) -> usize {
+        // Stock code under HVF executes real `SVC #0` at EL0 through the EL1
+        // monitor; zero tells the loader never to parse or patch trampolines.
+        if hvf_backend::active().is_some() {
+            return 0;
+        }
         // Not a single fixed function address: this platform's syscall callback
         // has to resolve the calling thread's own guest-entry state with the
         // one register the rewriter's `SVC` gate leaves free, which it does by
@@ -2566,6 +2802,10 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
     }
 
     fn get_guest_tp_slot_offset(&self) -> Option<usize> {
+        // Under HVF `TPIDR_EL0` is a real register on the vCPU.
+        if hvf_backend::active().is_some() {
+            return None;
+        }
         // `Host::MacOs` gates read this offset from the trampoline rather than
         // carrying it as an immediate, because the TSD key backing it is handed
         // out by `pthread_key_create` in this process and is not knowable to the
@@ -2574,6 +2814,11 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
     }
 
     fn get_sigreturn_trampoline_address(&self) -> Option<usize> {
+        // A vCPU cannot execute host code: under HVF the trampoline is a
+        // guest-executable page the backend installed before loading.
+        if let Some(backend) = hvf_backend::active() {
+            return Some(backend.trampoline_address());
+        }
         // See `get_vdso_address`: this platform has no vDSO to fall back to for
         // a guest handler installed without `SA_RESTORER`, so it provides its
         // own trampoline instead -- `guest::sigreturn_trampoline`'s own doc
@@ -3252,6 +3497,9 @@ unsafe impl Sync for ThreadId {}
 /// The state shared behind a [`ThreadHandle`].
 struct ThreadHandleInner {
     id: Mutex<Option<ThreadId>>,
+    /// Interrupt state for the HVF backend: a pending flag plus the vCPU lane
+    /// this thread is currently running on, so `interrupt` can kick it.
+    hvf: hvf_backend::HvfThreadSlot,
     /// This thread's own pending-signals bitmap -- see [`PENDING_SIGNALS`] for
     /// why it lives here, `Arc`-shared, rather than in a bare `thread_local!`.
     /// Not gated by `id`: recording a bit into a since-exited thread's copy is
@@ -3282,6 +3530,7 @@ impl ThreadHandle {
         // SAFETY: `pthread_self` has no preconditions.
         let handle = ThreadHandle(Arc::new(ThreadHandleInner {
             id: Mutex::new(Some(ThreadId(unsafe { libc::pthread_self() }))),
+            hvf: hvf_backend::HvfThreadSlot::new(),
             pending_signals: AtomicU64::new(0),
         }));
         // Points into `handle`'s own heap allocation, not `handle` itself, so
@@ -3307,7 +3556,7 @@ impl ThreadHandle {
         f()
     }
 
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         CURRENT_THREAD.with_borrow(|thread| {
             thread
                 .clone()
@@ -3320,6 +3569,16 @@ impl ThreadHandle {
             // SAFETY: the identifier is live for as long as this lock is held.
             unsafe { libc::pthread_kill(thread.0, INTERRUPT_SIGNAL) };
         }
+        // Under HVF the thread may be inside `hv_vcpu_run`, which no host
+        // signal reaches: record the interrupt and kick its vCPU.
+        if hvf_backend::active().is_some() {
+            self.0.hvf.kick();
+        }
+    }
+
+    /// This thread's HVF interrupt slot (see [`hvf_backend::HvfThreadSlot`]).
+    pub(crate) fn hvf_slot(&self) -> &hvf_backend::HvfThreadSlot {
+        &self.0.hvf
     }
 
     /// Records a pending host signal on this thread from anywhere --
@@ -3407,7 +3666,7 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
                 // reaches guest code.
                 let shim = init_thread.init();
                 ThreadHandle::run_with_handle(|| {
-                    with_signal_alt_stack(|| guest::run_thread(shim.as_ref(), &mut ctx));
+                    with_signal_alt_stack(|| run_guest_thread(shim.as_ref(), &mut ctx));
                 });
             })?;
         Ok(())
@@ -3427,11 +3686,31 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
     }
 
     fn get_fp_state(&self) -> litebox::platform::FpSimdState64 {
+        if hvf_backend::active().is_some() {
+            return hvf_backend::thread_fp_state();
+        }
         guest::guest_fp_state()
     }
 
     fn set_fp_state(&self, state: &litebox::platform::FpSimdState64) {
+        if hvf_backend::active().is_some() {
+            hvf_backend::set_thread_fp_state(state);
+            return;
+        }
         guest::set_guest_fp_state(state);
+    }
+}
+
+/// Runs one guest thread on whichever backend is installed: the HVF vCPU
+/// backend when the runner selected it, the native rewritten-code switch
+/// otherwise.
+fn run_guest_thread(
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+) {
+    match hvf_backend::active() {
+        Some(backend) => backend.run_thread(shim, ctx),
+        None => guest::run_thread(shim, ctx),
     }
 }
 
@@ -3439,14 +3718,41 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
 // Networking
 // ---------------------------------------------------------------------------
 
+impl MacOsUserland {
+    /// Install the rootless guest NAT engine: a second, private smoltcp stack
+    /// that terminates guest TCP flows and relays guest UDP datagrams over
+    /// ordinary host sockets, so outbound guest connectivity works with
+    /// neither a `utun` device (which needs root) nor proxy environment
+    /// variables in the guest. See the [`nat`] module docs.
+    ///
+    /// Idempotent: the first call builds and installs the engine; later calls
+    /// are no-ops. The engine is driven entirely inside
+    /// `send_ip_packet`/`receive_ip_packet`, which the shim's net_worker
+    /// already calls in its busy-poll/sleep-backoff loop, so no dedicated
+    /// thread or cross-thread lifetime is needed; when a `utun` device is
+    /// attached those bodies never consult the engine.
+    ///
+    /// The engine is configured with the guest network's default gateway
+    /// address; a runner overriding `--gateway-ip` must not enable it until
+    /// the address can be plumbed through.
+    pub fn enable_nat_engine(&'static self) {
+        self.nat
+            .get_or_init(|| Mutex::new(nat::NatEngine::new(litebox::net::GATEWAY_IP_ADDR)));
+        litebox_util_log::debug!(gateway:% = litebox::net::GATEWAY_IP_ADDR; "nat: engine enabled");
+    }
+}
+
 impl litebox::platform::IPInterfaceProvider for MacOsUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        // Without a `utun` device there is nowhere for the packet to go.
-        // `SendError` is `#[non_exhaustive]` with no variants, so silently
-        // dropping is the only representable outcome -- and it matches what a
-        // guest with no configured interface should observe.
+        // With neither a `utun` device nor the NAT engine installed there is
+        // nowhere for the packet to go. `SendError` is `#[non_exhaustive]`
+        // with no variants, so silently dropping is the only representable
+        // outcome -- and it matches what a guest with no configured interface
+        // should observe.
         if let Some(tun) = self.tun.as_ref() {
             net::write_packet(tun, packet);
+        } else if let Some(nat) = self.nat.get() {
+            nat.lock().unwrap().ingest_guest_packet(packet);
         }
         Ok(())
     }
@@ -3455,10 +3761,29 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        let Some(tun) = self.tun.as_ref() else {
-            return Err(litebox::platform::ReceiveError::WouldBlock);
-        };
-        net::read_packet(tun, packet).ok_or(litebox::platform::ReceiveError::WouldBlock)
+        if let Some(tun) = self.tun.as_ref() {
+            return net::read_packet(tun, packet).ok_or(litebox::platform::ReceiveError::WouldBlock);
+        }
+        if let Some(nat) = self.nat.get() {
+            let mut engine = nat.lock().unwrap();
+            // Packets already queued toward the guest are the previous tick's
+            // output: hand them over first. The net_worker's receive poll is
+            // the engine's only clock, so once the queue is empty pump the
+            // host side and look again -- one tick per drained queue rather
+            // than one per delivered packet, since a tick walks every flow.
+            if let Some(n) = engine.take_packet_to_guest(packet) {
+                return Ok(n);
+            }
+            engine.poll_host_side();
+            if let Some(n) = engine.take_packet_to_guest(packet) {
+                return Ok(n);
+            }
+        }
+        Err(litebox::platform::ReceiveError::WouldBlock)
+    }
+
+    fn has_external_interface(&self) -> bool {
+        self.tun.is_some() || self.nat.get().is_some()
     }
 }
 
@@ -3470,6 +3795,49 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
 /// Once initialized it is never deleted or replaced, so an already-loaded
 /// trampoline's byte offset remains valid for the process lifetime.
 static GUEST_TP_TSD_KEY: OnceLock<libc::pthread_key_t> = OnceLock::new();
+
+/// Raise the `RLIMIT_NOFILE` soft limit toward 65536, best-effort.
+///
+/// The rootless NAT engine holds one host socket per guest flow, so a few
+/// thousand concurrent flows would run the default ~256 soft limit out with
+/// `EMFILE`. Raised at construction, alongside the other host resources
+/// acquired before `enable_seatbelt_sandbox*` installs (which does not mediate
+/// `setrlimit`, but this keeps one lifecycle slot for all of them). Darwin
+/// rejects a soft limit above `kern.maxfilesperproc` with `EINVAL` even when
+/// the hard limit is unlimited, so the request backs off by halving; whatever
+/// limit stands on entry is kept if even that fails.
+fn raise_nofile_limit() {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limits` is a valid, uniquely-owned out-parameter.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limits) } != 0 {
+        return;
+    }
+    const TARGET: libc::rlim_t = 65536;
+    if limits.rlim_cur >= TARGET {
+        litebox_util_log::debug!(nofile:% = limits.rlim_cur; "nat: RLIMIT_NOFILE soft limit already sufficient");
+        return;
+    }
+    let mut raised = if limits.rlim_max == libc::RLIM_INFINITY {
+        TARGET
+    } else {
+        limits.rlim_max.min(TARGET)
+    };
+    loop {
+        limits.rlim_cur = raised;
+        // SAFETY: `limits` is a valid `rlimit` that outlives the call.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limits) } == 0 {
+            litebox_util_log::debug!(nofile:% = raised; "nat: raised RLIMIT_NOFILE soft limit");
+            return;
+        }
+        if raised <= 10240 {
+            return;
+        }
+        raised /= 2;
+    }
+}
 
 /// Return the process-wide pthread TSD key used for the guest thread pointer,
 /// reserving it on the first call.
@@ -3557,7 +3925,7 @@ where
     // reads `current_thread()`, and that panics on a thread this was never
     // called on. `spawn_thread` wraps its own entry the same way.
     ThreadHandle::run_with_handle(|| {
-        with_signal_alt_stack(|| guest::run_thread(&shim, ctx));
+        with_signal_alt_stack(|| run_guest_thread(&shim, ctx));
     });
 }
 

@@ -376,10 +376,12 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
             .as_rust_str()
             .map_err(errors::PathError::from)
             .map_err(OpenError::from)?;
-        let searched_status = self.file_status_as(credentials, path).map_err(|error| match error {
-            FileStatusError::PathError(error) => OpenError::PathError(error),
-            FileStatusError::Io | FileStatusError::ClosedFd => OpenError::Io,
-        })?;
+        let searched_status =
+            self.file_status_as(credentials, path)
+                .map_err(|error| match error {
+                    FileStatusError::PathError(error) => OpenError::PathError(error),
+                    FileStatusError::Io | FileStatusError::ClosedFd => OpenError::Io,
+                })?;
         if !matches!(searched_status.file_type, FileType::RegularFile)
             || !dac_allows_as(
                 credentials,

@@ -1,0 +1,1964 @@
+{
+  "captured_at_unix": 1788409628,
+  "format": 1,
+  "package_count": 276,
+  "packages": [
+    {
+      "cache_path": "apks/abseil-cpp-raw-logging-internal-20250814.1-r0.apk",
+      "name": "abseil-cpp-raw-logging-internal",
+      "sha256": "30679288b05533c12cd7ccffe2949d852b6df66ed87505af72a4240652cb87dd",
+      "size": 5289,
+      "version": "20250814.1-r0"
+    },
+    {
+      "cache_path": "apks/abseil-cpp-strings-20250814.1-r0.apk",
+      "name": "abseil-cpp-strings",
+      "sha256": "8ab707d857ba0953413a2ea07195d1d8aac59f65edbe6fb779534b2549409830",
+      "size": 51831,
+      "version": "20250814.1-r0"
+    },
+    {
+      "cache_path": "apks/abseil-cpp-strings-internal-20250814.1-r0.apk",
+      "name": "abseil-cpp-strings-internal",
+      "sha256": "5882652406afe9f91d62473c6a91372532c4f829036bb300239712679001e43f",
+      "size": 7426,
+      "version": "20250814.1-r0"
+    },
+    {
+      "cache_path": "apks/adwaita-fonts-50.0-r0.apk",
+      "name": "adwaita-fonts",
+      "sha256": "20d28de75ea527691a15439eece79f57fec7cd9c70759a748ce8bde274a3422c",
+      "size": 1284,
+      "version": "50.0-r0"
+    },
+    {
+      "cache_path": "apks/adwaita-fonts-mono-50.0-r0.apk",
+      "name": "adwaita-fonts-mono",
+      "sha256": "71e76472972598a4a6cefe21d51b176717631d219003bfac9e28d5e9029179a4",
+      "size": 2405815,
+      "version": "50.0-r0"
+    },
+    {
+      "cache_path": "apks/adwaita-fonts-sans-50.0-r0.apk",
+      "name": "adwaita-fonts-sans",
+      "sha256": "10d58c3300d89462d1a9ad1d1a6a4d0be15577d0bbf93c5d79b426464d895972",
+      "size": 960703,
+      "version": "50.0-r0"
+    },
+    {
+      "cache_path": "apks/adwaita-icon-theme-50.0-r1.apk",
+      "name": "adwaita-icon-theme",
+      "sha256": "0cbf179547d29ff418050ad04fa122abd3493755e1628bba10b0731da2b7e34f",
+      "size": 1895462,
+      "version": "50.0-r1"
+    },
+    {
+      "cache_path": "apks/adwaita-xfce-icon-theme-0.0.4-r0.apk",
+      "name": "adwaita-xfce-icon-theme",
+      "sha256": "e3e97fd68c213f1f77a0533699687630d824b6d7deaf0ac9fa8f7a6a18baaf0b",
+      "size": 62741,
+      "version": "0.0.4-r0"
+    },
+    {
+      "cache_path": "apks/alpine-baselayout-3.7.2-r1.apk",
+      "name": "alpine-baselayout",
+      "sha256": "5576f7b7807627f019dcc1f4a27c8b2a39101eaeffea2eb1c7a6d22bd087258d",
+      "size": 8265,
+      "version": "3.7.2-r1"
+    },
+    {
+      "cache_path": "apks/alpine-baselayout-data-3.7.2-r1.apk",
+      "name": "alpine-baselayout-data",
+      "sha256": "01afabfafb08de6f694b7d764f4cfa965e6adabba05afca0b8efd1b6f9b4cd85",
+      "size": 10780,
+      "version": "3.7.2-r1"
+    },
+    {
+      "cache_path": "apks/alsa-lib-1.2.15.3-r0.apk",
+      "name": "alsa-lib",
+      "sha256": "b2fa6d6c13bc17f3e24b94af245fb7943aed7678def1d621154b8b2438e44c68",
+      "size": 477905,
+      "version": "1.2.15.3-r0"
+    },
+    {
+      "cache_path": "apks/aom-libs-3.14.1-r0.apk",
+      "name": "aom-libs",
+      "sha256": "1a46f9a57ca5c3ad19f583c94e201177c09c332496b3a6d73a7f981fffffd563",
+      "size": 3367407,
+      "version": "3.14.1-r0"
+    },
+    {
+      "cache_path": "apks/apk-tools-3.0.8-r0.apk",
+      "name": "apk-tools",
+      "sha256": "852609bcd94e7d21b6315636a8bbcd4158aa6645941596a2a396ffe8a56b1c7b",
+      "size": 56412,
+      "version": "3.0.8-r0"
+    },
+    {
+      "cache_path": "apks/at-spi2-core-2.60.5-r0.apk",
+      "name": "at-spi2-core",
+      "sha256": "9beb086bbc607287e5c6325d5de21b23e6ee0c78fbf9fe4a868063da117c20f4",
+      "size": 62862,
+      "version": "2.60.5-r0"
+    },
+    {
+      "cache_path": "apks/at-spi2-core-libs-2.60.5-r0.apk",
+      "name": "at-spi2-core-libs",
+      "sha256": "dc87dba0de9c3af16c13da4c627fafdada70e1c5e2c48bec7464954df7c7d1ee",
+      "size": 84525,
+      "version": "2.60.5-r0"
+    },
+    {
+      "cache_path": "apks/avahi-libs-0.9_rc4-r0.apk",
+      "name": "avahi-libs",
+      "sha256": "bf6c5092d9a90b2e5c22f007d888e8e786de73dcb9a787361d7a04afb8f8ecf6",
+      "size": 42597,
+      "version": "0.9_rc4-r0"
+    },
+    {
+      "cache_path": "apks/brotli-libs-1.2.0-r1.apk",
+      "name": "brotli-libs",
+      "sha256": "e0e7a7892f28326a9f18e09607b1aea72baedda470bc4e3d2b11262b9ae5dda3",
+      "size": 424924,
+      "version": "1.2.0-r1"
+    },
+    {
+      "cache_path": "apks/bubblewrap-0.12.0-r0.apk",
+      "name": "bubblewrap",
+      "sha256": "f38670cd16e15268ab2588c6b788d380fe219de74d6430f91d102c3df1652e87",
+      "size": 30577,
+      "version": "0.12.0-r0"
+    },
+    {
+      "cache_path": "apks/busybox-1.37.0-r31.apk",
+      "name": "busybox",
+      "sha256": "18e3490a6f024004b2b13dd4b54bd50ccd82894938023b2d4eab389a4edcba70",
+      "size": 521974,
+      "version": "1.37.0-r31"
+    },
+    {
+      "cache_path": "apks/busybox-binsh-1.37.0-r31.apk",
+      "name": "busybox-binsh",
+      "sha256": "f3a1b2257cfa114ff20de05c665f380695385d589908bfc9af5768f39fef9ef5",
+      "size": 1547,
+      "version": "1.37.0-r31"
+    },
+    {
+      "cache_path": "apks/ca-certificates-20260611-r0.apk",
+      "name": "ca-certificates",
+      "sha256": "be5bd3346e2057d1771ea461cb1f790ef03521450572f0698b9bebf35b4c14d2",
+      "size": 131089,
+      "version": "20260611-r0"
+    },
+    {
+      "cache_path": "apks/ca-certificates-bundle-20260611-r0.apk",
+      "name": "ca-certificates-bundle",
+      "sha256": "bc5d3ae0b602748852e0bc601a4348cabc4f654f12f27578919cbf3c810f1c1e",
+      "size": 107310,
+      "version": "20260611-r0"
+    },
+    {
+      "cache_path": "apks/cairo-1.18.4-r1.apk",
+      "name": "cairo",
+      "sha256": "edb009c2331efe54a895468690c46d528ef2907025fc90ca9329950f41b87e61",
+      "size": 513204,
+      "version": "1.18.4-r1"
+    },
+    {
+      "cache_path": "apks/cairo-gobject-1.18.4-r1.apk",
+      "name": "cairo-gobject",
+      "sha256": "fd13da5b7ed6c793dda3e602a7b27611ffdc9b4e03e3d0a64a0e9e85eb4b73e9",
+      "size": 9391,
+      "version": "1.18.4-r1"
+    },
+    {
+      "cache_path": "apks/chromium-152.0.7977.64-r0.apk",
+      "name": "chromium",
+      "sha256": "013a4727172e7a2e5b0336895a95de7832ee3d131ee19b72dfe737aff47a4078",
+      "size": 140753610,
+      "version": "152.0.7977.64-r0"
+    },
+    {
+      "cache_path": "apks/chromium-angle-152.0.7977.64-r0.apk",
+      "name": "chromium-angle",
+      "sha256": "56cc688bd1c982750dc05c12500cb336dbb88a4b4e4c77bdd984b613c62ad625",
+      "size": 384948,
+      "version": "152.0.7977.64-r0"
+    },
+    {
+      "cache_path": "apks/chromium-common-152.0.7977.64-r0.apk",
+      "name": "chromium-common",
+      "sha256": "9f65b113ddb5a560a7154b36c286d96e610775ff73d04dc5c332d7f3eb962284",
+      "size": 413656,
+      "version": "152.0.7977.64-r0"
+    },
+    {
+      "cache_path": "apks/cjson-1.7.19-r1.apk",
+      "name": "cjson",
+      "sha256": "eb789967d0a757e4b0dc64965651d4c31628a98549cff1ae68be4cc01e266ca1",
+      "size": 13670,
+      "version": "1.7.19-r1"
+    },
+    {
+      "cache_path": "apks/crc32c-1.1.2-r3.apk",
+      "name": "crc32c",
+      "sha256": "dc30e3428ef496808459c8de77049b358296b5ce1d1cf169cd0b267803dd58e7",
+      "size": 10957,
+      "version": "1.1.2-r3"
+    },
+    {
+      "cache_path": "apks/cups-libs-2.4.19-r0.apk",
+      "name": "cups-libs",
+      "sha256": "9dda94ea64cb61b02c69789c42b0e402d886679957489b31ed9421afdc887323",
+      "size": 240123,
+      "version": "2.4.19-r0"
+    },
+    {
+      "cache_path": "apks/dbus-1.16.2-r2.apk",
+      "name": "dbus",
+      "sha256": "b98536633c8e7529895760a2062ead47d6f2c88bff077e49846c75559bc0ba27",
+      "size": 130840,
+      "version": "1.16.2-r2"
+    },
+    {
+      "cache_path": "apks/dbus-daemon-launch-helper-1.16.2-r2.apk",
+      "name": "dbus-daemon-launch-helper",
+      "sha256": "79cc6c63cce2ad0b04e51835459005c6be6f782f6212a2dfd7aa0c13519155c7",
+      "size": 23152,
+      "version": "1.16.2-r2"
+    },
+    {
+      "cache_path": "apks/dbus-libs-1.16.2-r2.apk",
+      "name": "dbus-libs",
+      "sha256": "b09b297d622377f870da5f162563b2bb4926dda17dfb2c7b1c84c37b05e8e295",
+      "size": 130817,
+      "version": "1.16.2-r2"
+    },
+    {
+      "cache_path": "apks/dbus-x11-1.16.2-r2.apk",
+      "name": "dbus-x11",
+      "sha256": "9184a012e662fb2312e1926512a881b32890e3affd68a16a9d6882cca12325cc",
+      "size": 11695,
+      "version": "1.16.2-r2"
+    },
+    {
+      "cache_path": "apks/desktop-file-utils-0.28-r0.apk",
+      "name": "desktop-file-utils",
+      "sha256": "dc8ad3b8ef4a05e03270ed3adfadf4c51ac5b089ebbc746e89262d06fc811ddb",
+      "size": 51578,
+      "version": "0.28-r0"
+    },
+    {
+      "cache_path": "apks/double-conversion-3.4.0-r0.apk",
+      "name": "double-conversion",
+      "sha256": "8bd4428d5e5626005e26d4df2bb21b365f4d72ac6409d86dd7ab15cd9719df9d",
+      "size": 37274,
+      "version": "3.4.0-r0"
+    },
+    {
+      "cache_path": "apks/duktape-libs-2.7.0-r3.apk",
+      "name": "duktape-libs",
+      "sha256": "a2a7b52fa72110ec625107e32278046aef3081fa41d1d6950de6b66f2819eb12",
+      "size": 154316,
+      "version": "2.7.0-r3"
+    },
+    {
+      "cache_path": "apks/encodings-1.1.0-r0.apk",
+      "name": "encodings",
+      "sha256": "184b072668ca132fa59caf6a5902f1c229dd89be68c393378688cd67b14aa236",
+      "size": 588284,
+      "version": "1.1.0-r0"
+    },
+    {
+      "cache_path": "apks/eudev-libs-3.2.14-r6.apk",
+      "name": "eudev-libs",
+      "sha256": "330022dcf23de371d8df9b08f9bf9c9e98ced062b7352b518ee977dcaf977956",
+      "size": 26450,
+      "version": "3.2.14-r6"
+    },
+    {
+      "cache_path": "apks/exo-4.20.0-r0.apk",
+      "name": "exo",
+      "sha256": "319c7d461efada867f38c15c10948259992dfffecdb4b07e0e2d26fdc5b18fd7",
+      "size": 33500,
+      "version": "4.20.0-r0"
+    },
+    {
+      "cache_path": "apks/exo-libs-4.20.0-r0.apk",
+      "name": "exo-libs",
+      "sha256": "e3ebbc0d2dea27b9f1bdc39a54aa1e1ef2112decb95e305b29168c3e9cd2fe77",
+      "size": 80172,
+      "version": "4.20.0-r0"
+    },
+    {
+      "cache_path": "apks/ffmpeg-libavcodec-8.1.2-r0.apk",
+      "name": "ffmpeg-libavcodec",
+      "sha256": "2ec21bb1c60e4cfb426adf9b9cc1c8a81a4f3442adcc0769c3bb2364ca890030",
+      "size": 8867975,
+      "version": "8.1.2-r0"
+    },
+    {
+      "cache_path": "apks/ffmpeg-libavformat-8.1.2-r0.apk",
+      "name": "ffmpeg-libavformat",
+      "sha256": "56e1157565ce81700e1273487a8b3619ffb005d19e8fecbb2c65c4f87cfc6bb8",
+      "size": 1520827,
+      "version": "8.1.2-r0"
+    },
+    {
+      "cache_path": "apks/ffmpeg-libavutil-8.1.2-r0.apk",
+      "name": "ffmpeg-libavutil",
+      "sha256": "156b175226c4469d44f7f670404f735ea74efc1cb4a3c12e45fb1714e6f63e19",
+      "size": 450861,
+      "version": "8.1.2-r0"
+    },
+    {
+      "cache_path": "apks/ffmpeg-libswresample-8.1.2-r0.apk",
+      "name": "ffmpeg-libswresample",
+      "sha256": "9791f1fb508884d59214e201508b53591a5ec55b60e481bb33c7dc9a2bd816b9",
+      "size": 56096,
+      "version": "8.1.2-r0"
+    },
+    {
+      "cache_path": "apks/file-5.47-r2.apk",
+      "name": "file",
+      "sha256": "fb1ccc520c2e80cb1d3b739500826cedf4b35b8a43ff78aa683c6f6bd48dd3e5",
+      "size": 10233,
+      "version": "5.47-r2"
+    },
+    {
+      "cache_path": "apks/font-alias-1.0.6-r0.apk",
+      "name": "font-alias",
+      "sha256": "129b6c1c1b8dc896cc671fd3198d7b28878f1bcb8078ce489b91d47a616d962c",
+      "size": 3933,
+      "version": "1.0.6-r0"
+    },
+    {
+      "cache_path": "apks/font-cursor-misc-1.0.4-r1.apk",
+      "name": "font-cursor-misc",
+      "sha256": "8eb12fdb2a239e981cd07b8ef6947352a175613c2a1795641506012f79339001",
+      "size": 7001,
+      "version": "1.0.4-r1"
+    },
+    {
+      "cache_path": "apks/font-dejavu-2.37-r6.apk",
+      "name": "font-dejavu",
+      "sha256": "786ad1bca0938ebb59e52894102cc31e2e8ef7a940f97d0e0b97d7a0caa5790e",
+      "size": 5394025,
+      "version": "2.37-r6"
+    },
+    {
+      "cache_path": "apks/font-misc-misc-1.1.3-r1.apk",
+      "name": "font-misc-misc",
+      "sha256": "db2cdb0a1ba8336e0021b26ad3ce6df00ba7e2acdbb8864d5c36e4a73f03c8ff",
+      "size": 3688031,
+      "version": "1.1.3-r1"
+    },
+    {
+      "cache_path": "apks/font-opensans-0_git20210927-r1.apk",
+      "name": "font-opensans",
+      "sha256": "235ce7d726311ddee6ee920e22e009ac0633f7653706bba6d771cd53b94db09f",
+      "size": 1722578,
+      "version": "0_git20210927-r1"
+    },
+    {
+      "cache_path": "apks/fontconfig-2.17.1-r1.apk",
+      "name": "fontconfig",
+      "sha256": "e4fc46de2fa0dc64ef948aab0798500f784eef15d75c9a2e8952a0e3017dacfc",
+      "size": 183219,
+      "version": "2.17.1-r1"
+    },
+    {
+      "cache_path": "apks/freetype-2.14.3-r0.apk",
+      "name": "freetype",
+      "sha256": "8f36a4b4b6c75574f2f51d62c3df27d23ec7054ae1cae97d54adad72e725e027",
+      "size": 355876,
+      "version": "2.14.3-r0"
+    },
+    {
+      "cache_path": "apks/fribidi-1.0.16-r3.apk",
+      "name": "fribidi",
+      "sha256": "b4f41c04682487ccc0d5e304a20f1062ddb47907ffa0a414208512e2c946e4d7",
+      "size": 32400,
+      "version": "1.0.16-r3"
+    },
+    {
+      "cache_path": "apks/garcon-4.20.0-r0.apk",
+      "name": "garcon",
+      "sha256": "af076b8d34437b3319b0feaaa9e685041cca700e61546d9f705e4e112f591848",
+      "size": 94009,
+      "version": "4.20.0-r0"
+    },
+    {
+      "cache_path": "apks/gdk-pixbuf-2.44.7-r1.apk",
+      "name": "gdk-pixbuf",
+      "sha256": "152fa4bb9045eb737c7cad912fb58dd9b91594e1f22f87fa79839d73d331e887",
+      "size": 98543,
+      "version": "2.44.7-r1"
+    },
+    {
+      "cache_path": "apks/glib-2.88.1-r1.apk",
+      "name": "glib",
+      "sha256": "0ae89191a79ea5d5a02515e41f29b62e5e0a0a80fb059804bbbacac2d77cce4e",
+      "size": 1995383,
+      "version": "2.88.1-r1"
+    },
+    {
+      "cache_path": "apks/glycin-image-rs-2.1.5-r0.apk",
+      "name": "glycin-image-rs",
+      "sha256": "fde0fba5de115054135ee76cd8b3dc93ebb732894a3cb9dc940235fb5f3abb7d",
+      "size": 1698334,
+      "version": "2.1.5-r0"
+    },
+    {
+      "cache_path": "apks/glycin-svg-2.1.5-r0.apk",
+      "name": "glycin-svg",
+      "sha256": "0524332ec443083c43b40be85f976bde6ee1c3a10eb315fd54d075660354a191",
+      "size": 598142,
+      "version": "2.1.5-r0"
+    },
+    {
+      "cache_path": "apks/gmp-6.3.0-r4.apk",
+      "name": "gmp",
+      "sha256": "4dab6e86b850fe1b5bc0cf2fac17efa4d7f648bea44f3d9019694cc1e1cb12b7",
+      "size": 221014,
+      "version": "6.3.0-r4"
+    },
+    {
+      "cache_path": "apks/gnutls-3.8.13-r0.apk",
+      "name": "gnutls",
+      "sha256": "8678c104d4c08e7e41b5fcacdfdbffa208066bcb1c3f7f8b620e0a6bd22b3e40",
+      "size": 901801,
+      "version": "3.8.13-r0"
+    },
+    {
+      "cache_path": "apks/gobject-introspection-1.86.0-r1.apk",
+      "name": "gobject-introspection",
+      "sha256": "583a1411425f9956d20a4cc25af485a3a877e944dbffd696f6633e0636f78f94",
+      "size": 96027,
+      "version": "1.86.0-r1"
+    },
+    {
+      "cache_path": "apks/graphite2-1.3.14-r6.apk",
+      "name": "graphite2",
+      "sha256": "07ac746525d14925865451eb20d283406b9a907bbe828e818c32d667dabf48d7",
+      "size": 60154,
+      "version": "1.3.14-r6"
+    },
+    {
+      "cache_path": "apks/gtk+3.0-3.24.52-r0.apk",
+      "name": "gtk+3.0",
+      "sha256": "f228f53f8da557919a194ea4c5a14d67289a83cf67cade80f30f57d4a8244c69",
+      "size": 3895864,
+      "version": "3.24.52-r0"
+    },
+    {
+      "cache_path": "apks/gtk-layer-shell-0.10.1-r0.apk",
+      "name": "gtk-layer-shell",
+      "sha256": "c8be2ecdd1b5e6be2a362e04ca83be18871554d822ca94058dba62cf90197d75",
+      "size": 58897,
+      "version": "0.10.1-r0"
+    },
+    {
+      "cache_path": "apks/gtk-update-icon-cache-3.24.52-r0.apk",
+      "name": "gtk-update-icon-cache",
+      "sha256": "0753aa69dbe70eb5b7288be4cfe0f957d98a8d70bbe96350985264b63f5c93d5",
+      "size": 15054,
+      "version": "3.24.52-r0"
+    },
+    {
+      "cache_path": "apks/harfbuzz-13.2.1-r0.apk",
+      "name": "harfbuzz",
+      "sha256": "0f2f652308dac47cbd2e75e4da9fd8cc3d08c6db562af4a2fbdfe5ebf54ebedd",
+      "size": 766734,
+      "version": "13.2.1-r0"
+    },
+    {
+      "cache_path": "apks/harfbuzz-subset-13.2.1-r0.apk",
+      "name": "harfbuzz-subset",
+      "sha256": "e2e2dde8f8e75d8c74db3fe9a995768a49353ebdec6ec6e024635e38dc5ab7e0",
+      "size": 573442,
+      "version": "13.2.1-r0"
+    },
+    {
+      "cache_path": "apks/hicolor-icon-theme-0.18-r0.apk",
+      "name": "hicolor-icon-theme",
+      "sha256": "ad7fcbb1bb774e7c5cd1996914cb455f6db81ace834dd3aae90c45561e4743d7",
+      "size": 27623,
+      "version": "0.18-r0"
+    },
+    {
+      "cache_path": "apks/hwdata-pci-0.408-r0.apk",
+      "name": "hwdata-pci",
+      "sha256": "d3831002498096bdf52b69b6c495323bd7d249f2d9b316a4677d3ebee60df2ac",
+      "size": 369078,
+      "version": "0.408-r0"
+    },
+    {
+      "cache_path": "apks/icu-data-full-78.1-r0.apk",
+      "name": "icu-data-full",
+      "sha256": "e5034d8b51ad6f4b2a934afb39bde070dcaafaafa8251b56948e9d480978d092",
+      "size": 12731006,
+      "version": "78.1-r0"
+    },
+    {
+      "cache_path": "apks/icu-libs-78.1-r0.apk",
+      "name": "icu-libs",
+      "sha256": "2393882dcf1e3f5be98696665c3468dd0d2a85cd568d50abd232729863df9738",
+      "size": 1957437,
+      "version": "78.1-r0"
+    },
+    {
+      "cache_path": "apks/iso-codes-4.20.1-r0.apk",
+      "name": "iso-codes",
+      "sha256": "eec1dfa77f283a5a4b1e95c7657f03c1e7634ef8ff9ff4ab9ed3512caa11c8ad",
+      "size": 360325,
+      "version": "4.20.1-r0"
+    },
+    {
+      "cache_path": "apks/json-glib-1.10.8-r0.apk",
+      "name": "json-glib",
+      "sha256": "4ec772f45e08d6ba9cfbf47edaf6c20fd3b358ac9000bfebc28040383d198495",
+      "size": 65410,
+      "version": "1.10.8-r0"
+    },
+    {
+      "cache_path": "apks/lame-libs-3.100-r5.apk",
+      "name": "lame-libs",
+      "sha256": "f419c674f87667947534be07c1f5388a12d614da464a9be97522e3d932d8f48f",
+      "size": 127319,
+      "version": "3.100-r5"
+    },
+    {
+      "cache_path": "apks/lcms2-2.19-r0.apk",
+      "name": "lcms2",
+      "sha256": "05c9e865ac443b8ff467c8e7c176ef323fac6c34f710410ef4f26c94478be7cd",
+      "size": 156324,
+      "version": "2.19-r0"
+    },
+    {
+      "cache_path": "apks/libSvtAv1Enc-4.1.0-r0.apk",
+      "name": "libSvtAv1Enc",
+      "sha256": "665a8228a6d5a1ad19ee54debc28b7d2d22e15a7ec94fb47b99c7202c91d9731",
+      "size": 2253476,
+      "version": "4.1.0-r0"
+    },
+    {
+      "cache_path": "apks/libapk-3.0.8-r0.apk",
+      "name": "libapk",
+      "sha256": "fe851eca83c5896d74fba5063d197acf84548daaf5ea5410b8c37911dcd66b09",
+      "size": 138168,
+      "version": "3.0.8-r0"
+    },
+    {
+      "cache_path": "apks/libasyncns-0.8-r5.apk",
+      "name": "libasyncns",
+      "sha256": "96ab346c1f8b7b07870125f7ed0248b013f63526fb0a5cce9d138f334fe05ffe",
+      "size": 10019,
+      "version": "0.8-r5"
+    },
+    {
+      "cache_path": "apks/libatk-1.0-2.60.5-r0.apk",
+      "name": "libatk-1.0",
+      "sha256": "de8231e434a21012c8586e330f9bb26a85d40d700d9af571e23933c65349cb63",
+      "size": 70867,
+      "version": "2.60.5-r0"
+    },
+    {
+      "cache_path": "apks/libatk-bridge-2.0-2.60.5-r0.apk",
+      "name": "libatk-bridge-2.0",
+      "sha256": "82ff33781a127c1c974e2babb399cdaa5a08a222c9ce3ef6f49bd279c477ec45",
+      "size": 69968,
+      "version": "2.60.5-r0"
+    },
+    {
+      "cache_path": "apks/libblkid-2.42.1-r0.apk",
+      "name": "libblkid",
+      "sha256": "5de536dd5f80772946aebf99211695a1f4ad033568d5c9ebd0d7d1dead33de44",
+      "size": 97014,
+      "version": "2.42.1-r0"
+    },
+    {
+      "cache_path": "apks/libbluray-1.4.0-r0.apk",
+      "name": "libbluray",
+      "sha256": "49f812bd1a759d9ec27b9fd055fff7844f7efe0ee3549475b70aaa720446304c",
+      "size": 114172,
+      "version": "1.4.0-r0"
+    },
+    {
+      "cache_path": "apks/libbsd-0.12.2-r0.apk",
+      "name": "libbsd",
+      "sha256": "1c4129bef0862afa2a7414217e8c3a50609abfe2e264b6f7ba6a5452ed6c3b35",
+      "size": 31282,
+      "version": "0.12.2-r0"
+    },
+    {
+      "cache_path": "apks/libbz2-1.0.8-r6.apk",
+      "name": "libbz2",
+      "sha256": "28cb76bb6d11d2a55c3061b5fcb2ab84996412a248b2c9fe52bb710d0a2a84e7",
+      "size": 34259,
+      "version": "1.0.8-r6"
+    },
+    {
+      "cache_path": "apks/libcamera-0.7.1-r1.apk",
+      "name": "libcamera",
+      "sha256": "892d1f6f01f7c2fc29cf56ec7db92f5d25432036dd741fcec37b86276582876d",
+      "size": 944869,
+      "version": "0.7.1-r1"
+    },
+    {
+      "cache_path": "apks/libcamera-ipa-0.7.1-r1.apk",
+      "name": "libcamera-ipa",
+      "sha256": "55af4387bee4ad276c4abaf13b1bd20284abda6342f05d056089d28fae4ac668",
+      "size": 699028,
+      "version": "0.7.1-r1"
+    },
+    {
+      "cache_path": "apks/libcap-ng-0.8.5-r2.apk",
+      "name": "libcap-ng",
+      "sha256": "64b7159d772cec5bdb3e3d091d4b4c8e33e7b8dee0b5873ac89e25e3899de3ca",
+      "size": 12793,
+      "version": "0.8.5-r2"
+    },
+    {
+      "cache_path": "apks/libcap2-2.78-r0.apk",
+      "name": "libcap2",
+      "sha256": "e13be383f18b1fcfe895361d816ff7cfd2b3c265e442bb371c4a234b29b0e4a9",
+      "size": 23993,
+      "version": "2.78-r0"
+    },
+    {
+      "cache_path": "apks/libcolord-1.4.8-r4.apk",
+      "name": "libcolord",
+      "sha256": "4b655ce28cd64a4c94f205a81d2189618d6fb831c5feeabdb4d269d5f2638ac4",
+      "size": 209467,
+      "version": "1.4.8-r4"
+    },
+    {
+      "cache_path": "apks/libcrypto3-3.5.8-r0.apk",
+      "name": "libcrypto3",
+      "sha256": "35b892813c23664a3592e4fc8c12a03538a22c579057655361c7043305272a9a",
+      "size": 2284775,
+      "version": "3.5.8-r0"
+    },
+    {
+      "cache_path": "apks/libdav1d-1.5.3-r0.apk",
+      "name": "libdav1d",
+      "sha256": "5a58c1055ef5e7e987e58928bbd4f103ce8240384a8914822c3861907ff5d5eb",
+      "size": 389023,
+      "version": "1.5.3-r0"
+    },
+    {
+      "cache_path": "apks/libdbusmenu-glib-16.04.0-r6.apk",
+      "name": "libdbusmenu-glib",
+      "sha256": "0e4897acd88a07cd8578ccf30bf4ac1994c7fbbb1ffadea24e2c99b7a60e56a1",
+      "size": 53518,
+      "version": "16.04.0-r6"
+    },
+    {
+      "cache_path": "apks/libdbusmenu-gtk3-16.04.0-r6.apk",
+      "name": "libdbusmenu-gtk3",
+      "sha256": "25c66f3204d4b9d0d500ee97287a8200eec7206109d02825873f44a3a8db9f5b",
+      "size": 28510,
+      "version": "16.04.0-r6"
+    },
+    {
+      "cache_path": "apks/libdisplay-info-0.3.0-r0.apk",
+      "name": "libdisplay-info",
+      "sha256": "b16c3bd7432f49cc2ad322228c56510932940fec35c2fa43e842d2e3f898a958",
+      "size": 80128,
+      "version": "0.3.0-r0"
+    },
+    {
+      "cache_path": "apks/libdrm-2.4.134-r0.apk",
+      "name": "libdrm",
+      "sha256": "ad796caa2b8685d8a3d586bc06bb3b710efb497e8503372ac65c93ab7260623b",
+      "size": 206147,
+      "version": "2.4.134-r0"
+    },
+    {
+      "cache_path": "apks/libdvdcss-1.4.3-r0.apk",
+      "name": "libdvdcss",
+      "sha256": "485a50d872652ae13e831b256d17513c67231b335fc78b4cc66f4a46ec72d688",
+      "size": 18082,
+      "version": "1.4.3-r0"
+    },
+    {
+      "cache_path": "apks/libdvdnav-6.1.1-r1.apk",
+      "name": "libdvdnav",
+      "sha256": "8fffe0ec8a3bac48f971569b5e1af42be0da521cd46b8650824dba4ebf7b5efc",
+      "size": 34866,
+      "version": "6.1.1-r1"
+    },
+    {
+      "cache_path": "apks/libdvdread-6.1.3-r2.apk",
+      "name": "libdvdread",
+      "sha256": "4716d8149707bdfe49087a7e1aa0a81e5b5c54823b32212ebda18c9f38dc47cd",
+      "size": 44725,
+      "version": "6.1.3-r2"
+    },
+    {
+      "cache_path": "apks/libeconf-0.8.3-r0.apk",
+      "name": "libeconf",
+      "sha256": "cf0899d49ded0a6891e3cdf1b37887f2ecd77293afe1d8f3cb8937763c83f183",
+      "size": 27259,
+      "version": "0.8.3-r0"
+    },
+    {
+      "cache_path": "apks/libelf-0.195-r0.apk",
+      "name": "libelf",
+      "sha256": "1c108314af454a885ac0b053201db57027470c4f2309412c016897e2a2bf5d0e",
+      "size": 44727,
+      "version": "0.195-r0"
+    },
+    {
+      "cache_path": "apks/libepoxy-1.5.10-r1.apk",
+      "name": "libepoxy",
+      "sha256": "ddb716957da6c47fbfc68e0b6a4ee87b1d734cc2bce4090d7e695e4aa0216417",
+      "size": 248331,
+      "version": "1.5.10-r1"
+    },
+    {
+      "cache_path": "apks/libevdev-1.13.6-r0.apk",
+      "name": "libevdev",
+      "sha256": "7e8f918dcdedbb817148ef46158d1093dac8856d58174d61b89679b06c57d347",
+      "size": 28201,
+      "version": "1.13.6-r0"
+    },
+    {
+      "cache_path": "apks/libexif-0.6.26-r0.apk",
+      "name": "libexif",
+      "sha256": "5d34945e0cdbf0fb585630368d9f5ec26658716a76dae44a45e927bb27b1f673",
+      "size": 71118,
+      "version": "0.6.26-r0"
+    },
+    {
+      "cache_path": "apks/libexpat-2.8.4-r0.apk",
+      "name": "libexpat",
+      "sha256": "ca1be5be36985a8370f4a8e9e33a25788ac95260295718e1b0b721a16bb2aa61",
+      "size": 60700,
+      "version": "2.8.4-r0"
+    },
+    {
+      "cache_path": "apks/libffi-3.5.2-r1.apk",
+      "name": "libffi",
+      "sha256": "9a67280b0c7c62db658c2d4d32ed1199903bef859c32dd4245e1a7e35c89ab4b",
+      "size": 17799,
+      "version": "3.5.2-r1"
+    },
+    {
+      "cache_path": "apks/libflac-1.4.3-r2.apk",
+      "name": "libflac",
+      "sha256": "07885c5f00fe9a1628cc72968b28e6713cdfea6b538190e3da0d5d10f862b4c7",
+      "size": 155237,
+      "version": "1.4.3-r2"
+    },
+    {
+      "cache_path": "apks/libfontenc-1.1.9-r0.apk",
+      "name": "libfontenc",
+      "sha256": "a0426b36ce7b2c8a8049daa01f47a765ec10b4cc336e0e8d14327e998e80fb89",
+      "size": 11873,
+      "version": "1.1.9-r0"
+    },
+    {
+      "cache_path": "apks/libgcc-15.2.0-r5.apk",
+      "name": "libgcc",
+      "sha256": "369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403",
+      "size": 66323,
+      "version": "15.2.0-r5"
+    },
+    {
+      "cache_path": "apks/libglycin-2.1.5-r0.apk",
+      "name": "libglycin",
+      "sha256": "3e36d9028c787ab22995769e550d3e5a6d96f608332469aadb2f952dd9c66b9c",
+      "size": 1103681,
+      "version": "2.1.5-r0"
+    },
+    {
+      "cache_path": "apks/libgomp-15.2.0-r5.apk",
+      "name": "libgomp",
+      "sha256": "90576a8899c560d3983b8ac8442b5b75957a917bc1c4e950e005945080f8682f",
+      "size": 146527,
+      "version": "15.2.0-r5"
+    },
+    {
+      "cache_path": "apks/libgtop-2.41.3-r1.apk",
+      "name": "libgtop",
+      "sha256": "a4c107b44fe8629968af64cf04b4744601b41845ae54d1169270c2b0ae3d8b0b",
+      "size": 45997,
+      "version": "2.41.3-r1"
+    },
+    {
+      "cache_path": "apks/libgudev-238-r1.apk",
+      "name": "libgudev",
+      "sha256": "879b00e515d274b683ff21670fe7d38200b4aa01521310cf123e84335d1c2658",
+      "size": 15820,
+      "version": "238-r1"
+    },
+    {
+      "cache_path": "apks/libhwy-1.3.0-r0.apk",
+      "name": "libhwy",
+      "sha256": "a6702b16ae297da5403e8320d600c80d49874b165a1aa30bb5eaad5cb7f899d8",
+      "size": 23468,
+      "version": "1.3.0-r0"
+    },
+    {
+      "cache_path": "apks/libice-1.1.2-r0.apk",
+      "name": "libice",
+      "sha256": "476b272715e49b036767a1d9935b581f5b33fb2bdfa8978244d145bbd1739792",
+      "size": 41404,
+      "version": "1.1.2-r0"
+    },
+    {
+      "cache_path": "apks/libidn2-2.3.8-r0.apk",
+      "name": "libidn2",
+      "sha256": "d02ffda4510652f89c5fb89cd2e7ff721afb0c74e7d75476ad60bebe7ac0ae20",
+      "size": 105430,
+      "version": "2.3.8-r0"
+    },
+    {
+      "cache_path": "apks/libintl-1.0-r0.apk",
+      "name": "libintl",
+      "sha256": "d106a13e3e68103d3a8217406aae6186289baf352d0f3d10fc21938d2dd8adb1",
+      "size": 41483,
+      "version": "1.0-r0"
+    },
+    {
+      "cache_path": "apks/libjpeg-turbo-3.1.3-r0.apk",
+      "name": "libjpeg-turbo",
+      "sha256": "0e82bb8d0abad143d9a84ee32152707e5a71176bd803b070b6179e85e11bf2be",
+      "size": 225383,
+      "version": "3.1.3-r0"
+    },
+    {
+      "cache_path": "apks/libjxl-0.11.2-r1.apk",
+      "name": "libjxl",
+      "sha256": "d0bc28b424ea917acc1a55b0bed5da496355575ea4f79d2eb87a614d7a29f90f",
+      "size": 1231553,
+      "version": "0.11.2-r1"
+    },
+    {
+      "cache_path": "apks/libltdl-2.6.0-r1.apk",
+      "name": "libltdl",
+      "sha256": "16d92108ccd2f7155c88348a144ee51fd1c28ff483ec8a1dec5f20ff67f1e079",
+      "size": 17169,
+      "version": "2.6.0-r1"
+    },
+    {
+      "cache_path": "apks/libmagic-5.47-r2.apk",
+      "name": "libmagic",
+      "sha256": "bcd233f28a6f1c07cd789c47df2234eb35d2bac295aa223ea2ccef17d75ce0f0",
+      "size": 527434,
+      "version": "5.47-r2"
+    },
+    {
+      "cache_path": "apks/libmd-1.2.0-r0.apk",
+      "name": "libmd",
+      "sha256": "cb94430ebc45dbd5dd6882bfd296bb73ea3c337691f469bd1438e696a6e867eb",
+      "size": 26213,
+      "version": "1.2.0-r0"
+    },
+    {
+      "cache_path": "apks/libmount-2.42.1-r0.apk",
+      "name": "libmount",
+      "sha256": "d2e5eefddf71f538ddbb546bd52783f0c7f20c73c9d6b82e4a809dc6234592ef",
+      "size": 127233,
+      "version": "2.42.1-r0"
+    },
+    {
+      "cache_path": "apks/libncursesw-6.6_p20260516-r0.apk",
+      "name": "libncursesw",
+      "sha256": "51a7aa4b3ec40b144d0801c0544e0a9f62e2a41d04b6067bb5e95786040741c6",
+      "size": 161906,
+      "version": "6.6_p20260516-r0"
+    },
+    {
+      "cache_path": "apks/libnotify-0.8.8-r0.apk",
+      "name": "libnotify",
+      "sha256": "cd92dcd284a4ce383ec29efb3b1195cbc88b7247c341d4cf54162b39741624e7",
+      "size": 28847,
+      "version": "0.8.8-r0"
+    },
+    {
+      "cache_path": "apks/libogg-1.3.6-r0.apk",
+      "name": "libogg",
+      "sha256": "a1805de4000502059b6de5a721b12d807ee99833efe76b9b0780e0544ae504b5",
+      "size": 20901,
+      "version": "1.3.6-r0"
+    },
+    {
+      "cache_path": "apks/libopenmpt-0.8.7-r0.apk",
+      "name": "libopenmpt",
+      "sha256": "1784be9f1a2c03473082dff7ed436e03039174dab125cf1c06aa016406d13149",
+      "size": 662861,
+      "version": "0.8.7-r0"
+    },
+    {
+      "cache_path": "apks/libpciaccess-0.19-r0.apk",
+      "name": "libpciaccess",
+      "sha256": "cc76a9b089614a20a5421d61c0551d3b2579efc85b57b9ee2f1be9bbfa5f433e",
+      "size": 15514,
+      "version": "0.19-r0"
+    },
+    {
+      "cache_path": "apks/libpisp-1.5.0-r0.apk",
+      "name": "libpisp",
+      "sha256": "3ffb9baec881c67890415f7be4b50db0986a4c47156462db53a2cf9341cbcf95",
+      "size": 166911,
+      "version": "1.5.0-r0"
+    },
+    {
+      "cache_path": "apks/libpng-1.6.58-r1.apk",
+      "name": "libpng",
+      "sha256": "98d3a69a159ea506a5587bff07de5fa3e91d0cc10501c17e3905e4314d1d30b8",
+      "size": 97450,
+      "version": "1.6.58-r1"
+    },
+    {
+      "cache_path": "apks/libpulse-17.0-r7.apk",
+      "name": "libpulse",
+      "sha256": "5d0895a2aa2e17465ec03af80b0e0e7cad5f3037ac7b3b4a85999d251fb22d88",
+      "size": 500092,
+      "version": "17.0-r7"
+    },
+    {
+      "cache_path": "apks/librist-0.2.15-r0.apk",
+      "name": "librist",
+      "sha256": "72e5671124c5338a44e7af974c5cde05f28606688c3b9c19ab61661b3380a85c",
+      "size": 74430,
+      "version": "0.2.15-r0"
+    },
+    {
+      "cache_path": "apks/librsvg-2.62.3-r0.apk",
+      "name": "librsvg",
+      "sha256": "4ae23ee35c408d8a7467c8a96815c75bef70fb51d14be632c78c353f69579e04",
+      "size": 1541031,
+      "version": "2.62.3-r0"
+    },
+    {
+      "cache_path": "apks/libseccomp-2.6.0-r2.apk",
+      "name": "libseccomp",
+      "sha256": "8d57be8b00171a0647ce70be272d3ddb067ce086223dff0662e7f39b1e13ec63",
+      "size": 51476,
+      "version": "2.6.0-r2"
+    },
+    {
+      "cache_path": "apks/libsharpyuv-1.6.0-r0.apk",
+      "name": "libsharpyuv",
+      "sha256": "c21fbafab87b1a5a105f4ede43e2fc78a221cb0a093502b8cb1e1ca55d48ab41",
+      "size": 11311,
+      "version": "1.6.0-r0"
+    },
+    {
+      "cache_path": "apks/libsm-1.2.6-r0.apk",
+      "name": "libsm",
+      "sha256": "011070c4c189b40f420c8b3a002aac8576d0da470dcfd6d98d8a1405ce4c98e6",
+      "size": 14997,
+      "version": "1.2.6-r0"
+    },
+    {
+      "cache_path": "apks/libsndfile-1.2.2-r2.apk",
+      "name": "libsndfile",
+      "sha256": "dab67a7bcc10da84a16d34e0e2312c1ace6358301d50ed864b953745bb99159d",
+      "size": 227696,
+      "version": "1.2.2-r2"
+    },
+    {
+      "cache_path": "apks/libsodium-1.0.22-r0.apk",
+      "name": "libsodium",
+      "sha256": "22caea234463bf7cc58b2612c62da686e9b4f6ca863540a18747847d7add70e8",
+      "size": 163569,
+      "version": "1.0.22-r0"
+    },
+    {
+      "cache_path": "apks/libsrt-1.5.3-r1.apk",
+      "name": "libsrt",
+      "sha256": "7d0973174d1d711c03875c1e983ef8ef1d8c3eb4c5bf9c915577dff37bbc4db7",
+      "size": 392737,
+      "version": "1.5.3-r1"
+    },
+    {
+      "cache_path": "apks/libssh-0.12.2-r0.apk",
+      "name": "libssh",
+      "sha256": "81b065cabe1c40f320c3f1b83569cc9d3856c1735c0e46de0aecfcfb373f3e4a",
+      "size": 204534,
+      "version": "0.12.2-r0"
+    },
+    {
+      "cache_path": "apks/libssl3-3.5.8-r0.apk",
+      "name": "libssl3",
+      "sha256": "d6ec970cc10e01539e41626f720c4e0ac69016eaa2079a10ef776ffd3243db5b",
+      "size": 370156,
+      "version": "3.5.8-r0"
+    },
+    {
+      "cache_path": "apks/libstdc++-15.2.0-r5.apk",
+      "name": "libstdc++",
+      "sha256": "2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7",
+      "size": 908984,
+      "version": "15.2.0-r5"
+    },
+    {
+      "cache_path": "apks/libtasn1-4.21.0-r0.apk",
+      "name": "libtasn1",
+      "sha256": "c9fcd102c576a05675ebf4d61f147e5209fd4518e8627f229032240afaf7624b",
+      "size": 34161,
+      "version": "4.21.0-r0"
+    },
+    {
+      "cache_path": "apks/libtheora-1.2.0-r1.apk",
+      "name": "libtheora",
+      "sha256": "7b41c11fbd92dfa4a7ed65cec2e9d18c46b3bf015842eace14f8a66ce86573eb",
+      "size": 342916,
+      "version": "1.2.0-r1"
+    },
+    {
+      "cache_path": "apks/libudfread-1.2.0-r1.apk",
+      "name": "libudfread",
+      "sha256": "24dfc1d0c5d67e4cacbc12223ab8b0b3137529f84193e0bee4d78cfc4f14158c",
+      "size": 14272,
+      "version": "1.2.0-r1"
+    },
+    {
+      "cache_path": "apks/libunistring-1.4.2-r0.apk",
+      "name": "libunistring",
+      "sha256": "58abfcbce2459071c505771a572a79953d6043d72b643ed0d5285ca39cdaf85c",
+      "size": 746169,
+      "version": "1.4.2-r0"
+    },
+    {
+      "cache_path": "apks/libunwind-1.8.3-r0.apk",
+      "name": "libunwind",
+      "sha256": "4713b081b36a2effa2d43c23b72c8f8ee3f91d56d490426aa11f815157f1ca83",
+      "size": 87561,
+      "version": "1.8.3-r0"
+    },
+    {
+      "cache_path": "apks/libutempter-1.2.3-r1.apk",
+      "name": "libutempter",
+      "sha256": "2ab463ea49dc53790f9f66ae0df18463aadcfc3dd70585b6cb869e662808f5ea",
+      "size": 7588,
+      "version": "1.2.3-r1"
+    },
+    {
+      "cache_path": "apks/libuuid-2.42.1-r0.apk",
+      "name": "libuuid",
+      "sha256": "d2f69552b05184ba205dbc8aa0e79f8a080fcf746ec5e5e25eb89d66fbbe6db6",
+      "size": 15381,
+      "version": "2.42.1-r0"
+    },
+    {
+      "cache_path": "apks/libuv-1.52.1-r0.apk",
+      "name": "libuv",
+      "sha256": "64e29a6c58f8375bc9cf83d57e0913e6743746cfc60851b1cb12cd572f5924f3",
+      "size": 96457,
+      "version": "1.52.1-r0"
+    },
+    {
+      "cache_path": "apks/libva-2.23.0-r0.apk",
+      "name": "libva",
+      "sha256": "b1d3d97898766a33d0cddf3572bae9440b5a987f6866cd2287bb4319d7a46f05",
+      "size": 88904,
+      "version": "2.23.0-r0"
+    },
+    {
+      "cache_path": "apks/libvdpau-1.5-r4.apk",
+      "name": "libvdpau",
+      "sha256": "3f99dfb36bdd2bfcc7b925ce2fe7315a0014082fa850684aade250771e4979e3",
+      "size": 25062,
+      "version": "1.5-r4"
+    },
+    {
+      "cache_path": "apks/libvorbis-1.3.7-r2.apk",
+      "name": "libvorbis",
+      "sha256": "1cd254abdafdf13610d47c19d37cfd8df69f5bed500f69d0aa4295ab479f0a8f",
+      "size": 184609,
+      "version": "1.3.7-r2"
+    },
+    {
+      "cache_path": "apks/libvpx-1.15.2-r1.apk",
+      "name": "libvpx",
+      "sha256": "331a802cfaedcf5a7dfcd6e556fcc9e5a19671953ef3a5a1225ab5ff959902c0",
+      "size": 1361321,
+      "version": "1.15.2-r1"
+    },
+    {
+      "cache_path": "apks/libwebp-1.6.0-r0.apk",
+      "name": "libwebp",
+      "sha256": "6bb4ac037094bdd70537fdfa90fc5f71eb4efc0d0b94e392bce7557fb0a6a208",
+      "size": 206319,
+      "version": "1.6.0-r0"
+    },
+    {
+      "cache_path": "apks/libwebpdemux-1.6.0-r0.apk",
+      "name": "libwebpdemux",
+      "sha256": "1cc90b2aea99f49fbee094b4ecdb8c4c789a1390ffe91b2a76e22a81f5ae5e0a",
+      "size": 9576,
+      "version": "1.6.0-r0"
+    },
+    {
+      "cache_path": "apks/libwebpmux-1.6.0-r0.apk",
+      "name": "libwebpmux",
+      "sha256": "3448d2dcad3604dd46299be72ea3fe0b6bba16403fae487ecbf672d71305414c",
+      "size": 20637,
+      "version": "1.6.0-r0"
+    },
+    {
+      "cache_path": "apks/libwnck3-43.3-r0.apk",
+      "name": "libwnck3",
+      "sha256": "773360ded13c81bacba7389dc0f39b70c7709e14d825acd71b1a9405202ebcbc",
+      "size": 122616,
+      "version": "43.3-r0"
+    },
+    {
+      "cache_path": "apks/libx11-1.8.13-r0.apk",
+      "name": "libx11",
+      "sha256": "177e63beb3c219f4b811a4453b84651814444547f11a890d688f1129961e4dd5",
+      "size": 869108,
+      "version": "1.8.13-r0"
+    },
+    {
+      "cache_path": "apks/libxau-1.0.12-r0.apk",
+      "name": "libxau",
+      "sha256": "179a76248d0eea545f3affafc1275358dc671547a2ab76ff3e93edecb612864b",
+      "size": 6206,
+      "version": "1.0.12-r0"
+    },
+    {
+      "cache_path": "apks/libxaw-1.0.16-r1.apk",
+      "name": "libxaw",
+      "sha256": "6a2bc547ad316c51d88eb234e938da8490f23a61324f0fe09e3ee04cd1da2edb",
+      "size": 169347,
+      "version": "1.0.16-r1"
+    },
+    {
+      "cache_path": "apks/libxcb-1.17.0-r2.apk",
+      "name": "libxcb",
+      "sha256": "21dbe6dfbc477baa1bad13b82b8e61b83e34e1c474d3913f33ad5fc5b890afa0",
+      "size": 261262,
+      "version": "1.17.0-r2"
+    },
+    {
+      "cache_path": "apks/libxcomposite-0.4.7-r0.apk",
+      "name": "libxcomposite",
+      "sha256": "756c00c22167d020da4bcce1a67a0276e245cdf5f6ed3d5b488cbd076816f1e7",
+      "size": 5129,
+      "version": "0.4.7-r0"
+    },
+    {
+      "cache_path": "apks/libxcursor-1.2.3-r0.apk",
+      "name": "libxcursor",
+      "sha256": "3e1d5f0beb0d0c1222178951195fe6a896afda3efa315dd89101c00ebc04ada6",
+      "size": 19695,
+      "version": "1.2.3-r0"
+    },
+    {
+      "cache_path": "apks/libxcvt-0.1.3-r0.apk",
+      "name": "libxcvt",
+      "sha256": "38febbc5857c3f886789aa1fc0a60046ca3ad8ee3da1feaee6f491915845162c",
+      "size": 8007,
+      "version": "0.1.3-r0"
+    },
+    {
+      "cache_path": "apks/libxdamage-1.1.7-r0.apk",
+      "name": "libxdamage",
+      "sha256": "15423918fc3968bd458931a6ae003d5155d68f850b04f893191e2c07d610476a",
+      "size": 5274,
+      "version": "1.1.7-r0"
+    },
+    {
+      "cache_path": "apks/libxdmcp-1.1.5-r1.apk",
+      "name": "libxdmcp",
+      "sha256": "4f6fe6269deadf99d2cd69b0a77cdaae1cab414738edf59df4ae79f4871c7adb",
+      "size": 9956,
+      "version": "1.1.5-r1"
+    },
+    {
+      "cache_path": "apks/libxext-1.3.7-r0.apk",
+      "name": "libxext",
+      "sha256": "06886b15075a537fcd499c243facd0ec8c3e38eddef19be68ef185c079c462e4",
+      "size": 26210,
+      "version": "1.3.7-r0"
+    },
+    {
+      "cache_path": "apks/libxfce4panel-4.20.7-r0.apk",
+      "name": "libxfce4panel",
+      "sha256": "35007d7b4a550b858caff4de68e1ea61837f906508758c02509dacef4735684d",
+      "size": 30884,
+      "version": "4.20.7-r0"
+    },
+    {
+      "cache_path": "apks/libxfce4ui-4.20.1-r1.apk",
+      "name": "libxfce4ui",
+      "sha256": "00ac257562d0a88402ae9aec8697b4a8ebfcda6cf2389861aae7f8e2fc7ba21e",
+      "size": 153323,
+      "version": "4.20.1-r1"
+    },
+    {
+      "cache_path": "apks/libxfce4util-4.20.1-r0.apk",
+      "name": "libxfce4util",
+      "sha256": "0f8c213f0fa2f985f485e036fae8b254c6a368aabb390bb51c2e0d328c258b75",
+      "size": 38459,
+      "version": "4.20.1-r0"
+    },
+    {
+      "cache_path": "apks/libxfce4windowing-4.20.6-r0.apk",
+      "name": "libxfce4windowing",
+      "sha256": "f5fadbdcc6758e8861b039dda5f6aeec7416fee0c793c8b8691358e8730748ba",
+      "size": 89223,
+      "version": "4.20.6-r0"
+    },
+    {
+      "cache_path": "apks/libxfixes-6.0.2-r0.apk",
+      "name": "libxfixes",
+      "sha256": "5d389f949f0f0e1753fcbfeeda8f06f12c9f14b13ec1cadb7f553cc8f11420a8",
+      "size": 9337,
+      "version": "6.0.2-r0"
+    },
+    {
+      "cache_path": "apks/libxfont2-2.0.8-r0.apk",
+      "name": "libxfont2",
+      "sha256": "e1d499da6acd64ae8e440c91ad825cdc9d410d1cddd45173e38c1dea574dd13b",
+      "size": 102301,
+      "version": "2.0.8-r0"
+    },
+    {
+      "cache_path": "apks/libxft-2.3.9-r0.apk",
+      "name": "libxft",
+      "sha256": "ec2eabfee31f018976518f95e84e707d4b47d2d4a27180bc171595316c35f385",
+      "size": 38248,
+      "version": "2.3.9-r0"
+    },
+    {
+      "cache_path": "apks/libxi-1.8.3-r0.apk",
+      "name": "libxi",
+      "sha256": "4735bd464940a424aa9c9b569fe2e028c45875c9acf226d35cf6e2ee3338c5db",
+      "size": 28970,
+      "version": "1.8.3-r0"
+    },
+    {
+      "cache_path": "apks/libxinerama-1.1.6-r0.apk",
+      "name": "libxinerama",
+      "sha256": "96198e671dbfd58a54fb00d6e70ac05975a18c186e68c987aad72d4614ab4ff3",
+      "size": 4903,
+      "version": "1.1.6-r0"
+    },
+    {
+      "cache_path": "apks/libxkbcommon-1.13.1-r0.apk",
+      "name": "libxkbcommon",
+      "sha256": "484370ec7cb91bd8035a7f947620885557daf0d4b10d8dbe50f207875828988e",
+      "size": 163632,
+      "version": "1.13.1-r0"
+    },
+    {
+      "cache_path": "apks/libxkbfile-1.2.0-r0.apk",
+      "name": "libxkbfile",
+      "sha256": "16da12a6b9cbe819c5e5779ea94067f09d945800f00f2fb0fdfd74197c362018",
+      "size": 60227,
+      "version": "1.2.0-r0"
+    },
+    {
+      "cache_path": "apks/libxklavier-5.4-r8.apk",
+      "name": "libxklavier",
+      "sha256": "66d8dd931000973731e3bfdb5a88d73d2134f4b06a7f777962215887e2985b33",
+      "size": 47492,
+      "version": "5.4-r8"
+    },
+    {
+      "cache_path": "apks/libxml2-2.13.9-r2.apk",
+      "name": "libxml2",
+      "sha256": "0a860a26ebdfea491498386fe682130f4c5565e46ee8e0a2281256db2ef1be27",
+      "size": 496747,
+      "version": "2.13.9-r2"
+    },
+    {
+      "cache_path": "apks/libxmu-1.3.1-r0.apk",
+      "name": "libxmu",
+      "sha256": "98cdc4029543869357d98fc109e86d1db7645a0c4522ee6033d90f435c43e275",
+      "size": 49853,
+      "version": "1.3.1-r0"
+    },
+    {
+      "cache_path": "apks/libxpm-3.5.19-r0.apk",
+      "name": "libxpm",
+      "sha256": "98577ca06b70b9792b48beaded6b8910b75195b2c361dff29834bc377fce5d4f",
+      "size": 44369,
+      "version": "3.5.19-r0"
+    },
+    {
+      "cache_path": "apks/libxpresent-1.0.2-r0.apk",
+      "name": "libxpresent",
+      "sha256": "a6e6bd7c8abd6d150795a1821464298057d687fc9762cfa1f8726ece255d2c83",
+      "size": 6285,
+      "version": "1.0.2-r0"
+    },
+    {
+      "cache_path": "apks/libxrandr-1.5.5-r0.apk",
+      "name": "libxrandr",
+      "sha256": "3d40a24141af8de45fb907864b18197aa1d66914c1102c3b0e11973a716ce232",
+      "size": 16821,
+      "version": "1.5.5-r0"
+    },
+    {
+      "cache_path": "apks/libxrender-0.9.12-r0.apk",
+      "name": "libxrender",
+      "sha256": "bdd1ac2c5b70b45c2a09bffbab54073d5dafb9a6fe989583fb439b15952ccf2b",
+      "size": 17144,
+      "version": "0.9.12-r0"
+    },
+    {
+      "cache_path": "apks/libxres-1.2.3-r0.apk",
+      "name": "libxres",
+      "sha256": "6b58ec4b3726d4336c9fddacb598a3337c3911fcfd7c904289392961c60101ee",
+      "size": 5877,
+      "version": "1.2.3-r0"
+    },
+    {
+      "cache_path": "apks/libxshmfence-1.3.3-r0.apk",
+      "name": "libxshmfence",
+      "sha256": "e92d2985e15419b30d180ffefc69bff0a26248e5fd980f94e5adbd57dcfdfc60",
+      "size": 4305,
+      "version": "1.3.3-r0"
+    },
+    {
+      "cache_path": "apks/libxslt-1.1.43-r3.apk",
+      "name": "libxslt",
+      "sha256": "c0f82af1a465343cde84e53f41f0941d66d6d7b28f66ed7ca11943f64ecc4c9e",
+      "size": 131054,
+      "version": "1.1.43-r3"
+    },
+    {
+      "cache_path": "apks/libxt-1.3.1-r0.apk",
+      "name": "libxt",
+      "sha256": "2fe4588dcab83f29ea12bf8ce4a63d25a487f1e86edc75bf60720b7da59dee7a",
+      "size": 156492,
+      "version": "1.3.1-r0"
+    },
+    {
+      "cache_path": "apks/libxtst-1.2.5-r0.apk",
+      "name": "libxtst",
+      "sha256": "fa0edf9a4fa15b808a07c153933f6896104ad002620c39c275ad010349b6dec9",
+      "size": 10527,
+      "version": "1.2.5-r0"
+    },
+    {
+      "cache_path": "apks/libxxf86vm-1.1.7-r0.apk",
+      "name": "libxxf86vm",
+      "sha256": "a85a4f82da77bef6055fe27adf01772acfcdf30cfecd74528149d6793c2685a4",
+      "size": 8236,
+      "version": "1.1.7-r0"
+    },
+    {
+      "cache_path": "apks/libyuv-0.0.1928-r0.apk",
+      "name": "libyuv",
+      "sha256": "d16c6f425629de40bb307fc582d5985bed7043e5ef82ffee6816556eb03a0f8b",
+      "size": 554168,
+      "version": "0.0.1928-r0"
+    },
+    {
+      "cache_path": "apks/libzmq-4.3.5-r2.apk",
+      "name": "libzmq",
+      "sha256": "d5ff48983d7cf39907bdd58ddc7f220ca19065be5a1aaf3ce529341b5eaec735",
+      "size": 258883,
+      "version": "4.3.5-r2"
+    },
+    {
+      "cache_path": "apks/llvm22-libs-22.1.3-r0.apk",
+      "name": "llvm22-libs",
+      "sha256": "468bc2e8efa070bf6837d0388122048806576d84e9578aa909e40bdd98109a93",
+      "size": 64263114,
+      "version": "22.1.3-r0"
+    },
+    {
+      "cache_path": "apks/lz4-libs-1.10.0-r1.apk",
+      "name": "lz4-libs",
+      "sha256": "af6cbe553adda941e04ac40cf0123455b714d65392472389113e7d6dcebbd8d8",
+      "size": 82505,
+      "version": "1.10.0-r1"
+    },
+    {
+      "cache_path": "apks/mbedtls3-3.6.7-r0.apk",
+      "name": "mbedtls3",
+      "sha256": "e58453b1554aedc4cd883f942732cf52c12dc40c21ebae37c7d1dcd00f129661",
+      "size": 412784,
+      "version": "3.6.7-r0"
+    },
+    {
+      "cache_path": "apks/mesa-26.1.6-r0.apk",
+      "name": "mesa",
+      "sha256": "081ea0a54f57373442b539e353a296f178af39a9e5e11da6b571424c398275e5",
+      "size": 12084225,
+      "version": "26.1.6-r0"
+    },
+    {
+      "cache_path": "apks/mesa-dri-gallium-26.1.6-r0.apk",
+      "name": "mesa-dri-gallium",
+      "sha256": "62cfd817a66b7bf3991e3c5b11c381f6e452e0261b757de9a91e3470d47dc65f",
+      "size": 22166,
+      "version": "26.1.6-r0"
+    },
+    {
+      "cache_path": "apks/mesa-egl-26.1.6-r0.apk",
+      "name": "mesa-egl",
+      "sha256": "6b49e6f263427218289aa19b83aae533d79bda984a430964e2ed21592b4b65eb",
+      "size": 129255,
+      "version": "26.1.6-r0"
+    },
+    {
+      "cache_path": "apks/mesa-gbm-26.1.6-r0.apk",
+      "name": "mesa-gbm",
+      "sha256": "3a5487b688e3f072f134133b8a6538d552c9ebc86dedb5f0d54e2566f110f5da",
+      "size": 7453,
+      "version": "26.1.6-r0"
+    },
+    {
+      "cache_path": "apks/mesa-gl-26.1.6-r0.apk",
+      "name": "mesa-gl",
+      "sha256": "580a5cd3e8d31b8774e78ad7a3d5798f667d0ee98d07e8afd0765daf6d450720",
+      "size": 171867,
+      "version": "26.1.6-r0"
+    },
+    {
+      "cache_path": "apks/mesa-gles-26.1.6-r0.apk",
+      "name": "mesa-gles",
+      "sha256": "1553461ee9e91a4d6fad5941d6a98f43e14b0d920c302b5e21504a6411b2183f",
+      "size": 22070,
+      "version": "26.1.6-r0"
+    },
+    {
+      "cache_path": "apks/minizip-1.3.2-r1.apk",
+      "name": "minizip",
+      "sha256": "38f73f68f9b7bfb6df78c0b3f35510c1b4550ed0af033795a97e113613eaf73e",
+      "size": 21479,
+      "version": "1.3.2-r1"
+    },
+    {
+      "cache_path": "apks/mkfontscale-1.2.4-r0.apk",
+      "name": "mkfontscale",
+      "sha256": "c373d5c19283b41dbb5661dbc3c40ad95368040a848562c673044b8b2462be97",
+      "size": 16072,
+      "version": "1.2.4-r0"
+    },
+    {
+      "cache_path": "apks/mpg123-libs-1.33.5-r0.apk",
+      "name": "mpg123-libs",
+      "sha256": "c84670c6c96fbb10b5d945db6b3cf05302042a006ded312b5e5f9797d85f5115",
+      "size": 173060,
+      "version": "1.33.5-r0"
+    },
+    {
+      "cache_path": "apks/mtdev-1.1.7-r0.apk",
+      "name": "mtdev",
+      "sha256": "f8b79dcbb4f761147ea12bdcc078383ebbd6c94399c76ae73ef79ee3e4ca6ed5",
+      "size": 10736,
+      "version": "1.1.7-r0"
+    },
+    {
+      "cache_path": "apks/musl-1.2.6-r2.apk",
+      "name": "musl",
+      "sha256": "5e9674b7f41152fe2119093b5cb4c13eaaadb19c2d5422b2d7267913e663ee6e",
+      "size": 417710,
+      "version": "1.2.6-r2"
+    },
+    {
+      "cache_path": "apks/musl-utils-1.2.6-r2.apk",
+      "name": "musl-utils",
+      "sha256": "164e3347b214313fe95994038ce76eeba67f98f42df1dd13fae2ffa770e4747b",
+      "size": 16890,
+      "version": "1.2.6-r2"
+    },
+    {
+      "cache_path": "apks/ncurses-terminfo-base-6.6_p20260516-r0.apk",
+      "name": "ncurses-terminfo-base",
+      "sha256": "e0c546b9461bdce206a90bc720cb69aa4628b5a5b8d908c3e5084e00f28f6a9d",
+      "size": 22150,
+      "version": "6.6_p20260516-r0"
+    },
+    {
+      "cache_path": "apks/nettle-3.10.2-r0.apk",
+      "name": "nettle",
+      "sha256": "573c54ecb55b157d9cd5323eb3a9bb9d87b375ee20392a6a9d16c0ba098af9e5",
+      "size": 356329,
+      "version": "3.10.2-r0"
+    },
+    {
+      "cache_path": "apks/nspr-4.38.2-r0.apk",
+      "name": "nspr",
+      "sha256": "e98abeff25fcbf006ed9081bed87ce2a60c96ea75df7672b3b69350bec840219",
+      "size": 124952,
+      "version": "4.38.2-r0"
+    },
+    {
+      "cache_path": "apks/nss-3.124-r0.apk",
+      "name": "nss",
+      "sha256": "9ba9909e523e3add8f148b5d46654d35702fefc9ee20b4082ca96dfbe5256b76",
+      "size": 1601217,
+      "version": "3.124-r0"
+    },
+    {
+      "cache_path": "apks/numactl-2.0.19-r0.apk",
+      "name": "numactl",
+      "sha256": "911046ec22d596820cc37427b470f80bb095bf415c0debcc2774b7c0c43be9d8",
+      "size": 21285,
+      "version": "2.0.19-r0"
+    },
+    {
+      "cache_path": "apks/openh264-2.6.0-r0.apk",
+      "name": "openh264",
+      "sha256": "5413b820c18a31c513787c74411ee4bb2c4eabd14d89dbe90da9a0f68c8c197d",
+      "size": 603953,
+      "version": "2.6.0-r0"
+    },
+    {
+      "cache_path": "apks/opus-1.6.1-r0.apk",
+      "name": "opus",
+      "sha256": "e4cb30c375a9a3c5600cf72d685732c27830d75188b590144003ff2f200b2fd1",
+      "size": 242031,
+      "version": "1.6.1-r0"
+    },
+    {
+      "cache_path": "apks/orc-0.4.41-r0.apk",
+      "name": "orc",
+      "sha256": "3df7fff2420d2c52c3cb1fbf18e99701324ccd52a0430987f426c1d1409c2e15",
+      "size": 192214,
+      "version": "0.4.41-r0"
+    },
+    {
+      "cache_path": "apks/p11-kit-0.26.2-r0.apk",
+      "name": "p11-kit",
+      "sha256": "0ad7cbbc011491b604b4d8fb8aafb6ce2a271c19eb8b785dd51f1704c61c58a5",
+      "size": 361410,
+      "version": "0.26.2-r0"
+    },
+    {
+      "cache_path": "apks/pango-1.57.1-r0.apk",
+      "name": "pango",
+      "sha256": "59a4be0b15a5dc3cf8bc425c65626a9f8a975a1d1beb5d3645fce34bf578c0a5",
+      "size": 269967,
+      "version": "1.57.1-r0"
+    },
+    {
+      "cache_path": "apks/pcre2-10.48-r0.apk",
+      "name": "pcre2",
+      "sha256": "0e8a425ec23fca1b549e83758b385e7186a070597e8dc014163462f960079167",
+      "size": 320066,
+      "version": "10.48-r0"
+    },
+    {
+      "cache_path": "apks/pipewire-libs-1.6.8-r4.apk",
+      "name": "pipewire-libs",
+      "sha256": "a21daad305b9184c39481e692e8b163775d1957e5d2576e59fab3730e86ef5bb",
+      "size": 2657113,
+      "version": "1.6.8-r4"
+    },
+    {
+      "cache_path": "apks/pixman-0.46.4-r0.apk",
+      "name": "pixman",
+      "sha256": "022ab7d2b766f3893e6c457a03c723fe3e79e9f009d8a62d06f1692d9f2fc77f",
+      "size": 180838,
+      "version": "0.46.4-r0"
+    },
+    {
+      "cache_path": "apks/pkgconf-2.5.1-r0.apk",
+      "name": "pkgconf",
+      "sha256": "6b716719ac9457bd35c8ea5373da1dc33ae86863bbb0f411aed0cb5e71b9cf2d",
+      "size": 56279,
+      "version": "2.5.1-r0"
+    },
+    {
+      "cache_path": "apks/polkit-noelogind-libs-127-r2.apk",
+      "name": "polkit-noelogind-libs",
+      "sha256": "9107ac4a6e20f4fdc18219748327a9598a273294fdede49bd670af575fda4767",
+      "size": 58383,
+      "version": "127-r2"
+    },
+    {
+      "cache_path": "apks/rav1e-libs-0.8.1-r0.apk",
+      "name": "rav1e-libs",
+      "sha256": "f0fabb8a0f5762c8bace671fb6745d9783b8541903368b91e9e74d4479abb411",
+      "size": 657014,
+      "version": "0.8.1-r0"
+    },
+    {
+      "cache_path": "apks/roc-toolkit-libs-0.4.0-r1.apk",
+      "name": "roc-toolkit-libs",
+      "sha256": "e17142a551941de07af9b4124c83e26f6aebac6bfa59c71e437354405b2462a1",
+      "size": 435565,
+      "version": "0.4.0-r1"
+    },
+    {
+      "cache_path": "apks/scanelf-1.3.9-r1.apk",
+      "name": "scanelf",
+      "sha256": "fb3aba7485ba455883488f02569995c8ba8003638c5d36b7d8fdd1241d219a6e",
+      "size": 31798,
+      "version": "1.3.9-r1"
+    },
+    {
+      "cache_path": "apks/setpriv-2.42.1-r0.apk",
+      "name": "setpriv",
+      "sha256": "92ad8e3191af2c24709b015e76bbfa50144aa5c9d7148772972d14afe5385a00",
+      "size": 15887,
+      "version": "2.42.1-r0"
+    },
+    {
+      "cache_path": "apks/shared-mime-info-2.4-r7.apk",
+      "name": "shared-mime-info",
+      "sha256": "d22666ee4ab5d0384040e0da3a1564bb9404cea20480e178bb2aea78acd7f87a",
+      "size": 371215,
+      "version": "2.4-r7"
+    },
+    {
+      "cache_path": "apks/simdutf-9.0.0-r0.apk",
+      "name": "simdutf",
+      "sha256": "336f5dfe8b0f784462cbccb4b58f71c15d64388c784ebca8568c8615b6f3c6b2",
+      "size": 101563,
+      "version": "9.0.0-r0"
+    },
+    {
+      "cache_path": "apks/skalibs-libs-2.15.0.0-r0.apk",
+      "name": "skalibs-libs",
+      "sha256": "7ea58fb512067402b519079fcce8a48381eb2b9c690341c4a017aa15f719c198",
+      "size": 91460,
+      "version": "2.15.0.0-r0"
+    },
+    {
+      "cache_path": "apks/soxr-0.1.3-r7.apk",
+      "name": "soxr",
+      "sha256": "c586068ca06810ffd28d5ff63abc1dbe94ef7dec979df251c69e761dc836cb76",
+      "size": 51642,
+      "version": "0.1.3-r7"
+    },
+    {
+      "cache_path": "apks/speexdsp-1.2.1-r2.apk",
+      "name": "speexdsp",
+      "sha256": "0989bde366b262de9f8311d3bab67d9fd4f3fcfcf2c91c31f60e1217d3a93a99",
+      "size": 35103,
+      "version": "1.2.1-r2"
+    },
+    {
+      "cache_path": "apks/spirv-tools-1.4.341.0-r0.apk",
+      "name": "spirv-tools",
+      "sha256": "28a3be7fe2552c2c11b33a366c7bf6a67a408d9bf509bfe66aea68bf79467c60",
+      "size": 1846347,
+      "version": "1.4.341.0-r0"
+    },
+    {
+      "cache_path": "apks/sqlite-libs-3.53.4-r0.apk",
+      "name": "sqlite-libs",
+      "sha256": "b39d8d73c1208838a436f2d481ba605b52a095f8d6ff781556eafc81cd1a13e9",
+      "size": 852532,
+      "version": "3.53.4-r0"
+    },
+    {
+      "cache_path": "apks/ssl_client-1.37.0-r31.apk",
+      "name": "ssl_client",
+      "sha256": "fa2911d412b7922b17a07829914ee630c2cd7091ef558abd4329ffb6020f879d",
+      "size": 5078,
+      "version": "1.37.0-r31"
+    },
+    {
+      "cache_path": "apks/startup-notification-0.12-r8.apk",
+      "name": "startup-notification",
+      "sha256": "f6cb75db660e9bf10e0b1a84b43aef41250a27128f6ed3a208e5f359b3dda991",
+      "size": 15876,
+      "version": "0.12-r8"
+    },
+    {
+      "cache_path": "apks/tdb-libs-1.4.15-r1.apk",
+      "name": "tdb-libs",
+      "sha256": "60104077fc72ad2844e0e69398343194645449611b87c15eb01c4f0be0fd44e6",
+      "size": 43795,
+      "version": "1.4.15-r1"
+    },
+    {
+      "cache_path": "apks/thunar-4.20.8-r0.apk",
+      "name": "thunar",
+      "sha256": "58792ca1e670646792240b697d7ebb707ffc77c0710e9112429134c27f45e963",
+      "size": 483810,
+      "version": "4.20.8-r0"
+    },
+    {
+      "cache_path": "apks/upower-1.91.0-r2.apk",
+      "name": "upower",
+      "sha256": "192553ba5f4faa51934b2c7e5efaa09c32b6a5013aa51c8cad3fcbfc2ee9f372",
+      "size": 128500,
+      "version": "1.91.0-r2"
+    },
+    {
+      "cache_path": "apks/util-macros-1.20.2-r0.apk",
+      "name": "util-macros",
+      "sha256": "a0a27ccc4451080025bcc5961e6d621ba5eebd1b88c7b74b84ccc6d07f318b1c",
+      "size": 24889,
+      "version": "1.20.2-r0"
+    },
+    {
+      "cache_path": "apks/utmps-libs-0.1.3.3-r0.apk",
+      "name": "utmps-libs",
+      "sha256": "d6487b6f260728969191314f6706d4cc62527370e757ec3ac6f7fee8ed38cf88",
+      "size": 5758,
+      "version": "0.1.3.3-r0"
+    },
+    {
+      "cache_path": "apks/vte3-0.84.0-r2.apk",
+      "name": "vte3",
+      "sha256": "9faea94ed2e26cdf61606d4cb20c40c2034dc7e1ba84e2b7deb9ccdaff9d7772",
+      "size": 332695,
+      "version": "0.84.0-r2"
+    },
+    {
+      "cache_path": "apks/vte3-profile-0.84.0-r2.apk",
+      "name": "vte3-profile",
+      "sha256": "80e362432b873a9677c9d16a5e50f2b0e1271897ad98d067ae6bbb470651e94d",
+      "size": 3851,
+      "version": "0.84.0-r2"
+    },
+    {
+      "cache_path": "apks/wayland-libs-client-1.25.0-r0.apk",
+      "name": "wayland-libs-client",
+      "sha256": "409b4ad8de59d7b69f7c8add50cc76ef0fe3fe8c80e7854d6fe93c6b1dccc005",
+      "size": 23501,
+      "version": "1.25.0-r0"
+    },
+    {
+      "cache_path": "apks/wayland-libs-cursor-1.25.0-r0.apk",
+      "name": "wayland-libs-cursor",
+      "sha256": "22129b3f85ecf905a00436040c4ca3d07a071e700997aebf9bb7a2430cb42946",
+      "size": 9482,
+      "version": "1.25.0-r0"
+    },
+    {
+      "cache_path": "apks/wayland-libs-egl-1.25.0-r0.apk",
+      "name": "wayland-libs-egl",
+      "sha256": "c06c148aa8fe57848f1a30ac46b95736b04fb1bf73324ccf29c0bae82ee4a7e7",
+      "size": 3606,
+      "version": "1.25.0-r0"
+    },
+    {
+      "cache_path": "apks/webrtc-audio-processing-2-2.1-r1.apk",
+      "name": "webrtc-audio-processing-2",
+      "sha256": "dfc17bf73b18bd4bd12502bb45936f1b5b14c9413a58b5e2b4578eb66fe44179",
+      "size": 369449,
+      "version": "2.1-r1"
+    },
+    {
+      "cache_path": "apks/x264-libs-0.164.3108-r1.apk",
+      "name": "x264-libs",
+      "sha256": "a40fc409c2eddbdfbd0d858ea2871215105c16b54a3ea97534dfc8d128cc39fa",
+      "size": 882852,
+      "version": "0.164.3108-r1"
+    },
+    {
+      "cache_path": "apks/x265-libs-4.1-r0.apk",
+      "name": "x265-libs",
+      "sha256": "899c5e8fbd2d906719a6719473117507fea935795cd6c6d0b6180d7300617e66",
+      "size": 3322009,
+      "version": "4.1-r0"
+    },
+    {
+      "cache_path": "apks/xcb-util-0.4.1-r3.apk",
+      "name": "xcb-util",
+      "sha256": "0b547394a06e7b4e53994bd8db42aed84e86de95d042c847f9ac9c135fdfb1b8",
+      "size": 7823,
+      "version": "0.4.1-r3"
+    },
+    {
+      "cache_path": "apks/xclock-1.1.1-r0.apk",
+      "name": "xclock",
+      "sha256": "4f51408869711c2263d2082e34dd486acddc2de6ce0d08430734cb29cee0c15f",
+      "size": 16778,
+      "version": "1.1.1-r0"
+    },
+    {
+      "cache_path": "apks/xdg-utils-1.2.1-r1.apk",
+      "name": "xdg-utils",
+      "sha256": "3e1b5e578b721d9280607b32d5ce49246f70aadc186ba2c63f8607173b8b93b3",
+      "size": 72583,
+      "version": "1.2.1-r1"
+    },
+    {
+      "cache_path": "apks/xeyes-1.3.1-r0.apk",
+      "name": "xeyes",
+      "sha256": "6e07acf2ee85c8538b90477e4e5ab02ecff84f26bcff5b25c7c0cf33fee35101",
+      "size": 11555,
+      "version": "1.3.1-r0"
+    },
+    {
+      "cache_path": "apks/xf86-input-evdev-2.11.0-r0.apk",
+      "name": "xf86-input-evdev",
+      "sha256": "e21f3fbb5a310dfd107d4241abfaabd01410daf5609a09891343e7e5e2519d6b",
+      "size": 25586,
+      "version": "2.11.0-r0"
+    },
+    {
+      "cache_path": "apks/xf86-video-fbdev-0.5.0-r6.apk",
+      "name": "xf86-video-fbdev",
+      "sha256": "0d0297fdd60798e1d87fb4dc53f87abf6bf73b555e4be1668af1d5d93fa3f9f3",
+      "size": 9953,
+      "version": "0.5.0-r6"
+    },
+    {
+      "cache_path": "apks/xfce4-panel-4.20.7-r0.apk",
+      "name": "xfce4-panel",
+      "sha256": "062759e815ef9e08feb9ce79416eb6f46a330c118abbfe7e001e6d123a79f75f",
+      "size": 755260,
+      "version": "4.20.7-r0"
+    },
+    {
+      "cache_path": "apks/xfce4-settings-4.20.4-r0.apk",
+      "name": "xfce4-settings",
+      "sha256": "9600e1deecea6e126c2e5d1f31f2ddeed84ec12d59c73a0dc48a1028138ad918",
+      "size": 719627,
+      "version": "4.20.4-r0"
+    },
+    {
+      "cache_path": "apks/xfce4-terminal-1.2.0-r0.apk",
+      "name": "xfce4-terminal",
+      "sha256": "94d959e8e787ce9db7ebd260f67af15f2ca380279d9e21feab05b99a5372c3b9",
+      "size": 136437,
+      "version": "1.2.0-r0"
+    },
+    {
+      "cache_path": "apks/xfconf-4.20.0-r2.apk",
+      "name": "xfconf",
+      "sha256": "d2add72c2f573e971e9037f84a8971e5e142d87ec5dd70396cab05b11b1b5525",
+      "size": 97143,
+      "version": "4.20.0-r2"
+    },
+    {
+      "cache_path": "apks/xfdesktop-4.20.1-r0.apk",
+      "name": "xfdesktop",
+      "sha256": "f190f6fce5836d50326e5b9c791f23d0f3c58f866dd5484fc264f14b3b6eb7b4",
+      "size": 1252356,
+      "version": "4.20.1-r0"
+    },
+    {
+      "cache_path": "apks/xfwm4-4.20.0-r1.apk",
+      "name": "xfwm4",
+      "sha256": "6d39b0784e4c94c02fbeb83563e51e6cd6977a8225b1343764b3ac7ad7a4d3b1",
+      "size": 338319,
+      "version": "4.20.0-r1"
+    },
+    {
+      "cache_path": "apks/xkbcomp-1.5.0-r0.apk",
+      "name": "xkbcomp",
+      "sha256": "84d08397381113a4bbfe1c68050bc8640f019a8ff1d728ab3650b39aadaca1c9",
+      "size": 80418,
+      "version": "1.5.0-r0"
+    },
+    {
+      "cache_path": "apks/xkeyboard-config-2.47-r0.apk",
+      "name": "xkeyboard-config",
+      "sha256": "a78c94324d215f874a6e6f29c3aa889f0755596ea952865f98ef64c06806a1c1",
+      "size": 565349,
+      "version": "2.47-r0"
+    },
+    {
+      "cache_path": "apks/xmessage-1.0.7-r0.apk",
+      "name": "xmessage",
+      "sha256": "9daac4eacc86b8499aca74dd9fd49d47178fa96df8e22506eb0c474e2eab45b0",
+      "size": 9740,
+      "version": "1.0.7-r0"
+    },
+    {
+      "cache_path": "apks/xorg-server-21.1.24-r0.apk",
+      "name": "xorg-server",
+      "sha256": "24a9adb572503acbdf3c11c53b088791131924deadfba1bceae64616d388dcaf",
+      "size": 1322494,
+      "version": "21.1.24-r0"
+    },
+    {
+      "cache_path": "apks/xorg-server-common-21.1.24-r0.apk",
+      "name": "xorg-server-common",
+      "sha256": "62a91b10b68a546bbc6b46497dcf2e6a8d5fb77e005b01cda2096c5de5414310",
+      "size": 8471,
+      "version": "21.1.24-r0"
+    },
+    {
+      "cache_path": "apks/xprop-1.2.8-r0.apk",
+      "name": "xprop",
+      "sha256": "3ad4f1bb3da2a696420b7fc6540cb554411b9748c4ef3b0f35198a6decc76196",
+      "size": 17981,
+      "version": "1.2.8-r0"
+    },
+    {
+      "cache_path": "apks/xrandr-1.5.4-r0.apk",
+      "name": "xrandr",
+      "sha256": "55d609489d7687407dcd8e3e60ddca24e3973f37949d2ea4cf87e9aa355c3311",
+      "size": 26314,
+      "version": "1.5.4-r0"
+    },
+    {
+      "cache_path": "apks/xset-1.2.5-r1.apk",
+      "name": "xset",
+      "sha256": "2521746c93b4a006ed1b225a2b1851eb685f31885d31740160050d50e13b79b8",
+      "size": 12627,
+      "version": "1.2.5-r1"
+    },
+    {
+      "cache_path": "apks/xterm-410-r0.apk",
+      "name": "xterm",
+      "sha256": "3d131ef2ccbdbe25d373e99b83728dbd4f5c85a2b33388114e172c6099eb0142",
+      "size": 329579,
+      "version": "410-r0"
+    },
+    {
+      "cache_path": "apks/xvidcore-1.3.7-r2.apk",
+      "name": "xvidcore",
+      "sha256": "c2d1d71005c093057576ccf4c591ee8b467859f6e1072d3e570490824cb039b5",
+      "size": 148252,
+      "version": "1.3.7-r2"
+    },
+    {
+      "cache_path": "apks/xz-libs-5.8.3-r0.apk",
+      "name": "xz-libs",
+      "sha256": "76dce86852903fef7adba0285d816e5ce9ffbe9fb3ca86bbb349b97afaba1f63",
+      "size": 118819,
+      "version": "5.8.3-r0"
+    },
+    {
+      "cache_path": "apks/yaml-0.2.5-r2.apk",
+      "name": "yaml",
+      "sha256": "fb6587c62fbd339d934ca9feb387aa9b3b2003710a1081d8287a4ec49a3d658f",
+      "size": 45083,
+      "version": "0.2.5-r2"
+    },
+    {
+      "cache_path": "apks/zlib-1.3.2-r0.apk",
+      "name": "zlib",
+      "sha256": "a535991af7c9e8369ebbf33c1e388c1bc63c87ead5142eddaee71f65836c33e3",
+      "size": 54312,
+      "version": "1.3.2-r0"
+    },
+    {
+      "cache_path": "apks/zstd-libs-1.5.7-r2.apk",
+      "name": "zstd-libs",
+      "sha256": "2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818",
+      "size": 365383,
+      "version": "1.5.7-r2"
+    }
+  ],
+  "repository_indexes": [
+    {
+      "file": "APKINDEX.3cace40b.tar.gz",
+      "sha256": "cc6373bb1887941bdd1b7cade9f53455e3f2b4762ee072b020a36e691f6cd451",
+      "signing_key": "alpine-devel@lists.alpinelinux.org-616ae350"
+    },
+    {
+      "file": "APKINDEX.5773bea6.tar.gz",
+      "sha256": "6ad66a68b4c9d08a5b64f19f6b0de56831e1e8505d15d6dbb6f7c92abc4b442f",
+      "signing_key": "alpine-devel@lists.alpinelinux.org-616ae350"
+    }
+  ],
+  "source": {
+    "alpine_branch": "3.24-stable",
+    "base_image": "public.ecr.aws/docker/library/alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
+    "base_image_digest": "sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
+    "kind": "alpine-real-repositories",
+    "mirrors": [
+      "https://dl-cdn.alpinelinux.org/alpine/v3.24/main",
+      "https://dl-cdn.alpinelinux.org/alpine/v3.24/community"
+    ],
+    "musl_patched": false,
+    "rebuild": false,
+    "x18_reserved": false
+  }
+}

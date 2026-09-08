@@ -1650,7 +1650,45 @@ fn prot_flags(flags: MemoryRegionPermissions) -> Win32_Memory::PAGE_PROTECTION_F
     }
 }
 
-fn do_prefetch_on_range(start: usize, size: usize) {
+#[derive(Clone, Copy)]
+struct Win32CallError(u32);
+
+impl Win32CallError {
+    fn last() -> Self {
+        Self(unsafe { GetLastError() })
+    }
+}
+
+static VIRTUAL_MEMORY_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_virtual_memory_mutation() -> std::sync::MutexGuard<'static, ()> {
+    match VIRTUAL_MEMORY_MUTATION_LOCK.lock() {
+        Ok(guard) => guard,
+        // A panic while this lock was held could have interrupted a VM mutation. Continuing with
+        // an untrusted address-space state would be less safe than terminating the process.
+        Err(_) => std::process::abort(),
+    }
+}
+
+fn query_memory_region(
+    base_addr: *mut c_void,
+) -> Result<Win32_Memory::MEMORY_BASIC_INFORMATION, Win32CallError> {
+    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+    let ok = unsafe {
+        Win32_Memory::VirtualQuery(
+            base_addr,
+            &raw mut mbi,
+            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+        ) != 0
+    };
+    if ok {
+        Ok(mbi)
+    } else {
+        Err(Win32CallError::last())
+    }
+}
+
+fn do_prefetch_on_range(start: usize, size: usize) -> Result<(), Win32CallError> {
     let ok = unsafe {
         let prefetch_entry = Win32_Memory::WIN32_MEMORY_RANGE_ENTRY {
             VirtualAddress: start as *mut c_void,
@@ -1658,22 +1696,111 @@ fn do_prefetch_on_range(start: usize, size: usize) {
         };
         PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const prefetch_entry, 0) != 0
     };
-    assert!(ok, "PrefetchVirtualMemory failed with error: {}", unsafe {
-        GetLastError()
-    });
+    if ok {
+        Ok(())
+    } else {
+        Err(Win32CallError::last())
+    }
 }
 
 fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_addr: *mut c_void) {
+    match query_memory_region(base_addr) {
+        Ok(result) => *mbi = result,
+        Err(error) => panic!("VirtualQuery addr={base_addr:p} failed: {}", error.0),
+    }
+}
+
+fn memory_range_is_in_state(
+    mut range: core::ops::Range<usize>,
+    expected_state: Win32_Memory::VIRTUAL_ALLOCATION_TYPE,
+) -> Result<bool, Win32CallError> {
+    while !range.is_empty() {
+        let mbi = query_memory_region(range.start as *mut c_void)?;
+        if mbi.State != expected_state {
+            return Ok(false);
+        }
+        let len = mbi.RegionSize.min(range.len());
+        if len == 0 {
+            return Ok(false);
+        }
+        range.start += len;
+    }
+    Ok(true)
+}
+
+enum FixedAllocationAction {
+    CommitReserved(core::ops::Range<usize>),
+    ReserveAndCommit {
+        reservation: core::ops::Range<usize>,
+        commit: core::ops::Range<usize>,
+    },
+}
+
+enum AllocationUndo {
+    /// Release the complete reservation identified by the exact base returned by `VirtualAlloc2`.
+    ReleaseReservation { base: usize },
+    /// Return pages that this transaction committed inside a reservation it did not create.
+    DecommitReservedPages(core::ops::Range<usize>),
+}
+
+fn release_reservation(base: usize) -> Result<(), Win32CallError> {
+    let ok = unsafe { VirtualFree(base as *mut c_void, 0, Win32_Memory::MEM_RELEASE) } != 0;
+    if ok {
+        Ok(())
+    } else {
+        Err(Win32CallError::last())
+    }
+}
+
+fn decommit_reserved_pages(range: core::ops::Range<usize>) -> Result<(), Win32CallError> {
     let ok = unsafe {
-        Win32_Memory::VirtualQuery(
-            base_addr,
-            mbi,
-            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
-        ) != 0
-    };
-    assert!(ok, "VirtualQuery addr={:p} failed: {}", base_addr, unsafe {
-        GetLastError()
-    });
+        VirtualFree(
+            range.start as *mut c_void,
+            range.len(),
+            Win32_Memory::MEM_DECOMMIT,
+        )
+    } != 0;
+    if ok {
+        Ok(())
+    } else {
+        Err(Win32CallError::last())
+    }
+}
+
+fn rollback_allocation(
+    journal: &mut alloc::vec::Vec<AllocationUndo>,
+) -> Result<(), Win32CallError> {
+    let mut first_error = None;
+    while let Some(undo) = journal.pop() {
+        let result = match undo {
+            AllocationUndo::ReleaseReservation { base } => release_reservation(base),
+            AllocationUndo::DecommitReservedPages(range) => decommit_reserved_pages(range),
+        };
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn rollback_allocation_or_abort(journal: &mut alloc::vec::Vec<AllocationUndo>) {
+    if rollback_allocation(journal).is_err() {
+        // Returning after an incomplete rollback would publish a partially-mutated address space.
+        std::process::abort();
+    }
+}
+
+fn fixed_allocation_error(error: Win32CallError) -> AllocationError {
+    if error.0 == Win32_Foundation::ERROR_INVALID_ADDRESS {
+        AllocationError::AddressInUse
+    } else {
+        AllocationError::OutOfMemory
+    }
 }
 
 /// Helper method to process a memory range by iterating through Windows memory regions.
@@ -1736,159 +1863,259 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
-        debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
-        debug_assert_alignment!(suggested_range, ALIGN);
-
-        // A helper closure to reserve and commit memory in one go.
-        //
-        // Note that MEM_RESERVE requires the base address to be aligned to system allocation granularity,
-        // while MEM_COMMIT only requires page-aligned address.
-        //
-        // To ensure future MEM_COMMIT calls on sub-ranges succeed, we always reserve the entire aligned range
-        // (i.e., MEM_RESERVE size is also made aligned to system allocation granularity).
-        let reserve_and_commit = |r: core::ops::Range<usize>,
-                                  flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
-         -> *mut c_void {
-            let aligned_start_addr = self.round_down_to_granu(r.start);
-            let aligned_end_addr = self.round_up_to_granu(r.end);
-            let ptr = unsafe {
-                VirtualAlloc2(
-                    GetCurrentProcess(),
-                    aligned_start_addr as *mut c_void,
-                    aligned_end_addr - aligned_start_addr,
-                    Win32_Memory::MEM_RESERVE,
-                    Win32_Memory::PAGE_NOACCESS,
-                    core::ptr::null_mut(),
-                    0,
-                )
-            };
-            if ptr.is_null() {
-                core::ptr::null_mut()
-            } else {
-                unsafe {
-                    VirtualAlloc2(
-                        GetCurrentProcess(),
-                        if r.start == 0 {
-                            ptr
-                        } else {
-                            r.start as *mut c_void
-                        },
-                        r.len(),
-                        Win32_Memory::MEM_COMMIT,
-                        flags,
-                        core::ptr::null_mut(),
-                        0,
-                    )
-                }
-            }
+        let Ok(sys_info) = self.sys_info.read() else {
+            std::process::abort();
         };
+        let page_size = sys_info.dwPageSize as usize;
+        let allocation_granularity = sys_info.dwAllocationGranularity as usize;
+        drop(sys_info);
 
-        let mut base_addr = suggested_range.start as *mut c_void;
-        let size = suggested_range.len();
-        // TODO: For Windows, there is no MAP_GROWDOWN features so far.
-        let _ = can_grow_down;
+        if ALIGN == 0
+            || page_size == 0
+            || allocation_granularity == 0
+            || !allocation_granularity.is_power_of_two()
+            || !ALIGN.is_multiple_of(page_size)
+            || !suggested_range.start.is_multiple_of(ALIGN)
+            || !suggested_range.end.is_multiple_of(ALIGN)
+        {
+            return Err(AllocationError::Unaligned);
+        }
+        let Some(size) = suggested_range.end.checked_sub(suggested_range.start) else {
+            return Err(AllocationError::OutOfMemory);
+        };
+        if size == 0 {
+            return Err(AllocationError::OutOfMemory);
+        }
 
         if suggested_range.start != 0 {
-            assert!(suggested_range.start >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
-                                                            TASK_ADDR_MIN);
-            assert!(suggested_range.end <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
-                                                            TASK_ADDR_MAX);
-
-            let has_committed_page =
-                process_memory_range_by_regions(suggested_range.clone(), |_r, state| {
-                    if state == Win32_Memory::MEM_COMMIT {
-                        Err(())
-                    } else {
-                        Ok(true)
-                    }
-                })
-                .is_err();
-            if has_committed_page && fixed_address_behavior == FixedAddressBehavior::Hint {
-                // If any page in the suggested range is already committed, and the caller
-                // did not request a fixed address, we ask the OS to allocate a new region.
-                base_addr = core::ptr::null_mut();
-            } else if has_committed_page
-                && fixed_address_behavior == FixedAddressBehavior::NoReplace
+            if suggested_range.start
+                < <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
             {
-                return Err(AllocationError::AddressInUse);
-            } else {
-                process_memory_range_by_regions(
-                    suggested_range,
-                    |r, state| -> Result<bool, std::convert::Infallible> {
-                        let ok = match state {
-                            // In case the region is already reserved, we just need to commit it.
-                            // In case the region is already committed, decommit and recommit it.
-                            Win32_Memory::MEM_RESERVE | Win32_Memory::MEM_COMMIT => {
-                                if state == Win32_Memory::MEM_COMMIT {
-                                    // TODO: handle this race condition properly.
-                                    assert_eq!(
-                                        fixed_address_behavior,
-                                        FixedAddressBehavior::Replace,
-                                        "raced with another memory allocator"
-                                    );
-                                    let decommit_ok = unsafe {
-                                        VirtualFree(
-                                            r.start as *mut c_void,
-                                            r.len(),
-                                            Win32_Memory::MEM_DECOMMIT,
-                                        )
-                                    } != 0;
-                                    assert!(
-                                        decommit_ok,
-                                        "VirtualFree(DECOMMIT) failed: {}",
-                                        unsafe { GetLastError() }
-                                    );
-                                }
-                                let ptr = unsafe {
+                return Err(AllocationError::BelowMinAddress);
+            }
+            if suggested_range.end
+                > <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
+            {
+                return Err(AllocationError::AboveMaxAddress);
+            }
+        }
+
+        // TODO: For Windows, there is no MAP_GROWDOWN feature so far.
+        let _ = can_grow_down;
+        let flags = prot_flags(initial_permissions);
+
+        // The process address space is shared by every `WindowsUserland` value. Keep discovery,
+        // application, prefetch, and any rollback in one critical section so another platform VM
+        // operation cannot observe the plan and invalidate it between regions.
+        let _vm_guard = lock_virtual_memory_mutation();
+
+        if suggested_range.start != 0 {
+            let mut plan = alloc::vec::Vec::new();
+            let mut remaining = suggested_range.clone();
+            let mut has_committed_page = false;
+
+            // Discover the entire target before changing any page. Every potential allocation while
+            // growing `plan` therefore happens before the final preflight below.
+            while !remaining.is_empty() {
+                let mbi = query_memory_region(remaining.start as *mut c_void)
+                    .map_err(fixed_allocation_error)?;
+                let len = mbi.RegionSize.min(remaining.len());
+                if len == 0 {
+                    return Err(AllocationError::AddressInUse);
+                }
+                let region = remaining.start..remaining.start + len;
+                match mbi.State {
+                    Win32_Memory::MEM_COMMIT => has_committed_page = true,
+                    Win32_Memory::MEM_RESERVE => {
+                        plan.try_reserve(1)
+                            .map_err(|_| AllocationError::OutOfMemory)?;
+                        plan.push(FixedAllocationAction::CommitReserved(region.clone()));
+                    }
+                    Win32_Memory::MEM_FREE => {
+                        if region.end.checked_add(allocation_granularity - 1).is_none() {
+                            return Err(AllocationError::OutOfMemory);
+                        }
+                        let reservation = self.round_down_to_granu(region.start)
+                            ..self.round_up_to_granu(region.end);
+                        plan.try_reserve(1)
+                            .map_err(|_| AllocationError::OutOfMemory)?;
+                        plan.push(FixedAllocationAction::ReserveAndCommit {
+                            reservation,
+                            commit: region.clone(),
+                        });
+                    }
+                    _ => return Err(AllocationError::AddressInUse),
+                }
+                remaining.start = region.end;
+            }
+
+            // There is no reversible implementation of Replace for committed pages: decommitting
+            // would discard their bytes, protection, and backing. Hint may fall back elsewhere;
+            // both fixed behaviors reject the occupied target without touching it.
+            if !has_committed_page {
+                let mut journal = alloc::vec::Vec::new();
+                journal
+                    .try_reserve_exact(plan.len())
+                    .map_err(|_| AllocationError::OutOfMemory)?;
+
+                // Revalidate the complete plan after all journal storage is allocated. A free target
+                // includes the allocation-granularity halo that `MEM_RESERVE` will actually claim.
+                let mut plan_is_available = true;
+                for action in &plan {
+                    let available = match action {
+                        FixedAllocationAction::CommitReserved(range) => {
+                            memory_range_is_in_state(range.clone(), Win32_Memory::MEM_RESERVE)
+                        }
+                        FixedAllocationAction::ReserveAndCommit { reservation, .. } => {
+                            memory_range_is_in_state(reservation.clone(), Win32_Memory::MEM_FREE)
+                        }
+                    }
+                    .map_err(fixed_allocation_error)?;
+                    plan_is_available &= available;
+                }
+
+                if plan_is_available {
+                    for action in &plan {
+                        match action {
+                            FixedAllocationAction::CommitReserved(range) => {
+                                let committed = unsafe {
                                     VirtualAlloc2(
                                         GetCurrentProcess(),
-                                        r.start as *mut c_void,
-                                        r.len(),
+                                        range.start as *mut c_void,
+                                        range.len(),
                                         Win32_Memory::MEM_COMMIT,
-                                        prot_flags(initial_permissions),
+                                        flags,
                                         core::ptr::null_mut(),
                                         0,
                                     )
                                 };
-                                !ptr.is_null()
+                                if committed.is_null() {
+                                    // Capture the originating failure before rollback can overwrite it.
+                                    let error = Win32CallError::last();
+                                    rollback_allocation_or_abort(&mut journal);
+                                    return Err(fixed_allocation_error(error));
+                                }
+                                // Capacity was reserved before the final preflight, so publishing
+                                // this undo record cannot allocate or fail.
+                                journal.push(AllocationUndo::DecommitReservedPages(range.clone()));
                             }
-                            // In case the region is free, we need to reserve and commit it.
-                            Win32_Memory::MEM_FREE => {
-                                let ptr =
-                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions));
-                                !ptr.is_null()
+                            FixedAllocationAction::ReserveAndCommit {
+                                reservation,
+                                commit,
+                            } => {
+                                let reserved = unsafe {
+                                    VirtualAlloc2(
+                                        GetCurrentProcess(),
+                                        reservation.start as *mut c_void,
+                                        reservation.len(),
+                                        Win32_Memory::MEM_RESERVE,
+                                        Win32_Memory::PAGE_NOACCESS,
+                                        core::ptr::null_mut(),
+                                        0,
+                                    )
+                                };
+                                if reserved.is_null() {
+                                    let error = Win32CallError::last();
+                                    rollback_allocation_or_abort(&mut journal);
+                                    return Err(fixed_allocation_error(error));
+                                }
+                                // `MEM_RELEASE` must use this exact base and a zero size. Record it
+                                // before the commit, which is the next fallible operation.
+                                journal.push(AllocationUndo::ReleaseReservation {
+                                    base: reserved as usize,
+                                });
+
+                                let committed = unsafe {
+                                    VirtualAlloc2(
+                                        GetCurrentProcess(),
+                                        commit.start as *mut c_void,
+                                        commit.len(),
+                                        Win32_Memory::MEM_COMMIT,
+                                        flags,
+                                        core::ptr::null_mut(),
+                                        0,
+                                    )
+                                };
+                                if committed.is_null() {
+                                    let error = Win32CallError::last();
+                                    rollback_allocation_or_abort(&mut journal);
+                                    return Err(fixed_allocation_error(error));
+                                }
                             }
-                            _ => unimplemented!(
-                                "Unexpected memory state: {:?} when allocating pages",
-                                state
-                            ),
-                        };
-                        // Prefetch the memory range if requested
-                        if ok && populate_pages_immediately {
-                            do_prefetch_on_range(r.start, r.len());
                         }
-                        Ok(ok)
-                    },
-                )
-                .unwrap();
-                return Ok(UserMutPtr::from_ptr(base_addr.cast()));
+                    }
+
+                    if populate_pages_immediately
+                        && let Err(error) =
+                            do_prefetch_on_range(suggested_range.start, suggested_range.len())
+                    {
+                        rollback_allocation_or_abort(&mut journal);
+                        return Err(fixed_allocation_error(error));
+                    }
+
+                    // Disarm rollback only after every requested step has succeeded.
+                    journal.clear();
+                    return Ok(UserMutPtr::from_ptr(suggested_range.start as *mut u8));
+                }
+            }
+
+            match fixed_address_behavior {
+                FixedAddressBehavior::Hint => {}
+                FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => {
+                    return Err(AllocationError::AddressInUse);
+                }
             }
         }
 
-        debug_assert!(base_addr.is_null());
-        let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
-        assert!(
-            !ptr.is_null(),
-            "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
-            size,
-            std::io::Error::last_os_error()
-        );
-
-        // Prefetch the memory range if requested
-        if populate_pages_immediately {
-            do_prefetch_on_range(ptr as usize, size);
+        // Ask Windows to select an address. Reserve an allocation-granularity-sized VAD, but commit
+        // only the requested pages so later commits inside the same reservation remain valid.
+        if size.checked_add(allocation_granularity - 1).is_none() {
+            return Err(AllocationError::OutOfMemory);
         }
-        Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
+        let reservation_size = self.round_up_to_granu(size);
+        let reserved = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                core::ptr::null_mut(),
+                reservation_size,
+                Win32_Memory::MEM_RESERVE,
+                Win32_Memory::PAGE_NOACCESS,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if reserved.is_null() {
+            return Err(AllocationError::OutOfMemory);
+        }
+
+        let committed = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                reserved,
+                size,
+                Win32_Memory::MEM_COMMIT,
+                flags,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if committed.is_null() {
+            let _error = Win32CallError::last();
+            if release_reservation(reserved as usize).is_err() {
+                std::process::abort();
+            }
+            return Err(AllocationError::OutOfMemory);
+        }
+
+        if populate_pages_immediately
+            && let Err(_error) = do_prefetch_on_range(committed as usize, size)
+        {
+            if release_reservation(reserved as usize).is_err() {
+                std::process::abort();
+            }
+            return Err(AllocationError::OutOfMemory);
+        }
+        Ok(UserMutPtr::from_ptr(committed.cast::<u8>()))
     }
 
     unsafe fn deallocate_pages(
@@ -1896,6 +2123,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         debug_assert_alignment!(range, ALIGN);
+        let _vm_guard = lock_virtual_memory_mutation();
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
@@ -1916,6 +2144,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         debug_assert_alignment!(range, ALIGN);
         let flags = prot_flags(new_permissions);
+        let _vm_guard = lock_virtual_memory_mutation();
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {

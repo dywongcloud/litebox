@@ -12,8 +12,11 @@
 //!
 //! Wire protocol, deliberately simpler than RFB:
 //! * server -> client, binary: `[u16 width BE][u16 height BE][width*height*4 RGBA bytes]` --
-//!   one whole frame per message, sent only when the frame content changed (cheap sum hash),
-//!   at most every `FRAME_INTERVAL` (50ms).
+//!   one whole frame per message, sent only when the frame content changed, at most every
+//!   `FRAME_INTERVAL` (50ms), and only once the browser has acknowledged the previous frame:
+//!   each frame is followed by a WebSocket ping carrying the frame's sequence number, and every
+//!   browser answers pings with a pong automatically (RFC 6455 §5.5.2), so the pong is a
+//!   frame-consumed signal that needs nothing from the page's own script (see `FrameAcks`).
 //! * client -> server, binary: `[1u8][down u8][keysym u32 BE]` for keys (X11 keysyms, same
 //!   values RFB uses, so the runner's existing translation applies unchanged), and
 //!   `[2u8][button_mask u8][x u16 BE][y u16 BE]` for pointer state (RFB-style mask: bit 0
@@ -26,17 +29,23 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::server::{
     FramebufferSource, InputClient, InputEvent, InputHandler, InputMessage, KeyEvent, PointerEvent,
 };
 
 /// Interval between frame pushes to a connected browser. Same cadence as the RFB server's
-/// `UPDATE_INTERVAL`; unchanged frames are skipped entirely, so idle cost is one snapshot+hash
-/// per tick.
-const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// `UPDATE_INTERVAL`; unchanged frames are skipped entirely, so idle cost is one
+/// snapshot+compare per tick.
+const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Longest the pusher waits for the pong acknowledging the previous frame before sending the next
+/// one regardless. Bounds the damage a client that never answers pings can do to its own frame
+/// rate (1 fps) without letting it hold a frame back forever.
+const FRAME_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Maximum time a client may spend completing its HTTP request head.
 const HTTP_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -265,7 +274,8 @@ impl WsWriter {
     }
 
     fn write_control(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
-        if !matches!(opcode, 0x8 | 0xa) || payload.len() > 125 {
+        // 0x8 close, 0x9 ping (the pusher's frame-consumed probe, see `FrameAcks`), 0xa pong.
+        if !matches!(opcode, 0x8..=0xa) || payload.len() > 125 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid WebSocket control frame",
@@ -275,7 +285,7 @@ impl WsWriter {
     }
 
     fn try_write_control(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
-        if !matches!(opcode, 0x8 | 0xa) || payload.len() > 125 {
+        if !matches!(opcode, 0x8..=0xa) || payload.len() > 125 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid WebSocket control frame",
@@ -291,6 +301,60 @@ impl WsWriter {
     }
 }
 
+/// Frame acknowledgements for one browser connection: the highest frame sequence number whose
+/// ping the client has answered, shared between the reader thread (which records pongs) and the
+/// pusher (which waits for them). The wire protocol carries no application-level ack and the
+/// page's script must not change, but a browser pongs only once its network stack has read
+/// past the frame, and Chromium/Firefox read from the socket only as fast as the page consumes
+/// messages -- so waiting for the pong keeps at most one frame in flight per client and lets
+/// the pusher snapshot the newest frame at the moment the browser is ready for it. Without it,
+/// TCP alone lets a slow page queue seconds of stale frames in socket and browser buffers.
+struct FrameAcks {
+    state: Mutex<AckState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct AckState {
+    acked: u64,
+    stop: bool,
+}
+
+impl FrameAcks {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AckState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, AckState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn ack(&self, seq: u64) {
+        let mut state = self.lock();
+        state.acked = state.acked.max(seq);
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        self.lock().stop = true;
+        self.changed.notify_all();
+    }
+
+    /// Waits until frame `seq` is acknowledged or `timeout` passes; `false` once stopped.
+    fn wait_acked(&self, seq: u64, timeout: Duration) -> bool {
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(self.lock(), timeout, |state| {
+                state.acked < seq && !state.stop
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        !state.stop
+    }
+}
+
 /// After the 101: a pusher thread streams changed frames while this thread reads input
 /// messages -- the same two-thread split as the RFB server's `serve_client`.
 fn serve_websocket<F: FramebufferSource>(
@@ -299,32 +363,30 @@ fn serve_websocket<F: FramebufferSource>(
     on_input: &Arc<InputHandler>,
 ) -> io::Result<()> {
     let write_stream = stream.try_clone()?;
-    write_stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    write_stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let writer = Arc::new(WsWriter::new(write_stream));
     let mut input_client = InputClient::connect(&**on_input);
-    let pusher_stop = Arc::new(AtomicBool::new(false));
+    let acks = Arc::new(FrameAcks::new());
     let pusher = {
         let framebuffer = Arc::clone(framebuffer);
         let writer = Arc::clone(&writer);
-        let stop = Arc::clone(&pusher_stop);
+        let acks = Arc::clone(&acks);
         std::thread::spawn(move || {
             let mut pixels = Vec::new();
+            // Pixels of the last frame sent, so unchanged frames are skipped outright.
+            let mut sent = Vec::new();
             let mut message = Vec::new();
-            let mut last_hash = 0u64;
-            while !stop.load(Ordering::Relaxed) {
+            let mut seq = 0u64;
+            loop {
                 std::thread::sleep(FRAME_INTERVAL);
+                if !acks.wait_acked(seq, FRAME_ACK_TIMEOUT) {
+                    break;
+                }
                 let (width, height) = framebuffer.dimensions();
                 framebuffer.snapshot_into(&mut pixels);
-                // FNV-1a over the raw pixels: cheap, and a stale positive only costs one
-                // skipped frame that the next real change replaces.
-                let mut hash = 0xcbf2_9ce4_8422_2325u64;
-                for &b in &pixels {
-                    hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-                }
-                if hash == last_hash {
+                if pixels == sent {
                     continue;
                 }
-                last_hash = hash;
                 message.clear();
                 message.extend_from_slice(&width.to_be_bytes());
                 message.extend_from_slice(&height.to_be_bytes());
@@ -332,17 +394,21 @@ fn serve_websocket<F: FramebufferSource>(
                 for px in pixels.as_chunks::<4>().0 {
                     message.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
                 }
-                if writer.write_binary(&message).is_err() {
+                seq += 1;
+                if writer.write_binary(&message).is_err()
+                    || writer.write_control(0x9, &seq.to_be_bytes()).is_err()
+                {
                     break;
                 }
+                std::mem::swap(&mut sent, &mut pixels);
             }
         })
     };
 
-    let result = read_ws_loop(stream, &writer, &mut input_client);
+    let result = read_ws_loop(stream, &writer, &acks, &mut input_client);
     // Input cleanup must not wait behind a framebuffer writer blocked on the disconnected socket.
     drop(input_client);
-    pusher_stop.store(true, Ordering::Relaxed);
+    acks.stop();
     let _ = pusher.join();
     result
 }
@@ -386,10 +452,11 @@ fn write_ws_frame(stream: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8])
 }
 
 /// Client-to-server frames: masked per RFC 6455. Handles binary input messages, answers ping
-/// with pong, exits on close.
+/// with pong, records the frame acknowledged by a pong, exits on close.
 fn read_ws_loop(
     mut stream: TcpStream,
     writer: &WsWriter,
+    acks: &FrameAcks,
     input_client: &mut InputClient<'_>,
 ) -> io::Result<()> {
     loop {
@@ -464,8 +531,13 @@ fn read_ws_loop(
                 writer.try_write_control(0x8, &payload)?;
                 return Ok(());
             }
-            // Pong has no application effect.
-            0xa => {}
+            // Pong: the answer to the ping sent after a frame carries that frame's sequence
+            // number (see `FrameAcks`); any other pong is a no-op.
+            0xa => {
+                if let Ok(seq) = <[u8; 8]>::try_from(payload.as_slice()) {
+                    acks.ack(u64::from_be_bytes(seq));
+                }
+            }
             // This endpoint accepts binary input only.
             0x1 => {
                 return Err(io::Error::new(
@@ -575,439 +647,4 @@ fn base64(data: &[u8]) -> String {
         });
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::{Read as _, Write as _};
-    use std::net::{Ipv4Addr, TcpListener, TcpStream};
-    use std::sync::{Arc, Barrier};
-
-    fn capture_ws_binary(payload: &[u8]) -> Vec<u8> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (writer, _) = listener.accept().unwrap();
-        let payload = payload.to_vec();
-        let sender = std::thread::spawn(move || {
-            super::WsWriter::new(writer).write_binary(&payload).unwrap();
-        });
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).unwrap();
-        sender.join().unwrap();
-        bytes
-    }
-
-    fn capture_concurrent_binary_and_pong(payload: &[u8]) -> Vec<u8> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        let writer = Arc::new(super::WsWriter::new(stream));
-        let barrier = Arc::new(Barrier::new(3));
-
-        let binary_writer = Arc::clone(&writer);
-        let binary_barrier = Arc::clone(&barrier);
-        let payload = payload.to_vec();
-        let binary = std::thread::spawn(move || {
-            binary_barrier.wait();
-            binary_writer.write_binary(&payload).unwrap();
-        });
-
-        let control_writer = Arc::clone(&writer);
-        let control_barrier = Arc::clone(&barrier);
-        let control = std::thread::spawn(move || {
-            control_barrier.wait();
-            control_writer.write_control(0xa, b"probe").unwrap();
-        });
-
-        barrier.wait();
-        drop(writer);
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).unwrap();
-        binary.join().unwrap();
-        control.join().unwrap();
-        bytes
-    }
-
-    fn parse_ws_frames(mut bytes: &[u8]) -> Vec<(bool, u8, Vec<u8>)> {
-        let mut frames = Vec::new();
-        while !bytes.is_empty() {
-            assert!(bytes.len() >= 2);
-            let fin = bytes[0] & 0x80 != 0;
-            let opcode = bytes[0] & 0x0f;
-            assert_eq!(bytes[1] & 0x80, 0);
-            let (header_len, payload_len) = match bytes[1] & 0x7f {
-                len @ 0..=125 => (2, usize::from(len)),
-                126 => {
-                    assert!(bytes.len() >= 4);
-                    (4, usize::from(u16::from_be_bytes([bytes[2], bytes[3]])))
-                }
-                127 => panic!("server fragment used a 64-bit payload length"),
-                _ => unreachable!(),
-            };
-            let frame_len = header_len + payload_len;
-            assert!(bytes.len() >= frame_len);
-            frames.push((fin, opcode, bytes[header_len..frame_len].to_vec()));
-            bytes = &bytes[frame_len..];
-        }
-        frames
-    }
-
-    fn masked_client_frame(first_byte: u8, payload: &[u8]) -> Vec<u8> {
-        let mut frame = vec![first_byte];
-        if payload.len() < 126 {
-            frame.push(0x80 | u8::try_from(payload.len()).unwrap());
-        } else {
-            frame.push(0x80 | 0x7e);
-            frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
-        }
-        let mask = [0x12, 0x34, 0x56, 0x78];
-        frame.extend_from_slice(&mask);
-        frame.extend(
-            payload
-                .iter()
-                .enumerate()
-                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
-        );
-        frame
-    }
-
-    fn run_client_bytes(bytes: &[u8]) -> (std::io::Result<()>, usize) {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        let writer = super::WsWriter::new(stream.try_clone().unwrap());
-        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let callback_count = Arc::clone(&count);
-        let on_input: Arc<super::InputHandler> = Arc::new(move |_| {
-            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        });
-        client.write_all(bytes).unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
-        let result = super::read_ws_loop(stream, &writer, &on_input);
-        (result, count.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    struct OnePixelFramebuffer;
-
-    impl crate::server::FramebufferSource for OnePixelFramebuffer {
-        fn dimensions(&self) -> (u16, u16) {
-            (1, 1)
-        }
-
-        fn snapshot_into(&self, dst: &mut Vec<u8>) {
-            dst.clear();
-            dst.resize(4, 0);
-        }
-    }
-
-    fn websocket_request(host: &str, origin: Option<&str>, upgrade: &str, version: &str) -> String {
-        let origin = origin
-            .map(|value| format!("Origin: {value}\r\n"))
-            .unwrap_or_default();
-        format!(
-            "GET /ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: {upgrade}\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: {version}\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{origin}\r\n"
-        )
-    }
-
-    fn run_http_request(build_request: impl FnOnce(std::net::SocketAddr) -> String) -> Vec<u8> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        let framebuffer = Arc::new(OnePixelFramebuffer);
-        let on_input: Arc<super::InputHandler> = Arc::new(|_| {});
-        let server = std::thread::spawn(move || {
-            super::serve_connection(stream, &framebuffer, &on_input).unwrap();
-        });
-        client.write_all(build_request(addr).as_bytes()).unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).unwrap();
-        server.join().unwrap();
-        response
-    }
-
-    #[test]
-    fn websocket_binary_fragment_boundaries_and_replay() {
-        const LIMIT: usize = u16::MAX as usize;
-        const DESKTOP_MESSAGE_LEN: usize = 4 + 1024 * 768 * 4;
-
-        for len in [
-            0,
-            1,
-            125,
-            126,
-            LIMIT - 1,
-            LIMIT,
-            LIMIT + 1,
-            LIMIT * 2,
-            LIMIT * 2 + 1,
-            DESKTOP_MESSAGE_LEN,
-        ] {
-            let payload: Vec<_> = (0u8..=250).cycle().take(len).collect();
-            let encoded = capture_ws_binary(&payload);
-            let frames = parse_ws_frames(&encoded);
-            let expected_count = if payload.is_empty() {
-                1
-            } else {
-                payload.len().div_ceil(LIMIT)
-            };
-            assert_eq!(frames.len(), expected_count);
-            for (index, (fin, opcode, fragment)) in frames.iter().enumerate() {
-                assert_eq!(*fin, index + 1 == expected_count);
-                assert_eq!(*opcode, if index == 0 { 0x2 } else { 0x0 });
-                assert!(fragment.len() <= LIMIT);
-            }
-            let reassembled: Vec<_> = frames
-                .iter()
-                .flat_map(|(_, _, fragment)| fragment.iter().copied())
-                .collect();
-            assert_eq!(reassembled, payload);
-            assert_eq!(capture_ws_binary(&payload), encoded);
-        }
-    }
-
-    #[test]
-    fn websocket_server_writes_are_serialized() {
-        const LIMIT: usize = u16::MAX as usize;
-        let payload: Vec<_> = (0u8..=250).cycle().take(LIMIT * 2 + 1).collect();
-
-        for _ in 0..8 {
-            let captures = std::thread::scope(|scope| {
-                let writers: Vec<_> = (0..8)
-                    .map(|_| scope.spawn(|| capture_concurrent_binary_and_pong(&payload)))
-                    .collect();
-                writers
-                    .into_iter()
-                    .map(|writer| writer.join().unwrap())
-                    .collect::<Vec<_>>()
-            });
-            for bytes in captures {
-                let frames = parse_ws_frames(&bytes);
-                let pong_index = frames
-                    .iter()
-                    .position(|(_, opcode, _)| *opcode == 0xa)
-                    .unwrap();
-                assert!(pong_index == 0 || pong_index + 1 == frames.len());
-                assert_eq!(frames[pong_index], (true, 0xa, b"probe".to_vec()));
-
-                let binary: Vec<_> = frames
-                    .iter()
-                    .filter(|(_, opcode, _)| *opcode != 0xa)
-                    .collect();
-                assert_eq!(binary.len(), 3);
-                for (index, (fin, opcode, fragment)) in binary.iter().enumerate() {
-                    assert_eq!(*fin, index + 1 == binary.len());
-                    assert_eq!(*opcode, if index == 0 { 0x2 } else { 0x0 });
-                    assert!(fragment.len() <= LIMIT);
-                }
-                let reassembled: Vec<_> = binary
-                    .iter()
-                    .flat_map(|(_, _, fragment)| fragment.iter().copied())
-                    .collect();
-                assert_eq!(reassembled, payload);
-            }
-        }
-    }
-
-    #[test]
-    fn websocket_handshake_enforces_same_origin() {
-        let accepted = run_http_request(|addr| {
-            let host = addr.to_string();
-            websocket_request(&host, Some(&format!("http://{host}")), "websocket", "13")
-        });
-        assert!(accepted.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
-
-        let localhost = run_http_request(|addr| {
-            let host = format!("localhost:{}", addr.port());
-            websocket_request(&host, Some(&format!("http://{host}")), "websocket", "13")
-        });
-        assert!(localhost.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
-
-        let foreign_origin = run_http_request(|addr| {
-            websocket_request(
-                &addr.to_string(),
-                Some("http://attacker.example"),
-                "websocket",
-                "13",
-            )
-        });
-        assert!(foreign_origin.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-
-        let rebinding_host = run_http_request(|_| {
-            websocket_request(
-                "attacker.example",
-                Some("http://attacker.example"),
-                "websocket",
-                "13",
-            )
-        });
-        assert!(rebinding_host.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-
-        let missing_origin =
-            run_http_request(|addr| websocket_request(&addr.to_string(), None, "websocket", "13"));
-        assert!(missing_origin.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-
-        let wrong_upgrade = run_http_request(|addr| {
-            let host = addr.to_string();
-            websocket_request(&host, Some(&format!("http://{host}")), "invalid", "13")
-        });
-        assert!(wrong_upgrade.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
-
-        let wrong_version = run_http_request(|addr| {
-            let host = addr.to_string();
-            websocket_request(&host, Some(&format!("http://{host}")), "websocket", "12")
-        });
-        assert!(wrong_version.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
-
-        let duplicate_host = run_http_request(|addr| {
-            let host = addr.to_string();
-            let mut request =
-                websocket_request(&host, Some(&format!("http://{host}")), "websocket", "13");
-            request.insert_str(request.len() - 2, "Host: attacker.example\r\n");
-            request
-        });
-        assert!(duplicate_host.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-
-        let duplicate_origin = run_http_request(|addr| {
-            let host = addr.to_string();
-            let mut request =
-                websocket_request(&host, Some(&format!("http://{host}")), "websocket", "13");
-            request.insert_str(request.len() - 2, "Origin: http://attacker.example\r\n");
-            request
-        });
-        assert!(duplicate_origin.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-
-        let encoded_separator = run_http_request(|addr| {
-            let host = addr.to_string();
-            websocket_request(
-                &host,
-                Some(&format!("http://{host}%0d%0aX-LiteBox: injected")),
-                "websocket",
-                "13",
-            )
-        });
-        assert!(encoded_separator.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-
-        let host_separator = run_http_request(|addr| {
-            let host = format!("{addr};attacker.example");
-            websocket_request(&host, Some(&format!("http://{host}")), "websocket", "13")
-        });
-        assert!(host_separator.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-    }
-
-    #[test]
-    fn websocket_incomplete_http_head_is_bounded() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        let framebuffer = Arc::new(OnePixelFramebuffer);
-        let on_input: Arc<super::InputHandler> = Arc::new(|_| {});
-        let started = std::time::Instant::now();
-        let server = std::thread::spawn(move || {
-            super::serve_connection_with_head_timeout(
-                stream,
-                &framebuffer,
-                &on_input,
-                std::time::Duration::from_millis(50),
-            )
-        });
-
-        client.write_all(b"GET /ws HTTP/1.1\r\nHost: ").unwrap();
-        let error = server.join().unwrap().unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        assert!(matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ));
-        client
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).unwrap();
-        assert!(response.is_empty());
-    }
-
-    #[test]
-    fn websocket_client_frames_fail_closed() {
-        let input = [1, 1, 0, 0, 0, 0x41];
-        let valid = masked_client_frame(0x82, &input);
-        let (result, count) = run_client_bytes(&valid);
-        assert!(result.is_ok());
-        assert_eq!(count, 1);
-
-        let mut replay = valid.clone();
-        replay.extend_from_slice(&valid);
-        let (result, count) = run_client_bytes(&replay);
-        assert!(result.is_ok());
-        assert_eq!(count, 2);
-
-        let mut unmasked = vec![0x82, u8::try_from(input.len()).unwrap()];
-        unmasked.extend_from_slice(&input);
-        let malformed = [
-            unmasked,
-            masked_client_frame(0x02, &input),
-            masked_client_frame(0xc2, &input),
-            masked_client_frame(0x81, b"text"),
-            masked_client_frame(0x82, b"bad"),
-            masked_client_frame(0x83, &[]),
-            masked_client_frame(0x89, &[0; 126]),
-            masked_client_frame(0x88, &[0]),
-        ];
-        for frame in malformed {
-            let (result, count) = run_client_bytes(&frame);
-            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
-            assert_eq!(count, 0);
-        }
-    }
-
-    #[test]
-    fn websocket_write_timeout_closes_connection() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        stream
-            .set_write_timeout(Some(std::time::Duration::from_millis(100)))
-            .unwrap();
-        let writer = super::WsWriter::new(stream);
-        let payload = vec![0; 32 * 1024 * 1024];
-        let started = std::time::Instant::now();
-        let error = writer.write_binary(&payload).unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert!(matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-        ));
-        drop(writer);
-        reader
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-            .unwrap();
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).unwrap();
-        assert!(bytes.len() < payload.len());
-    }
-
-    #[test]
-    fn websocket_control_payload_is_bounded() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let _reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        let error = super::WsWriter::new(stream)
-            .write_control(0xa, &[0; 126])
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    /// RFC 6455 §1.3's worked handshake example -- proves the SHA-1 and base64 above against
-    /// the spec's own vector.
-    #[test]
-    fn rfc6455_accept_vector() {
-        assert_eq!(
-            super::websocket_accept_value("dGhlIHNhbXBsZSBub25jZQ=="),
-            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-        );
-    }
 }

@@ -102,6 +102,8 @@ struct ReservationToken;
 /// against the live table on every draw.
 static AUTOBIND_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// The `SO_PEERCRED` view of a task: its process id and *effective* ids, as
+/// Linux's `cred_to_ucred` reports them.
 fn task_ucred<Platform: ShimPlatform, FS: ShimFS>(task: &Task<Platform, FS>) -> Ucred {
     let credentials = task.credentials.borrow();
     Ucred {
@@ -110,6 +112,27 @@ fn task_ucred<Platform: ShimPlatform, FS: ShimFS>(task: &Task<Platform, FS>) -> 
         gid: credentials.egid,
     }
 }
+
+/// The `SCM_CREDENTIALS` a task implicitly attaches to what it sends: its
+/// process id and *real* ids, as Linux's `maybe_add_creds` captures them
+/// (`task_tgid(current)` + `current_uid_gid`).
+fn task_send_ucred<Platform: ShimPlatform, FS: ShimFS>(task: &Task<Platform, FS>) -> Ucred {
+    let credentials = task.credentials.borrow();
+    Ucred {
+        pid: task.pid.cast_unsigned(),
+        uid: credentials.uid,
+        gid: credentials.gid,
+    }
+}
+
+/// What a `SO_PASSCRED` receiver sees when no sender credentials are
+/// attached to what it read (EOF, for instance): pid 0 and the overflow
+/// ids, matching Linux's `from_kuid_munged(INVALID_UID)`.
+const UNSET_UCRED: Ucred = Ucred {
+    pid: 0,
+    uid: 65534,
+    gid: 65534,
+};
 
 /// An exclusive claim on one key in the shared Unix address table, held
 /// from `bind()` time until the socket either upgrades it into a real
@@ -700,11 +723,19 @@ impl<FS: ShimFS> AddrView<FS> {
 struct Message<Platform: ShimPlatform, FS: ShimFS> {
     data: Vec<u8>,
     rights: Vec<TransferredFd<Platform, FS>>,
+    /// The sender's credentials, captured when the message was queued
+    /// (explicit `SCM_CREDENTIALS` if the sender supplied one, else its
+    /// process id and real ids).
+    credentials: Ucred,
 }
 
 pub(super) struct RecvResult<Platform: ShimPlatform, FS: ShimFS> {
     pub(super) size: usize,
     pub(super) rights: Vec<TransferredFd<Platform, FS>>,
+    /// `Some` only when the receiving socket has `SO_PASSCRED` set: the
+    /// `SCM_CREDENTIALS` payload to deliver (the first consumed message's
+    /// sender credentials).
+    pub(super) credentials: Option<Ucred>,
 }
 
 /// Represents a connected Unix stream socket.
@@ -802,14 +833,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         self.connected_send_channel.try_write_one(msg)
     }
 
+    /// `want_credentials` is the receiving socket's `SO_PASSCRED`: when set, the
+    /// result carries the first consumed message's sender credentials and a
+    /// stream read stops at a message whose sender credentials differ from
+    /// them, as Linux's `unix_stream_read_generic` does (`unix_skb_scm_eq`),
+    /// so one `SCM_CREDENTIALS` always describes every byte returned.
     fn try_recvfrom(
         &self,
         mut buf: &mut [u8],
+        want_credentials: bool,
     ) -> Result<RecvResult<Platform, FS>, TryOpError<Errno>> {
         if buf.is_empty() {
             return Ok(RecvResult {
                 size: 0,
                 rights: Vec::new(),
+                credentials: want_credentials.then_some(UNSET_UCRED),
             });
         }
         if self.preserve_message_boundaries {
@@ -824,6 +862,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                         RecvResult {
                             size: message_len,
                             rights: core::mem::take(&mut msg.rights),
+                            credentials: want_credentials.then_some(msg.credentials),
                         },
                     ))
                 })
@@ -836,10 +875,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         let mut result = RecvResult {
             size: 0,
             rights: Vec::new(),
+            credentials: None,
         };
         while !buf.is_empty() {
-            let (n, mut rights, ancillary_barrier) =
+            let (n, mut rights, credentials, ancillary_barrier) =
                 match self.recv_channel.peek_and_consume_one(|msg| {
+                    if want_credentials
+                        && let Some(first) = result.credentials
+                        && first != msg.credentials
+                    {
+                        // Credentials boundary: leave this message queued for
+                        // the next read.
+                        return Err(Errno::EAGAIN);
+                    }
                     let ancillary_barrier = !msg.rights.is_empty();
                     let copy_len = buf.len().min(msg.data.len());
                     buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
@@ -848,11 +896,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                     } else {
                         core::mem::take(&mut msg.rights)
                     };
+                    let credentials = msg.credentials;
                     if copy_len == msg.data.len() {
-                        Ok((true, (copy_len, rights, ancillary_barrier)))
+                        Ok((true, (copy_len, rights, credentials, ancillary_barrier)))
                     } else {
                         msg.data = msg.data.split_off(copy_len);
-                        Ok((false, (copy_len, rights, ancillary_barrier)))
+                        Ok((false, (copy_len, rights, credentials, ancillary_barrier)))
                     }
                 }) {
                     Ok(value) => value,
@@ -868,6 +917,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                 };
             result.size += n;
             result.rights.append(&mut rights);
+            if want_credentials && result.credentials.is_none() {
+                result.credentials = Some(credentials);
+            }
             buf = &mut buf[n..];
             if ancillary_barrier {
                 break;
@@ -1121,18 +1173,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         &self,
         cx: &WaitContext<'_, Platform>,
         timeout: Option<Duration>,
-        buf: &[u8],
-        rights: Vec<TransferredFd<Platform, FS>>,
+        msg: Message<Platform, FS>,
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
-        if buf.is_empty() {
+        let len = msg.data.len();
+        if len == 0 {
             return Ok(0);
         }
-        let mut msg = Some(Message {
-            data: buf.to_vec(),
-            rights,
-        });
+        let mut msg = Some(msg);
         cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
@@ -1153,7 +1202,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                             return Err(TryOpError::Other(Errno::EISCONN));
                         }
                         match conn.try_sendto(msg.take().unwrap()) {
-                            Ok(()) => Ok(buf.len()),
+                            Ok(()) => Ok(len),
                             Err((m, Errno::EAGAIN)) => {
                                 let _ = msg.replace(m);
                                 Err(TryOpError::TryAgain)
@@ -1172,6 +1221,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         timeout: Option<Duration>,
         buf: &mut [u8],
         is_nonblocking: bool,
+        want_credentials: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<RecvResult<Platform, FS>, Errno> {
         let res = cx
@@ -1191,7 +1241,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                         let conn = state
                             .connected()
                             .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        let n = conn.try_recvfrom(buf)?;
+                        let n = conn.try_recvfrom(buf, want_credentials)?;
                         // For connected stream sockets, no need to return the source address
                         if let Some(source_addr) = source_addr.as_deref_mut() {
                             *source_addr = None;
@@ -1295,9 +1345,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
 #[derive(Clone)]
 struct DatagramMessage {
     data: Vec<u8>,
-    // TODO: add control messages
-    // cmsgs: Option<Vec<Cmsg>>,
+    // TODO: add SCM_RIGHTS
     source: UnixSocketAddr,
+    /// The sender's credentials, captured when the datagram was queued (see
+    /// `Message::credentials`).
+    credentials: Ucred,
 }
 
 impl<Platform: ShimPlatform> WriteEnd<Platform, DatagramMessage> {
@@ -1337,12 +1389,13 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
     ///
     /// Reads exactly one message, preserving message boundaries. If the buffer
     /// is smaller than the message, the excess data is discarded (truncated).
-    /// Returns the original message size (which may exceed `buf.len()`).
+    /// Returns the original message size (which may exceed `buf.len()`) and
+    /// the sender's credentials.
     fn try_read(
         &self,
         buf: &mut [u8],
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<usize, TryOpError<Errno>> {
+    ) -> Result<(usize, Ucred), TryOpError<Errno>> {
         let is_self_shutdown = self.is_shutdown();
         self.peek_and_consume_one(|msg| {
             let copy_len = buf.len().min(msg.data.len());
@@ -1351,7 +1404,7 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
                 *source_addr = Some(msg.source.clone());
             }
             // Always consume the entire message to preserve boundaries.
-            Ok((true, msg.data.len()))
+            Ok((true, (msg.data.len(), msg.credentials)))
         })
         .map_err(|e| match e {
             Errno::EAGAIN => TryOpError::TryAgain,
@@ -1557,7 +1610,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         buf: &mut [u8],
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<usize, Errno> {
+    ) -> Result<(usize, Ucred), Errno> {
         let res = cx
             .with_timeout(timeout)
             .wait_on_events(
@@ -1596,6 +1649,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         task: &Task<Platform, FS>,
         timeout: Option<Duration>,
         buf: &[u8],
+        credentials: Ucred,
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
@@ -1624,6 +1678,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             DatagramMessage {
                 data: buf.to_vec(),
                 source,
+                credentials,
             },
             is_nonblocking,
         )?;
@@ -1791,9 +1846,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
-        self.sendmsg(task, buf, flags, addr, Vec::new())
+        self.sendmsg(task, buf, flags, addr, Vec::new(), None)
     }
 
+    /// `credentials` is an explicit, already-validated `SCM_CREDENTIALS` the
+    /// sender attached; without one the sender's own process id and real ids
+    /// travel with the data, so a `SO_PASSCRED` receiver always learns who
+    /// sent what (Linux `maybe_add_creds`).
     pub(super) fn sendmsg(
         &self,
         task: &Task<Platform, FS>,
@@ -1801,6 +1860,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
         rights: Vec<TransferredFd<Platform, FS>>,
+        credentials: Option<Ucred>,
     ) -> Result<usize, Errno> {
         let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
         if flags.intersects(supported_flags.complement()) {
@@ -1810,15 +1870,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let is_nonblocking =
             flags.contains(SendFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
         let timeout = self.options.lock().send_timeout;
+        let credentials = credentials.unwrap_or_else(|| task_send_ucred(task));
         match &self.inner {
-            UnixSocketInner::Stream(stream) => {
-                stream.sendto(&task.wait_cx(), timeout, buf, rights, is_nonblocking, addr)
-            }
+            UnixSocketInner::Stream(stream) => stream.sendto(
+                &task.wait_cx(),
+                timeout,
+                Message {
+                    data: buf.to_vec(),
+                    rights,
+                    credentials,
+                },
+                is_nonblocking,
+                addr,
+            ),
             UnixSocketInner::Datagram(datagram) => {
                 if !rights.is_empty() {
                     return Err(Errno::EOPNOTSUPP);
                 }
-                datagram.sendto(task, timeout, buf, is_nonblocking, addr)
+                datagram.sendto(task, timeout, buf, credentials, is_nonblocking, addr)
             }
         }
     }
@@ -1848,22 +1917,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
         let is_nonblocking =
             flags.contains(ReceiveFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
-        let timeout = self.options.lock().recv_timeout;
+        let (timeout, pass_cred) = {
+            let options = self.options.lock();
+            (options.recv_timeout, options.pass_cred)
+        };
         let ret = match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                stream.recvfrom(cx, timeout, buf, is_nonblocking, pass_cred, source_addr)
             }
             UnixSocketInner::Datagram(datagram) => datagram
                 .recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
-                .map(|size| RecvResult {
+                .map(|(size, credentials)| RecvResult {
                     size,
                     rights: Vec::new(),
+                    credentials: pass_cred.then_some(credentials),
                 }),
         };
         match ret {
+            // EOF: Linux still runs `scm_recv`, so a `SO_PASSCRED` receiver gets an
+            // `SCM_CREDENTIALS` naming nobody (pid 0, overflow ids).
             Err(Errno::ESHUTDOWN) => Ok(RecvResult {
                 size: 0,
                 rights: Vec::new(),
+                credentials: pass_cred.then_some(UNSET_UCRED),
             }),
             other => other,
         }
@@ -1976,6 +2052,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     Err(Errno::ENOPROTOOPT)
                 }
+                // SO_PASSCRED: from now on every recvmsg on this socket carries an
+                // SCM_CREDENTIALS control message naming the sender.
+                SocketOption::PASSCRED => {
+                    let enabled = super::read_from_user::<u32, Platform>(optval, optlen)? != 0;
+                    self.options.lock().pass_cred = enabled;
+                    Ok(())
+                }
                 // SO_RCVBUF / SO_SNDBUF are advisory hints. Accept them and keep
                 // the fixed internal buffer size, instead of returning EOPNOTSUPP.
                 // Log at debug so the accepted-but-ignored option stays visible.
@@ -2030,6 +2113,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 // Unix sockets don't track async errors
                 SocketOption::ERROR => 0,
                 SocketOption::TYPE => self.sock_type as u32,
+                SocketOption::PASSCRED => u32::from(self.options.lock().pass_cred),
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {

@@ -90,6 +90,7 @@ where
                     }
                 }
             });
+            network.gateway_ip = gateway_ip;
         }
         network
     }
@@ -97,6 +98,34 @@ where
     /// Return the configured IPv4 address for this network's synthetic interface.
     pub fn interface_ip(&self) -> core::net::Ipv4Addr {
         self.device.interface_ip
+    }
+
+    /// Return the configured IPv4 default-route gateway for this network.
+    pub fn gateway_ip(&self) -> core::net::Ipv4Addr {
+        self.gateway_ip
+    }
+
+    /// Whether a packet for a destination other than this interface's own addresses (its
+    /// external IP and `127.0.0.0/8`, which loop back in-process) can actually leave this
+    /// process -- `false` when the platform has no external interface attached and would
+    /// silently drop it. See [`platform::IPInterfaceProvider::has_external_interface`].
+    pub fn external_interface_available(&self) -> bool {
+        self.device.platform.has_external_interface()
+    }
+
+    /// Whether `ip` is served entirely inside this network stack (loopback or the interface's
+    /// own address), i.e. reachable even with no external interface attached.
+    pub fn is_local_ip(&self, ip: core::net::Ipv4Addr) -> bool {
+        ip.is_loopback() || ip == self.device.interface_ip
+    }
+
+    /// Whether `ip` is the directed broadcast address of the interface's own `/24` (e.g.
+    /// `10.0.0.255` for `10.0.0.2/24`). Nothing answers it: the platform side only forwards
+    /// unicast, so a caller is told up front instead of waiting out a SYN timeout.
+    pub fn is_directed_broadcast(&self, ip: core::net::Ipv4Addr) -> bool {
+        let [a, b, c, d] = ip.octets();
+        let [ia, ib, ic, _] = self.device.interface_ip.octets();
+        d == 255 && [a, b, c] == [ia, ib, ic]
     }
 }
 

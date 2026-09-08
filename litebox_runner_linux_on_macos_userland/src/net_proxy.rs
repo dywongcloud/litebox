@@ -96,7 +96,11 @@ pub fn open_icmp_socket() -> io::Result<OwnedFd> {
 ///
 /// Requests and responses carry a four-byte IPv4 address prefix followed by one ICMP message.
 /// Both ends accept Echo Request/Reply only; no arbitrary raw packet can traverse this channel.
-pub fn serve_icmp(socket: &GuestDatagramSocket<Platform>, host: OwnedFd) {
+/// An echo to one of the guest's own addresses (`local_ips`: its interface and gateway, plus
+/// loopback) is answered here directly -- those addresses exist only inside the guest's
+/// synthetic network, so forwarding them to the host would ping some unrelated LAN host or
+/// nothing at all.
+pub fn serve_icmp(socket: &GuestDatagramSocket<Platform>, host: OwnedFd, local_ips: [Ipv4Addr; 2]) {
     const MAX_FRAME_SIZE: usize = 4 + 4096;
     let mut frame = [0u8; MAX_FRAME_SIZE];
     loop {
@@ -107,7 +111,9 @@ pub fn serve_icmp(socket: &GuestDatagramSocket<Platform>, host: OwnedFd) {
                 continue;
             }
         };
-        let Some(response) = proxy_icmp_echo(&host, &frame[..len]) else {
+        let Some(response) = local_icmp_echo(&frame[..len], &local_ips)
+            .or_else(|| proxy_icmp_echo(&host, &frame[..len]))
+        else {
             continue;
         };
         // A full guest UDP ring is transient. Retry for a short bound rather than losing a real
@@ -119,6 +125,33 @@ pub fn serve_icmp(socket: &GuestDatagramSocket<Platform>, host: OwnedFd) {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+}
+
+/// Synthesize the Echo Reply for a request aimed at one of the guest's own addresses (or
+/// loopback): the request with its type flipped and checksum redone. `None` for anything else,
+/// or for a frame that is not a well-formed Echo Request.
+fn local_icmp_echo(frame: &[u8], local_ips: &[Ipv4Addr]) -> Option<Vec<u8>> {
+    const PREFIX: usize = litebox::net::ICMP_ECHO_PROXY_PREFIX_LEN;
+    if !(PREFIX + 8..=PREFIX + 4096).contains(&frame.len()) {
+        return None;
+    }
+    let target = Ipv4Addr::new(frame[0], frame[1], frame[2], frame[3]);
+    if !(target.is_loopback() || local_ips.contains(&target)) {
+        return None;
+    }
+    let request = &frame[PREFIX..];
+    if request[0] != 8 || request[1] != 0 {
+        return None;
+    }
+    let mut reply = request.to_vec();
+    reply[0] = 0; // Echo Reply
+    reply[2..4].copy_from_slice(&[0, 0]);
+    let checksum = icmp_checksum(&reply).to_be_bytes();
+    reply[2..4].copy_from_slice(&checksum);
+    let mut response = Vec::with_capacity(PREFIX + reply.len());
+    response.extend_from_slice(&target.octets());
+    response.extend_from_slice(&reply);
+    Some(response)
 }
 
 fn proxy_icmp_echo(host: &OwnedFd, frame: &[u8]) -> Option<Vec<u8>> {
@@ -280,44 +313,91 @@ pub fn snapshot_resolvers() -> Vec<Ipv4Addr> {
     out
 }
 
-/// A minimal, cache-backed A-record resolver over plain UDP port 53.
+/// What one name lookup established, as the guest-facing responder must report it.
+#[derive(Clone)]
+enum Lookup {
+    /// `NOERROR` with these A records -- possibly none at all (a real name with no A record).
+    Answers(Vec<Ipv4Addr>),
+    /// The name does not exist (`NXDOMAIN`).
+    NxDomain,
+    /// No upstream produced a usable answer within the budget (`SERVFAIL`). Never cached.
+    ServFail,
+}
+
+/// A minimal, cache-backed A-record resolver over plain UDP port 53. Shared read-only between
+/// the HTTP proxy's thread and the DNS responder's worker pool; the cache is the only mutable
+/// state and is held only for the duration of a hash lookup, never across an upstream query.
 struct Resolver {
     servers: Vec<Ipv4Addr>,
-    cache: HashMap<String, (Vec<Ipv4Addr>, Instant)>,
+    cache: std::sync::Mutex<HashMap<String, (Lookup, Instant)>>,
 }
 
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(0x1337);
 
 impl Resolver {
     const TTL: Duration = Duration::from_mins(2);
+    /// `NXDOMAIN`/`NODATA` are remembered briefly too: a resolver retrying a bad name (musl
+    /// fires A and AAAA, `getaddrinfo` callers retry) must not re-pay the upstream round trip.
+    const NEGATIVE_TTL: Duration = Duration::from_secs(30);
     const QUERY_BUDGET: Duration = Duration::from_secs(4);
 
-    fn resolve(&mut self, host: &str) -> Vec<Ipv4Addr> {
-        self.resolve_until(host, Instant::now() + Self::QUERY_BUDGET)
+    fn new(servers: Vec<Ipv4Addr>) -> Self {
+        Self {
+            servers,
+            cache: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
-    fn resolve_until(&mut self, host: &str, deadline: Instant) -> Vec<Ipv4Addr> {
+    /// The addresses for `host`, or none when it has no A record, does not exist, or could not
+    /// be resolved -- the HTTP proxy's `502` does not distinguish those.
+    fn resolve_until(&self, host: &str, deadline: Instant) -> Vec<Ipv4Addr> {
+        match self.lookup(host, deadline) {
+            Lookup::Answers(ips) => ips,
+            Lookup::NxDomain | Lookup::ServFail => Vec::new(),
+        }
+    }
+
+    fn normalize(host: &str) -> String {
+        host.trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    /// A still-fresh cached lookup for an already-normalized name.
+    fn cached(&self, host: &str) -> Option<Lookup> {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (lookup, at) = cache.get(host)?;
+        let ttl = match lookup {
+            Lookup::Answers(ips) if !ips.is_empty() => Self::TTL,
+            _ => Self::NEGATIVE_TTL,
+        };
+        (at.elapsed() < ttl).then(|| lookup.clone())
+    }
+
+    fn lookup(&self, host: &str, deadline: Instant) -> Lookup {
         if let Ok(ip) = host.parse::<Ipv4Addr>() {
-            return vec![ip];
+            return Lookup::Answers(vec![ip]);
         }
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let host = Self::normalize(host);
         if host.is_empty() || host.len() > 253 {
-            return Vec::new();
+            return Lookup::NxDomain;
         }
-        if let Some((ips, at)) = self.cache.get(&host)
-            && at.elapsed() < Self::TTL
-        {
-            return ips.clone();
+        if let Some(hit) = self.cached(&host) {
+            return hit;
         }
         let dns_deadline = deadline.min(Instant::now() + Self::QUERY_BUDGET);
-        let ips = self.query(&host, dns_deadline);
-        if !ips.is_empty() {
-            self.cache.insert(host, (ips.clone(), Instant::now()));
+        let result = self.query(&host, dns_deadline);
+        if !matches!(result, Lookup::ServFail) {
+            self.cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(host, (result.clone(), Instant::now()));
         }
-        ips
+        result
     }
 
-    fn query(&self, host: &str, deadline: Instant) -> Vec<Ipv4Addr> {
+    fn query(&self, host: &str, deadline: Instant) -> Lookup {
         let id = DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed).to_be_bytes();
         let mut packet = vec![
             id[0], id[1], // id
@@ -327,7 +407,7 @@ impl Resolver {
         for label in host.split('.') {
             let bytes = label.as_bytes();
             if bytes.is_empty() || bytes.len() > 63 {
-                return Vec::new();
+                return Lookup::NxDomain;
             }
             packet.push(u8::try_from(bytes.len()).unwrap_or(0));
             packet.extend_from_slice(bytes);
@@ -337,7 +417,7 @@ impl Resolver {
             Ok(s) => s,
             Err(e) => {
                 litebox_util_log::debug!(error:% = e; "net-proxy: dns udp bind failed");
-                return Vec::new();
+                return Lookup::ServFail;
             }
         };
         for (index, server) in self.servers.iter().enumerate() {
@@ -385,24 +465,35 @@ impl Resolver {
                 if source != expected_source {
                     continue;
                 }
-                if let Some(ips) = parse_dns_a_answers(&buf[..n], id) {
-                    return ips;
+                match parse_dns_response(&buf[..n], id) {
+                    Some(answer @ (Lookup::Answers(_) | Lookup::NxDomain)) => return answer,
+                    // This server could not answer (SERVFAIL/REFUSED): move on to the next one
+                    // rather than waiting out its budget for a reply that already came.
+                    Some(Lookup::ServFail) => break,
+                    None => {}
                 }
             }
         }
-        Vec::new()
+        Lookup::ServFail
     }
 }
 
-/// Extract every deduplicated A record from one matching DNS response. Name compression only needs
-/// to be skipped here; the proxy does not need to reconstruct owner names.
-fn parse_dns_a_answers(msg: &[u8], id: [u8; 2]) -> Option<Vec<Ipv4Addr>> {
+/// Classify one matching DNS response: `NXDOMAIN`, a failure code, or the deduplicated A
+/// records of a `NOERROR` answer (possibly none). Name compression only needs to be skipped
+/// here; the proxy does not need to reconstruct owner names. `None` for a packet that is not a
+/// response to `id` at all.
+fn parse_dns_response(msg: &[u8], id: [u8; 2]) -> Option<Lookup> {
     if msg.len() < 12 || msg.get(..2)? != id.as_slice() {
         return None;
     }
     let flags = u16::from_be_bytes([msg[2], msg[3]]);
-    if flags & 0x8000 == 0 || flags & 0x000f != 0 {
+    if flags & 0x8000 == 0 {
         return None;
+    }
+    match flags & 0x000f {
+        0 => {}
+        3 => return Some(Lookup::NxDomain),
+        _ => return Some(Lookup::ServFail),
     }
     let qdcount = usize::from(u16::from_be_bytes([msg[4], msg[5]]));
     let ancount = usize::from(u16::from_be_bytes([msg[6], msg[7]]));
@@ -436,7 +527,7 @@ fn parse_dns_a_answers(msg: &[u8], id: [u8; 2]) -> Option<Vec<Ipv4Addr>> {
         }
         pos = data_end;
     }
-    Some(out)
+    Some(Lookup::Answers(out))
 }
 
 fn skip_dns_name(msg: &[u8], pos: &mut usize) -> Option<()> {
@@ -511,15 +602,20 @@ struct Conn {
     to_guest: Vec<u8>,
     /// The host side saw EOF; once `to_guest` drains, the connection is done.
     host_eof: bool,
+    /// The guest half-closed its sending side (`shutdown(SHUT_WR)` / close after the request).
+    /// That is not the end of the conversation: busybox wget, `nc -q`, and any "send the request
+    /// then FIN" client still expect the whole response. Nothing more is read from the guest, the
+    /// half-close is propagated to a plain upstream once `to_host` drains, and relaying continues
+    /// host -> guest until the origin is done.
+    guest_eof: bool,
+    /// The upstream's write side has been half-closed (plain TCP only; see `guest_eof`).
+    host_write_closed: bool,
 }
 
 /// Drive the proxy forever. Runs on its own host thread, spawned before the sandbox comes up
 /// (thread creation is unmediated, and the widened profile keeps `connect` working after).
 pub fn serve(listener: &GuestListener<Platform>, resolvers: Vec<Ipv4Addr>, tls: Arc<ClientConfig>) {
-    let mut resolver = Resolver {
-        servers: resolvers,
-        cache: HashMap::new(),
-    };
+    let resolver = Resolver::new(resolvers);
     let mut conns: Vec<Conn> = Vec::new();
     let mut scratch = vec![0u8; 64 * 1024];
     loop {
@@ -532,10 +628,12 @@ pub fn serve(listener: &GuestListener<Platform>, resolvers: Vec<Ipv4Addr>, tls: 
                 to_host: Vec::new(),
                 to_guest: Vec::new(),
                 host_eof: false,
+                guest_eof: false,
+                host_write_closed: false,
             });
         }
         let mut progressed = false;
-        conns.retain_mut(|conn| match step(conn, &mut resolver, &tls, &mut scratch) {
+        conns.retain_mut(|conn| match step(conn, &resolver, &tls, &mut scratch) {
             StepOutcome::Progressed => {
                 progressed = true;
                 true
@@ -557,7 +655,7 @@ enum StepOutcome {
 
 fn step(
     conn: &mut Conn,
-    resolver: &mut Resolver,
+    resolver: &Resolver,
     tls: &Arc<ClientConfig>,
     scratch: &mut [u8],
 ) -> StepOutcome {
@@ -599,15 +697,30 @@ fn step(
                 return StepOutcome::Done;
             };
             // guest -> host
-            if conn.to_host.is_empty() {
+            if conn.to_host.is_empty() && !conn.guest_eof {
                 match conn.guest.try_read(scratch) {
                     StreamRead::Data(n) => {
                         conn.to_host.extend_from_slice(&scratch[..n]);
                         progressed = true;
                     }
                     StreamRead::Empty => {}
-                    StreamRead::Closed => return StepOutcome::Done,
+                    StreamRead::Closed => {
+                        // Half-close, not close: keep relaying the origin's reply.
+                        conn.guest_eof = true;
+                        progressed = true;
+                    }
                 }
+            }
+            if conn.guest_eof && conn.to_host.is_empty() && !conn.host_write_closed {
+                conn.host_write_closed = true;
+                if let Upstream::Plain(stream) = host {
+                    // Propagate the guest's FIN so an origin (or CONNECT tunnel peer) that
+                    // waits for end-of-request sees it. A TLS upstream is left open: a
+                    // close_notify this early makes some origins drop the request instead of
+                    // answering it, and the origin closes on its own after the reply.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                }
+                progressed = true;
             }
             if !conn.to_host.is_empty() {
                 match host.write(&conn.to_host) {
@@ -670,7 +783,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 /// guest's plaintext proxy hop and establishes a separately authenticated TLS connection upstream.
 fn open_upstream(
     head: &[u8],
-    resolver: &mut Resolver,
+    resolver: &Resolver,
     tls: &Arc<ClientConfig>,
 ) -> Option<(Upstream, Vec<u8>, Vec<u8>)> {
     const TOTAL_DEADLINE: Duration = Duration::from_secs(20);
@@ -794,6 +907,17 @@ fn split_host_port(authority: &str, default_port: u16) -> Option<(&str, u16)> {
 /// reach it, and litebox's guest-root packaging can ship an `/etc/resolv.conf` pointing here.
 pub const DNS_ADDR: (Ipv4Addr, u16) = (Ipv4Addr::LOCALHOST, 53);
 
+/// The guest's own host name, as the shim's `uname` reports it; resolved to the interface
+/// address so `hostname -i` and anything that looks itself up work without an `/etc/hosts` entry.
+const GUEST_HOSTNAME: &str = "litebox";
+
+/// Upstream lookups run on this many worker threads, so one slow or unanswerable name cannot
+/// hold every other guest query behind its full [`Resolver::QUERY_BUDGET`].
+const DNS_WORKERS: usize = 4;
+/// Queries waiting for a free worker beyond this are dropped; the guest's resolver retries,
+/// exactly as it would against an overloaded real nameserver.
+const DNS_QUEUE_DEPTH: usize = 64;
+
 /// Drive the in-guest DNS responder forever, on its own host thread. For each guest query,
 /// resolves the question through [`Resolver`] (the same UDP-to-real-resolvers path the HTTP
 /// proxy uses to dial out) and replies with a synthesized A-record answer.
@@ -803,130 +927,209 @@ pub const DNS_ADDR: (Ipv4Addr, u16) = (Ipv4Addr::LOCALHOST, 53);
 /// record types): a tool that only needs a name to turn into an address (`wget`, `curl` through
 /// the HTTP proxy, TLS `SNI` lookups) is fully served. The separately bounded ICMP Echo bridge
 /// also uses this responder for hostname-based `ping`; no general raw-IP path is exposed.
-pub fn serve_dns(socket: &GuestDatagramSocket<Platform>, resolvers: Vec<Ipv4Addr>) {
-    let mut resolver = Resolver {
-        servers: resolvers,
-        cache: HashMap::new(),
-    };
+///
+/// Anything answerable without the network (AAAA, the guest's own name, `localhost`, an
+/// address literal, a cache hit) is answered inline; everything else is handed to a small
+/// worker pool so a query stuck waiting on an upstream never delays the next one.
+pub fn serve_dns(
+    socket: &GuestDatagramSocket<Platform>,
+    resolvers: Vec<Ipv4Addr>,
+    interface_ip: Ipv4Addr,
+) {
+    let resolver = Arc::new(Resolver::new(resolvers));
+    let (work_tx, work_rx) =
+        std::sync::mpsc::sync_channel::<(DnsQuestion, SocketAddr)>(DNS_QUEUE_DEPTH);
+    let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>();
+    for _ in 0..DNS_WORKERS {
+        let work_rx = Arc::clone(&work_rx);
+        let done_tx = done_tx.clone();
+        let resolver = Arc::clone(&resolver);
+        std::thread::spawn(move || {
+            loop {
+                let job = work_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv();
+                let Ok((question, from)) = job else { return };
+                let lookup =
+                    resolver.lookup(&question.host, Instant::now() + Resolver::QUERY_BUDGET);
+                if done_tx.send((question.reply(&lookup), from)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
     let mut buf = [0u8; 512];
     loop {
-        let (len, from) = match socket.try_recv_from(&mut buf) {
-            DatagramRead::Data { len, from } => (len, from),
-            DatagramRead::Empty => {
-                std::thread::sleep(Duration::from_millis(2));
-                continue;
+        let mut progressed = false;
+        while let Ok((response, to)) = done_rx.try_recv() {
+            send_to_guest(socket, &response, to);
+            progressed = true;
+        }
+        if let DatagramRead::Data { len, from } = socket.try_recv_from(&mut buf) {
+            progressed = true;
+            if let Some(question) = DnsQuestion::parse(&buf[..len]) {
+                match question.answer_locally(&resolver, interface_ip) {
+                    Some(response) => send_to_guest(socket, &response, from),
+                    None => {
+                        if work_tx.try_send((question, from)).is_err() {
+                            litebox_util_log::debug!(
+                                "net-proxy: dns worker queue full; dropping query"
+                            );
+                        }
+                    }
+                }
             }
-        };
-        let Some(response) = build_dns_response(&buf[..len], &mut resolver) else {
-            continue;
-        };
-        socket.try_send_to(&response, from);
+        }
+        if !progressed {
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 
-/// Build a DNS response for one guest query: the query's own bytes (header + question section,
-/// reused verbatim rather than re-encoded, so the name/qtype/qclass the guest sent are echoed
-/// back exactly) with an A-record answer appended for an A query, or an empty NOERROR/NODATA
-/// answer section for anything else recognized (AAAA in particular).
-///
-/// musl's resolver fires A and AAAA queries in parallel and waits for a reply to *both* before
-/// `getaddrinfo` returns -- dropping the AAAA query outright (this responder has no IPv6
-/// records to offer) left musl's read loop blocked until its own internal timeout, discarding
-/// the A answer it had already received and failing the whole lookup ("bad address") even
-/// though the hostname resolved fine. An explicit NOERROR/ancount=0 reply is what a real
-/// resolver sends for a name with no AAAA records, and completes musl's wait immediately.
-///
-/// `None` only for a query this responder cannot parse or answer at all (empty/malformed
-/// query, no question, or a record type it's never heard of) -- the guest's resolver will
-/// retry or time out, the same outward behavior as an unreachable real nameserver.
-fn build_dns_response(query: &[u8], resolver: &mut Resolver) -> Option<Vec<u8>> {
-    const QTYPE_A: u16 = 1;
-    const QTYPE_AAAA: u16 = 28;
-    const QCLASS_IN: u16 = 1;
-    if query.len() < 12 {
-        return None;
-    }
-    let qdcount = u16::from_be_bytes([query[4], query[5]]);
-    if qdcount == 0 {
-        return None;
-    }
-    let mut pos = 12;
-    let name_start = pos;
-    loop {
-        let len = *query.get(pos)? as usize;
-        if len == 0 {
-            pos += 1;
-            break;
+/// A full guest UDP ring is transient. Retry for a short bound rather than losing an answer at
+/// exactly the point the guest is waiting for it.
+fn send_to_guest(socket: &GuestDatagramSocket<Platform>, response: &[u8], to: SocketAddr) {
+    for _ in 0..50 {
+        if socket.try_send_to(response, to) {
+            return;
         }
-        // A compressed name can't appear in the question section of a query a real resolver
-        // originates, and nothing here originates one either; treat it as malformed.
-        if len & 0xc0 == 0xc0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+const QTYPE_A: u16 = 1;
+const QCLASS_IN: u16 = 1;
+const RCODE_NOERROR: u8 = 0;
+const RCODE_SERVFAIL: u8 = 2;
+const RCODE_NXDOMAIN: u8 = 3;
+
+/// One parsed guest question. The header id and the question section are kept verbatim so
+/// the reply echoes back exactly the name/qtype/qclass the guest sent, rather than a
+/// re-encoding of them.
+struct DnsQuestion {
+    id: [u8; 2],
+    question: Vec<u8>,
+    host: String,
+    qtype: u16,
+    qclass: u16,
+}
+
+impl DnsQuestion {
+    /// `None` for a query this responder cannot parse at all (too short, no question, a
+    /// compressed or malformed name) -- the guest's resolver retries or times out, the same
+    /// outward behavior as an unreachable real nameserver.
+    fn parse(query: &[u8]) -> Option<Self> {
+        if query.len() < 12 {
             return None;
         }
-        pos += 1 + len;
-    }
-    let name_end = pos;
-    let qtype = u16::from_be_bytes([*query.get(pos)?, *query.get(pos + 1)?]);
-    pos += 4; // qtype + qclass
-    let question_end = pos;
-
-    // Decode the dotted name back out of its length-prefixed labels to resolve it.
-    let mut host = String::new();
-    let mut label_pos = name_start;
-    while label_pos < name_end - 1 {
-        let len = query[label_pos] as usize;
-        if !host.is_empty() {
-            host.push('.');
+        let qdcount = u16::from_be_bytes([query[4], query[5]]);
+        if qdcount == 0 {
+            return None;
         }
-        host.push_str(core::str::from_utf8(query.get(label_pos + 1..label_pos + 1 + len)?).ok()?);
-        label_pos += 1 + len;
+        let mut pos = 12;
+        let name_start = pos;
+        loop {
+            let len = *query.get(pos)? as usize;
+            if len == 0 {
+                pos += 1;
+                break;
+            }
+            // A compressed name can't appear in the question section of a query a real
+            // resolver originates, and nothing here originates one either; treat it as
+            // malformed.
+            if len & 0xc0 == 0xc0 {
+                return None;
+            }
+            pos += 1 + len;
+        }
+        let name_end = pos;
+        let qtype = u16::from_be_bytes([*query.get(pos)?, *query.get(pos + 1)?]);
+        let qclass = u16::from_be_bytes([*query.get(pos + 2)?, *query.get(pos + 3)?]);
+        pos += 4; // qtype + qclass
+        let question_end = pos;
+
+        // Decode the dotted name back out of its length-prefixed labels to resolve it.
+        let mut host = String::new();
+        let mut label_pos = name_start;
+        while label_pos < name_end - 1 {
+            let len = query[label_pos] as usize;
+            if !host.is_empty() {
+                host.push('.');
+            }
+            host.push_str(
+                core::str::from_utf8(query.get(label_pos + 1..label_pos + 1 + len)?).ok()?,
+            );
+            label_pos += 1 + len;
+        }
+        Some(Self {
+            id: [query[0], query[1]],
+            question: query[12..question_end].to_vec(),
+            host,
+            qtype,
+            qclass,
+        })
     }
 
-    if qtype != QTYPE_A && qtype != QTYPE_AAAA {
-        return None;
+    /// A reply that needs no upstream round trip, or `None` when the name has to be resolved.
+    ///
+    /// musl's resolver fires A and AAAA queries in parallel and waits for a reply to *both*
+    /// before `getaddrinfo` returns -- dropping the AAAA query outright (this responder has no
+    /// IPv6 records to offer) left musl's read loop blocked until its own internal timeout,
+    /// discarding the A answer it had already received and failing the whole lookup ("bad
+    /// address") even though the hostname resolved fine. An explicit NOERROR/ancount=0 reply is
+    /// what a real resolver sends for a name with no AAAA records, and completes musl's wait
+    /// immediately; the same NODATA shape answers any other record type this responder does not
+    /// serve.
+    fn answer_locally(&self, resolver: &Resolver, interface_ip: Ipv4Addr) -> Option<Vec<u8>> {
+        if self.qclass != QCLASS_IN || self.qtype != QTYPE_A {
+            return Some(self.reply(&Lookup::Answers(Vec::new())));
+        }
+        let host = Resolver::normalize(&self.host);
+        let local = match host.as_str() {
+            GUEST_HOSTNAME => Some(interface_ip),
+            "localhost" | "localhost.localdomain" => Some(Ipv4Addr::LOCALHOST),
+            _ => host.parse::<Ipv4Addr>().ok(),
+        };
+        if let Some(ip) = local {
+            return Some(self.reply(&Lookup::Answers(vec![ip])));
+        }
+        resolver.cached(&host).map(|hit| self.reply(&hit))
     }
 
-    let mut response = Vec::with_capacity(question_end + 16);
-    response.extend_from_slice(&query[..2]); // id
-
-    if qtype == QTYPE_AAAA {
-        response.extend_from_slice(&[0x81, 0x80]); // flags: response, recursion available, no error
+    /// Encode `lookup` as the wire reply to this question: `NXDOMAIN`/`SERVFAIL` carry the
+    /// question and nothing else; a `NOERROR` answer appends one A record per address.
+    fn reply(&self, lookup: &Lookup) -> Vec<u8> {
+        let (rcode, ips): (u8, &[Ipv4Addr]) = match lookup {
+            Lookup::Answers(ips) => (RCODE_NOERROR, ips),
+            Lookup::NxDomain => (RCODE_NXDOMAIN, &[]),
+            Lookup::ServFail => (RCODE_SERVFAIL, &[]),
+        };
+        let ips = &ips[..ips.len().min(16)];
+        let mut response = Vec::with_capacity(12 + self.question.len() + 16 * ips.len());
+        response.extend_from_slice(&self.id);
+        // flags: response, recursion desired + available, rcode
+        response.extend_from_slice(&[0x81, 0x80 | rcode]);
         response.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-        response.extend_from_slice(&0u16.to_be_bytes()); // ancount: no AAAA records offered
+        response.extend_from_slice(&u16::try_from(ips.len()).unwrap_or(0).to_be_bytes());
         response.extend_from_slice(&[0, 0]); // nscount
         response.extend_from_slice(&[0, 0]); // arcount
-        response.extend_from_slice(&query[12..question_end]); // question, verbatim
-        return Some(response);
+        response.extend_from_slice(&self.question); // question, verbatim
+        for ip in ips {
+            response.extend_from_slice(&[0xc0, 0x0c]); // answer name: pointer to question's name
+            response.extend_from_slice(&QTYPE_A.to_be_bytes());
+            response.extend_from_slice(&QCLASS_IN.to_be_bytes());
+            response.extend_from_slice(&60u32.to_be_bytes()); // ttl
+            response.extend_from_slice(&4u16.to_be_bytes()); // rdlength
+            response.extend_from_slice(&ip.octets());
+        }
+        response
     }
-
-    let ips = resolver
-        .resolve(&host)
-        .into_iter()
-        .take(16)
-        .collect::<Vec<_>>();
-    let answer_count = u16::try_from(ips.len()).ok()?;
-    if answer_count == 0 {
-        return None;
-    }
-    response.extend_from_slice(&[0x81, 0x80]); // flags: response, recursion available, no error
-    response.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-    response.extend_from_slice(&answer_count.to_be_bytes());
-    response.extend_from_slice(&[0, 0]); // nscount
-    response.extend_from_slice(&[0, 0]); // arcount
-    response.extend_from_slice(&query[12..question_end]); // question, verbatim
-    for ip in ips {
-        response.extend_from_slice(&[0xc0, 0x0c]); // answer name: pointer to question's name
-        response.extend_from_slice(&QTYPE_A.to_be_bytes());
-        response.extend_from_slice(&QCLASS_IN.to_be_bytes());
-        response.extend_from_slice(&60u32.to_be_bytes()); // ttl
-        response.extend_from_slice(&4u16.to_be_bytes()); // rdlength
-        response.extend_from_slice(&ip.octets());
-    }
-    Some(response)
 }
 
 fn open_origin(
-    resolver: &mut Resolver,
+    resolver: &Resolver,
     host: &str,
     port: u16,
     secure: bool,

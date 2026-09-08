@@ -8,6 +8,8 @@
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
@@ -62,6 +64,24 @@ bitflags::bitflags! {
 
         /// The area can grow downward upon page fault.
         const VM_GROWSDOWN = 1 << 8;
+
+        /// LiteBox-internal, never guest-visible: the range is reserved in the
+        /// VMA tracker only, and the platform holds no state for it yet.
+        /// Set on `PROT_NONE` anonymous private mappings (pure VA reservations,
+        /// e.g. V8's multi-GiB cage/sandbox), which Linux also books without
+        /// any page-table state. Materialized lazily by `protect_mapping` when
+        /// any access flag is first added; unmapping one never touches the
+        /// platform.
+        const VM_DEFERRED = 1 << 9;
+
+        /// `MADV_WIPEONFORK`: a forked child sees this range zero-filled
+        /// instead of inheriting the parent's contents (the parent keeps
+        /// its own). Linux records it as `VM_WIPEONFORK` on the VMA; only
+        /// private anonymous mappings can carry it, `MADV_KEEPONFORK`
+        /// clears it, and a mapping created over the range drops it with
+        /// the VMA it belonged to. See [`Vmem::set_wipe_on_fork`] and
+        /// [`Vmem::wipe_on_fork_ranges`].
+        const VM_WIPEONFORK = 1 << 10;
 
         const VM_ACCESS_FLAGS = Self::VM_READ.bits()
             | Self::VM_WRITE.bits()
@@ -300,6 +320,10 @@ impl Default for SharedFutexBacking {
     }
 }
 
+/// Never-reused identity of a mapping while its initialization callback runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct InitializationId(usize);
+
 /// Virtual memory area
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct VmArea {
@@ -310,6 +334,8 @@ pub(super) struct VmArea {
     /// Identity and original virtual origin of shared backing, used to derive futex keys that
     /// survive virtual-address moves without aliasing unrelated shared mappings.
     shared_futex: Option<SharedFutexMapping>,
+    /// Distinguishes adjacent mappings while either initialization still owns its exact range.
+    initialization: Option<InitializationId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -351,6 +377,7 @@ impl VmArea {
                 identity: backing.identity,
                 position: SharedFutexPosition::PendingOffset(offset),
             }),
+            initialization: None,
         }
     }
 }
@@ -366,6 +393,24 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     pub(super) brk: usize,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
+    /// Temporary ownership of mappings whose caller callback has not returned.
+    pending_initializations: RangeMap<usize, InitializationId>,
+    /// Next callback identity. Zero is never issued and identities are never reused.
+    next_initialization_id: usize,
+    /// Address ranges a caller has claimed as logically owned without (or no longer) having a
+    /// live mapping here -- disjoint, start -> end. A flexible (non-`MAP_FIXED`) placement search
+    /// treats these exactly like a live `vmas` entry: occupied, never handed out. `MAP_FIXED`
+    /// requests are unaffected (see `get_unmmaped_area`'s `fixed_addr` branch), matching the
+    /// narrow problem this exists for: a shared, single flat address space faking multiple guest
+    /// processes by taking turns (`litebox_shim_linux`'s `SharedAddressSpace`) can have one member
+    /// "parked" -- its memory copied out, its addresses momentarily absent from `vmas` -- while
+    /// another member of the same family keeps running and, on `execve`, tears down and rebuilds
+    /// its own (shared) `vmas` entries. Nothing stopped the fresh image's flexible placement from
+    /// landing on exactly the addresses the parked member still remembers and will later try to
+    /// restore into, corrupting or safely-but-fatally colliding with whatever is there by then.
+    /// The park/restore machinery reserves a member's saved ranges here for exactly as long as it
+    /// is parked, so a fresh placement is steered elsewhere instead.
+    reserved: BTreeMap<usize, usize>,
 }
 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
@@ -375,8 +420,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) fn new(platform: &'static Platform) -> Self {
         let mut vmem = Self {
             vmas: RangeMap::new(),
+            pending_initializations: RangeMap::new(),
+            next_initialization_id: 1,
             brk: 0,
             platform,
+            reserved: BTreeMap::new(),
         };
         for each in platform.reserved_pages() {
             assert!(
@@ -389,6 +437,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     flags: VmFlags::empty(),
                     is_file_backed: false,
                     shared_futex: None,
+                    initialization: None,
                 },
             );
         }
@@ -399,6 +448,128 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// ordered by key range.
     pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
         self.vmas.iter()
+    }
+
+    /// Reserves a callback identity before publishing the mapping it will own.
+    /// Consumed identities are deliberately not reused, including when allocation fails.
+    pub(super) fn reserve_initialization_id(&mut self) -> Result<InitializationId, MappingError> {
+        let identity = self.next_initialization_id;
+        self.next_initialization_id = identity
+            .checked_add(1)
+            .ok_or(MappingError::InitializationIdentityExhausted)?;
+        Ok(InitializationId(identity))
+    }
+
+    /// Marks a newly-published mapping as owned by one initialization callback.
+    pub(super) fn track_initialization(
+        &mut self,
+        range: PageRange<ALIGN>,
+        identity: InitializationId,
+    ) {
+        let tracked = Range::from(range);
+        let mut vma = {
+            let (mapped, vma) = self
+                .vmas
+                .get_key_value(&tracked.start)
+                .expect("a newly created mapping must be tracked");
+            assert!(
+                mapped.end >= tracked.end,
+                "a new mapping must be contiguous"
+            );
+            *vma
+        };
+        vma.initialization = Some(identity);
+        self.vmas.insert(tracked.clone(), vma);
+        self.pending_initializations.insert(tracked, identity);
+    }
+
+    /// Returns whether the complete range still belongs to the original callback.
+    pub(super) fn owns_initialization(
+        &self,
+        range: PageRange<ALIGN>,
+        identity: InitializationId,
+    ) -> bool {
+        self.pending_initializations
+            .get_key_value(&range.start)
+            .is_some_and(|(owned, current)| {
+                *current == identity && owned.start <= range.start && owned.end >= range.end
+            })
+    }
+
+    pub(super) fn has_pending_initialization(&self, range: &Range<usize>) -> bool {
+        self.pending_initializations.overlaps(range)
+    }
+
+    fn clear_initialization_markers(&mut self, range: Range<usize>) {
+        let pieces: Vec<(Range<usize>, VmArea)> = self
+            .vmas
+            .overlapping(range.clone())
+            .filter(|(_, vma)| vma.initialization.is_some())
+            .map(|(mapped, vma)| {
+                (
+                    mapped.start.max(range.start)..mapped.end.min(range.end),
+                    *vma,
+                )
+            })
+            .collect();
+        for (piece, mut vma) in pieces {
+            vma.initialization = None;
+            self.vmas.insert(piece, vma);
+        }
+    }
+
+    /// Completes a callback after its exact mapping has been finalized.
+    pub(super) fn finish_initialization(
+        &mut self,
+        range: PageRange<ALIGN>,
+        identity: InitializationId,
+    ) -> bool {
+        if !self.owns_initialization(range, identity) {
+            return false;
+        }
+        let range = Range::from(range);
+        self.pending_initializations.remove(range.clone());
+        self.clear_initialization_markers(range);
+        true
+    }
+
+    /// Removes only fragments still owned by `identity`, never a same-address replacement.
+    pub(super) unsafe fn cleanup_initialization(
+        &mut self,
+        range: PageRange<ALIGN>,
+        identity: InitializationId,
+    ) -> Result<(), VmemUnmapError> {
+        let requested = Range::from(range);
+        let pieces: Vec<Range<usize>> = self
+            .pending_initializations
+            .overlapping(requested.clone())
+            .filter(|(_, current)| **current == identity)
+            .filter_map(|(owned, _)| {
+                let piece = owned.start.max(requested.start)..owned.end.min(requested.end);
+                (!piece.is_empty()).then_some(piece)
+            })
+            .collect();
+        let mut first_error = None;
+        for piece in pieces {
+            match unsafe { self.platform.deallocate_pages(piece.clone()) } {
+                Ok(()) => {
+                    self.vmas.remove(piece.clone());
+                    self.pending_initializations.remove(piece);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(VmemUnmapError::UnmapError(error));
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn invalidate_initializations(&mut self, range: Range<usize>) {
+        self.pending_initializations.remove(range.clone());
+        self.clear_initialization_markers(range);
     }
 
     /// Returns the flags for the mapping containing `address`.
@@ -457,7 +628,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         mut vma: VmArea,
     ) {
         self.assign_shared_futex_identity(&mut vma, range.start);
-        self.vmas.insert(range.into(), vma);
+        let range = Range::from(range);
+        self.vmas.insert(range.clone(), vma);
+        self.invalidate_initializations(range);
     }
 
     /// Gets an iterator over all the stored ranges that are
@@ -490,12 +663,44 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             start:? = range.start, end:? = range.end;
             "removing mapping"
         );
-        unsafe {
-            self.platform
-                .deallocate_pages(range.into())
-                .map_err(VmemUnmapError::UnmapError)?;
+        let range = Range::from(range);
+        let deferred_pieces: alloc::vec::Vec<Range<usize>> = self
+            .overlapping(range.clone())
+            .filter(|(_, vma)| vma.flags.contains(VmFlags::VM_DEFERRED))
+            .map(|(r, _)| r.clone())
+            .collect();
+        if deferred_pieces.is_empty() {
+            unsafe {
+                self.platform
+                    .deallocate_pages(range.clone())
+                    .map_err(VmemUnmapError::UnmapError)?;
+            }
+        } else {
+            // Deferred (VM_DEFERRED) pieces have no platform state to tear
+            // down; deallocating the whole range would ask the platform to
+            // unmap pages it never mapped. Deallocate only the pieces that
+            // were actually materialized.
+            let pieces: alloc::vec::Vec<(Range<usize>, VmArea)> = self
+                .overlapping(range.clone())
+                .map(|(r, vma)| (r.clone(), *vma))
+                .collect();
+            for (r, vma) in pieces {
+                if vma.flags.contains(VmFlags::VM_DEFERRED) {
+                    continue;
+                }
+                let piece = r.start.max(range.start)..r.end.min(range.end);
+                if piece.is_empty() {
+                    continue;
+                }
+                unsafe {
+                    self.platform
+                        .deallocate_pages(piece)
+                        .map_err(VmemUnmapError::UnmapError)?;
+                }
+            }
         }
-        self.vmas.remove(range.into());
+        self.vmas.remove(range.clone());
+        self.invalidate_initializations(range);
         Ok(())
     }
 
@@ -535,6 +740,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     return Err(VmemResetError::FileBacked);
                 }
                 unimplemented!("resetting file-backed mappings is not supported yet");
+            }
+            if vma.flags.contains(VmFlags::VM_DEFERRED) {
+                // A deferred reservation has no contents to invalidate: it is
+                // still pure VA bookkeeping, exactly the state a reset would
+                // restore.
+                continue;
             }
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
@@ -576,6 +787,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
         if end > Platform::TASK_ADDR_MAX {
             return Err(AllocationError::AboveMaxAddress);
+        }
+        if vma.flags.contains(VmFlags::VM_DEFERRED) {
+            // A deferred reservation is pure VA bookkeeping: the platform is
+            // engaged only when the range is materialized (see
+            // `protect_mapping`). Fresh placements arrive with no overlap by
+            // `get_unmmaped_area` construction, and `reset_pages` never
+            // re-inserts a deferred area, so any overlap here would mean
+            // skipping a live mapping's platform teardown -- refuse it loudly
+            // instead of leaking it.
+            if self.vmas.overlaps(&(start..end)) {
+                return Err(AllocationError::AddressInUse);
+            }
+            self.vmas.insert(start..end, vma);
+            self.invalidate_initializations(start..end);
+            return Ok(Platform::RawMutPointer::from_usize(start));
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
             FixedAddressBehavior::Hint => FixedAddressBehavior::Hint,
@@ -671,7 +897,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_len;
         self.assign_shared_futex_identity(&mut vma, new_start);
-        self.vmas.insert(new_start..new_end, vma);
+        let installed = new_start..new_end;
+        self.vmas.insert(installed.clone(), vma);
+        self.invalidate_initializations(installed);
         debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
         debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
         Ok(ret)
@@ -773,44 +1001,52 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .ok_or(VmemResizeError::NotExist(range.start))?;
 
         let new_end = range.start + new_size.as_usize();
-        match new_end.cmp(&range.end) {
-            core::cmp::Ordering::Equal => {
-                // no change
-                return Ok(());
-            }
-            core::cmp::Ordering::Less => {
-                // shrink
-                let range = PageRange::new(new_end, range.end).unwrap();
-                unsafe { self.remove_mapping(range) }.unwrap();
-                return Ok(());
-            }
-            core::cmp::Ordering::Greater => {}
+        if new_end == range.end {
+            return Ok(());
         }
-
-        // grow
         if range.end > cur_range.end {
-            // we can't remap across vm area boundaries
             return Err(VmemResizeError::InvalidAddr {
                 range: cur_range.clone(),
                 addr: range.end,
             });
         }
+        if self.has_pending_initialization(&range) {
+            return Err(VmemResizeError::InitializationPending(range));
+        }
+        if new_end < range.end {
+            let removed = PageRange::new(new_end, range.end).unwrap();
+            unsafe { self.remove_mapping(removed) }.map_err(VmemResizeError::UnmapError)?;
+            return Ok(());
+        }
 
+        // grow
         if range.end == cur_range.end {
             // expand the current range
             let r = range.end..new_end;
             if self.vmas.overlaps(&r) {
                 return Err(VmemResizeError::RangeOccupied(r));
             }
-            if cur_vma.is_file_backed() && !cur_vma.flags.contains(VmFlags::VM_SHARED) {
-                unimplemented!("private file-backed mapping expansion is not supported yet");
-            }
+            // A private file-backed mapping grown past its original extent gets
+            // anonymous zero-fill pages for the new range, exactly as Linux's own
+            // `mremap` does: nothing re-reads more file content in just because the
+            // mapping got bigger, and `insert_mapping` below never populates content
+            // itself either way (the caller's initial `mmap` copies file bytes in as
+            // a separate step; growing calls no such step). Tagging the new piece
+            // `is_file_backed: false` -- instead of cloning `*cur_vma` verbatim --
+            // matters beyond bookkeeping accuracy: `reset_pages`/`set_wipe_on_fork`
+            // both refuse to touch a range they see as file-backed, and this tail is
+            // genuinely anonymous memory now, so it must qualify for both.
+            let new_piece_vma = if cur_vma.is_file_backed() && !cur_vma.flags.contains(VmFlags::VM_SHARED) {
+                VmArea::new(cur_vma.flags, false, None)
+            } else {
+                *cur_vma
+            };
             let range = PageRange::new(range.end, new_end).unwrap();
             // Try to extend the mapping. Although we checked that there are no
             // litebox mappings in this range, this may fail if there are
             // platform mappings in the way.
             match unsafe {
-                self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
+                self.insert_mapping(range, new_piece_vma, false, FixedAddressBehavior::NoReplace)
             } {
                 Ok(_) => {}
                 Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
@@ -863,6 +1099,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .get_key_value(&old_range.start)
             .expect("VMEM: range not found");
         assert!(cur_range.contains(&(old_range.end - 1)));
+        if self.has_pending_initialization(&Range::from(old_range)) {
+            return Err(VmemMoveError::OutOfMemory);
+        }
 
         if vma.is_file_backed() && !vma.flags.contains(VmFlags::VM_SHARED) {
             unimplemented!("private file-backed mapping move is not supported yet");
@@ -875,10 +1114,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let SharedFutexPosition::Origin(origin) = shared.position else {
                 unreachable!("installed shared futex mappings always have an origin")
             };
-            (
-                shared.identity,
-                old_range.start.wrapping_sub(origin),
-            )
+            (shared.identity, old_range.start.wrapping_sub(origin))
         });
         let new_addr = unsafe {
             if let Some((identity, offset)) = shared_remap {
@@ -906,9 +1142,103 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let old_offset = old_range.start.wrapping_sub(*origin);
             *origin = new_start.wrapping_sub(old_offset);
         }
-        self.vmas.insert(new_start..new_end, moved_vma);
+        let installed = new_start..new_end;
+        self.vmas.insert(installed.clone(), moved_vma);
         self.vmas.remove(old_range.into());
+        self.invalidate_initializations(installed);
+        self.invalidate_initializations(old_range.into());
         Ok(new_addr)
+    }
+
+    fn record_protected_piece(
+        &mut self,
+        original: Range<usize>,
+        intersection: Range<usize>,
+        vma: VmArea,
+        flags: VmFlags,
+    ) {
+        self.vmas.remove(original.clone());
+        let before = original.start..intersection.start;
+        let after = intersection.end..original.end;
+        self.vmas.insert(
+            intersection,
+            VmArea {
+                flags,
+                is_file_backed: vma.is_file_backed,
+                shared_futex: vma.shared_futex,
+                initialization: vma.initialization,
+            },
+        );
+        if !before.is_empty() {
+            self.vmas.insert(before, vma);
+        }
+        if !after.is_empty() {
+            self.vmas.insert(after, vma);
+        }
+    }
+
+    /// Sets (`MADV_WIPEONFORK`) or clears (`MADV_KEEPONFORK`) [`VmFlags::VM_WIPEONFORK`] on
+    /// every mapping overlapping `range`, splitting mappings at the range's edges exactly as
+    /// [`Self::protect_mapping`] does for access flags.
+    ///
+    /// Mirrors Linux's `madvise_vma_behavior`: the flag is refused with `EINVAL` on a
+    /// file-backed or shared mapping (there is no private copy to wipe), and a hole in the
+    /// range is `ENOMEM`. Every mapping is validated before any is changed, so an error
+    /// leaves the flags as they were. A `VM_DEFERRED` reservation can carry the flag -- it is
+    /// pure bookkeeping until the reservation is materialized, and a wipe of it is a no-op
+    /// because it has no contents yet.
+    pub(super) fn set_wipe_on_fork(
+        &mut self,
+        range: PageRange<ALIGN>,
+        enable: bool,
+    ) -> Result<(), VmemWipeOnForkError> {
+        let range = range.start..range.end;
+        let pieces: Vec<(Range<usize>, Range<usize>, VmArea)> = self
+            .vmas
+            .overlapping(range.clone())
+            .map(|(mapped, vma)| {
+                (
+                    mapped.clone(),
+                    mapped.start.max(range.start)..mapped.end.min(range.end),
+                    *vma,
+                )
+            })
+            .collect();
+        let mut covered = range.start;
+        let mut holes = false;
+        for (_, intersection, vma) in &pieces {
+            if intersection.start != covered {
+                holes = true;
+            }
+            covered = intersection.end;
+            if enable && (vma.is_file_backed || vma.flags.contains(VmFlags::VM_SHARED)) {
+                return Err(VmemWipeOnForkError::NotPrivateAnonymous(intersection.clone()));
+            }
+        }
+        if covered != range.end {
+            holes = true;
+        }
+        for (original, intersection, vma) in pieces {
+            if vma.flags.contains(VmFlags::VM_WIPEONFORK) == enable {
+                continue;
+            }
+            let mut flags = vma.flags;
+            flags.set(VmFlags::VM_WIPEONFORK, enable);
+            self.record_protected_piece(original, intersection, vma, flags);
+        }
+        if holes {
+            return Err(VmemWipeOnForkError::Unmapped(range));
+        }
+        Ok(())
+    }
+
+    /// Every mapping carrying [`VmFlags::VM_WIPEONFORK`], with its flags, in address order.
+    pub(super) fn wipe_on_fork_ranges(&self) -> Vec<(Range<usize>, VmFlags)> {
+        self.vmas
+            .iter()
+            .filter(|(_, vma)| vma.flags.contains(VmFlags::VM_WIPEONFORK))
+            .map(|(r, vma)| (r.clone(), vma.flags))
+            .collect()
     }
 
     /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of a range in the virtual address space.
@@ -928,59 +1258,108 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let flags =
             VmFlags::from_bits(u32::from(permissions.bits())).unwrap() & VmFlags::VM_ACCESS_FLAGS;
         let range = range.start..range.end;
-        let mut mappings_to_change = Vec::new();
-        for (r, vma) in self.vmas.overlapping(range.clone()) {
-            mappings_to_change.push((r.start, r.end, *vma));
-        }
-        if mappings_to_change.is_empty() {
-            return Err(VmemProtectError::InvalidRange(range));
-        }
-
-        for (start, end, vma) in mappings_to_change {
-            if vma.flags & VmFlags::VM_ACCESS_FLAGS == flags {
-                continue;
+        let mappings_to_change: Vec<(Range<usize>, Range<usize>, VmArea)> = self
+            .vmas
+            .overlapping(range.clone())
+            .map(|(mapped, vma)| {
+                (
+                    mapped.clone(),
+                    mapped.start.max(range.start)..mapped.end.min(range.end),
+                    *vma,
+                )
+            })
+            .collect();
+        let mut covered = range.start;
+        for (_, intersection, vma) in &mappings_to_change {
+            if intersection.start != covered {
+                return Err(VmemProtectError::InvalidRange(range));
             }
-            // flags >> 4 shift VM_MAY% in place of VM_%
-            // turning on VM_% requires VM_MAY%
+            covered = intersection.end;
             if (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits() != 0 {
                 return Err(VmemProtectError::NoAccess {
                     old: vma.flags,
                     new: flags,
                 });
             }
+        }
+        if covered != range.end {
+            return Err(VmemProtectError::InvalidRange(range));
+        }
+        if mappings_to_change
+            .iter()
+            .all(|(_, _, vma)| vma.flags & VmFlags::VM_ACCESS_FLAGS == flags)
+        {
+            return Ok(());
+        }
 
-            self.vmas.remove(start..end);
-            let intersection = range.start.max(start)..range.end.min(end);
-            // split r into three parts: before, intersection, and after
-            let before = start..intersection.start;
-            let after = intersection.end..end;
+        let any_deferred = mappings_to_change
+            .iter()
+            .any(|(_, _, vma)| vma.flags.contains(VmFlags::VM_DEFERRED));
 
-            let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            // `intersection` is page aligned.
+        if self.platform.has_transactional_permission_updates() && !any_deferred {
+            // This provider explicitly guarantees that an ordinary error means
+            // no page changed; HVF uses process-abort containment after any
+            // lower publication. One call therefore closes the multi-VMA
+            // partial-progress boundary without assuming the same of native
+            // providers with reservation or backing boundaries.
+            unsafe { self.platform.update_permissions(range.clone(), permissions) }
+                .map_err(VmemProtectError::ProtectError)?;
+            for (original, intersection, vma) in mappings_to_change {
+                if vma.flags & VmFlags::VM_ACCESS_FLAGS != flags {
+                    let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
+                    self.record_protected_piece(original, intersection, vma, new_flags);
+                }
+            }
+            return Ok(());
+        }
+
+        // Native providers retain their individual mapping boundaries. All
+        // coverage and VM_MAY checks above complete before the first mutation,
+        // so no deterministic validation failure can follow earlier progress.
+        //
+        // A deferred (VM_DEFERRED) piece has no platform state yet: it is
+        // *materialized* here -- freshly allocated with the requested access --
+        // rather than permission-updated. With EXECUTE in the target, the
+        // allocation is made non-executable first and then updated, because
+        // platforms are entitled to refuse born-executable allocations (the
+        // HVF memory manager does: `HvfMemoryError::InitialExecute`).
+        for (original, intersection, vma) in mappings_to_change {
+            if vma.flags & VmFlags::VM_ACCESS_FLAGS == flags {
+                continue;
+            }
+            if vma.flags.contains(VmFlags::VM_DEFERRED) {
+                let wants_exec = flags.contains(VmFlags::VM_EXEC);
+                let allocate_perms = if wants_exec {
+                    (permissions & !crate::platform::page_mgmt::MemoryRegionPermissions::EXEC)
+                        | crate::platform::page_mgmt::MemoryRegionPermissions::READ
+                } else {
+                    permissions
+                };
+                self.platform
+                    .allocate_pages(
+                        intersection.clone(),
+                        allocate_perms,
+                        false,
+                        false,
+                        crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
+                    )
+                    .map_err(VmemProtectError::DeferredAllocate)?;
+                if wants_exec {
+                    unsafe { self.platform.update_permissions(intersection.clone(), permissions) }
+                        .map_err(VmemProtectError::ProtectError)?;
+                }
+                let new_flags =
+                    (vma.flags & !VmFlags::VM_ACCESS_FLAGS & !VmFlags::VM_DEFERRED) | flags;
+                self.record_protected_piece(original, intersection, vma, new_flags);
+                continue;
+            }
             unsafe {
                 self.platform
                     .update_permissions(intersection.clone(), permissions)
             }
-            .map_err(|e| {
-                // restore the original mapping
-                self.vmas.insert(start..end, vma);
-                VmemProtectError::ProtectError(e)
-            })?;
-
-            self.vmas.insert(
-                intersection,
-                VmArea {
-                    flags: new_flags,
-                    is_file_backed: vma.is_file_backed,
-                    shared_futex: vma.shared_futex,
-                },
-            );
-            if !before.is_empty() {
-                self.vmas.insert(before, vma);
-            }
-            if !after.is_empty() {
-                self.vmas.insert(after, vma);
-            }
+            .map_err(VmemProtectError::ProtectError)?;
+            let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
+            self.record_protected_piece(original, intersection, vma, new_flags);
         }
 
         Ok(())
@@ -1016,6 +1395,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
+        // A `PROT_NONE` anonymous private mapping is a pure VA reservation:
+        // Linux allocates no page-table state for it either, and deferring the
+        // platform allocation keeps huge reservations (observed live: V8's
+        // ~4 GiB pointer-compression cage and ~32 GiB sandbox, whose per-page
+        // platform tracking exceeds what the HVF memory manager is built for)
+        // working on every platform. It is materialized lazily on the first
+        // `mprotect` that adds access flags (see `protect_mapping`).
+        let defer = perms.is_empty()
+            && !shared
+            && !file_backed
+            && !flags.intersects(
+                CreatePagesFlags::FIXED_ADDR
+                    | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY
+                    | CreatePagesFlags::IS_STACK,
+            );
         unsafe {
             self.create_mapping(
                 suggested_new_address,
@@ -1023,6 +1417,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 VmArea::new(
                     VmFlags::from(perms)
                         | VmFlags::may_flags_for_mapping(shared, file_backed)
+                        | if defer {
+                            VmFlags::VM_DEFERRED
+                        } else {
+                            VmFlags::empty()
+                        }
                         | if flags.contains(CreatePagesFlags::IS_STACK) {
                             VmFlags::VM_GROWSDOWN
                         } else {
@@ -1100,6 +1499,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 && !self
                     .vmas
                     .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
+                && !self.reserved_overlaps(&(suggested_address.0..(suggested_address.0 + size)))
             {
                 return Some(suggested_address.0);
             }
@@ -1110,13 +1510,58 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
 
         // top down
-        // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (
+        let (low_limit, unconstrained_high_limit) = (
             Platform::TASK_ADDR_MIN,
             Platform::TASK_ADDR_MAX - length.as_usize(),
         );
         debug_assert_eq!(Platform::TASK_ADDR_MIN % ALIGN, 0);
         debug_assert_eq!(Platform::TASK_ADDR_MAX % ALIGN, 0);
+        // An unusable hint is advisory (see above), but that does not mean it carries no
+        // information: a caller re-probing with a *lower* hint after an earlier attempt (V8's
+        // code-range/pointer-compression-cage placement does exactly this, mmap-ing the same
+        // size at a descending sequence of hints until one lands where it needs) means "try
+        // somewhere at or below here first" -- searching the unconstrained full range would
+        // return the exact same top-of-space address on every such retry (nothing about free
+        // space changed), so the caller's presumably-different constraint on *this* retry could
+        // never be satisfied, and it would exhaust its own retry budget and fail outright. Bias
+        // the search toward staying at or below the hint first; only if nothing fits there does
+        // this fall back to the unconstrained search, exactly as if no hint had been given.
+        if let Some(suggested_address) = suggested_address
+            && suggested_address.0 < unconstrained_high_limit
+            && let Some(found) =
+                self.top_down_search(low_limit, suggested_address.0, size)
+        {
+            return Some(found);
+        }
+        self.top_down_search(low_limit, unconstrained_high_limit, size)
+    }
+
+    /// The unhinted top-down search `get_unmmaped_area` falls back to: the highest gap of at
+    /// least `size` bytes whose start is in `[low_limit, high_limit]`. Shared by the
+    /// unconstrained search and, with a smaller `high_limit`, the hint-biased search above.
+    fn top_down_search(&self, low_limit: usize, high_limit: usize, size: usize) -> Option<usize> {
+        // An inverted range is empty by this function's own contract (`start
+        // in [low_limit, high_limit]`) and must fail cleanly. This guards a
+        // real caller mistake, not a hypothetical one: `get_unmmaped_area`'s
+        // hint-biased call passes the raw hint as `high_limit`, and a hint
+        // below `low_limit` (observed live: a node:alpine guest's V8
+        // CodeRange hint landing below `TASK_ADDR_MIN`, entirely plausible
+        // since host library mappings reported by `reserved_pages` commonly
+        // sit below the guest's floor) makes `high_limit < low_limit`.
+        // Without this guard, the fast path below can still return that
+        // too-low `high_limit` verbatim whenever some tracked range (again,
+        // typically a host mapping from `reserved_pages`) starts at or below
+        // it: `last_end` then defaults no higher than `low_limit` itself, so
+        // `last_end <= high_limit` can hold even though `high_limit` is
+        // below `low_limit` -- silently handing the caller an address
+        // outside the caller's own requested floor. `insert_mapping` still
+        // catches the resulting placement (`start < TASK_ADDR_MIN`), but as
+        // `AllocationError::BelowMinAddress`, which the guest sees as EPERM
+        // on an ordinary hinted `mmap` -- V8 treats that as fatal OOM.
+        if high_limit < low_limit {
+            return None;
+        }
+        // 1. check [last_end, high_limit]
         // The globally last (highest-addressed) tracked range is not
         // necessarily relevant here: as the loop below already accounts for,
         // a platform's `reserved_pages` can report host mappings that sit
@@ -1153,7 +1598,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // `high_limit` for it. `overlaps` re-derives the true answer directly
         // from the candidate range instead of trusting the `r.start <=
         // high_limit` proxy.
-        if last_end <= high_limit && !self.vmas.overlaps(&(high_limit..Platform::TASK_ADDR_MAX)) {
+        if last_end <= high_limit
+            && !self.vmas.overlaps(&(high_limit..high_limit + size))
+            && !self.reserved_overlaps(&(high_limit..high_limit + size))
+        {
             return Some(high_limit);
         }
 
@@ -1175,12 +1623,72 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 // (See [`Vmem::new`]) and thus `start` may be larger than `high_limit`.
                 continue;
             }
-            if !self.vmas.overlaps(&(start..start + size)) {
+            if !self.vmas.overlaps(&(start..start + size))
+                && !self.reserved_overlaps(&(start..start + size))
+            {
                 return Some(start);
             }
         }
 
         None
+    }
+
+    /// Whether any part of `range` is covered by an externally reserved range
+    /// (see [`Self::reserved`]).
+    fn reserved_overlaps(&self, range: &Range<usize>) -> bool {
+        self.reserved
+            .range(..range.end)
+            .next_back()
+            .is_some_and(|(_, &end)| range.start < end)
+    }
+
+    /// Marks `range` as reserved: a flexible placement search will steer around it even though it
+    /// has no live `vmas` entry. Overlapping/adjacent existing reservations are merged. See
+    /// [`Self::reserved`].
+    pub(super) fn reserve_external(&mut self, range: Range<usize>) {
+        if range.start >= range.end {
+            return;
+        }
+        let mut start = range.start;
+        let mut end = range.end;
+        let overlapping: Vec<(usize, usize)> = self
+            .reserved
+            .range(..=end)
+            .rev()
+            .take_while(|&(_, &e)| e >= start)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in overlapping {
+            self.reserved.remove(&s);
+            start = start.min(s);
+            end = end.max(e);
+        }
+        self.reserved.insert(start, end);
+    }
+
+    /// Releases a reservation made by [`Self::reserve_external`]. `range` need not exactly match
+    /// what was reserved (a partial release shrinks/splits the covering reservation); releasing
+    /// where nothing is reserved is a no-op.
+    pub(super) fn release_external(&mut self, range: Range<usize>) {
+        if range.start >= range.end {
+            return;
+        }
+        let overlapping: Vec<(usize, usize)> = self
+            .reserved
+            .range(..range.end)
+            .rev()
+            .take_while(|&(_, &e)| e > range.start)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in overlapping {
+            self.reserved.remove(&s);
+            if s < range.start {
+                self.reserved.insert(s, range.start);
+            }
+            if range.end < e {
+                self.reserved.insert(range.end, e);
+            }
+        }
     }
 }
 
@@ -1204,6 +1712,17 @@ pub enum VmemResetError {
     FileBacked,
 }
 
+/// Error for [`Vmem::set_wipe_on_fork`] (`madvise(MADV_WIPEONFORK|MADV_KEEPONFORK)`).
+#[derive(Error, Debug)]
+pub enum VmemWipeOnForkError {
+    #[error("arg is not aligned")]
+    UnAligned,
+    #[error("the range {0:?} contains unmapped pages")]
+    Unmapped(Range<usize>),
+    #[error("the mapping at {0:?} is file-backed or shared, so it cannot be wiped on fork")]
+    NotPrivateAnonymous(Range<usize>),
+}
+
 /// Error for [`Vmem::resize_mapping`]
 #[derive(Error, Debug)]
 pub(super) enum VmemResizeError {
@@ -1213,6 +1732,10 @@ pub(super) enum VmemResizeError {
     InvalidAddr { range: Range<usize>, addr: usize },
     #[error("range {0:?} is already (partially) occupied")]
     RangeOccupied(Range<usize>),
+    #[error("range {0:?} has a pending initialization")]
+    InitializationPending(Range<usize>),
+    #[error("failed to unmap the removed range: {0}")]
+    UnmapError(#[source] VmemUnmapError),
     #[error("out of memory")]
     OutOfMemory,
 }
@@ -1239,6 +1762,8 @@ pub enum VmemProtectError {
     NoAccess { old: VmFlags, new: VmFlags },
     #[error("mprotect failed: {0}")]
     ProtectError(#[from] crate::platform::page_mgmt::PermissionUpdateError),
+    #[error("failed to materialize a deferred reservation: {0}")]
+    DeferredAllocate(#[from] crate::platform::page_mgmt::AllocationError),
 }
 
 /// Error for creating mappings
@@ -1262,6 +1787,28 @@ pub enum MappingError {
 
     #[error("mapping failed: {0}")]
     MapError(#[from] crate::platform::page_mgmt::AllocationError),
+
+    /// A concurrent operation on this address space (another thread of the same
+    /// `CLONE_VM` family unmapping or otherwise invalidating the range) removed a
+    /// just-created mapping before its post-creation permission change could apply.
+    /// See [`super::PageManager::create_pages`]'s two-phase create-then-protect
+    /// sequence, which necessarily drops its lock around the caller-supplied `op`
+    /// (which may itself need to re-enter the page-fault handler) between those two
+    /// phases.
+    #[error("mapping was concurrently removed before its permissions could be finalized")]
+    ConcurrentlyRemoved,
+
+    #[error("mapping initialization identity space is exhausted")]
+    InitializationIdentityExhausted,
+
+    #[error("mapping permission finalization failed: {0}")]
+    FinalizeProtection(#[source] VmemProtectError),
+
+    #[error("{primary}; initialization cleanup also failed: {cleanup}")]
+    Cleanup {
+        primary: Box<MappingError>,
+        cleanup: VmemUnmapError,
+    },
 }
 
 /// Enable [`super::PageManager`] to handle page faults if its platform implements this trait

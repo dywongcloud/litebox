@@ -45,6 +45,10 @@ VNC_PORT="${2:-5900}"
 VNC_WEB_PORT="${3:-6080}"
 
 RUNNER_BIN="${RUNNER_BIN:-$script_dir/../../../target/release/litebox_runner_linux_on_macos_userland}"
+# Extra runner flags, e.g. `RUNNER_EXTRA_FLAGS=--hvf` to supervise the
+# Hypervisor.framework desktop image (/tmp/litebox-hvf-desktop-gui-v*.tar), which
+# the default x18-rewritten image path does not need.
+RUNNER_EXTRA_FLAGS="${RUNNER_EXTRA_FLAGS:-}"
 POLL_SECONDS="${POLL_SECONDS:-5}"
 FREEZE_SECONDS="${FREEZE_SECONDS:-65}"
 CLICK_SETTLE_SECONDS="${CLICK_SETTLE_SECONDS:-3}"
@@ -98,9 +102,11 @@ launch_runner() {
     runner_recovery_reason=""
     runner_stop_action="none"
     runner_wait_status=""
-    log_event "launching runner: $RUNNER_BIN --unstable --guest-root --net-proxy --initial-files $TAR_PATH --vnc --vnc-port $VNC_PORT --vnc-web $VNC_WEB_PORT -- /usr/bin/start-desktop.sh (log: $run_log)"
+    log_event "launching runner: $RUNNER_BIN --unstable $RUNNER_EXTRA_FLAGS --guest-root --net-proxy --initial-files $TAR_PATH --vnc --vnc-port $VNC_PORT --vnc-web $VNC_WEB_PORT -- /usr/bin/start-desktop.sh (log: $run_log)"
+    # shellcheck disable=SC2086
     "$RUNNER_BIN" \
         --unstable \
+        $RUNNER_EXTRA_FLAGS \
         --guest-root \
         --net-proxy \
         --initial-files "$TAR_PATH" \

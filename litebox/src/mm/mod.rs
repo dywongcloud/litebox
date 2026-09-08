@@ -3,6 +3,9 @@
 
 //! Memory management related functionality
 
+#[cfg(panic = "unwind")]
+extern crate std;
+
 pub mod allocator;
 pub mod exception_table;
 pub mod linux;
@@ -12,18 +15,20 @@ mod tests;
 
 use core::ops::Range;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use linux::{
-    CreatePagesFlags, MappingError, PageFaultError, PageRange, SharedFutexBacking, VmArea, VmFlags,
-    Vmem, VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
+    CreatePagesFlags, InitializationId, MappingError, PageFaultError, PageRange,
+    SharedFutexBacking, VmArea, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError,
+    VmemUnmapError,
 };
 
 use crate::{
     LiteBox,
-    mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError},
+    mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError, VmemWipeOnForkError},
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{MemoryRegionPermissions, RemapError},
+        page_mgmt::{DeallocationError, MemoryRegionPermissions, RemapError},
     },
     sync::{RawSyncPrimitivesProvider, RwLock, RwLockReadGuard},
 };
@@ -45,6 +50,53 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     vmem: RwLockReadGuard<'a, Platform, Vmem<Platform, ALIGN>>,
+}
+
+struct InitializationGuard<'a, Platform, const ALIGN: usize>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    manager: &'a PageManager<Platform, ALIGN>,
+    range: PageRange<ALIGN>,
+    identity: InitializationId,
+    armed: bool,
+}
+
+impl<Platform, const ALIGN: usize> InitializationGuard<'_, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<Platform, const ALIGN: usize> Drop for InitializationGuard<'_, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(panic = "unwind")]
+        {
+            let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut vmem = self.manager.vmem.write();
+                unsafe { vmem.cleanup_initialization(self.range, self.identity) }
+            }));
+            if !matches!(cleanup, Ok(Ok(()))) {
+                std::process::abort();
+            }
+        }
+        #[cfg(not(panic = "unwind"))]
+        {
+            let mut vmem = self.manager.vmem.write();
+            if let Err(error) = unsafe { vmem.cleanup_initialization(self.range, self.identity) } {
+                panic!("cleaning a mapping after its initialization callback panicked: {error}");
+            }
+        }
+    }
 }
 
 impl<Platform, const ALIGN: usize> MappingReadGuard<'_, Platform, ALIGN>
@@ -70,6 +122,21 @@ where
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
         let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
         Self { vmem }
+    }
+
+    fn cleanup_initialization_error(
+        vmem: &mut Vmem<Platform, ALIGN>,
+        range: PageRange<ALIGN>,
+        identity: InitializationId,
+        primary: MappingError,
+    ) -> MappingError {
+        match unsafe { vmem.cleanup_initialization(range, identity) } {
+            Ok(()) => primary,
+            Err(cleanup) => MappingError::Cleanup {
+                primary: Box::new(primary),
+                cleanup,
+            },
+        }
     }
 
     /// Create a mapping with the given flags.
@@ -105,9 +172,12 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        let addr = {
+        let (addr, identity) = {
             let mut vmem = self.vmem.write();
-            unsafe {
+            // Reserve before allocation so identity exhaustion cannot occur after
+            // the platform has already published the new mapping.
+            let identity = vmem.reserve_initialization_id()?;
+            let addr = unsafe {
                 vmem.create_pages(
                     suggested_address,
                     length,
@@ -115,28 +185,73 @@ where
                     before_perms,
                     shared_futex_backing,
                 )
-            }?
+            }?;
+            let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
+                .expect("a platform allocation must retain the requested alignment and length");
+            vmem.track_initialization(range, identity);
+            (addr, identity)
         };
-        // call the user function with the pages
-        // Note `op` may trigger page fault handler which requires write lock to `vmem`.
-        if let Err(e) = op(addr) {
-            // remove the mapping if the user function fails
-            let mut vmem = self.vmem.write();
-            unsafe {
-                vmem.remove_mapping(
-                    PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap(),
-                )
+        let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
+            .expect("the tracked mapping range was already validated");
+        let mut initialization = InitializationGuard {
+            manager: self,
+            range,
+            identity,
+            armed: true,
+        };
+        // `op` may trigger the page-fault handler, which requires the same write lock.
+        #[cfg(panic = "unwind")]
+        let callback = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(addr))) {
+            Ok(callback) => callback,
+            Err(payload) => {
+                drop(initialization);
+                std::panic::resume_unwind(payload)
             }
-            .unwrap();
-            return Err(e);
+        };
+        #[cfg(not(panic = "unwind"))]
+        let callback = op(addr);
+        let mut vmem = self.vmem.write();
+
+        if let Err(primary) = callback {
+            initialization.disarm();
+            return Err(Self::cleanup_initialization_error(
+                &mut vmem, range, identity, primary,
+            ));
         }
-        if before_perms != after_perms {
-            let range =
-                PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
-            // `protect` should succeed, as we just created the mapping.
-            let mut vmem = self.vmem.write();
-            unsafe { vmem.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
+
+        // A sibling sharing this address space may have unmapped, reset, or replaced the range
+        // while the callback ran. The transient ID is invalidated by those mutations, so
+        // identical metadata at the same address cannot pass this check after an ABA replacement.
+        if !vmem.owns_initialization(range, identity) {
+            initialization.disarm();
+            return Err(Self::cleanup_initialization_error(
+                &mut vmem,
+                range,
+                identity,
+                MappingError::ConcurrentlyRemoved,
+            ));
         }
+
+        if let Err(error) = unsafe { vmem.protect_mapping(range, after_perms) } {
+            initialization.disarm();
+            return Err(Self::cleanup_initialization_error(
+                &mut vmem,
+                range,
+                identity,
+                MappingError::FinalizeProtection(error),
+            ));
+        }
+
+        if !vmem.finish_initialization(range, identity) {
+            initialization.disarm();
+            return Err(Self::cleanup_initialization_error(
+                &mut vmem,
+                range,
+                identity,
+                MappingError::ConcurrentlyRemoved,
+            ));
+        }
+        initialization.disarm();
         Ok(addr)
     }
 
@@ -350,15 +465,26 @@ where
 
     /// Set the initial program break address.
     ///
-    /// This function should be called once to set the initial program break,
+    /// This function should be called once per image to set the initial program break,
     /// which is usually the end of the data segment.
     ///
-    /// # Panics
-    ///
-    /// Panics if the initial program break is already set.
+    /// Under the per-process swap protocol described at [`Self::swap_brk`] the manager's
+    /// break is 0 between operations, so a non-zero value here is a break that a previous
+    /// caller published and never took back -- an `exec` that failed between publishing
+    /// the new image's break and swapping it out (stack allocation is the fallible step
+    /// in between, and under a spawn storm it does fail). That value belongs to nobody:
+    /// its process either died or still holds its own authoritative slot. It is replaced
+    /// and logged rather than asserted on, because this runs inside the mapping lock and
+    /// a panic here took every other guest process's heap down with it (observed live as
+    /// `initial brk is already set` under ~900 concurrent spawns).
     pub fn set_initial_brk(&self, brk: usize) {
         let mut vmem = self.vmem.write();
-        assert_eq!(vmem.brk, 0, "initial brk is already set");
+        if vmem.brk != 0 {
+            litebox_util_log::warn!(
+                stale:? = vmem.brk, new:? = brk;
+                "initial brk is already set; replacing a break left behind by an aborted exec"
+            );
+        }
         vmem.brk = brk;
     }
 
@@ -421,6 +547,9 @@ where
         let new_brk = brk.next_multiple_of(linux::PAGE_SIZE);
         if vmem.brk >= brk {
             // Shrink the memory region
+            if new_brk < old_brk && vmem.has_pending_initialization(&(new_brk..old_brk)) {
+                return Ok(vmem.brk);
+            }
             let brk = match unsafe {
                 vmem.remove_mapping(
                     PageRange::new(new_brk, old_brk).ok_or(MappingError::UnAligned)?,
@@ -457,7 +586,7 @@ where
         Ok(brk)
     }
 
-    /// Release memory mappings and reset the program break.
+    /// Release memory mappings. The program break is not touched, see the note at the end.
     ///
     /// `releasable` is called once per tracked mapping and returns the *sub-ranges* of it to
     /// release, not merely whether to release the whole of it. That distinction is load-bearing,
@@ -492,9 +621,16 @@ where
             }
         }
 
-        // reset brk
-        let mut vmem = self.vmem.write();
-        vmem.brk = 0;
+        // The program break is deliberately left alone. Under the per-process swap protocol
+        // ([`Self::swap_brk`]) the manager's break is 0 between operations and, during one, it
+        // is *another* process's live break -- the releasing process is exiting or exec'ing on
+        // its own thread and holds no break operation of its own. Zeroing it here (as this
+        // used to) therefore never cleared anything of the caller's and could only clobber a
+        // neighbour's, which was observed live under a 900-process spawn storm as an exec
+        // reading back a zero break right after its loader published one ("execve: loader
+        // left no initial brk", 2 of 900 execs), leaving that process with no heap. A caller
+        // that models a single break for a single process resets it through
+        // [`Self::swap_brk`] or the next [`Self::set_initial_brk`].
 
         Ok(())
     }
@@ -568,6 +704,14 @@ where
                 }
             }
             Err(linux::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
+            Err(linux::VmemResizeError::InitializationPending(_)) => Err(RemapError::OutOfMemory),
+            Err(linux::VmemResizeError::UnmapError(
+                VmemUnmapError::UnAligned
+                | VmemUnmapError::UnmapError(DeallocationError::Unaligned),
+            )) => Err(RemapError::Unaligned),
+            Err(linux::VmemResizeError::UnmapError(VmemUnmapError::UnmapError(
+                DeallocationError::AlreadyUnallocated,
+            ))) => Err(RemapError::AlreadyUnallocated),
             Err(linux::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
         }
     }
@@ -612,6 +756,101 @@ where
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemResetError::UnAligned)?;
         unsafe { vmem.reset_pages(range, anonymous_only) }
+    }
+
+    /// `madvise(MADV_WIPEONFORK)` (`enable`) / `madvise(MADV_KEEPONFORK)` (`!enable`): marks
+    /// the mappings in `[ptr, ptr + len)` so that a forked child sees them zero-filled while
+    /// the parent keeps its contents. Only the flag is recorded here; the wipe itself is
+    /// [`Self::wipe_on_fork_child`], which the process model calls at the point where the
+    /// child's view of memory diverges from the parent's.
+    ///
+    /// Fails with [`VmemWipeOnForkError::NotPrivateAnonymous`] on a file-backed or shared
+    /// mapping (Linux: `EINVAL`) and [`VmemWipeOnForkError::Unmapped`] on a hole (`ENOMEM`).
+    pub fn set_wipe_on_fork(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+        enable: bool,
+    ) -> Result<(), VmemWipeOnForkError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len).ok_or(VmemWipeOnForkError::UnAligned)?;
+        vmem.set_wipe_on_fork(range, enable)
+    }
+
+    /// Every mapping marked `MADV_WIPEONFORK`, with its flags. Like [`Self::mappings`], one
+    /// entry can span more than one `mmap`; callers that act on a subset of a process's memory
+    /// intersect these with their own ownership records, see [`Self::wipe_on_fork_child`].
+    pub fn ranges_to_wipe_on_fork(&self) -> Vec<(Range<usize>, VmFlags)> {
+        self.vmem.read().wipe_on_fork_ranges()
+    }
+
+    /// Gives the *child* of a fork the `MADV_WIPEONFORK` view of memory: every wipe-marked
+    /// private anonymous mapping is dropped and re-created zero-filled, keeping its flags
+    /// (including the wipe mark itself, which Linux also inherits, so grandchildren are
+    /// wiped too).
+    ///
+    /// Written for a process model where the child runs on the parent's live pages after the
+    /// parent copied its own contents out (litebox's Linux shim: `save_address_space`, then
+    /// `hand_off_to`): calling this between those two steps makes the child start from zeros
+    /// while the parent's saved image brings its bytes back untouched. Call order is what
+    /// makes it child-only -- called before the parent's copy-out it would wipe the parent.
+    ///
+    /// `restrict` names the parts of each marked mapping that belong to the forking process,
+    /// exactly as [`Self::release_memory`]'s predicate does, because a coalesced manager
+    /// entry can cover a neighbour's memory; parts are clamped to the entry and empty ones
+    /// are skipped. Only writable, materialized, private anonymous pieces are wiped: those
+    /// are precisely the ones a copy-out saves, so nothing the parent cannot restore is ever
+    /// zeroed. A piece that cannot be wiped is logged loudly and left as is, because fork must
+    /// not fail for it, but a child then sees inherited bytes the program asked to be gone.
+    ///
+    /// Returns the number of bytes wiped.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the previous contents of the wiped ranges are no longer
+    /// relied upon by whoever runs on these pages next (the parent's copy must already be
+    /// saved).
+    pub unsafe fn wipe_on_fork_child<R>(
+        &self,
+        restrict: impl Fn(Range<usize>, VmFlags) -> R,
+    ) -> usize
+    where
+        R: IntoIterator<Item = Range<usize>>,
+    {
+        let mut wiped = 0;
+        for (r, flags) in self.ranges_to_wipe_on_fork() {
+            if !flags.contains(VmFlags::VM_WRITE)
+                || flags.contains(VmFlags::VM_SHARED)
+                || flags.contains(VmFlags::VM_DEFERRED)
+            {
+                // Not writable: the parent's copy-out skipped it, so a wipe here would be
+                // parent-visible. Deferred: nothing has been materialized to wipe.
+                litebox_util_log::debug!(
+                    start:? = r.start, end:? = r.end, flags:? = flags;
+                    "wipe-on-fork range skipped: not a writable materialized private mapping"
+                );
+                continue;
+            }
+            for part in restrict(r.clone(), flags) {
+                let Some(range) = PageRange::new(part.start.max(r.start), part.end.min(r.end))
+                else {
+                    continue;
+                };
+                let mut vmem = self.vmem.write();
+                match unsafe { vmem.reset_pages(range, true) } {
+                    Ok(()) => wiped += range.len(),
+                    Err(error) => litebox_util_log::error!(
+                        start:? = range.start, end:? = range.end, error:% = error;
+                        "wipe-on-fork range could not be zeroed; the child inherits its contents"
+                    ),
+                }
+            }
+        }
+        if wiped != 0 {
+            litebox_util_log::debug!(bytes:? = wiped; "wiped MADV_WIPEONFORK ranges for a forked child");
+        }
+        wiped
     }
 
     /// Internal common function used by `make_pages_*` to change page permissions.
@@ -776,6 +1015,18 @@ where
             .collect()
     }
 
+    /// Reserves `range` so a flexible (non-`MAP_FIXED`) placement search steers around it even
+    /// though it has no live mapping. See [`linux::Vmem::reserve_external`]'s doc comment for why
+    /// this exists (a saved-but-currently-unmapped fork-family member's memory).
+    pub fn reserve_external(&self, range: Range<usize>) {
+        self.vmem.write().reserve_external(range);
+    }
+
+    /// Releases a reservation made by [`Self::reserve_external`].
+    pub fn release_external(&self, range: Range<usize>) {
+        self.vmem.write().release_external(range);
+    }
+
     /// Get the memory permissions of a given address range.
     ///
     /// `ptr` specifies the start address of the memory range.
@@ -820,17 +1071,21 @@ where
 
         let mut vmem = self.vmem.write();
         // Find the range closest to the fault address
-        let (start, vma) = {
+        let (mapped_range, vma) = {
             let (r, vma) = vmem
                 .overlapping(fault_addr..Platform::TASK_ADDR_MAX)
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
-            (r.start, *vma)
+            (r.clone(), *vma)
         };
+        let start = mapped_range.start;
         if fault_addr < start {
             // address is out of range, test if it is next to a stack
             if !vma.flags().contains(VmFlags::VM_GROWSDOWN) {
                 return Err(PageFaultError::AccessError("no mapping"));
+            }
+            if vmem.has_pending_initialization(&mapped_range) {
+                return Err(PageFaultError::AllocationFailed);
             }
 
             if !vmem

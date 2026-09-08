@@ -940,6 +940,8 @@ pub const SIOCGIFNETMASK: u32 = 0x891b;
 pub const SIOCGIFBRDADDR: u32 = 0x8919;
 pub const SIOCGIFHWADDR: u32 = 0x8927;
 pub const SIOCGIFMTU: u32 = 0x8921;
+pub const SIOCGIFINDEX: u32 = 0x8933;
+pub const SIOCGIFTXQLEN: u32 = 0x8942;
 
 bitflags::bitflags! {
     /// `ifr_flags` bits this shim reports (`linux/if.h`).
@@ -1110,6 +1112,9 @@ pub enum SocketOption {
     /// shall block the process during close() until it can transmit the data
     /// or until the time expires.
     LINGER = 13,
+    /// `SO_PASSCRED`: deliver an `SCM_CREDENTIALS` control message (the
+    /// sender's `struct ucred`) with every `recvmsg` on an `AF_UNIX` socket.
+    PASSCRED = 16,
     PEERCRED = 17,
     RCVTIMEO = 20,
     SNDTIMEO = 21,
@@ -1159,7 +1164,7 @@ impl SocketOptionName {
     }
 }
 
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct Ucred {
     pub pid: u32,
@@ -2265,6 +2270,12 @@ pub enum PrctlOption {
     SetFpMode = 45,
     GetFpMode = 46,
     CapAmbient = 47,
+    /// `PR_SET_VMA` (`0x53564d41`, the ASCII "SVMA"): name an anonymous
+    /// mapping (`PR_SET_VMA_ANON_NAME`). Emitted by PartitionAlloc for every
+    /// large allocation, so it must decode (and be visible in a syscall
+    /// trace) even though the shim answers it with `EINVAL` like a kernel
+    /// built without `CONFIG_ANON_VMA_NAME`.
+    SetVma = 0x5356_4d41,
 }
 
 #[non_exhaustive]
@@ -2275,9 +2286,31 @@ pub enum PrctlArg {
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
     GetDumpable,
+    /// `PR_SET_DUMPABLE`: the decoder has already checked the value is
+    /// `SUID_DUMP_DISABLE` (0) or `SUID_DUMP_USER` (1), as Linux does.
+    SetDumpable(u64),
+    /// `PR_SET_VMA`: `opcode` is `PR_SET_VMA_ANON_NAME` (0) on every kernel
+    /// so far; `addr`/`len` bound the mapping and `arg` is the name pointer.
+    SetVma {
+        opcode: u64,
+        addr: usize,
+        len: usize,
+        arg: usize,
+    },
     CapBSetRead(usize),
     SetNoNewPrivs,
     GetNoNewPrivs,
+    /// `PR_SET_KEEPCAPS`: whether the permitted capability set is cleared on
+    /// a UID switch away from 0. LiteBox does not model capabilities at all
+    /// (`CapBSetRead` above always reports none held), so this is accepted
+    /// as a no-op rather than rejected -- real callers (e.g. `setpriv
+    /// --reuid`/`--regid`, which sets this before dropping privileges so
+    /// the subsequent explicit `capset` isn't undone by the kernel's
+    /// default clear-on-UID-change behavior) only need the call to
+    /// succeed, not to observe any actual capability state change.
+    SetKeepCaps(bool),
+    /// `PR_GET_KEEPCAPS`: see `SetKeepCaps`.
+    GetKeepCaps,
 }
 
 #[repr(i32)]
@@ -2558,6 +2591,30 @@ pub enum SyscallRequest {
     },
     Fchdir {
         fd: i32,
+    },
+    /// `chroot(2)`: make `path` the calling process's root directory.
+    Chroot {
+        path: UserPtr<c_char>,
+    },
+    /// `seccomp(2)`: `operation` is one of `SECCOMP_SET_MODE_STRICT` (0),
+    /// `SECCOMP_SET_MODE_FILTER` (1), `SECCOMP_GET_ACTION_AVAIL` (2) or
+    /// `SECCOMP_GET_NOTIF_SIZES` (3); `args` points at an operation-specific
+    /// structure (a `struct sock_fprog` for `SET_MODE_FILTER`).
+    /// `prctl(PR_SET_SECCOMP, mode, filter)` decodes to the equivalent
+    /// request (`flags == 0`), exactly as Linux's `prctl_set_seccomp` does.
+    Seccomp {
+        operation: u32,
+        flags: u32,
+        args: UserPtr<u8>,
+    },
+    /// `mseal(2)` (Linux 6.10+, syscall 462 on every architecture): seal the
+    /// mappings in `[addr, addr + len)` against further changes. Decoded so
+    /// that it appears in the syscall trace even though nothing implements
+    /// sealing yet (the shim answers `ENOSYS`, like an older kernel).
+    Mseal {
+        addr: usize,
+        len: usize,
+        flags: usize,
     },
     Mmap {
         addr: usize,
@@ -2852,6 +2909,78 @@ pub enum SyscallRequest {
         fd: i32,
         length: usize,
     },
+    /// `fadvise64(2)` (`posix_fadvise`): `advice` is one of the `POSIX_FADV_*` values.
+    Fadvise64 {
+        fd: i32,
+        offset: usize,
+        len: usize,
+        advice: i32,
+    },
+    /// `fallocate(2)`: `mode` is the `FALLOC_FL_*` bit set; `offset`/`len` are the raw
+    /// (sign-bearing) `off_t` arguments, range-checked by the handler.
+    Fallocate {
+        fd: i32,
+        mode: i32,
+        offset: usize,
+        len: usize,
+    },
+    /// `preadv2(2)`: `preadv` plus the `RWF_*` flag word; `pos_l`/`pos_h` of `-1` means
+    /// "the file offset" (`readv` semantics).
+    Preadv2 {
+        fd: i32,
+        iovec: UserPtr<IoReadVec>,
+        iovcnt: usize,
+        pos_l: usize,
+        pos_h: usize,
+        flags: u32,
+    },
+    /// `pwritev2(2)`: `pwritev` plus the `RWF_*` flag word (see [`Self::Preadv2`]).
+    Pwritev2 {
+        fd: i32,
+        iovec: UserPtr<IoWriteVec>,
+        iovcnt: usize,
+        pos_l: usize,
+        pos_h: usize,
+        flags: u32,
+    },
+    /// `rt_sigtimedwait(2)`: dequeue one signal from `set`, waiting up to `timeout`.
+    RtSigtimedwait {
+        set: Option<UserPtr<SigSet>>,
+        info: Option<UserPtrMut<signal::Siginfo>>,
+        timeout: TimeParam,
+        sigsetsize: usize,
+    },
+    /// `rt_sigqueueinfo(2)`: send `sig` with a caller-supplied `siginfo` to process `pid`.
+    RtSigqueueinfo {
+        pid: i32,
+        sig: i32,
+        info: Option<UserPtr<signal::Siginfo>>,
+    },
+    /// `rt_tgsigqueueinfo(2)`: send `sig` with a caller-supplied `siginfo` to thread `tid` of
+    /// thread group `tgid`.
+    RtTgsigqueueinfo {
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+        info: Option<UserPtr<signal::Siginfo>>,
+    },
+    /// `getpriority(2)`: `which` is `PRIO_PROCESS`/`PRIO_PGRP`/`PRIO_USER`.
+    Getpriority {
+        which: i32,
+        who: i32,
+    },
+    /// `setpriority(2)`: `niceval` is the requested nice value, clamped by the handler.
+    Setpriority {
+        which: i32,
+        who: i32,
+        niceval: i32,
+    },
+    /// `membarrier(2)`.
+    Membarrier {
+        cmd: i32,
+        flags: u32,
+        cpu_id: i32,
+    },
     MemfdCreate {
         name: UserPtr<c_char>,
         flags: u32,
@@ -2910,6 +3039,11 @@ pub enum SyscallRequest {
         fd: i32,
         mode: u32,
     },
+    /// Reached through `fsync`, `fdatasync`, and `syncfs`: every LiteBox filesystem is
+    /// memory-resident, so the three collapse into one "is this fd open" request.
+    Fsync {
+        fd: i32,
+    },
     /// Reached through `fchown`. `owner`/`group` carry the raw `uid_t`/`gid_t`; a value of
     /// `(uid_t)-1` (`u32::MAX`) means "leave unchanged", which the shim maps to `None`.
     Fchown {
@@ -2946,6 +3080,18 @@ pub enum SyscallRequest {
     Eventfd2 {
         initval: u32,
         flags: EfdFlags,
+    },
+    InotifyInit1 {
+        flags: InotifyInitFlags,
+    },
+    InotifyAddWatch {
+        fd: i32,
+        pathname: UserPtr<c_char>,
+        mask: InotifyMask,
+    },
+    InotifyRmWatch {
+        fd: i32,
+        wd: i32,
     },
     Pipe2 {
         pipefd: UserPtrMut<u32>,
@@ -3079,6 +3225,18 @@ pub enum SyscallRequest {
         egid: u32,
         sgid: u32,
     },
+    /// `getresuid`: read back the real/effective/saved uid set by `Setresuid`.
+    Getresuid {
+        ruid: UserPtrMut<u32>,
+        euid: UserPtrMut<u32>,
+        suid: UserPtrMut<u32>,
+    },
+    /// See [`Self::Getresuid`]; `getresgid`, with group IDs.
+    Getresgid {
+        rgid: UserPtrMut<u32>,
+        egid: UserPtrMut<u32>,
+        sgid: UserPtrMut<u32>,
+    },
     Sysinfo {
         buf: UserPtrMut<Sysinfo>,
     },
@@ -3089,6 +3247,10 @@ pub enum SyscallRequest {
     CapGet {
         header: UserPtrMut<CapHeader>,
         data: Option<UserPtrMut<CapData>>,
+    },
+    CapSet {
+        header: UserPtr<CapHeader>,
+        data: Option<UserPtr<CapData>>,
     },
     GetDirent64 {
         fd: i32,
@@ -3159,6 +3321,17 @@ pub enum SyscallRequest {
         fd: i32,
         buf: UserPtrMut<Statfs>,
     },
+    /// `ptrace(request, pid, addr, data)`. `addr`/`data` are decoded generically here (as a raw
+    /// address and a raw machine word, matching the real syscall's `void *`/`long` signature) --
+    /// `request` determines how they are actually used (e.g. `PTRACE_GETREGSET`'s `data` is a
+    /// `struct iovec *`), so that per-request interpretation happens in
+    /// `syscalls::ptrace::Task::sys_ptrace`, not here.
+    Ptrace {
+        request: i64,
+        pid: i32,
+        addr: usize,
+        data: usize,
+    },
 }
 
 impl SyscallRequest {
@@ -3179,6 +3352,11 @@ impl SyscallRequest {
     // `ReinterpretTruncatedFromUsize` in order to support stronger types (especially if one desires
     // a fail-free parse), but also quite helpful is to define a `TryFrom<i32>` and use the `:?`
     // combinator (which will return `EINVAL` upon parse failure).
+    /// `mseal` (Linux 6.10) is number 462 on every architecture but is absent from the
+    /// `syscalls` 0.6.18 table, so `Sysno::new` cannot name it; `try_from_raw` decodes it by
+    /// raw number so it is a visible request rather than an anonymous "unknown syscall".
+    const SYS_MSEAL: usize = 462;
+
     pub fn try_from_raw(
         syscall_number: usize,
         ctx: &PtRegs,
@@ -3245,6 +3423,9 @@ impl SyscallRequest {
             };
         }
 
+        if syscall_number == Self::SYS_MSEAL {
+            return Ok(sys_req!(Mseal { addr, len, flags }));
+        }
         let sysno = Sysno::new(syscall_number).ok_or_else(|| {
             log_unsupported(format_args!("unknown syscall {syscall_number}"));
             errno::Errno::ENOSYS
@@ -3281,6 +3462,8 @@ impl SyscallRequest {
                 mode,
                 flags: { AtFlags::empty() },
             }),
+            Sysno::fchmodat2 => sys_req!(Fchmodat { dirfd, pathname:*, mode, flags }),
+            Sysno::fsync | Sysno::fdatasync | Sysno::syncfs => sys_req!(Fsync { fd }),
             Sysno::fchownat => sys_req!(Fchownat { dirfd, pathname:*, owner, group, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::chown => SyscallRequest::Fchownat {
@@ -3301,6 +3484,12 @@ impl SyscallRequest {
             },
             Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::chroot => sys_req!(Chroot { path:* }),
+            Sysno::seccomp => sys_req!(Seccomp {
+                operation,
+                flags,
+                args:*
+            }),
             Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
@@ -3331,6 +3520,14 @@ impl SyscallRequest {
             Sysno::kill => sys_req!(Kill { pid, sig }),
             Sysno::tkill => sys_req!(Tkill { tid, sig }),
             Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),
+            Sysno::rt_sigtimedwait => {
+                sys_req!(RtSigtimedwait { set:*, info:*, timeout: { =*> TimeParam::timespec_old }, sigsetsize })
+            }
+            Sysno::rt_sigqueueinfo => sys_req!(RtSigqueueinfo { pid, sig, info:* }),
+            Sysno::rt_tgsigqueueinfo => sys_req!(RtTgsigqueueinfo { tgid, tid, sig, info:* }),
+            Sysno::getpriority => sys_req!(Getpriority { which, who }),
+            Sysno::setpriority => sys_req!(Setpriority { which, who, niceval }),
+            Sysno::membarrier => sys_req!(Membarrier { cmd, flags, cpu_id }),
             Sysno::sigaltstack => sys_req!(Sigaltstack { ss:*, old_ss:* }),
             Sysno::ioctl => SyscallRequest::Ioctl {
                 fd: ctx.sys_req_arg(0),
@@ -3379,6 +3576,8 @@ impl SyscallRequest {
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
             Sysno::preadv => sys_req!(Preadv { fd, iovec:*, iovcnt, pos_l, pos_h }),
             Sysno::pwritev => sys_req!(Pwritev { fd, iovec:*, iovcnt, pos_l, pos_h }),
+            Sysno::preadv2 => sys_req!(Preadv2 { fd, iovec:*, iovcnt, pos_l, pos_h, flags }),
+            Sysno::pwritev2 => sys_req!(Pwritev2 { fd, iovec:*, iovcnt, pos_l, pos_h, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::access => SyscallRequest::Faccessat {
                 dirfd: AT_FDCWD,
@@ -3536,6 +3735,8 @@ impl SyscallRequest {
             Sysno::setgid => sys_req!(Setgid { gid }),
             Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
             Sysno::setresgid => sys_req!(Setresgid { rgid, egid, sgid }),
+            Sysno::getresuid => sys_req!(Getresuid { ruid:*, euid:*, suid:* }),
+            Sysno::getresgid => sys_req!(Getresgid { rgid:*, egid:*, sgid:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::epoll_wait => {
@@ -3602,13 +3803,57 @@ impl SyscallRequest {
                         PrctlOption::GetName => SyscallRequest::Prctl {
                             args: PrctlArg::GetName(ctx.sys_req_ptr(1)),
                         },
-                        PrctlOption::GetDumpable
-                            if (1..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
-                        {
+                        // Linux (`kernel/sys.c`) does not check the trailing arguments for
+                        // `PR_GET_DUMPABLE`; callers (Chromium's sandbox) pass whatever is
+                        // left in the registers, and an `EINVAL` here reads as "no dumpable
+                        // support" and trips their CHECK.
+                        PrctlOption::GetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::GetDumpable,
+                        },
+                        // Linux (`kernel/sys.c`): only `SUID_DUMP_DISABLE` (0) and
+                        // `SUID_DUMP_USER` (1) may be set through prctl; anything else is
+                        // `EINVAL`. The trailing arguments are not checked by the kernel.
+                        PrctlOption::SetDumpable => {
+                            let value: usize = ctx.sys_req_arg(1);
+                            if value > 1 {
+                                return Err(unsupported_einval(format_args!(
+                                    "prctl(PR_SET_DUMPABLE, {value})"
+                                )));
+                            }
                             SyscallRequest::Prctl {
-                                args: PrctlArg::GetDumpable,
+                                args: PrctlArg::SetDumpable(value as u64),
                             }
                         }
+                        // `prctl(PR_SET_SECCOMP, mode, filter)` is `seccomp(op, 0, filter)`
+                        // with `SECCOMP_MODE_STRICT` (1) -> `SECCOMP_SET_MODE_STRICT` (0) and
+                        // `SECCOMP_MODE_FILTER` (2) -> `SECCOMP_SET_MODE_FILTER` (1), exactly
+                        // as the kernel's `prctl_set_seccomp` maps it; other modes are
+                        // `EINVAL`.
+                        PrctlOption::SetSeccomp => {
+                            let mode: usize = ctx.sys_req_arg(1);
+                            let operation = match mode {
+                                1 => 0,
+                                2 => 1,
+                                _ => {
+                                    return Err(unsupported_einval(format_args!(
+                                        "prctl(PR_SET_SECCOMP, mode = {mode})"
+                                    )));
+                                }
+                            };
+                            SyscallRequest::Seccomp {
+                                operation,
+                                flags: 0,
+                                args: ctx.sys_req_ptr(2),
+                            }
+                        }
+                        PrctlOption::SetVma => SyscallRequest::Prctl {
+                            args: PrctlArg::SetVma {
+                                opcode: ctx.sys_req_arg::<usize>(1) as u64,
+                                addr: ctx.sys_req_arg(2),
+                                len: ctx.sys_req_arg(3),
+                                arg: ctx.sys_req_arg(4),
+                            },
+                        },
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
                         },
@@ -3627,12 +3872,32 @@ impl SyscallRequest {
                                 args: PrctlArg::GetNoNewPrivs,
                             }
                         }
+                        PrctlOption::SetKeepCaps
+                            if (2..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            let keep: usize = ctx.sys_req_arg(1);
+                            if keep > 1 {
+                                return Err(unsupported_einval(format_args!(
+                                    "prctl(PR_SET_KEEPCAPS, {keep})"
+                                )));
+                            }
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetKeepCaps(keep == 1),
+                            }
+                        }
+                        PrctlOption::GetKeepCaps
+                            if (1..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::GetKeepCaps,
+                            }
+                        }
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
                     }
                 } else {
-                    return Err(errno::Errno::EINVAL);
+                    return Err(unsupported_einval(format_args!("prctl(option = {op:#x})")));
                 }
             }
             #[cfg(target_arch = "x86_64")]
@@ -3739,6 +4004,8 @@ impl SyscallRequest {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::fallocate => sys_req!(Fallocate { fd, mode, offset, len }),
+            Sysno::fadvise64 => sys_req!(Fadvise64 { fd, offset, len, advice }),
             Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
@@ -3750,6 +4017,13 @@ impl SyscallRequest {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::inotify_init => SyscallRequest::InotifyInit1 {
+                flags: InotifyInitFlags::empty(),
+            },
+            Sysno::inotify_init1 => sys_req!(InotifyInit1 { flags }),
+            Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
+            Sysno::inotify_rm_watch => sys_req!(InotifyRmWatch { fd, wd }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {
@@ -3805,6 +4079,7 @@ impl SyscallRequest {
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
             Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
+            Sysno::capset => sys_req!(CapSet { header:*,data:* }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {
                 let pid = ctx.sys_req_arg(0);
@@ -3861,6 +4136,12 @@ impl SyscallRequest {
             }),
             Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
             Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
+            Sysno::ptrace => sys_req!(Ptrace {
+                request,
+                pid,
+                addr,
+                data
+            }),
             // Noisy unsupported syscalls.
             Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
@@ -4107,6 +4388,88 @@ pub struct PtRegs {
     /* add remaining fields if needed */
 }
 
+/// AArch64 `ptrace(2)` request numbers, `NT_*` regset identifiers, and the
+/// on-the-wire register layouts a `PTRACE_GETREGSET`/`PTRACE_SETREGSET`
+/// exchanges for each supported `NT_*` type.
+///
+/// Only [`NT_PRSTATUS`] (general-purpose registers) and [`NT_ARM_TLS`]
+/// (`TPIDR_EL0`) are supported. Any other regset is a distinct, real Linux
+/// type this shim does not populate (`NT_PRFPREG`/`NT_ARM_VFP` for FPSIMD
+/// state, `NT_ARM_HW_BREAK`/`NT_ARM_HW_WATCH` for hardware debug state, and
+/// so on) -- callers must reject those explicitly (`ENODEV`), never return
+/// zeroed or partially-populated data for them.
+#[cfg(target_arch = "aarch64")]
+pub mod ptrace {
+    use zerocopy::{FromBytes, Immutable, IntoBytes};
+
+    /// Attach to a running process, stopping it and delivering the usual
+    /// synthetic `SIGSTOP` a tracer waits for.
+    pub const PTRACE_ATTACH: i64 = 16;
+    /// Detach, resuming the tracee.
+    pub const PTRACE_DETACH: i64 = 17;
+    /// Resume a stopped tracee, optionally delivering `data` as a pending
+    /// signal.
+    pub const PTRACE_CONT: i64 = 7;
+    /// Attach without an implicit stop; the tracee keeps running until an
+    /// explicit `PTRACE_INTERRUPT` (unsupported here) or its own trap.
+    pub const PTRACE_SEIZE: i64 = 0x4206;
+    /// Read a register set (`data` is a `struct iovec *`).
+    pub const PTRACE_GETREGSET: i64 = 0x4204;
+    /// Write a register set (`data` is a `struct iovec *`).
+    pub const PTRACE_SETREGSET: i64 = 0x4205;
+
+    /// General-purpose registers: `x0`-`x30`, `sp`, `pc`, `pstate` -- Linux's
+    /// `struct user_pt_regs`, 34 64-bit words / 272 bytes. Field-for-field
+    /// identical to the leading portion of [`super::PtRegs`], so marshaling is
+    /// a direct copy, never a reinterpretation of unrelated bytes.
+    pub const NT_PRSTATUS: i32 = 1;
+    /// A single `u64`: the thread pointer, `TPIDR_EL0`.
+    pub const NT_ARM_TLS: i32 = 0x401;
+
+    /// The `NT_PRSTATUS` wire layout: Linux's `struct user_pt_regs`.
+    #[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+    #[repr(C)]
+    pub struct UserPtRegs {
+        pub regs: [u64; super::AARCH64_GENERAL_REGISTER_COUNT],
+        pub sp: u64,
+        pub pc: u64,
+        pub pstate: u64,
+    }
+
+    impl UserPtRegs {
+        pub const SIZE: usize = core::mem::size_of::<Self>();
+    }
+
+    impl From<&super::PtRegs> for UserPtRegs {
+        fn from(ctx: &super::PtRegs) -> Self {
+            let mut regs = [0u64; super::AARCH64_GENERAL_REGISTER_COUNT];
+            for (dst, src) in regs.iter_mut().zip(ctx.regs.iter()) {
+                *dst = *src as u64;
+            }
+            Self {
+                regs,
+                sp: ctx.sp as u64,
+                pc: ctx.pc as u64,
+                pstate: ctx.pstate,
+            }
+        }
+    }
+
+    impl UserPtRegs {
+        /// Applies this register set onto `ctx`, leaving every field `ctx`
+        /// owns that is not part of `NT_PRSTATUS` (`orig_x0`, `syscallno`)
+        /// untouched.
+        pub fn write_into(&self, ctx: &mut super::PtRegs) {
+            for (dst, src) in ctx.regs.iter_mut().zip(self.regs.iter()) {
+                *dst = *src as usize;
+            }
+            ctx.sp = self.sp as usize;
+            ctx.pc = self.pc as usize;
+            ctx.pstate = self.pstate;
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub mod arch {
     // User returns must not target the null-guard region.
@@ -4351,6 +4714,8 @@ reinterpret_truncated_from_usize_for! {
         RngFlags,
         TimerFlags,
         StatxMask,
+        InotifyInitFlags,
+        InotifyMask,
     ],
 }
 

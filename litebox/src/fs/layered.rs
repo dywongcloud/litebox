@@ -21,7 +21,7 @@ use super::errors::{
 };
 use super::private;
 use super::{
-    AccessCredentials, DirEntry, DacAccessKind, FileStatus, FileSystem as _, FileType, Mode,
+    AccessCredentials, DacAccessKind, DirEntry, FileStatus, FileSystem as _, FileType, Mode,
     NodeInfo, OFlags, SeekWhence, Timestamp, UserInfo, dac_allows_as,
     sticky_directory_allows_removal,
 };
@@ -164,21 +164,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             status.owner,
             status.mode,
             DacAccessKind::DirectorySearch,
-        ) || !dac_allows_as(
-            credentials,
-            status.owner,
-            status.mode,
-            DacAccessKind::Write,
-        ) {
+        ) || !dac_allows_as(credentials, status.owner, status.mode, DacAccessKind::Write)
+        {
             return Err(ParentAuthorizationError::Denied);
         }
         Ok(status)
     }
 
-    fn authorize_inode_owner(
-        credentials: AccessCredentials<'_>,
-        status: &FileStatus,
-    ) -> bool {
+    fn authorize_inode_owner(credentials: AccessCredentials<'_>, status: &FileStatus) -> bool {
         credentials.user() == 0 || credentials.owns(status.owner)
     }
 
@@ -247,10 +240,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     }
 
     fn cleanup_regular_copy_up_staging(&self, path: &str) {
-        match self
-            .upper
-            .remove_file_for_copy_up(&private::COPY_UP, path)
-        {
+        match self.upper.remove_file_for_copy_up(&private::COPY_UP, path) {
             Ok(())
             | Err(UnlinkError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -286,10 +276,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         if held.file_type != FileType::Directory {
             return Ok(None);
         }
-        let current = match self
-            .upper
-            .file_status_as(AccessCredentials::root(), path)
-        {
+        let current = match self.upper.file_status_as(AccessCredentials::root(), path) {
             Ok(status) => status,
             Err(FileStatusError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -321,10 +308,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         if held.file_type != FileType::Directory {
             return Ok(None);
         }
-        let current = match self
-            .lower
-            .file_status_as(AccessCredentials::root(), path)
-        {
+        let current = match self.lower.file_status_as(AccessCredentials::root(), path) {
             Ok(status) => status,
             Err(FileStatusError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -441,15 +425,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         if path_status.file_type != FileType::Directory {
             return Ok(None);
         }
-        let fd = match self
-            .upper
-            .open_as(
-                AccessCredentials::root(),
-                path,
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-        {
+        let fd = match self.upper.open_as(
+            AccessCredentials::root(),
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
             Ok(fd) => fd,
             Err(OpenError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -486,15 +467,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         if path_status.file_type != FileType::Directory {
             return Ok(None);
         }
-        let fd = match self
-            .lower
-            .open_as(
-                AccessCredentials::root(),
-                path,
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-        {
+        let fd = match self.lower.open_as(
+            AccessCredentials::root(),
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
             Ok(fd) => fd,
             Err(OpenError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -701,9 +679,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 return Err(PathError::ComponentNotADirectory.into());
             }
 
-            match self
-                .upper
-                .file_status_as(AccessCredentials::root(), dir) {
+            match self.upper.file_status_as(AccessCredentials::root(), dir) {
                 Ok(upper_status) if upper_status.file_type == FileType::Directory => {}
                 Ok(_) => return Err(PathError::ComponentNotADirectory.into()),
                 Err(FileStatusError::PathError(
@@ -715,15 +691,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     status.owner,
                 ) {
                     Ok(()) => {}
-                    Err(MkdirError::AlreadyExists) => match self
-                .upper
-                .file_status_as(AccessCredentials::root(), dir) {
-                        Ok(upper_status) if upper_status.file_type == FileType::Directory => {}
-                        Ok(_) => return Err(PathError::ComponentNotADirectory.into()),
-                        Err(FileStatusError::PathError(error)) => return Err(error.into()),
-                        Err(FileStatusError::Io) => return Err(MkdirError::Io),
-                        Err(FileStatusError::ClosedFd) => unreachable!(),
-                    },
+                    Err(MkdirError::AlreadyExists) => {
+                        match self.upper.file_status_as(AccessCredentials::root(), dir) {
+                            Ok(upper_status) if upper_status.file_type == FileType::Directory => {}
+                            Ok(_) => return Err(PathError::ComponentNotADirectory.into()),
+                            Err(FileStatusError::PathError(error)) => return Err(error.into()),
+                            Err(FileStatusError::Io) => return Err(MkdirError::Io),
+                            Err(FileStatusError::ClosedFd) => unreachable!(),
+                        }
+                    }
                     Err(error) => return Err(error),
                 },
                 Err(FileStatusError::PathError(error)) => return Err(error.into()),
@@ -734,10 +710,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         unreachable!("increasing_ancestors always reaches the leaf")
     }
 
-    fn mkdir_migrating_ancestor_dirs_for_rename(
-        &self,
-        path: &str,
-    ) -> Result<(), RenameError> {
+    fn mkdir_migrating_ancestor_dirs_for_rename(&self, path: &str) -> Result<(), RenameError> {
         self.mkdir_migrating_ancestor_dirs(path)
             .map_err(|error| match error {
                 MkdirError::NoWritePerms => RenameError::NoWritePerms,
@@ -759,12 +732,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         initiating_fd: Option<&FileFd<Platform, Upper, Lower>>,
     ) -> Result<(), MigrationError> {
         let namespace_guard = self.namespace.lock();
-        self.migrate_file_up_under_namespace(
-            &namespace_guard,
-            path,
-            copy_data,
-            initiating_fd,
-        )
+        self.migrate_file_up_under_namespace(&namespace_guard, path, copy_data, initiating_fd)
     }
 
     fn migrate_file_up_under_namespace(
@@ -774,7 +742,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         copy_data: bool,
         initiating_fd: Option<&FileFd<Platform, Upper, Lower>>,
     ) -> Result<(), MigrationError> {
-
         let initiating = match initiating_fd {
             Some(fd) => Some(
                 self.litebox
@@ -801,10 +768,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 None => return Err(MigrationError::Io),
             }
         } else {
-            match self
-                .upper
-                .file_status_as(AccessCredentials::root(), path)
-            {
+            match self.upper.file_status_as(AccessCredentials::root(), path) {
                 Ok(_) => return Ok(()),
                 Err(FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -855,10 +819,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             return Err(MigrationError::NotAFile);
         }
 
-        let upper_absent = match self
-            .upper
-            .file_status_as(AccessCredentials::root(), path)
-        {
+        let upper_absent = match self.upper.file_status_as(AccessCredentials::root(), path) {
             Ok(_) => false,
             Err(FileStatusError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -963,7 +924,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             }
             match self
                 .upper
-                .file_status_as(AccessCredentials::root(), candidate.as_str()) {
+                .file_status_as(AccessCredentials::root(), candidate.as_str())
+            {
                 Err(FileStatusError::PathError(
                     PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
                 )) => break candidate,
@@ -1147,7 +1109,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 preparation_stage = "replacement-open";
                 let replacement = self
                     .upper
-                    .open_as(AccessCredentials::root(), staging.as_str(), flags, Mode::empty())
+                    .open_as(
+                        AccessCredentials::root(),
+                        staging.as_str(),
+                        flags,
+                        Mode::empty(),
+                    )
                     .map_err(|error| match error {
                         OpenError::AccessNotAllowed
                         | OpenError::OperationNotPermitted
@@ -1409,31 +1376,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         if self.path_suppresses_lower(&path) {
             let _ = self.lower.close(&lower_fd);
             if original_flags.contains(OFlags::CREAT) {
-                let upper_fd = match self
-                    .upper
-                    .open_as(credentials, path.as_str(), original_flags, mode)
-                {
-                    Ok(fd) => fd,
-                    Err(OpenError::PathError(PathError::MissingComponent)) => {
-                        self.authorize_mutating_parent(credentials, &path)
-                            .map_err(ParentAuthorizationError::into_open)?;
-                        self.mkdir_migrating_ancestor_dirs(&path)
-                            .map_err(|error| match error {
-                                MkdirError::NoWritePerms => OpenError::NoWritePerms,
-                                MkdirError::ReadOnlyFileSystem => OpenError::ReadOnlyFileSystem,
-                                MkdirError::Io => OpenError::Io,
-                                MkdirError::PathError(error) => OpenError::PathError(error),
-                                MkdirError::AlreadyExists => OpenError::AlreadyExists,
-                            })?;
-                        self.upper.open_as(
-                            credentials,
-                            path.as_str(),
-                            original_flags,
-                            mode,
-                        )?
-                    }
-                    Err(error) => return Err(error),
-                };
+                let upper_fd =
+                    match self
+                        .upper
+                        .open_as(credentials, path.as_str(), original_flags, mode)
+                    {
+                        Ok(fd) => fd,
+                        Err(OpenError::PathError(PathError::MissingComponent)) => {
+                            self.authorize_mutating_parent(credentials, &path)
+                                .map_err(ParentAuthorizationError::into_open)?;
+                            self.mkdir_migrating_ancestor_dirs(&path).map_err(
+                                |error| match error {
+                                    MkdirError::NoWritePerms => OpenError::NoWritePerms,
+                                    MkdirError::ReadOnlyFileSystem => OpenError::ReadOnlyFileSystem,
+                                    MkdirError::Io => OpenError::Io,
+                                    MkdirError::PathError(error) => OpenError::PathError(error),
+                                    MkdirError::AlreadyExists => OpenError::AlreadyExists,
+                                },
+                            )?;
+                            self.upper
+                                .open_as(credentials, path.as_str(), original_flags, mode)?
+                        }
+                        Err(error) => return Err(error),
+                    };
                 self.publish_upper_nondirectory(&path);
                 return self.finish_upper_open(&namespace_guard, path, original_flags, upper_fd);
             }
@@ -1789,7 +1754,8 @@ impl<
                     }
                     Ok(_) => {
                         drop(guard);
-                        match self.open_as(credentials, path.as_str(), flags - OFlags::CREAT, mode) {
+                        match self.open_as(credentials, path.as_str(), flags - OFlags::CREAT, mode)
+                        {
                             Ok(fd) => return Ok(fd),
                             Err(OpenError::PathError(
                                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -1879,7 +1845,9 @@ impl<
                                 "mkdir_migrating_ancestor_dirs handles existing ancestors"
                             ),
                         }
-                        let fd = self.upper.open_as(credentials, path.as_str(), flags, mode)?;
+                        let fd = self
+                            .upper
+                            .open_as(credentials, path.as_str(), flags, mode)?;
                         self.publish_upper_nondirectory(&path);
                         return self.finish_upper_open(
                             create_guard
@@ -1947,11 +1915,9 @@ impl<
                 {
                     return Err(PathError::ComponentNotADirectory.into());
                 }
-                let exclusive_existing =
-                    original_flags.contains(OFlags::CREAT | OFlags::EXCL);
+                let exclusive_existing = original_flags.contains(OFlags::CREAT | OFlags::EXCL);
                 if !exclusive_existing && !original_flags.contains(OFlags::PATH) {
-                    let access_mode =
-                        original_flags & (OFlags::WRONLY | OFlags::RDWR);
+                    let access_mode = original_flags & (OFlags::WRONLY | OFlags::RDWR);
                     let read_requested =
                         access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
                     let write_requested =
@@ -2368,11 +2334,14 @@ impl<
         match state.as_ref().map(|state| &state.backing) {
             Some(EntryX::Upper { fd }) => self.upper.fd_chmod_as(credentials, fd, mode),
             Some(EntryX::Lower { fd: lower_fd }) => {
-                let status = self.lower.fd_file_status(lower_fd).map_err(|error| match error {
-                    FileStatusError::ClosedFd => ChmodError::ClosedFd,
-                    FileStatusError::PathError(error) => ChmodError::PathError(error),
-                    FileStatusError::Io => ChmodError::Io,
-                })?;
+                let status = self
+                    .lower
+                    .fd_file_status(lower_fd)
+                    .map_err(|error| match error {
+                        FileStatusError::ClosedFd => ChmodError::ClosedFd,
+                        FileStatusError::PathError(error) => ChmodError::PathError(error),
+                        FileStatusError::Io => ChmodError::Io,
+                    })?;
                 if !Self::authorize_inode_owner(credentials, &status) {
                     return Err(ChmodError::NotTheOwner);
                 }
@@ -2408,10 +2377,7 @@ impl<
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = self.absolute_path(path)?;
-        match self
-            .upper
-            .chown_as(credentials, path.as_str(), user, group)
-        {
+        match self.upper.chown_as(credentials, path.as_str(), user, group) {
             Ok(()) => return Ok(()),
             Err(e) => match e {
                 ChownError::NotTheOwner
@@ -2455,8 +2421,7 @@ impl<
                 return Err(ChownError::Io);
             }
         }
-        self.upper
-            .chown_as(credentials, path.as_str(), user, group)
+        self.upper.chown_as(credentials, path.as_str(), user, group)
     }
 
     fn fd_chown(
@@ -2492,15 +2457,16 @@ impl<
             .flatten()?;
         let state = entry.state.lock();
         match state.as_ref().map(|state| &state.backing) {
-            Some(EntryX::Upper { fd }) => {
-                self.upper.fd_chown_as(credentials, fd, user, group)
-            }
+            Some(EntryX::Upper { fd }) => self.upper.fd_chown_as(credentials, fd, user, group),
             Some(EntryX::Lower { fd: lower_fd }) => {
-                let status = self.lower.fd_file_status(lower_fd).map_err(|error| match error {
-                    FileStatusError::ClosedFd => ChownError::ClosedFd,
-                    FileStatusError::PathError(error) => ChownError::PathError(error),
-                    FileStatusError::Io => ChownError::Io,
-                })?;
+                let status = self
+                    .lower
+                    .fd_file_status(lower_fd)
+                    .map_err(|error| match error {
+                        FileStatusError::ClosedFd => ChownError::ClosedFd,
+                        FileStatusError::PathError(error) => ChownError::PathError(error),
+                        FileStatusError::Io => ChownError::Io,
+                    })?;
                 if !Self::authorize_chown(credentials, &status, user, group) {
                     return Err(ChownError::NotTheOwner);
                 }
@@ -2622,15 +2588,16 @@ impl<
             .flatten()?;
         let state = entry.state.lock();
         match state.as_ref().map(|state| &state.backing) {
-            Some(EntryX::Upper { fd }) => {
-                self.upper.fd_utimensat_as(credentials, fd, atime, mtime)
-            }
+            Some(EntryX::Upper { fd }) => self.upper.fd_utimensat_as(credentials, fd, atime, mtime),
             Some(EntryX::Lower { fd: lower_fd }) => {
-                let status = self.lower.fd_file_status(lower_fd).map_err(|error| match error {
-                    FileStatusError::ClosedFd => UtimeError::ClosedFd,
-                    FileStatusError::PathError(error) => UtimeError::PathError(error),
-                    FileStatusError::Io => UtimeError::Io,
-                })?;
+                let status = self
+                    .lower
+                    .fd_file_status(lower_fd)
+                    .map_err(|error| match error {
+                        FileStatusError::ClosedFd => UtimeError::ClosedFd,
+                        FileStatusError::PathError(error) => UtimeError::PathError(error),
+                        FileStatusError::Io => UtimeError::Io,
+                    })?;
                 if !Self::authorize_inode_owner(credentials, &status) {
                     return Err(UtimeError::NoWritePerms);
                 }
@@ -2950,19 +2917,14 @@ impl<
             self.mkdir_migrating_ancestor_dirs_for_rename(&new)?;
 
             if lower_source.file_type == FileType::RegularFile {
-                self.migrate_file_up_under_namespace(
-                    &namespace_guard,
-                    old.as_str(),
-                    true,
-                    None,
-                )
-                .map_err(|error| match error {
-                    MigrationError::UpperCannotHoldFile => RenameError::ReadOnlyFileSystem,
-                    MigrationError::PathError(error) => RenameError::PathError(error),
-                    MigrationError::NoReadPerms | MigrationError::NotAFile | MigrationError::Io => {
-                        RenameError::Io
-                    }
-                })?;
+                self.migrate_file_up_under_namespace(&namespace_guard, old.as_str(), true, None)
+                    .map_err(|error| match error {
+                        MigrationError::UpperCannotHoldFile => RenameError::ReadOnlyFileSystem,
+                        MigrationError::PathError(error) => RenameError::PathError(error),
+                        MigrationError::NoReadPerms
+                        | MigrationError::NotAFile
+                        | MigrationError::Io => RenameError::Io,
+                    })?;
 
                 // Copy-up retained the source inode mapping and rebound every open description.
                 // Whiteout lower before the physical upper rename, rolling it back if publication
@@ -3148,10 +3110,7 @@ impl<
         ensure_absent()?;
         self.authorize_mutating_parent(credentials, &path)
             .map_err(ParentAuthorizationError::into_symlink)?;
-        let result = match self
-            .upper
-            .symlink_as(credentials, target, path.as_str())
-        {
+        let result = match self.upper.symlink_as(credentials, target, path.as_str()) {
             Ok(()) => Ok(()),
             Err(SymlinkError::PathError(PathError::MissingComponent)) => {
                 self.mkdir_migrating_ancestor_dirs(&path)
@@ -3163,8 +3122,7 @@ impl<
                         MkdirError::PathError(error) => SymlinkError::PathError(error),
                     })?;
                 ensure_absent()?;
-                self.upper
-                    .symlink_as(credentials, target, path.as_str())
+                self.upper.symlink_as(credentials, target, path.as_str())
             }
             Err(error) => Err(error),
         };

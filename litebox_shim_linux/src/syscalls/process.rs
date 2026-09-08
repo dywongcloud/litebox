@@ -51,6 +51,21 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     /// Signal requested with `PR_SET_PDEATHSIG`, delivered when this process's parent exits.
     /// Linux clears it in every freshly cloned task and preserves it across `execve`.
     parent_death_signal: Cell<Option<Signal>>,
+    /// The program the thread is about to `exec`, staged by [`Task::resolve_shebang`] and
+    /// consumed by `Task::load_program` once the image is live: the absolute, symlink-resolved
+    /// path of the image (`/proc/<pid>/exe`) and the command name (`comm`), which Linux takes
+    /// from the basename of the filename handed to `execve` -- `sh` for `/bin/sh`, the script's
+    /// own name for a `#!` script -- not from the image finally mapped. Staged rather than
+    /// threaded through the ELF loader because the loader keeps its path private and the
+    /// initial-program path is resolved by the shim's own `load_program` entry point, which
+    /// never sees a `Task` method.
+    staged_exec: RefCell<Option<StagedExec>>,
+}
+
+/// See `ThreadState::staged_exec`.
+struct StagedExec {
+    exe: alloc::string::String,
+    comm: Vec<u8>,
 }
 
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
@@ -162,6 +177,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
             parent_death_signal: Cell::new(None),
+            staged_exec: RefCell::new(None),
         }
     }
 
@@ -175,6 +191,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
             parent_death_signal: Cell::new(None),
+            staged_exec: RefCell::new(None),
         })
     }
 
@@ -237,6 +254,21 @@ pub(crate) struct ThreadRemote<Platform: ShimPlatform> {
     /// into that `RefCell` by the owning thread itself in `Task::process_signals`/
     /// `Task::has_pending_signals`, the same way `Process::shared_pending` already is.
     remote_pending: Mutex<Platform, super::signal::PendingSignals>,
+    /// `ptrace` attach/stop state for this thread. See [`super::ptrace::PtraceState`].
+    ///
+    /// AArch64-only: `NT_PRSTATUS`/`NT_ARM_TLS` wire layouts and the `PTRACE_*` request numbers
+    /// this builds on live in `litebox_common_linux::ptrace`, gated the same way.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) ptrace: super::ptrace::PtraceState<Platform>,
+    /// This thread's command name, as `/proc/<pid>/task/<tid>/comm` reports it. The owning
+    /// task's `comm` is a `Cell` only its own thread may read, so the value is mirrored here for
+    /// `/proc` readers on other threads (see `Task::set_task_comm`).
+    comm: Mutex<Platform, [u8; litebox_common_linux::TASK_COMM_LEN]>,
+    /// This thread's nice value (`-20..=19`), the `setpriority(PRIO_PROCESS, tid)` /
+    /// `getpriority` state. Per thread, as on Linux, where every thread is its own scheduling
+    /// entity; lives here so a sibling thread's `getpriority(tid)` can read it. Purely
+    /// bookkeeping -- the host scheduler is never told.
+    nice: core::sync::atomic::AtomicI32,
 }
 
 impl<Platform: ShimPlatform> ThreadRemote<Platform> {
@@ -245,10 +277,40 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
             is_exiting: AtomicBool::new(false),
             handle: once_cell::race::OnceBox::new(),
             remote_pending: Mutex::new(super::signal::PendingSignals::new()),
+            #[cfg(target_arch = "aarch64")]
+            ptrace: super::ptrace::PtraceState::new(),
+            comm: Mutex::new([0; litebox_common_linux::TASK_COMM_LEN]),
+            nice: core::sync::atomic::AtomicI32::new(0),
         }
     }
 
-    fn interrupt(&self) {
+    /// The thread's nice value; see [`Self::nice`].
+    pub(crate) fn nice(&self) -> i32 {
+        self.nice.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_nice(&self, nice: i32) {
+        self.nice.store(nice, Ordering::Relaxed);
+    }
+
+    /// Mirror the owning task's command name for `/proc` readers.
+    pub(crate) fn set_comm(&self, comm: &[u8; litebox_common_linux::TASK_COMM_LEN]) {
+        *self.comm.lock() = *comm;
+    }
+
+    /// The command name, trimmed of trailing NULs.
+    fn comm(&self) -> Vec<u8> {
+        let comm = *self.comm.lock();
+        let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+        comm[..end].to_vec()
+    }
+
+    /// Interrupts a wait or, under HVF, kicks the vCPU lane this thread may currently be running
+    /// on -- see [`litebox::event::wait::ThreadHandle::interrupt`]. `pub(crate)` (rather than
+    /// only `super`-visible) so `syscalls::ptrace`'s `PTRACE_ATTACH` can reach a tracee that may
+    /// be deep inside a blocking syscall or `hv_vcpu_run`, the same way `tkill`/process-directed
+    /// signals already do.
+    pub(crate) fn interrupt(&self) {
         if let Some(handle) = self.handle.get() {
             handle.interrupt();
         }
@@ -362,6 +424,36 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// Unix98 PTY number serving as this process's controlling terminal, or
     /// [`NO_CONTROLLING_PTY`] when it has none.
     controlling_pty: AtomicU32,
+    /// This process's place in a [`SharedAddressSpace`], `None` when its memory is its own.
+    /// Process-wide (every thread runs on the same memory and takes turns as one member), see
+    /// [`AddressSpaceMembership`].
+    pub(crate) address_space: Mutex<Platform, Option<Arc<AddressSpaceMembership<Platform>>>>,
+    /// `prctl(PR_SET_DUMPABLE)` state. Linux keeps this on the `mm` (so it is process-wide,
+    /// inherited by `fork` and reset by `execve`: to 1 for an ordinary exec, to the
+    /// `suid_dumpable` sysctl's default 0 for a set-uid/set-gid one). Only the flag itself is
+    /// modelled -- LiteBox writes no core dumps and has no `ptrace` access check that consults
+    /// it -- so that a launcher like Chromium's `chrome-sandbox`, which clears it before
+    /// dropping root and `CHECK`s that it read back 0, sees Linux's answers.
+    dumpable: AtomicBool,
+}
+
+/// What `/proc/<pid>/{status,stat,cmdline,exe}` describe about a process, kept where a reader
+/// on another thread can see it (the owning task's credentials and `comm` are thread-local
+/// `Cell`s/`RefCell`s). Refreshed by the owning task on every change it makes (`execve`,
+/// `prctl(PR_SET_NAME)`) and ahead of each of its own `/proc` lookups, so a reader sees at worst
+/// the state as of the target's last publish -- a live `setuid` by a process that never looks at
+/// `/proc` afterwards is the one thing that can lag.
+#[derive(Clone, Default)]
+pub(crate) struct ProcIdentity {
+    ppid: i32,
+    uid: u32,
+    gid: u32,
+    /// The thread-group leader's command name, trimmed of trailing NULs.
+    comm: Vec<u8>,
+    /// NUL-separated, NUL-terminated `argv` of the current image.
+    cmdline: Vec<u8>,
+    /// Absolute, symlink-resolved path of the current image (`/proc/<pid>/exe`).
+    exe: Option<alloc::string::String>,
 }
 
 /// A set of address ranges, kept sorted and non-overlapping.
@@ -383,6 +475,40 @@ impl OwnedRanges {
         self.remove(range.clone());
         let at = self.ranges.partition_point(|r| r.start < range.start);
         self.ranges.insert(at, range);
+    }
+
+    /// The parts of this set that `other` does not cover.
+    fn difference(&self, other: &OwnedRanges) -> OwnedRanges {
+        let mut out = OwnedRanges::default();
+        for range in &self.ranges {
+            let mut cursor = range.start;
+            for covered in other.intersect(range) {
+                if cursor < covered.start {
+                    out.ranges.push(cursor..covered.start);
+                }
+                cursor = cursor.max(covered.end);
+            }
+            if cursor < range.end {
+                out.ranges.push(cursor..range.end);
+            }
+        }
+        out
+    }
+
+    /// Adds every range of `other`, merging with whatever it overlaps (a true union, unlike
+    /// [`Self::insert`], which replaces).
+    fn union_with(&mut self, other: &OwnedRanges) {
+        for range in &other.ranges {
+            let mut lo = range.start;
+            let mut hi = range.end;
+            for existing in &self.ranges {
+                if existing.start < hi && lo < existing.end {
+                    lo = lo.min(existing.start);
+                    hi = hi.max(existing.end);
+                }
+            }
+            self.insert(lo..hi);
+        }
     }
 
     fn insert_bounded(&mut self, range: Range<usize>, max_ranges: usize) {
@@ -474,6 +600,18 @@ struct VmBookkeeping<Platform: ShimPlatform> {
     elf_patch_cache: VmLockedValue<Platform, super::mm::ElfPatchCache>,
     brk: AtomicUsize,
     futex_namespace: usize,
+    /// DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): identity of
+    /// this process's current `SharedAddressSpace` family, as `Arc::as_ptr(&membership.shared)
+    /// as usize` (0 = not currently a family member). Lives here, rather than on `Process`
+    /// directly, so [`ProcessTable::overlaps_another_process`] can read it through the same
+    /// narrow `Weak<VmBookkeepingSlot<_>>` already kept for `owned_ranges` -- see that field's
+    /// own doc comment for why a `Weak<Process<_>>` is not used. Set in `Task::join_address_space`,
+    /// cleared wherever a membership is dropped (`Task::release_address_space`'s single-threaded
+    /// branch, `Task::leave_address_space_if_alone`). Distinguishes an overlap that is *expected*
+    /// (two members of the SAME family, which by this platform's design believe they own the
+    /// same addresses -- see `SharedAddressSpace`'s own doc comment) from one between processes
+    /// that should have disjoint memory, which is the actual corruption candidate.
+    family_id: AtomicUsize,
 }
 
 impl<Platform: ShimPlatform> VmBookkeeping<Platform> {
@@ -483,6 +621,7 @@ impl<Platform: ShimPlatform> VmBookkeeping<Platform> {
             elf_patch_cache: VmLockedValue::new(BTreeMap::new()),
             brk: AtomicUsize::new(0),
             futex_namespace,
+            family_id: AtomicUsize::new(0),
         }
     }
 }
@@ -620,13 +759,26 @@ impl<Platform: ShimPlatform> SharedVmAtomicUsize<Platform> {
 /// * A member that never blocks and never exits starves the others. The token is only ever
 ///   yielded voluntarily; there is no preemption, because memory cannot be taken away from a
 ///   thread that is in the middle of executing guest instructions on it.
-/// * `CLONE_THREAD` threads of a member do not join the family, so a guest that `fork`s from a
-///   multithreaded process still gets the old, single-holder behaviour for its extra threads.
-///   Guests in scope here (shells) are single-threaded when they fork.
+/// * Membership is per *process*: every thread of a member runs on the memory while the process
+///   holds the token. A single-threaded member gives the token up whenever it blocks, as above.
+///   A multithreaded member gives it up only when another member is waiting for it (a waiter
+///   kicks the holder's threads, see [`Self::acquire`]): the first thread to notice at a safe
+///   point closes the process's fork gate so every sibling parks off the memory
+///   ([`Task::quiesce_and_hand_off`]), copies the image out, releases, and waits for the token
+///   to come back before reopening the gate. That is what lets a `fork`ed child that never
+///   `exec`s -- a Chromium zygote's renderer -- create threads. The cost is that every hand-off
+///   copies the member's whole shared image, and a member busy in guest code yields only at its
+///   next syscall or vCPU kick.
 pub(crate) struct SharedAddressSpace<Platform: ShimPlatform> {
-    /// [`ADDRESS_SPACE_FREE`], or the tid of the member holding the token. Used directly as the
+    /// [`ADDRESS_SPACE_FREE`], or the pid of the member holding the token. Used directly as the
     /// word members block on while waiting to acquire.
     holder: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// Members currently blocked in [`Self::acquire`]. A multithreaded holder yields only while
+    /// this is non-zero (see [`Task::yield_address_space_to_waiters`]).
+    waiters: AtomicUsize,
+    /// The holder's thread table, so a waiter can kick its threads to a safe point. Cleared on
+    /// release.
+    holder_threads: Mutex<Platform, Option<Weak<Mutex<Platform, ProcessInner<Platform>>>>>,
 }
 
 const PROCESS_LAUNCH_PENDING: u32 = 0;
@@ -682,15 +834,26 @@ const VFORK_COMPLETE: u32 = 1;
 
 pub(crate) struct VforkCompletion<Platform: ShimPlatform> {
     state: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    /// Whether the vfork parent was already a [`SharedAddressSpace`] member when it vforked. A
+    /// child on the parent's memory then cannot fork (see `do_process_clone`): the membership it
+    /// would hand back below has nowhere to go.
+    parent_shares_address_space: bool,
+    /// The membership a `CLONE_VM` child that forked while still on its parent's memory hands to
+    /// that parent as it exits or execs. See [`Task::hand_address_space_to_vfork_parent`].
+    inherited_membership: Mutex<Platform, Option<Arc<AddressSpaceMembership<Platform>>>>,
 }
 
 impl<Platform: ShimPlatform> VforkCompletion<Platform> {
-    fn new() -> Self {
+    fn new(parent_shares_address_space: bool) -> Self {
         let state = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         state
             .underlying_atomic()
             .store(VFORK_ACTIVE, Ordering::Relaxed);
-        Self { state }
+        Self {
+            state,
+            parent_shares_address_space,
+            inherited_membership: Mutex::new(None),
+        }
     }
 
     fn complete(&self) {
@@ -715,23 +878,106 @@ impl<Platform: ShimPlatform> VforkCompletion<Platform> {
     }
 }
 
-/// A copy of a guest process's private memory, as `(start address, contents)` pairs.
-type MemoryImage = Vec<(usize, alloc::boxed::Box<[u8]>)>;
+/// One piece of a guest process's view of the memory it shares with other members: the page
+/// protection it had, and -- for a writable piece -- its contents.
+struct SavedRange {
+    start: usize,
+    end: usize,
+    /// The mapping's protection (`VM_READ`/`VM_WRITE`/`VM_EXEC`) at save time.
+    flags: VmFlags,
+    /// The bytes, for a writable piece. A non-writable piece (a `PROT_NONE` allocator
+    /// reservation, a read-only segment) carries only its protection, which the restore
+    /// re-applies -- and, for `PROT_NONE`, clears whatever another member left there, since
+    /// Linux hands a process zero pages when it commits such a range.
+    bytes: Option<alloc::boxed::Box<[u8]>>,
+}
+
+/// A copy of a guest process's view of its shared memory; see [`SavedRange`].
+type MemoryImage = Vec<SavedRange>;
+
+/// The `mprotect` protection a page-manager mapping's flags describe.
+fn prot_of(flags: VmFlags) -> litebox_common_linux::ProtFlags {
+    use litebox_common_linux::ProtFlags;
+    let mut prot = ProtFlags::PROT_NONE;
+    prot.set(ProtFlags::PROT_READ, flags.contains(VmFlags::VM_READ));
+    prot.set(ProtFlags::PROT_WRITE, flags.contains(VmFlags::VM_WRITE));
+    prot.set(ProtFlags::PROT_EXEC, flags.contains(VmFlags::VM_EXEC));
+    prot
+}
+
+/// The protection bits of a mapping's flags, for comparing two members' views of one range.
+fn access_bits(flags: VmFlags) -> VmFlags {
+    flags & (VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_EXEC)
+}
 
 /// Above this many disjoint below-SP ABI ranges, preserve their one bounding interval instead.
 const MAX_PRESERVED_STACK_RANGES: usize = 64;
 
-/// One member's place in a [`SharedAddressSpace`].
+/// One member process's place in a [`SharedAddressSpace`], shared by all of its threads (hence
+/// `Arc` in [`Process::address_space`] and interior synchronization throughout).
 pub(crate) struct AddressSpaceMembership<Platform: ShimPlatform> {
     shared: Arc<SharedAddressSpace<Platform>>,
     /// Whether this member currently holds the token.
-    holding: Cell<bool>,
+    holding: AtomicBool,
     /// This member's copy of its own private memory, taken when it gave the token up. `Some`
     /// exactly while [`Self::holding`] is false and the member still intends to come back.
-    parked: RefCell<Option<MemoryImage>>,
+    parked: Mutex<Platform, Option<MemoryImage>>,
     /// Small guest ranges whose contents remain semantically live even when they sit below the
     /// current stack pointer. Clone child-TID words are the canonical case.
-    preserved_stack_ranges: RefCell<OwnedRanges>,
+    preserved_stack_ranges: Mutex<Platform, OwnedRanges>,
+    /// The ranges this member has ever shared with another member: its owned ranges at every
+    /// `fork` it took part in (for a child, the parent's at that moment). Only these need
+    /// copying out and back on a hand-off -- memory a member mapped afterwards is at addresses
+    /// no other member owns, so nobody else can disturb it. For a renderer that grows to
+    /// hundreds of megabytes after being forked from a small zygote, this is the difference
+    /// between copying the zygote's image and copying everything.
+    shared_ranges: Mutex<Platform, OwnedRanges>,
+    /// Set by the one thread quiescing this multithreaded member for a hand-off; see
+    /// [`Task::quiesce_and_hand_off`].
+    quiescing: AtomicBool,
+    /// When this member last took the token, as the platform's monotonic clock. A
+    /// multithreaded member keeps the token for at least [`Self::QUANTUM`] before yielding to
+    /// a waiter: every hand-off copies its whole shared image out and back, so yielding at the
+    /// first syscall after each acquisition -- with several runnable members, every few
+    /// microseconds -- spent everything on copying and nothing on the guest (live-measured:
+    /// 22,606 hand-offs in 90 s, none of the members getting anywhere).
+    acquired_at: Mutex<Platform, Option<Platform::Instant>>,
+}
+
+impl<Platform: ShimPlatform> AddressSpaceMembership<Platform> {
+    fn new(
+        shared: Arc<SharedAddressSpace<Platform>>,
+        preserved_stack_ranges: OwnedRanges,
+        shared_ranges: OwnedRanges,
+    ) -> Self {
+        Self {
+            shared,
+            holding: AtomicBool::new(true),
+            parked: Mutex::new(None),
+            preserved_stack_ranges: Mutex::new(preserved_stack_ranges),
+            shared_ranges: Mutex::new(shared_ranges),
+            quiescing: AtomicBool::new(false),
+            acquired_at: Mutex::new(None),
+        }
+    }
+
+    /// The least a multithreaded member runs between hand-offs; see [`Self::acquired_at`].
+    const QUANTUM: Duration = Duration::from_millis(40);
+
+    fn holding(&self) -> bool {
+        self.holding.load(Ordering::Acquire)
+    }
+
+    fn mark_acquired(&self, now: Platform::Instant) {
+        *self.acquired_at.lock() = Some(now);
+    }
+
+    /// Whether this member has had the token for at least [`Self::QUANTUM`].
+    fn quantum_elapsed(&self, now: Platform::Instant) -> bool {
+        self.acquired_at
+            .lock()
+            .is_none_or(|since| now.duration_since(&since) >= Self::QUANTUM)
+    }
 }
 
 /// The value of [`SharedAddressSpace::holder`] when no member holds the token. No tid is ever
@@ -746,62 +992,136 @@ fn tid_as_holder(tid: i32) -> u32 {
 }
 
 impl<Platform: ShimPlatform> SharedAddressSpace<Platform> {
-    /// How long to block before re-checking whether this task is being torn down. The token is
-    /// handed over explicitly, so this only bounds how long a *dying* task waits for a holder
-    /// that will never release; it is not a polling interval in the normal case.
+    /// How long to block before re-checking whether this task is being torn down, and between
+    /// kicks of a multithreaded holder's threads. The token is handed over explicitly, so in the
+    /// single-threaded case this only bounds how long a *dying* task waits for a holder that
+    /// will never release; it is not a polling interval in the normal case.
     const ABANDON_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 
-    fn new(initial_holder: i32) -> Self {
+    fn new(
+        initial_holder: i32,
+        holder_inner: &Arc<Mutex<Platform, ProcessInner<Platform>>>,
+    ) -> Self {
         let holder = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
         holder
             .underlying_atomic()
             .store(tid_as_holder(initial_holder), Ordering::Relaxed);
-        Self { holder }
+        Self {
+            holder,
+            waiters: AtomicUsize::new(0),
+            holder_threads: Mutex::new(Some(Arc::downgrade(holder_inner))),
+        }
     }
 
-    /// Blocks until the token is free and takes it for `tid`.
+    fn waiters(&self) -> usize {
+        self.waiters.load(Ordering::Acquire)
+    }
+
+    /// Interrupts every thread of the current holder so each reaches a safe point and, if the
+    /// holder is multithreaded, notices the waiter (see [`Task::yield_address_space_to_waiters`]).
+    fn kick_holder(&self) {
+        let holder = self.holder_threads.lock().clone();
+        if let Some(inner) = holder.and_then(|weak| weak.upgrade()) {
+            for thread in inner.lock().threads.values() {
+                thread.interrupt();
+            }
+        }
+    }
+
+    /// Blocks until the token is free and takes it for the process `pid`, whose thread table is
+    /// `inner`.
     ///
-    /// Returns `false` if `abandon` became true first, which only happens when the caller is
-    /// being torn down and will never run guest code again.
-    fn acquire(&self, tid: i32, mut abandon: impl FnMut() -> bool) -> bool {
-        let me = tid_as_holder(tid);
-        loop {
+    /// Returns `true` once the process holds the token -- taken here, or (`already_held`) by a
+    /// sibling thread of the same process in the meantime. Returns `false` if `abandon` became
+    /// true first, which only happens when the caller is being torn down and will never run
+    /// guest code again.
+    fn acquire(
+        &self,
+        pid: i32,
+        already_held: impl Fn() -> bool,
+        mut abandon: impl FnMut() -> bool,
+        inner: &Arc<Mutex<Platform, ProcessInner<Platform>>>,
+    ) -> bool {
+        let me = tid_as_holder(pid);
+        let mut waiting = false;
+        let outcome = loop {
+            if already_held() {
+                break true;
+            }
             match self.holder.underlying_atomic().compare_exchange(
                 ADDRESS_SPACE_FREE,
                 me,
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    *self.holder_threads.lock() = Some(Arc::downgrade(inner));
+                    // Siblings blocked below on the holder word re-check `already_held`.
+                    self.holder.wake_all();
+                    break true;
+                }
                 Err(current) => {
                     if abandon() {
-                        return false;
+                        break false;
                     }
+                    if !waiting {
+                        waiting = true;
+                        self.waiters.fetch_add(1, Ordering::AcqRel);
+                    }
+                    self.kick_holder();
                     let _ = self
                         .holder
                         .block_or_timeout(current, Self::ABANDON_CHECK_INTERVAL);
                 }
             }
+        };
+        if waiting {
+            self.waiters.fetch_sub(1, Ordering::AcqRel);
         }
+        outcome
     }
 
     /// Gives the token up, waking anything waiting for it.
     fn release(&self) {
+        *self.holder_threads.lock() = None;
         self.holder
             .underlying_atomic()
             .store(ADDRESS_SPACE_FREE, Ordering::Release);
         self.holder.wake_all();
     }
 
-    /// Passes the token straight to `tid` without ever making it free.
+    /// After a [`Self::release`] made on a waiter's behalf: blocks until some waiter has taken
+    /// the token (or every waiter has given up), so the releasing member -- still on-CPU and
+    /// about to re-acquire -- cannot snatch it straight back. Without this a multithreaded
+    /// member quiesced, released and re-acquired thousands of times a second while the waiter
+    /// it had yielded for never once won the race (live-measured: 23,444 hand-offs with
+    /// `away_us=0` in 90 s).
+    fn wait_until_taken(&self, mut abandon: impl FnMut() -> bool) {
+        loop {
+            if self.waiters() == 0 || abandon() {
+                return;
+            }
+            let current = self.holder.underlying_atomic().load(Ordering::Acquire);
+            if current != ADDRESS_SPACE_FREE {
+                return;
+            }
+            let _ = self
+                .holder
+                .block_or_timeout(ADDRESS_SPACE_FREE, Self::ABANDON_CHECK_INTERVAL);
+        }
+    }
+
+    /// Passes the token straight to process `pid` (thread table `inner`) without ever making it
+    /// free.
     ///
     /// Used by `fork`: the child is not running yet and so cannot [`Self::acquire`] for itself,
     /// and a free window here would let some other member take the address space out from under
     /// it before its first instruction.
-    fn hand_off_to(&self, tid: i32) {
+    fn hand_off_to(&self, pid: i32, inner: &Arc<Mutex<Platform, ProcessInner<Platform>>>) {
+        *self.holder_threads.lock() = Some(Arc::downgrade(inner));
         self.holder
             .underlying_atomic()
-            .store(tid_as_holder(tid), Ordering::Release);
+            .store(tid_as_holder(pid), Ordering::Release);
     }
 }
 
@@ -841,7 +1161,32 @@ struct LiveProcess<Platform: ShimPlatform> {
     process_inner: Weak<Mutex<Platform, ProcessInner<Platform>>>,
     /// The target's live resource limits, used when queueing user-originated signals.
     limits: Weak<ResourceLimits>,
+    /// The target's VM identity slot, so a cross-lineage guest-address-range overlap can be
+    /// detected against its `owned_ranges` (see [`ProcessTable::overlaps_another_process`]).
+    /// `Weak<VmBookkeepingSlot<_>>` rather than `Weak<Process<_>>`: the latter drags in
+    /// `Process::alarm_timer`'s platform `TimerHandle`, which is not `Send`, and this table must
+    /// stay `Sync` (see the other fields' narrow `Weak`s, chosen for the same reason).
+    ///
+    /// DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): added to
+    /// directly test the hypothesis in `litebox-chromium-zygote-fork-corruption.md` -- that the
+    /// one flat, process-blind host address space (see `Process::owned_ranges`'s own doc
+    /// comment: "they live at disjoint addresses in the one host address space") ever actually
+    /// fails to keep two unrelated guest processes' address ranges disjoint, which is the
+    /// precondition for one process's fork/save/restore machinery to ever touch another's live
+    /// memory.
+    vm: Weak<VmBookkeepingSlot<Platform>>,
 }
+
+/// One selected recipient of a process-directed signal: its pending queue, the thread list to
+/// wake once the signal is posted, and the limits a user-originated signal is queued against.
+type SignalTarget<Platform> = (
+    crate::syscalls::signal::RemoteSignalTarget<Platform>,
+    Arc<Mutex<Platform, ProcessInner<Platform>>>,
+    Arc<ResourceLimits>,
+);
+
+/// The initial guest process's pid; `GlobalState::next_thread_id` starts at 2 to leave it free.
+const INIT_PID: i32 = 1;
 
 struct ChildRecord {
     ppid: i32,
@@ -894,8 +1239,116 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
                 signals,
                 process_inner: Arc::downgrade(&process.inner),
                 limits: Arc::downgrade(&process.limits),
+                vm: Arc::downgrade(&process.owned_ranges.vm),
             },
         );
+    }
+
+    /// DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): every OTHER
+    /// live process (by pid) whose `owned_ranges` currently overlaps `range` AND whose
+    /// `family_id` differs from `self_family_id` (0 = not in any family) -- i.e. excludes the
+    /// EXPECTED overlap between two members of the SAME `SharedAddressSpace` family (which, by
+    /// this platform's design, believe they own the same addresses; see that type's own doc
+    /// comment), surfacing only overlap between processes that are supposed to have disjoint
+    /// memory. Each hit also carries the other process's own `family_id`, so a hit can still be
+    /// told apart from "family-id tracking itself missed a relationship" (e.g. vfork, which does
+    /// not go through `Task::join_address_space`) during triage. An empty result under every
+    /// real trial is direct evidence against the "flat shared address space lets unrelated
+    /// lineages collide" hypothesis; any non-empty result is the smoking gun the investigation is
+    /// looking for -- see call sites in `Task::save_address_space` / `Task::restore_address_space`.
+    fn overlaps_another_process(
+        &self,
+        self_pid: i32,
+        self_family_id: usize,
+        range: &Range<usize>,
+    ) -> Vec<(i32, usize, Range<usize>)> {
+        if range.start >= range.end {
+            return Vec::new();
+        }
+        let others: Vec<(i32, Arc<VmBookkeepingSlot<Platform>>)> = {
+            let inner = self.inner.lock();
+            inner
+                .live
+                .iter()
+                .filter(|&(&pid, _)| pid != self_pid)
+                .filter_map(|(&pid, live)| Some((pid, live.vm.upgrade()?)))
+                .collect()
+        };
+        let mut hits = Vec::new();
+        for (other_pid, vm) in others {
+            let bookkeeping = vm.current();
+            let other_family_id = bookkeeping.family_id.load(Ordering::Acquire);
+            if self_family_id != 0 && self_family_id == other_family_id {
+                continue;
+            }
+            bookkeeping.owned_ranges.lock();
+            // SAFETY: `owned_ranges.lock()` above establishes exclusive access to the cell until
+            // `unlock()` below, mirroring `SharedVmLockedFieldGuard`'s own Deref.
+            let overlaps: Vec<Range<usize>> =
+                unsafe { &*bookkeeping.owned_ranges.value.get() }
+                    .intersect(range)
+                    .collect();
+            unsafe { bookkeeping.owned_ranges.unlock() };
+            for overlap in overlaps {
+                hits.push((other_pid, other_family_id, overlap));
+            }
+        }
+        hits
+    }
+
+    /// Every registered live pid, ascending -- what `/proc` lists.
+    pub(crate) fn live_pids(&self) -> Vec<i32> {
+        self.inner.lock().live.keys().copied().collect()
+    }
+
+    /// Thread `tid` of live process `tgid`, with that process's resource limits, for a
+    /// thread-directed signal from another process (`tgkill`/`rt_tgsigqueueinfo`). `None` when
+    /// either is not live, which is Linux's `ESRCH`.
+    pub(crate) fn remote_thread(
+        &self,
+        tgid: i32,
+        tid: i32,
+    ) -> Option<(Arc<ThreadRemote<Platform>>, Arc<ResourceLimits>)> {
+        let (process_inner, limits) = {
+            let inner = self.inner.lock();
+            let live = inner.live.get(&tgid)?;
+            (live.process_inner.upgrade()?, live.limits.upgrade()?)
+        };
+        let thread = process_inner.lock().threads.get(&tid).cloned()?;
+        Some((thread, limits))
+    }
+
+    /// The live threads of process `pid` (empty when it is not live), plus its process group
+    /// and real uid, for `getpriority`/`setpriority` over another process. Table lock first,
+    /// then the process lock, the order `send_process_signal` uses.
+    pub(crate) fn priority_targets(
+        &self,
+        pid: i32,
+    ) -> Option<(Vec<Arc<ThreadRemote<Platform>>>, i32, u32)> {
+        let (process_inner, pgid) = {
+            let inner = self.inner.lock();
+            let live = inner.live.get(&pid)?;
+            (
+                live.process_inner.upgrade()?,
+                live.process_group_id.upgrade()?.load(Ordering::Relaxed),
+            )
+        };
+        let inner = process_inner.lock();
+        Some((
+            inner.threads.values().cloned().collect(),
+            pgid,
+            inner.identity.uid,
+        ))
+    }
+
+    /// The `/proc/<pid>` view of registered live process `pid`, or `None` when no such process
+    /// is registered (or it has already torn down its `Process`).
+    pub(crate) fn proc_task_info(&self, pid: i32) -> Option<litebox::fs::proc::ProcTaskInfo> {
+        // Take the process handle out from under the table lock before locking the process
+        // itself, the same order `send_process_signal` uses.
+        let process_inner = self.inner.lock().live.get(&pid)?.process_inner.upgrade()?;
+        let inner = process_inner.lock();
+        Some(proc_task_info(pid, &inner))
     }
 
     pub(crate) fn send_process_signal(
@@ -924,12 +1377,55 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
         true
     }
 
-    /// Posts a process-directed signal to every live process in `process_group_id` except
-    /// `excluded_pid`.
+    /// Selects every live process `select` accepts.
     ///
     /// Target discovery and weak-reference upgrades happen under one process-table lock, so an
     /// exit cannot leave a selected target half-upgraded. Signal delivery and thread wakeups happen
-    /// after releasing that lock.
+    /// after releasing that lock, in [`Self::post_to_targets`].
+    fn select_signal_targets(
+        &self,
+        mut select: impl FnMut(i32, &LiveProcess<Platform>) -> bool,
+    ) -> Vec<SignalTarget<Platform>> {
+        let inner = self.inner.lock();
+        inner
+            .live
+            .iter()
+            .filter_map(|(&pid, live)| {
+                select(pid, live).then(|| {
+                    Some((
+                        live.signals.clone(),
+                        live.process_inner.upgrade()?,
+                        live.limits.upgrade()?,
+                    ))
+                })?
+            })
+            .collect()
+    }
+
+    /// Posts a user-originated `signal` to each of `targets` and wakes every one of their threads.
+    /// Returns how many processes were signalled.
+    fn post_to_targets(
+        targets: &[SignalTarget<Platform>],
+        signal: litebox_common_linux::signal::Signal,
+        siginfo: &litebox_common_linux::signal::Siginfo,
+    ) -> usize {
+        for (signals, process_inner, limits) in targets {
+            signals.post_from_user(limits, signal, siginfo.clone());
+            for thread in process_inner.lock().threads.values() {
+                thread.interrupt();
+            }
+        }
+        targets.len()
+    }
+
+    fn in_process_group(live: &LiveProcess<Platform>, process_group_id: i32) -> bool {
+        live.process_group_id
+            .upgrade()
+            .is_some_and(|group| group.load(Ordering::Acquire) == process_group_id)
+    }
+
+    /// Posts a process-directed signal to every live process in `process_group_id` except
+    /// `excluded_pid`. Returns how many processes were signalled.
     pub(crate) fn send_process_group_signal(
         &self,
         process_group_id: i32,
@@ -937,35 +1433,45 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
         signal: litebox_common_linux::signal::Signal,
         siginfo: litebox_common_linux::signal::Siginfo,
     ) -> usize {
-        let targets: Vec<_> = {
-            let inner = self.inner.lock();
-            inner
-                .live
-                .iter()
-                .filter_map(|(&pid, live)| {
-                    if pid == excluded_pid {
-                        return None;
-                    }
-                    let target_group = live.process_group_id.upgrade()?;
-                    if target_group.load(Ordering::Acquire) != process_group_id {
-                        return None;
-                    }
-                    Some((
-                        live.signals.clone(),
-                        live.process_inner.upgrade()?,
-                        live.limits.upgrade()?,
-                    ))
-                })
-                .collect()
-        };
-        for (signals, process_inner, limits) in &targets {
-            signals.post_from_user(limits, signal, siginfo.clone());
-            let inner = process_inner.lock();
-            for thread in inner.threads.values() {
-                thread.interrupt();
-            }
-        }
-        targets.len()
+        let targets = self.select_signal_targets(|pid, live| {
+            pid != excluded_pid && Self::in_process_group(live, process_group_id)
+        });
+        Self::post_to_targets(&targets, signal, &siginfo)
+    }
+
+    /// Posts a process-directed signal to every live process except `excluded_pid` and the
+    /// initial process, which `kill(-1, sig)` spares exactly as Linux spares init. Returns how
+    /// many processes were signalled.
+    pub(crate) fn send_signal_to_all_processes(
+        &self,
+        excluded_pid: i32,
+        signal: litebox_common_linux::signal::Signal,
+        siginfo: litebox_common_linux::signal::Siginfo,
+    ) -> usize {
+        let targets = self.select_signal_targets(|pid, _| pid != excluded_pid && pid != INIT_PID);
+        Self::post_to_targets(&targets, signal, &siginfo)
+    }
+
+    /// Whether some live process other than `excluded_pid` is in `process_group_id` -- the
+    /// existence test behind `kill(-pgid, 0)`.
+    pub(crate) fn has_process_group_member(
+        &self,
+        process_group_id: i32,
+        excluded_pid: i32,
+    ) -> bool {
+        self.inner.lock().live.iter().any(|(&pid, live)| {
+            pid != excluded_pid && Self::in_process_group(live, process_group_id)
+        })
+    }
+
+    /// Whether [`Self::send_signal_to_all_processes`] from `excluded_pid` would reach anything --
+    /// the existence test behind `kill(-1, 0)`.
+    pub(crate) fn has_other_live_process(&self, excluded_pid: i32) -> bool {
+        self.inner
+            .lock()
+            .live
+            .keys()
+            .any(|&pid| pid != excluded_pid && pid != INIT_PID)
     }
 
     /// Returns whether `pid` currently names a live guest process.
@@ -1016,15 +1522,27 @@ impl<Platform: ShimPlatform> ProcessTable<Platform> {
         // busybox's `ash` implements a blocking `wait`, via `sigsuspend` -- never wakes up. The
         // signal is discarded harmlessly by a parent that has no `SIGCHLD` handler; see
         // [`Task::has_pending_signals`].
-        if let Some(live) = inner.live.get(&parent) {
+        let parent_inner = inner.live.get(&parent).and_then(|live| {
             live.signals.post(
                 litebox_common_linux::signal::Signal::SIGCHLD,
                 crate::syscalls::signal::siginfo_child_exited(child, status),
             );
-        }
+            live.process_inner.upgrade()
+        });
         drop(inner);
         for waker in wakers {
             waker.wake();
+        }
+        // The wakers above only cover a parent registered in `wait4`/`rt_sigsuspend`. One blocked
+        // anywhere else interruptible -- `ppoll`, `read`, `nanosleep`, `epoll_pwait` -- has to be
+        // kicked the way `send_process_signal` kicks it, or it runs its `SIGCHLD` handler (or gets
+        // its `EINTR`) only once something unrelated wakes it: `sudo` and xterm's close path both
+        // hang exactly there. Deliverability stays the parent's own call, in
+        // `check_for_interrupt`; a parent ignoring `SIGCHLD` simply goes back to sleep.
+        if let Some(parent_inner) = parent_inner {
+            for thread in parent_inner.lock().threads.values() {
+                thread.interrupt();
+            }
         }
     }
 
@@ -1192,6 +1710,34 @@ struct ProcessInner<Platform: ShimPlatform> {
     exit_status: ExitStatus,
     /// The thread list for the process, mapped by thread ID.
     threads: BTreeMap<i32, Arc<ThreadRemote<Platform>>>,
+    /// See [`ProcIdentity`].
+    identity: ProcIdentity,
+}
+
+/// [`ProcessInner`] as `/proc/<pid>` describes it: the published identity plus every live
+/// thread's id and command name, ascending by tid.
+fn proc_task_info<Platform: ShimPlatform>(
+    pid: i32,
+    inner: &ProcessInner<Platform>,
+) -> litebox::fs::proc::ProcTaskInfo {
+    let identity = &inner.identity;
+    litebox::fs::proc::ProcTaskInfo {
+        pid,
+        ppid: identity.ppid,
+        uid: identity.uid,
+        gid: identity.gid,
+        comm: identity.comm.clone(),
+        cmdline: identity.cmdline.clone(),
+        exe: identity.exe.clone(),
+        threads: inner
+            .threads
+            .iter()
+            .map(|(&tid, remote)| litebox::fs::proc::ProcThreadInfo {
+                tid,
+                comm: remote.comm(),
+            })
+            .collect(),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1229,6 +1775,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 group_exit: false,
                 is_killing_other_threads: false,
                 threads: BTreeMap::from_iter([(pid, remote)]),
+                identity: ProcIdentity::default(),
             })),
             vm: vm.clone(),
             futex_manager,
@@ -1247,7 +1794,56 @@ impl<Platform: ShimPlatform> Process<Platform> {
             session_id: AtomicI32::new(pid),
             process_group_id: Arc::new(AtomicI32::new(process_group_id)),
             controlling_pty: AtomicU32::new(NO_CONTROLLING_PTY),
+            dumpable: AtomicBool::new(true),
+            address_space: Mutex::new(None),
         }
+    }
+
+    /// `PR_GET_DUMPABLE`.
+    pub(crate) fn dumpable(&self) -> bool {
+        self.dumpable.load(Ordering::Relaxed)
+    }
+
+    /// `PR_SET_DUMPABLE`, and the `execve`/`fork` resets described on the field.
+    pub(crate) fn set_dumpable(&self, dumpable: bool) {
+        self.dumpable.store(dumpable, Ordering::Relaxed);
+    }
+
+    /// `/proc/<pid>` view of this process: see [`ProcIdentity`].
+    pub(crate) fn proc_task_info(&self, pid: i32) -> litebox::fs::proc::ProcTaskInfo {
+        proc_task_info(pid, &self.inner.lock())
+    }
+
+    /// Publish the credential half of [`ProcIdentity`].
+    fn set_proc_credentials(&self, ppid: i32, uid: u32, gid: u32) {
+        let mut inner = self.inner.lock();
+        inner.identity.ppid = ppid;
+        inner.identity.uid = uid;
+        inner.identity.gid = gid;
+    }
+
+    /// Publish the thread-group leader's command name (`/proc/<pid>/comm`).
+    fn set_proc_comm(&self, comm: &[u8]) {
+        let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+        self.inner.lock().identity.comm = comm[..end].to_vec();
+    }
+
+    /// Publish the image half of [`ProcIdentity`] after a successful `execve`.
+    fn set_proc_image(&self, cmdline: Vec<u8>, exe: Option<alloc::string::String>) {
+        let mut inner = self.inner.lock();
+        inner.identity.cmdline = cmdline;
+        inner.identity.exe = exe;
+    }
+
+    /// A `fork` child starts out describing the same image as its parent (a new pid, and a
+    /// parent of its own, but the same `argv`/`exe`/`comm` until it `exec`s).
+    fn inherit_proc_identity(&self, parent: &Process<Platform>, ppid: i32) {
+        let mut identity = parent.inner.lock().identity.clone();
+        identity.ppid = ppid;
+        let mut inner = self.inner.lock();
+        inner.identity = identity;
+        self.dumpable.store(parent.dumpable(), Ordering::Relaxed);
+        drop(inner);
     }
 
     fn futex_manager(&self) -> &FutexManager<Platform> {
@@ -1272,6 +1868,15 @@ impl<Platform: ShimPlatform> Process<Platform> {
         if let Some(completion) = self.vfork_completion.lock().take() {
             completion.complete();
         }
+    }
+
+    /// Whether the parent this vfork child shares its memory with is itself a
+    /// [`SharedAddressSpace`] member. `false` once the vfork has completed.
+    fn vfork_parent_shares_address_space(&self) -> bool {
+        self.vfork_completion
+            .lock()
+            .as_ref()
+            .is_some_and(|completion| completion.parent_shares_address_space)
     }
 
     fn await_launch(&self) -> bool {
@@ -1430,6 +2035,15 @@ impl<Platform: ShimPlatform> Process<Platform> {
         if self.fork_gate.underlying_atomic().load(Ordering::Acquire) & FORK_GATE_CLOSED != 0 {
             self.fork_gate.wake_all();
         }
+        // Release any attached tracer rather than leaving it blocked forever on a rendezvous
+        // that can now never happen: this thread is gone, so a stop it may still owe its tracer
+        // will never arrive. A tracer's next `ptrace` request against this `tid` finds no
+        // `ThreadRemote` at all (already removed from `threads` above) and gets `ESRCH`, exactly
+        // like `tkill` against an exited thread -- PID/TID-reuse-safe by the same construction.
+        #[cfg(target_arch = "aarch64")]
+        if let Some(remote) = &data {
+            remote.ptrace.on_thread_exit();
+        }
         is_last_thread
     }
 }
@@ -1573,6 +2187,18 @@ enum ThreadInitState {
         stack: Option<usize>,
         tls: Option<ThreadLocalDescriptor>,
         set_child_tid: Option<UserPtrMut<i32>>,
+        /// The parent's FPSIMD register file at the moment of `clone`/`fork`,
+        /// captured on the parent thread (where [`ThreadProvider::get_fp_state`]
+        /// reads the *calling* thread's state) since the new host OS thread's
+        /// own per-thread FP shadow otherwise starts zeroed -- Linux's
+        /// `copy_thread` copies the parent's FPSIMD state into the child task,
+        /// so a cloned/forked guest thread must observe the same vector/FPCR/
+        /// FPSR values the parent had at the syscall, not a cleared file (that
+        /// reset is correct only for `execve`, via `NewProcess`).
+        ///
+        /// [`ThreadProvider::get_fp_state`]: litebox::platform::ThreadProvider::get_fp_state
+        #[cfg(target_arch = "aarch64")]
+        fp: litebox::platform::FpSimdState64,
     },
 }
 
@@ -1611,6 +2237,11 @@ pub(crate) struct Credentials {
     pub sgid: u32,
     supplementary_groups: SupplementaryGroups,
     no_new_privs: bool,
+    /// `PR_SET_KEEPCAPS` state. LiteBox does not model capabilities (see
+    /// `PrctlArg::SetKeepCaps`'s doc comment), so this is stored only so
+    /// `PR_GET_KEEPCAPS` reads back whatever was last set -- there is no
+    /// actual capability set for it to gate.
+    keep_caps: bool,
 }
 
 impl Credentials {
@@ -1628,6 +2259,7 @@ impl Credentials {
             sgid: egid,
             supplementary_groups: SupplementaryGroups::default(),
             no_new_privs: false,
+            keep_caps: false,
         }
     }
 
@@ -1637,6 +2269,10 @@ impl Credentials {
 
     pub(crate) fn no_new_privs(&self) -> bool {
         self.no_new_privs
+    }
+
+    pub(crate) fn keep_caps(&self) -> bool {
+        self.keep_caps
     }
 }
 
@@ -1658,17 +2294,69 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         new_comm[..comm.len()].copy_from_slice(comm);
         self.comm.set(new_comm);
 
-        // Publish to `/proc/<pid>/{stat,status,comm}`, if a `/proc` is mounted. `pid`/`ppid`
-        // never change after task construction, and live `setuid`/`setgid` credential changes
-        // are not tracked here (out of this call's scope); re-publishing them on every `comm`
-        // change is simply cheaper than a separate first-publish flag, not a claim that they can
-        // change. Note that this backend is shim-wide while pids now are not: with `fork`, the
-        // last task to publish wins, so `/proc/self` describes whichever process most recently
-        // `exec`ed rather than the reader.
-        if let Some(proc) = &self.global.proc_handle {
-            let credentials = self.credentials.borrow();
-            proc.set_identity(self.pid, self.ppid, credentials.uid, credentials.gid);
-            proc.set_comm(&new_comm);
+        // Publish to `/proc/<pid>/task/<tid>/comm` (every thread) and `/proc/<pid>/comm` (the
+        // leader), alongside the credentials `/proc/<pid>/status` reports -- see `ProcIdentity`.
+        self.thread.remote.set_comm(&new_comm);
+        if self.tid == self.pid {
+            self.process().set_proc_comm(&new_comm);
+        }
+        self.publish_proc_credentials();
+    }
+
+    /// Refresh the credential half of this process's [`ProcIdentity`] from this task's live
+    /// credentials.
+    pub(crate) fn publish_proc_credentials(&self) {
+        let credentials = self.credentials.borrow();
+        self.process()
+            .set_proc_credentials(self.ppid, credentials.uid, credentials.gid);
+    }
+
+    /// This task's own `/proc/<pid>` view, refreshed from its live credentials first; what the
+    /// shim publishes as `/proc/self` ahead of each lookup (see `syscalls::file`'s
+    /// `publish_proc_view`).
+    pub(crate) fn proc_task_info(&self) -> litebox::fs::proc::ProcTaskInfo {
+        self.publish_proc_credentials();
+        self.process().proc_task_info(self.pid)
+    }
+
+    /// Handle syscall `seccomp` (and `prctl(PR_SET_SECCOMP)`, which decodes to it).
+    ///
+    /// The shim has no BPF filter engine, so this answers as a kernel built without
+    /// `CONFIG_SECCOMP`: `ENOSYS` for both mode-setting operations, never a fake success. A `0`
+    /// here would make a sandboxed program believe its filter is enforced when nothing is --
+    /// Chromium's renderer would then run with a "layer-2 sandbox" that filters nothing.
+    /// Chromium's probes (`sandbox/linux/seccomp-bpf/sandbox_bpf.cc`,
+    /// `KernelSupportsSeccompBPF`/`KernelSupportsSeccompFlags`) take only `EFAULT` as "supported"
+    /// and `DCHECK` that anything else is `ENOSYS` or `EINVAL`, so `seccomp_bpf_supported_`
+    /// stays false, `StartSeccompBPF` returns without a promise and `CheckForBrokenPromises`
+    /// has nothing to `CHECK`; the setuid/namespace layer-1 sandbox is unaffected. The two
+    /// query operations answer as a kernel without `CONFIG_SECCOMP_FILTER` does
+    /// (`EOPNOTSUPP`); an unknown operation is `EINVAL`, as in Linux's `do_seccomp`.
+    pub(crate) fn sys_seccomp(
+        &self,
+        operation: u32,
+        flags: u32,
+        args: UserPtr<u8>,
+    ) -> Result<usize, Errno> {
+        const SECCOMP_SET_MODE_STRICT: u32 = 0;
+        const SECCOMP_SET_MODE_FILTER: u32 = 1;
+        const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
+        const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
+        // One line per (operation, flags), not per call: the per-call `args` pointer is in
+        // the trace-level `syscall req=` record.
+        let _ = args;
+        match operation {
+            SECCOMP_SET_MODE_STRICT | SECCOMP_SET_MODE_FILTER => {
+                log_unsupported!(
+                    "seccomp(operation = {operation}, flags = {flags:#x}): no BPF filtering -> ENOSYS"
+                );
+                Err(Errno::ENOSYS)
+            }
+            SECCOMP_GET_ACTION_AVAIL | SECCOMP_GET_NOTIF_SIZES => {
+                log_unsupported!("seccomp(operation = {operation}) -> EOPNOTSUPP");
+                Err(Errno::EOPNOTSUPP)
+            }
+            _ => Err(Errno::EINVAL),
         }
     }
 
@@ -1721,7 +2409,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // Note we don't support capabilities in LiteBox, so we always return 0.
                 Ok(0)
             }
-            PrctlArg::GetDumpable => Ok(1),
+            PrctlArg::GetDumpable => Ok(usize::from(self.process().dumpable())),
+            // Only `SUID_DUMP_DISABLE` (0) and `SUID_DUMP_USER` (1) may be set; Linux refuses
+            // `SUID_DUMP_ROOT` (2) and anything else with `EINVAL`.
+            PrctlArg::SetDumpable(value) => match value {
+                0 | 1 => {
+                    self.process().set_dumpable(value == 1);
+                    Ok(0)
+                }
+                _ => Err(Errno::EINVAL),
+            },
             PrctlArg::SetNoNewPrivs => {
                 let mut credentials = self.credentials.borrow().as_ref().clone();
                 credentials.no_new_privs = true;
@@ -1731,6 +2428,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             PrctlArg::GetNoNewPrivs => Ok(usize::from(
                 self.credentials.borrow().no_new_privs(),
             )),
+            PrctlArg::SetKeepCaps(keep) => {
+                let mut credentials = self.credentials.borrow().as_ref().clone();
+                credentials.keep_caps = keep;
+                *self.credentials.borrow_mut() = Arc::new(credentials);
+                Ok(0)
+            }
+            PrctlArg::GetKeepCaps => Ok(usize::from(self.credentials.borrow().keep_caps())),
             // `PrctlArg` is `#[non_exhaustive]`; the syscall decoder rejects every option not
             // represented above with `EINVAL` before constructing one.
             _ => unreachable!(),
@@ -1903,10 +2607,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let clear_child_tid_on_exit =
             self.process().nr_threads() > 1 || self.process().shares_parent_vm();
         let can_touch_guest_memory = self
-            .address_space
-            .borrow()
-            .as_ref()
-            .is_none_or(|membership| membership.holding.get());
+            .membership()
+            .is_none_or(|membership| membership.holding());
         if exit_is_publishable && can_touch_guest_memory {
             if let Some(clear_child_tid) = self.thread.clear_child_tid.take()
                 && clear_child_tid_on_exit
@@ -1940,11 +2642,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // forever. An aborted launch never received the fork token in the first place, despite its
         // not-yet-running membership being constructed as the future holder, so it must only drop
         // that membership rather than release the actual parent's token. See [`SharedAddressSpace`].
-        if exit_is_publishable {
-            let _ = self.leave_address_space();
+        // The ranges this process shared with its family, captured before the membership is
+        // given up below: what is *not* in them is this process's alone to release.
+        let shared_ranges = self
+            .membership()
+            .map(|membership| membership.shared_ranges.lock().clone());
+        // Membership is the process's, so only its last thread settles it; a sibling still
+        // running needs the token exactly as before.
+        let alone_in_address_space = if !is_last_thread {
+            false
+        } else if !exit_is_publishable {
+            self.process().address_space.lock().take();
+            false
+        } else if self.process().shares_parent_vm() {
+            // The memory is the vfork parent's, and so is any family this task forked into.
+            self.hand_address_space_to_vfork_parent();
+            false
         } else {
-            self.address_space.borrow_mut().take();
-        }
+            self.leave_address_space()
+        };
 
         // `FilesState` is shared (via `Arc`) across every `CLONE_FILES` thread of the process,
         // and closing an fd is only ever done explicitly (via `do_close`, which routes through
@@ -1960,7 +2676,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // the one exiting, matching `CLONE_FILES` semantics (a single thread of a still-running
         // multithreaded process exiting must NOT close fds out from under its siblings).
         if is_last_thread {
+            // Descriptors go first: anything at the other end of one of them (an X server seeing
+            // its client vanish, a pipe reader getting EOF) then learns of the exit before the
+            // slower memory teardown below, and nothing in a close path needs the mappings --
+            // shared-file copy-back holds its own entry handles, not fds, and runs on `munmap`.
             self.close_all_fds_on_exit();
+            // Linux tears a process's address space down when its last thread exits. Here that
+            // is only safe when no other guest process can be using the bytes at this process's
+            // addresses: a fork-family member that is not alone has a parked sibling whose live
+            // image occupies exactly these ranges (the child took the parent's image over at
+            // the same addresses), and a vfork-shared child's `owned_ranges` *are* its parent's.
+            // Both of those keep their memory for the survivor, exactly as `execve` decides via
+            // `leave_address_space_if_alone`/`detach_vfork_vm`. Everything else -- every
+            // ordinary exec'd process -- releases what it owns, so short-lived processes stop
+            // leaking their whole image and stack into the process-blind page manager forever.
+            if alone_in_address_space && exit_is_publishable && !self.process().shares_parent_vm() {
+                self.release_owned_memory_on_exit();
+            } else if exit_is_publishable
+                && !self.process().shares_parent_vm()
+                && let Some(shared_ranges) = shared_ranges
+            {
+                // Still a family member's sibling: the shared ranges stay (the others own them
+                // too), but what this process mapped for itself after the fork is nobody else's
+                // and would otherwise leak for the family's lifetime -- a zygote spawns many
+                // short-lived children.
+                self.release_private_memory_on_exit(&shared_ranges);
+            }
             // The process is gone: become a zombie its parent can `wait4`, and let go of any
             // children of our own (nothing can ever reap them now).
             let status = self.thread.process.inner.lock().exit_status;
@@ -2122,7 +2863,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let process_kind_flags = CloneFlags::VM | CloneFlags::VFORK;
         let process_tid_flags =
             CloneFlags::PARENT_SETTID | CloneFlags::CHILD_SETTID | CloneFlags::CHILD_CLEARTID;
-        let supported_process_flags = process_kind_flags | process_tid_flags;
+        // `CLONE_FS` on a new *process* shares the cwd/umask/root with the parent, the way
+        // Chromium's `chrome-sandbox` spawns its chroot helper (`clone(CLONE_FS | SIGCHLD)`)
+        // so that the helper's `chroot` lands on the sandboxed process.
+        let supported_process_flags = process_kind_flags | process_tid_flags | CloneFlags::FS;
         if !flags.intersects(!supported_process_flags) {
             match flags & process_kind_flags {
                 kind_flags if kind_flags.is_empty() => {
@@ -2187,15 +2931,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        // A new thread would run on memory this task only holds a *turn* on (see
-        // `SharedAddressSpace`), and it has no turn of its own: it and the token holder would
-        // both write to the same pages, and one of them would later have its writes rolled back
-        // by a restore it knows nothing about. There is no way to support that here, so refuse
-        // rather than corrupt the guest silently.
-        if self.shares_address_space() {
-            log_unsupported!("clone of a new thread from a process that has forked");
-            return Err(Errno::ENOSYS);
-        }
+        // A new thread shares its process's place in a `SharedAddressSpace` (membership is
+        // per process), so a forked child that never `exec`s may go multithreaded; see
+        // `Task::quiesce_and_hand_off` for how such a process takes its turns. This used to
+        // opportunistically drop the membership here when the process had gone solo in its
+        // family (every forked child since exited or exec'ed) -- but a process is not done
+        // forking just because its most recent child already exited (a fork server's ordinary
+        // loop), and doing this on the hottest possible path (`pthread_create`, called before
+        // every new thread) churned through disjoint families constantly, implicated live
+        // 2026-09-07 in guest-level `struct pthread` corruption after a fork (see
+        // `Task::release_address_space`'s doc comment and memory
+        // litebox-chromium-zygote-fork-corruption.md). A solo-but-still-membered process costs
+        // nothing to leave as is: `leave_address_space` (execve, or this process's last thread
+        // exiting) retires it for real when the process is actually done with it.
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
@@ -2261,10 +3009,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
+        thread.remote.set_comm(&self.comm.get());
         thread.init_state.set(ThreadInitState::NewThread {
             stack: sp,
             tls,
             set_child_tid,
+            // Captured on this (the parent/calling) thread: `get_fp_state`
+            // reads whichever thread it is called on, so the child's FPSIMD
+            // file must be read here, before the new host OS thread (with its
+            // own zeroed FP shadow) starts running.
+            #[cfg(target_arch = "aarch64")]
+            fp: self.global.platform.get_fp_state(),
         });
         thread.clear_child_tid.set(clear_child_tid);
 
@@ -2284,7 +3039,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
-                        address_space: RefCell::new(None),
                         guest_sp: Cell::new(0),
                     },
                 }),
@@ -2312,15 +3066,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if args.exit_signal > MAX_SIGNAL_NUMBER {
             return Err(Errno::EINVAL);
         }
-        if args.stack != 0
-            || args.stack_size != 0
-            || args.set_tid != 0
-            || args.set_tid_size != 0
-            || args.cgroup != 0
-        {
-            log_unsupported!("fork with a stack, set_tid or cgroup");
+        if args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
+            log_unsupported!("fork with set_tid or cgroup");
             return Err(Errno::EINVAL);
         }
+        // A stack of the child's own is honoured only when the child runs on the parent's live
+        // memory (`CLONE_VM|CLONE_VFORK`): musl's `posix_spawn` is `clone(CLONE_VM|CLONE_VFORK|
+        // SIGCHLD, stack, ...)` with the child function's frame on a small buffer in the parent,
+        // and the suspended parent is exactly why that memory stays valid. A copying fork snapshots
+        // and restores memory around the parent's own `sp`, which a foreign stack would sit outside
+        // of, so it is still refused. Legacy `clone` passes the initial `sp` itself (`stack_size`
+        // 0); `clone3` passes the base and size, the way `do_clone` already reads them.
+        let child_sp = if args.stack != 0 || args.stack_size != 0 {
+            if !kind.shares_parent_vm() || args.stack == 0 {
+                log_unsupported!("fork with a stack");
+                return Err(Errno::EINVAL);
+            }
+            let stack: usize = args.stack.trunc();
+            Some(stack.wrapping_add(args.stack_size.trunc()))
+        } else {
+            None
+        };
         let child_tid_ptr =
             (args.child_tid != 0).then(|| UserPtrMut::from_usize(args.child_tid.trunc()));
         let set_child_tid = flags
@@ -2341,6 +3107,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // task suspended while sibling threads continue on the parent's copy needs a
             // process-wide address-space membership, which this backend does not yet have.
             log_unsupported!("CLONE_VFORK without CLONE_VM from a multithreaded process");
+            return Err(Errno::ENOSYS);
+        }
+        // A vfork child that has not exec'd yet runs on its *parent's* memory, so the family
+        // this fork creates is really the parent's: the child stands in for it until it exits or
+        // execs and hands the membership over (`hand_address_space_to_vfork_parent`). That has
+        // nowhere to go when the parent is already a member of another family, so refuse rather
+        // than run two token protocols over one memory.
+        if kind.copies_vm()
+            && self.process().shares_parent_vm()
+            && self.process().vfork_parent_shares_address_space()
+        {
+            log_unsupported!("fork from a vfork child whose parent has itself forked");
             return Err(Errno::ENOSYS);
         }
         let _fork_gate_guard = match kind {
@@ -2365,7 +3143,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let child_pid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let files = self.files.borrow().fork_copy(self)?;
-        let fs = alloc::sync::Arc::new((**self.fs.borrow()).clone());
+        let fs = if flags.contains(CloneFlags::FS) {
+            self.fs.borrow().clone()
+        } else {
+            alloc::sync::Arc::new((**self.fs.borrow()).clone())
+        };
 
         // The guest's thread pointer lives in a per-host-thread slot, so the new host thread has
         // to be told the value the parent is running with -- the libc data it points at is in the
@@ -2400,19 +3182,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                     .then_some(tid_range)
             });
-        let (shared, preserved_stack_ranges) = if kind.copies_vm() {
-            let shared = self.join_address_space();
+        let (shared, preserved_stack_ranges, shared_ranges) = if kind.copies_vm() {
+            let membership = self.join_address_space();
             let mut ranges = self.preserved_address_space_ranges();
             if let Some(range) = child_tid_range.as_ref() {
                 ranges.insert_bounded(range.clone(), MAX_PRESERVED_STACK_RANGES);
             }
-            (Some(shared), ranges)
+            // Everything the parent owns right now is what the child inherits, and so what the
+            // two of them must copy out and back for each other.
+            let shared_ranges = self.process().owned_ranges.lock().clone();
+            (Some(membership.shared.clone()), ranges, shared_ranges)
         } else {
-            (None, OwnedRanges::default())
+            (None, OwnedRanges::default(), OwnedRanges::default())
         };
         let vfork_completion = kind
             .waits_for_exec_or_exit()
-            .then(|| Arc::new(VforkCompletion::new()));
+            .then(|| Arc::new(VforkCompletion::new(self.shares_address_space())));
         let launch = Arc::new(ProcessLaunch::new());
 
         let thread = match kind {
@@ -2438,10 +3223,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ),
         };
         thread.init_state.set(ThreadInitState::NewThread {
-            // No stack of its own: it runs on the parent's, below the parent's `sp`.
-            stack: None,
+            // Usually no stack of its own: it runs on the parent's, below the parent's `sp`.
+            stack: child_sp,
             tls,
             set_child_tid,
+            // See the `do_clone` call site's identical capture: read on the
+            // parent thread, before the child's own OS thread (and its
+            // separately zeroed FP shadow) starts running.
+            #[cfg(target_arch = "aarch64")]
+            fp: self.global.platform.get_fp_state(),
         });
         thread.clear_child_tid.set(clear_child_tid);
 
@@ -2457,14 +3247,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             fs: fs.into(),
             files: Arc::new(files).into(),
             signals: self.signals.clone_for_new_process(),
-            address_space: RefCell::new(shared.as_ref().map(|shared| AddressSpaceMembership {
-                shared: shared.clone(),
-                holding: Cell::new(true),
-                parked: RefCell::new(None),
-                preserved_stack_ranges: RefCell::new(preserved_stack_ranges.clone()),
-            })),
             guest_sp: Cell::new(fork_sp),
         };
+        if let Some(shared) = shared.as_ref() {
+            let membership = Arc::new(AddressSpaceMembership::new(
+                shared.clone(),
+                preserved_stack_ranges.clone(),
+                shared_ranges,
+            ));
+            membership.mark_acquired(self.global.platform.now());
+            *child.process().address_space.lock() = Some(membership);
+            // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+            // `VmBookkeeping::family_id`. This is the CHILD's side of joining the family --
+            // `Task::join_address_space` (which sets `family_id` on the parent) only ever runs
+            // on the forking (parent) task, so without this the child's own `family_id` would
+            // stay at its default 0 despite genuinely, correctly sharing `shared` with the
+            // parent, producing a false-positive "cross-lineage" reading for every legitimate
+            // parent/child overlap.
+            child
+                .process()
+                .vm
+                .current()
+                .family_id
+                .store(Arc::as_ptr(shared) as usize, Ordering::Release);
+        }
+        let child_inner = child.process().inner.clone();
+        child.process().limits.inherit_from(&self.process().limits);
+        child.process().inherit_proc_identity(self.process(), self.pid);
+        child.thread.remote.set_comm(&self.comm.get());
         child.process().session_id.store(
             self.process().session_id.load(Ordering::Acquire),
             Ordering::Release,
@@ -2506,8 +3316,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if created_parent_address_space {
                 // `join_address_space` made this membership solely for the child that failed to
                 // launch. The parent still holds the token, so discard the bookkeeping without
-                // releasing it; retaining it would spuriously make later thread clones fail.
-                self.address_space.borrow_mut().take();
+                // releasing it.
+                self.process().address_space.lock().take();
             }
             return Err(Errno::ENOMEM);
         }
@@ -2528,7 +3338,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // space only now: if host-thread creation failed, the parent still owns the token and can
         // return ENOMEM instead of waiting forever for a child that does not exist.
         if kind.copies_vm() {
-            self.park_and_hand_off(fork_sp, child_pid);
+            self.park_and_hand_off(fork_sp, child_pid, &child_inner);
         }
         launch.commit();
 
@@ -2539,8 +3349,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.acquire_address_space()
             }
             ProcessCloneKind::VforkShared => {
-                vfork_completion.as_ref().unwrap().wait();
-                false
+                let completion = vfork_completion.as_ref().unwrap();
+                completion.wait();
+                self.inherit_address_space_from_vfork_child(completion)
             }
         };
         if parent_image_is_live
@@ -2552,124 +3363,296 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(usize::try_from(child_pid).unwrap())
     }
 
-    /// Returns this task's shared address space, creating one (with this task as its first
-    /// member and current holder) if it is not in one yet.
-    fn join_address_space(&self) -> Arc<SharedAddressSpace<Platform>> {
-        let mut slot = self.address_space.borrow_mut();
+    /// Returns this process's membership in a shared address space, creating one (with this
+    /// process as its first member and current holder) if it is not in one yet, and records the
+    /// ranges this process owns right now as shared: a child forked now inherits all of them.
+    fn join_address_space(&self) -> Arc<AddressSpaceMembership<Platform>> {
+        let owned = self.process().owned_ranges.lock().clone();
+        let mut slot = self.process().address_space.lock();
         if let Some(membership) = slot.as_ref() {
             debug_assert!(
-                membership.holding.get(),
+                membership.holding(),
                 "forking without holding the address space"
             );
-            return membership.shared.clone();
+            membership.shared_ranges.lock().union_with(&owned);
+            return membership.clone();
         }
-        let shared = Arc::new(SharedAddressSpace::new(self.tid));
-        *slot = Some(AddressSpaceMembership {
-            shared: shared.clone(),
-            holding: Cell::new(true),
-            parked: RefCell::new(None),
-            preserved_stack_ranges: RefCell::new(OwnedRanges::default()),
-        });
-        shared
+        // DIAGNOSTIC (musl-fork-atfork-parent-corruption-20260905, temporary, additive-only):
+        // logs every time a fork starts a *brand new* SharedAddressSpace rather than reusing an
+        // existing one for this process. Fires legitimately on a process's first-ever fork; if it
+        // also fires on a LATER fork by a process with a live fork-family history, that would mean
+        // `leave_address_space_if_alone` (called from every plain `do_clone`/pthread_create) raced
+        // this fork and dropped the prior membership out from under it, silently starting a second,
+        // disconnected token/SharedAddressSpace over the same physical guest memory.
+        litebox_util_log::debug!(
+            pid:? = self.pid, tid:? = self.tid;
+            "diag: join_address_space creating a brand-new SharedAddressSpace (no prior membership)"
+        );
+        let shared = Arc::new(SharedAddressSpace::new(self.pid, &self.process().inner));
+        // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+        // `VmBookkeeping::family_id`.
+        self.process()
+            .vm
+            .current()
+            .family_id
+            .store(Arc::as_ptr(&shared) as usize, Ordering::Release);
+        let membership = Arc::new(AddressSpaceMembership::new(
+            shared,
+            OwnedRanges::default(),
+            owned,
+        ));
+        *slot = Some(membership.clone());
+        membership
     }
 
     fn preserve_address_space_range(&self, range: Range<usize>) {
-        let slot = self.address_space.borrow();
-        let membership = slot.as_ref().expect("preserving a range before fork join");
+        let membership = self.membership().expect("preserving a range before fork join");
         membership
             .preserved_stack_ranges
-            .borrow_mut()
+            .lock()
             .insert_bounded(range, MAX_PRESERVED_STACK_RANGES);
     }
 
+    /// This process's membership, if its memory is shared with another guest process.
+    fn membership(&self) -> Option<Arc<AddressSpaceMembership<Platform>>> {
+        self.process().address_space.lock().clone()
+    }
+
     fn preserved_address_space_ranges(&self) -> OwnedRanges {
-        let slot = self.address_space.borrow();
-        let membership = slot.as_ref().expect("copying ranges before fork join");
-        let ranges = membership.preserved_stack_ranges.borrow().clone();
+        let membership = self.membership().expect("copying ranges before fork join");
+        let ranges = membership.preserved_stack_ranges.lock().clone();
         ranges
     }
 
-    /// Copies this task's memory out and passes the address space directly to `tid`.
+    /// Copies this process's memory out and passes the address space directly to the child
+    /// process `pid` (thread table `inner`).
     ///
     /// # Panics
     ///
-    /// Panics if this task is not currently a member holding the token; `fork` is the only
+    /// Panics if this process is not currently a member holding the token; `fork` is the only
     /// caller and it has just made sure of both.
-    fn park_and_hand_off(&self, sp: usize, tid: i32) {
-        let slot = self.address_space.borrow();
-        let membership = slot.as_ref().expect("forking outside an address space");
-        assert!(membership.holding.get());
-        let preserved = membership.preserved_stack_ranges.borrow();
-        let saved = self.save_address_space(sp, &preserved);
-        drop(preserved);
-        *membership.parked.borrow_mut() = Some(saved);
-        membership.holding.set(false);
-        membership.shared.hand_off_to(tid);
+    fn park_and_hand_off(
+        &self,
+        sp: usize,
+        pid: i32,
+        inner: &Arc<Mutex<Platform, ProcessInner<Platform>>>,
+    ) {
+        let membership = self.membership().expect("forking outside an address space");
+        assert!(membership.holding());
+        let saved = {
+            let preserved = membership.preserved_stack_ranges.lock();
+            let shared_ranges = membership.shared_ranges.lock();
+            self.save_address_space(sp, &preserved, &shared_ranges)
+        };
+        // Linux `dup_mmap`: `MADV_WIPEONFORK` ranges are zero-filled in the child. The parent's
+        // copy has just been saved, so wiping the live pages now (before the child runs on them)
+        // is exactly what the child sees and nothing the parent cannot restore. Wipes are
+        // clamped to this process's own ranges: the manager's entries may cover a neighbour.
+        let owned = self.process().owned_ranges.lock();
+        let wiped = unsafe {
+            self.global
+                .pm
+                .wipe_on_fork_child(|r, _| owned.intersect(&r).collect::<Vec<_>>())
+        };
+        drop(owned);
+        if wiped != 0 {
+            litebox_util_log::debug!(pid:? = self.pid, tid:? = pid, wiped; "fork: wiped MADV_WIPEONFORK ranges for the child");
+        }
+        *membership.parked.lock() = Some(saved);
+        membership.holding.store(false, Ordering::Release);
+        membership.shared.hand_off_to(pid, inner);
     }
 
     /// Gives the address space up for as long as this task is blocked, so that another member can
     /// run on it. Paired with [`Task::acquire_address_space`].
     ///
-    /// Does nothing if this task is not sharing an address space, or is already parked. If it is
-    /// the *only* remaining member, membership is dropped instead of parked: nobody can take the
-    /// token, so copying memory out and back would be pure cost. (A new member can only appear
-    /// via `fork`, which requires holding the token, so no member can turn up while this runs.)
+    /// Does nothing if this process is not sharing an address space, or is already parked. If it
+    /// is the *only* remaining member, membership is dropped instead of parked: nobody can take
+    /// the token, so copying memory out and back would be pure cost. (A new member can only
+    /// appear via `fork`, which requires holding the token, so no member can turn up while this
+    /// runs.)
+    ///
+    /// A single-threaded member parks eagerly, every time it blocks: it has nothing else to run,
+    /// and a shell's forked child must be able to run the moment the shell waits on it. A
+    /// multithreaded member parks only when another member is actually waiting -- a sibling
+    /// thread may well have work to do, and a hand-off means quiescing all of them -- see
+    /// [`Task::quiesce_and_hand_off`].
     pub(crate) fn release_address_space(&self) {
-        let mut slot = self.address_space.borrow_mut();
-        let Some(membership) = slot.as_ref() else {
+        let Some(membership) = self.membership() else {
             return;
         };
-        if !membership.holding.get() {
+        if !membership.holding() {
+            return;
+        }
+        // `strong_count == 1` ("nobody else is left in this family") is only a safe signal to
+        // tear the membership down outright for a single-threaded member: it is about to park
+        // anyway (below), so there is nothing else useful the fact could gate. For a
+        // multithreaded member -- a fork server / zygote is exactly this shape -- it is not:
+        // the most recently forked child dying does not mean THIS process will not fork again
+        // shortly, and destroying the family here just forces the next fork's `join_address_space`
+        // to build a brand-new one from scratch instead of reusing this one. Diagnosed live
+        // 2026-09-07 (musl-fork-atfork-parent-corruption-20260905): a Chromium zygote observed
+        // creating 23 independent, disjoint `SharedAddressSpace` families in a single ~7 s run
+        // this way, immediately before/around guest-level `struct pthread` corruption in forked
+        // children (see memory litebox-chromium-zygote-fork-corruption.md). The multithreaded
+        // branch below already no-ops correctly when genuinely alone (`waiters()` is 0 with
+        // nobody left to wait), so skipping this shortcut there costs nothing but leaving an
+        // otherwise-idle membership allocated a little longer, until `leave_address_space`
+        // (execve or last-thread-exit) retires it for real.
+        if self.process().nr_threads() > 1 {
+            if membership.shared.waiters() > 0
+                && membership.quantum_elapsed(self.global.platform.now())
+            {
+                self.quiesce_and_hand_off(&membership);
+            }
             return;
         }
         if Arc::strong_count(&membership.shared) == 1 {
-            *slot = None;
+            *self.process().address_space.lock() = None;
+            // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+            // `VmBookkeeping::family_id`.
+            self.process().vm.current().family_id.store(0, Ordering::Release);
             return;
         }
-        let preserved = membership.preserved_stack_ranges.borrow();
-        let saved = self.save_address_space(self.guest_sp.get(), &preserved);
-        drop(preserved);
-        *membership.parked.borrow_mut() = Some(saved);
-        membership.holding.set(false);
+        let saved = {
+            let preserved = membership.preserved_stack_ranges.lock();
+            let shared_ranges = membership.shared_ranges.lock();
+            self.save_address_space(self.guest_sp.get(), &preserved, &shared_ranges)
+        };
+        *membership.parked.lock() = Some(saved);
+        membership.holding.store(false, Ordering::Release);
         membership.shared.release();
     }
 
-    /// Takes the address space back and restores this task's memory into it, blocking until the
-    /// current holder gives it up.
+    /// Hands the address space to a waiting member and takes it back, on behalf of this whole
+    /// multithreaded process. Called at every safe point -- before blocking, when kicked out of
+    /// a wait, and before re-entering guest code -- once a waiter exists.
     ///
-    /// Does nothing if this task is not sharing an address space, or already holds it. Returns
-    /// whether this task's own memory image is live when the call completes.
+    /// A single-threaded member does not go through here: it yields when it blocks, and only
+    /// then (no preemption), which is the behaviour every shell-shaped guest was built against.
+    pub(crate) fn yield_address_space_to_waiters(&self) {
+        let Some(membership) = self.membership() else {
+            return;
+        };
+        if !membership.holding() || membership.shared.waiters() == 0 || self.is_exiting() {
+            return;
+        }
+        if self.process().nr_threads() <= 1 {
+            return;
+        }
+        if !membership.quantum_elapsed(self.global.platform.now()) {
+            return;
+        }
+        self.quiesce_and_hand_off(&membership);
+    }
+
+    /// The multithreaded hand-off. The first thread here becomes the initiator: it closes the
+    /// fork gate so every sibling parks at its next safe point (blocked siblings are kicked
+    /// there; one mid-copy into guest memory finishes first), copies the process's shared image
+    /// out, releases the token, waits for it to come back, restores the image and reopens the
+    /// gate. Any later thread just parks at that gate like a sibling. Nothing but the initiator
+    /// touches guest memory between the copy out and the copy back.
+    fn quiesce_and_hand_off(&self, membership: &Arc<AddressSpaceMembership<Platform>>) {
+        if membership
+            .quiescing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.park_while_fork_gate_closed();
+            return;
+        }
+        let started = self.global.platform.now();
+        let guard = self.park_sibling_threads_for_fork();
+        let quiesced = self.global.platform.now();
+        // Re-checked with every sibling parked: the token may have changed hands while this
+        // thread was closing the gate (a sibling won the race in `acquire_address_space`).
+        if membership.holding() && membership.shared.waiters() > 0 {
+            let saved = {
+                let preserved = membership.preserved_stack_ranges.lock();
+                let shared_ranges = membership.shared_ranges.lock();
+                self.save_address_space(self.guest_sp.get(), &preserved, &shared_ranges)
+            };
+            *membership.parked.lock() = Some(saved);
+            membership.holding.store(false, Ordering::Release);
+            membership.shared.release();
+            membership.shared.wait_until_taken(|| self.is_exiting());
+            let released = self.global.platform.now();
+            let got = membership.shared.acquire(
+                self.pid,
+                || membership.holding(),
+                || self.is_exiting(),
+                &self.process().inner,
+            );
+            let back = self.global.platform.now();
+            if got && !membership.holding() {
+                if let Some(saved) = membership.parked.lock().take() {
+                    self.restore_address_space(saved);
+                }
+                membership.holding.store(true, Ordering::Release);
+            }
+            if got {
+                membership.mark_acquired(self.global.platform.now());
+            }
+            litebox_util_log::debug!(
+                pid:? = self.pid, tid:? = self.tid,
+                quiesce_us:? = quiesced.duration_since(&started).as_micros(),
+                save_us:? = released.duration_since(&quiesced).as_micros(),
+                away_us:? = back.duration_since(&released).as_micros(),
+                got;
+                "address space: multithreaded hand-off complete"
+            );
+        }
+        membership.quiescing.store(false, Ordering::Release);
+        drop(guard);
+    }
+
+    /// Takes the address space back and restores this process's memory into it, blocking until
+    /// the current holder gives it up.
+    ///
+    /// Does nothing if this process is not sharing an address space, or already holds it. Returns
+    /// whether this process's own memory image is live when the call completes.
     pub(crate) fn acquire_address_space(&self) -> bool {
-        let slot = self.address_space.borrow();
-        let Some(membership) = slot.as_ref() else {
+        let Some(membership) = self.membership() else {
             return true;
         };
-        if membership.holding.get() {
+        if membership.holding() {
             return true;
         }
-        if !membership.shared.acquire(self.tid, || self.is_exiting()) {
+        if !membership.shared.acquire(
+            self.pid,
+            || membership.holding(),
+            || self.is_exiting(),
+            &self.process().inner,
+        ) {
             // Preserve the non-holding membership until exit cleanup. Dropping it here would make
             // `prepare_for_exit` mistake whichever sibling's image is live for this task's own and
             // dereference stale robust-list/child-TID pointers into that sibling.
             return false;
         }
-        membership.holding.set(true);
-        if let Some(saved) = membership.parked.borrow_mut().take() {
-            self.restore_address_space(saved);
+        if !membership.holding() {
+            if let Some(saved) = membership.parked.lock().take() {
+                self.restore_address_space(saved);
+            }
+            membership.holding.store(true, Ordering::Release);
+            membership.mark_acquired(self.global.platform.now());
         }
         true
     }
 
     /// Leaves the shared address space for good, waking anything waiting for it.
     ///
-    /// Returns `true` if, afterwards, this task's guest memory is its alone -- either it was
+    /// Returns `true` if, afterwards, this process's guest memory is its alone -- either it was
     /// never shared, or this was the last member -- and so is safe to tear down. Called from
-    /// `execve`, whose new image lives at addresses no other member owns, and from task exit.
+    /// `execve`, whose new image lives at addresses no other member owns, and from the exit of
+    /// a process's last thread.
     fn leave_address_space(&self) -> bool {
-        let Some(membership) = self.address_space.borrow_mut().take() else {
+        let Some(membership) = self.process().address_space.lock().take() else {
             return true;
         };
-        if membership.holding.get() {
+        // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+        // `VmBookkeeping::family_id`. This process is leaving its family for good either way.
+        self.process().vm.current().family_id.store(0, Ordering::Release);
+        if membership.holding() {
             membership.shared.release();
         }
         // The only other strong reference is this one, so no other member is left to care about
@@ -2678,9 +3661,68 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Arc::strong_count(&membership.shared) == 1
     }
 
-    /// Whether this task's guest memory is shared with another guest process.
+    /// Whether this process's guest memory is shared with another guest process.
     fn shares_address_space(&self) -> bool {
-        self.address_space.borrow().is_some()
+        self.process().address_space.lock().is_some()
+    }
+
+    /// Passes this vfork child's [`AddressSpaceMembership`] -- token, parked image and all -- to
+    /// the parent whose memory it has been running on, which
+    /// [`Task::inherit_address_space_from_vfork_child`] installs once the vfork completes.
+    ///
+    /// The family was created by a `fork` this child issued on the parent's memory (see
+    /// `do_process_clone`), so its other members' images alias the *parent's* mappings; the
+    /// parent has to keep taking turns with them, exactly as it would had it forked itself. A
+    /// membership is only ever handed over before [`Process::complete_vfork`] wakes the parent.
+    /// Dropped nothing: a child that never forked has no membership to pass.
+    fn hand_address_space_to_vfork_parent(&self) {
+        let Some(membership) = self.process().address_space.lock().take() else {
+            return;
+        };
+        match self.process().vfork_completion.lock().as_ref() {
+            Some(completion) => *completion.inherited_membership.lock() = Some(membership),
+            // The vfork already completed (an exec'd child exiting), so this membership is the
+            // child's own and leaves the family the ordinary way.
+            None => {
+                if membership.holding() {
+                    membership.shared.release();
+                }
+            }
+        }
+    }
+
+    /// Takes over the family a vfork child forked into while on this task's memory, and returns
+    /// whether this task's own image is live afterwards.
+    ///
+    /// The child may have died parked (killed while waiting for the token), in which case the
+    /// token is taken and the child's last image put back before this task runs another guest
+    /// instruction on it.
+    fn inherit_address_space_from_vfork_child(
+        &self,
+        completion: &VforkCompletion<Platform>,
+    ) -> bool {
+        let Some(membership) = completion.inherited_membership.lock().take() else {
+            return false;
+        };
+        debug_assert!(
+            self.process().address_space.lock().is_none(),
+            "vfork parent was refused a family of its own (see do_process_clone)"
+        );
+        // The membership now belongs to this process; its threads are the ones to kick.
+        if membership.holding() {
+            membership
+                .shared
+                .hand_off_to(self.pid, &self.process().inner);
+        }
+        // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+        // `VmBookkeeping::family_id`.
+        self.process()
+            .vm
+            .current()
+            .family_id
+            .store(Arc::as_ptr(&membership.shared) as usize, Ordering::Release);
+        *self.process().address_space.lock() = Some(membership);
+        self.acquire_address_space()
     }
 
     /// Leaves the shared address space if this task is its only remaining member, and reports
@@ -2688,16 +3730,102 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// `execve` uses this to decide whether the old mappings are its to tear down. A sole member
     /// still holds the token, so no new member can appear while this runs.
+    /// Releases every mapping this process owns, at process exit, with the same
+    /// intersection discipline `execve` uses when it discards an old image: only
+    /// `owned_ranges ∩ mapping`, never a whole coalesced page-manager entry that
+    /// merely overlaps (an adjacent sibling's memory shares entries with ours),
+    /// reserved mappings (empty `VmFlags`) untouched, and a live `/dev/fb0`
+    /// guest mapping deregistered before its pages go away. Callers must have
+    /// established that no other guest process can be using these bytes.
+    /// Releases, at the exit of a process that is still sharing an address space with others,
+    /// only the ranges no other member can own: `owned_ranges` minus the ranges shared with the
+    /// family (see [`AddressSpaceMembership::shared_ranges`]). Same intersection discipline as
+    /// [`Self::release_owned_memory_on_exit`].
+    fn release_private_memory_on_exit(&self, shared_ranges: &OwnedRanges) {
+        let mut owned = self.process().owned_ranges.lock();
+        let private = owned.difference(shared_ranges);
+        if private.ranges.is_empty() {
+            return;
+        }
+        litebox_util_log::debug!(
+            pid:? = self.pid, count:? = private.ranges.len();
+            "exit: releasing the process's private mappings, shared ones stay with the family"
+        );
+        if let Some(fb) = self.global.framebuffer.as_ref()
+            && let Some((fb_addr, fb_len)) = fb.guest_mapping()
+            && private
+                .intersect(&(fb_addr..fb_addr.saturating_add(fb_len)))
+                .next()
+                .is_some()
+        {
+            fb.clear_guest_mapping_overlapping(fb_addr, fb_len);
+        }
+        let release = |r: Range<usize>, vm: VmFlags| {
+            if vm.is_empty() {
+                Vec::new()
+            } else {
+                private.intersect(&r).collect::<Vec<_>>()
+            }
+        };
+        // SAFETY: only ranges this process mapped after it joined the family are released --
+        // no other member's `owned_ranges` can include them -- and its last thread is exiting.
+        if let Err(error) = unsafe { self.global.pm.release_memory(release) } {
+            litebox_util_log::error!(error:? = error; "exit: failed to release the process's private mappings");
+        }
+        let remaining = owned.difference(&private);
+        *owned = remaining;
+    }
+
+    fn release_owned_memory_on_exit(&self) {
+        let owned = self.process().owned_ranges.lock();
+        if let Some(fb) = self.global.framebuffer.as_ref()
+            && let Some((fb_addr, fb_len)) = fb.guest_mapping()
+            && owned
+                .intersect(&(fb_addr..fb_addr.saturating_add(fb_len)))
+                .next()
+                .is_some()
+        {
+            fb.clear_guest_mapping_overlapping(fb_addr, fb_len);
+        }
+        let release = |r: Range<usize>, vm: VmFlags| {
+            if vm.is_empty() {
+                Vec::new()
+            } else {
+                owned.intersect(&r).collect::<Vec<_>>()
+            }
+        };
+        // SAFETY: the caller established that this process is the sole user of its owned
+        // ranges (alone in its address-space family and not vfork-sharing a parent), and its
+        // last thread is exiting, so no guest code can touch them again.
+        if let Err(error) = unsafe { self.global.pm.release_memory(release) } {
+            litebox_util_log::error!(error:? = error; "exit: failed to release the process's mappings");
+        }
+        drop(owned);
+        self.process().owned_ranges.lock().clear();
+    }
+
     fn leave_address_space_if_alone(&self) -> bool {
-        let mut slot = self.address_space.borrow_mut();
+        let mut slot = self.process().address_space.lock();
         let Some(membership) = slot.as_ref() else {
             return true;
         };
         if Arc::strong_count(&membership.shared) != 1 {
             return false;
         }
-        debug_assert!(membership.holding.get());
+        // DIAGNOSTIC (musl-fork-atfork-parent-corruption-20260905, temporary, additive-only):
+        // logs every time a plain do_clone (pthread_create) drops this process's
+        // AddressSpaceMembership because it observed strong_count==1. See the matching
+        // diagnostic in join_address_space: if that one also fires soon after for the SAME pid,
+        // the drop-then-recreate pair is the suspected TOCTOU.
+        litebox_util_log::debug!(
+            pid:? = self.pid, tid:? = self.tid;
+            "diag: leave_address_space_if_alone dropping membership (strong_count==1)"
+        );
+        debug_assert!(membership.holding());
         *slot = None;
+        // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+        // `VmBookkeeping::family_id`.
+        self.process().vm.current().family_id.store(0, Ordering::Release);
         true
     }
 
@@ -2706,7 +3834,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.guest_sp.set(sp);
     }
 
-    /// Copies this process's private writable memory out into host memory.
+    /// GUARD (litebox-ordinary-syscall-cross-process-clobber): whether `range` currently belongs,
+    /// in whole or in part, to a live process outside this one's own family.
+    ///
+    /// `overlaps_another_process` (used by `save_address_space`/`restore_address_space` above) is
+    /// otherwise the *only* place in this codebase that checks "a process may only ever touch its
+    /// own memory" before acting -- confirmed live during this investigation: an ordinary guest
+    /// `munmap`/`mprotect`/`mmap(MAP_FIXED)` reaches `litebox_common_linux::mm`'s handlers, which
+    /// operate directly on the guest-supplied address with no such check, because on real Linux a
+    /// process's own address space makes touching another process's memory this way physically
+    /// impossible -- an invariant this platform's one flat, shared, permission-mirrored host
+    /// address space (`hvf_backend.rs`'s own doc comment) does not itself provide. The *only* thing
+    /// that stopped an ordinary mutating call from ever landing on a stranger's memory was `Vmem`'s
+    /// own bookkeeping happening to stay perfectly consistent -- true for a placement decision
+    /// (already covered elsewhere: `Vmem::reserve_external`), but not a defense against a wrong or
+    /// stale *explicit* address a caller already has in hand for any other reason. This is called
+    /// from the ordinary-syscall dispatch path in `lib.rs` (not `syscalls/mm.rs`, which stays
+    /// unmodified) for exactly the operations that can make another process's memory disappear or
+    /// change permissions out from under it: `munmap`, `mprotect`, and a `MAP_FIXED` `mmap`.
+    pub(crate) fn touches_another_process(&self, addr: usize, length: usize) -> bool {
+        let Some(end) = addr.checked_add(length) else {
+            return false;
+        };
+        let self_family_id = self.process().vm.current().family_id.load(Ordering::Acquire);
+        let hits = self.global.processes.overlaps_another_process(
+            self.pid,
+            self_family_id,
+            &(addr..end),
+        );
+        if !hits.is_empty() {
+            // Permanent diagnostic aid, not a temporary probe: firing here is rare (a real
+            // cross-process overlap on an ordinary syscall) and worth a permanent record when it
+            // does. Confirmed 2026-09-08: across repeated live reproductions of the concurrent
+            // multi-`node`-process SIGSEGV this guard was added for, it never fired once, ruling
+            // out an ordinary explicit-address `munmap`/`mprotect`/`mmap(MAP_FIXED)` collision as
+            // that crash's mechanism -- the guard stays in as a real, independently-justified
+            // safety net regardless (see this function's own doc comment), not because it was
+            // shown to fix that specific bug.
+            litebox_util_log::error!(
+                pid:? = self.pid, addr:? = addr, end:? = end, hits:? = hits;
+                "diag: touches_another_process fired on an ordinary syscall"
+            );
+        }
+        !hits.is_empty()
+    }
+
+    /// Copies this process's view of the memory it shares with other members out into host
+    /// memory: the protection of every shared piece, plus the contents of the writable ones.
     ///
     /// This is what makes a shared-address-space `fork` behave like a real one for a guest that
     /// was built for a real one. The child necessarily runs on the parent's memory (see
@@ -2720,85 +3894,365 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `fork(2)` promises -- its own memory, untouched -- while the child saw a faithful copy of
     /// the parent's, because it *was* it.
     ///
-    /// Two deliberate limits on what is saved:
+    /// Protections are part of the view. An allocator (PartitionAlloc in every Chromium
+    /// process) reserves gigabytes `PROT_NONE` and commits pieces with `mprotect` as it goes; a
+    /// member that commits and writes into a piece its sibling still has reserved must not leave
+    /// the sibling reading its data once the sibling commits the same piece expecting zero pages.
+    /// So every shared piece is recorded with its protection, and the restore re-establishes it
+    /// (see [`SavedRange`]).
     ///
-    /// * Only ranges this process owns, so that a sibling guest process running concurrently at
-    ///   other addresses is never rolled back. See [`Process::owned_ranges`].
+    /// Deliberate limits on what is saved:
+    ///
+    /// * Only ranges this process owns *and* has shared with another member (see
+    ///   [`AddressSpaceMembership::shared_ranges`]), so that a sibling guest process running
+    ///   concurrently at other addresses is never rolled back, and memory a member mapped for
+    ///   itself after the fork is never copied.
     /// * Of the mapping holding the stack pointer, only the ABI-live suffix is copied: `[sp, end)`
     ///   on AArch64 and the 128-byte red zone plus that suffix on x86-64. Explicit kernel ABI
     ///   pointers below that boundary, such as clone child-TID words, are copied separately through
     ///   `preserved_stack_ranges`; this avoids copying the whole 8 MiB stack on every handoff.
-    fn save_address_space(&self, sp: usize, preserved_stack_ranges: &OwnedRanges) -> MemoryImage {
-        let owned = self.process().owned_ranges.lock();
+    /// * Read-only pieces (the image's text and rodata) carry no contents: nothing correct writes
+    ///   to them, and they are the bulk of the image.
+    fn save_address_space(
+        &self,
+        sp: usize,
+        preserved_stack_ranges: &OwnedRanges,
+        shared_ranges: &OwnedRanges,
+    ) -> MemoryImage {
+        let started = self.global.platform.now();
+        // Cloned, not held: the diagnostic `overlaps_another_process` call inside `save` below
+        // (musl-fork-struct-pthread-corruption, temporary, additive-only) locks OTHER processes'
+        // `owned_ranges` while running, and this process is quiesced for the whole duration of a
+        // hand-off (see `Task::quiesce_and_hand_off`/the single-threaded caller in
+        // `release_address_space`), so nothing mutates `owned_ranges` underneath a snapshot here
+        // -- but holding this process's OWN lock while acquiring another's would be a lock-order
+        // inversion against a concurrent, unrelated process doing the same in the other
+        // direction (deadlock, live-reproduced during this investigation).
+        let owned = self.process().owned_ranges.lock().clone();
+        // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+        // `VmBookkeeping::family_id`.
+        let self_family_id = self.process().vm.current().family_id.load(Ordering::Acquire);
         let mut saved = Vec::new();
-        let mut save = |start: usize, end: usize| {
+        let mut save = |start: usize, end: usize, flags: VmFlags, with_bytes: bool| {
             if start >= end {
                 return;
             }
-            match UserPtr::<u8>::from_usize(start).to_owned_slice::<Platform>(end - start) {
-                Some(bytes) => saved.push((start, bytes)),
-                // Only reachable if a mapping this process owns is no longer readable, which no
-                // correct program arranges. Loud, because the consequence is that this task's own
-                // writes to that range are silently lost the next time another member runs.
-                None => litebox_util_log::error!(
-                    pid:? = self.pid, start:? = start, end:? = end;
-                    "could not copy a mapping out before giving up the address space; this \
-                     process's data in it will be whatever the next process to run leaves there"
-                ),
+            // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+            // `ProcessTable::overlaps_another_process`. This range is believed to be exclusively
+            // this process's own (per `owned_ranges`); if it also belongs to another live
+            // process OUTSIDE this process's own family right now, saving it is reading memory
+            // this process does not own.
+            let cross = self
+                .global
+                .processes
+                .overlaps_another_process(self.pid, self_family_id, &(start..end));
+            if !cross.is_empty() {
+                litebox_util_log::error!(
+                    pid:? = self.pid, tid:? = self.tid, self_family_id:? = self_family_id,
+                    start:? = start, end:? = end, cross:? = cross;
+                    "diag: CROSS-LINEAGE OVERLAP -- save_address_space range also owned by another live process"
+                );
             }
+            let bytes = if with_bytes {
+                match UserPtr::<u8>::from_usize(start).to_owned_slice::<Platform>(end - start) {
+                    Some(bytes) => Some(bytes),
+                    // Only reachable if a mapping this process owns is no longer readable, which no
+                    // correct program arranges. Loud, because the consequence is that this task's
+                    // own writes to that range are silently lost the next time another member runs.
+                    None => {
+                        litebox_util_log::error!(
+                            pid:? = self.pid, start:? = start, end:? = end;
+                            "could not copy a mapping out before giving up the address space; this \
+                             process's data in it will be whatever the next process to run leaves there"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            saved.push(SavedRange {
+                start,
+                end,
+                flags: access_bits(flags),
+                bytes,
+            });
         };
         #[cfg(target_arch = "x86_64")]
         let live_stack_start = sp.saturating_sub(128);
         #[cfg(target_arch = "aarch64")]
         let live_stack_start = sp;
 
+        // The stack-suffix shortcut is only sound when this thread's stack is the only live one
+        // in its mapping: musl thread stacks are separate mmaps that the page manager coalesces
+        // with their neighbours, so in a multithreaded process the mapping holding `sp` may also
+        // hold sibling threads' stacks and TCBs, below `sp`. Save it whole then.
+        let suffix_only = self.process().nr_threads() <= 1;
         for (range, flags) in self.global.pm.mappings() {
-            if !flags.contains(VmFlags::VM_WRITE) || flags.contains(VmFlags::VM_SHARED) {
+            if flags.contains(VmFlags::VM_SHARED) {
                 continue;
             }
-            let stack = range.start < sp && sp <= range.end;
-            for part in owned.intersect(&range) {
-                let start = if stack {
-                    part.start.max(live_stack_start)
-                } else {
-                    part.start
-                };
-                save(start, part.end);
-                if stack {
-                    for extra in preserved_stack_ranges.intersect(&part) {
-                        // The main suffix already includes anything at or above `start`.
-                        save(extra.start, extra.end.min(start));
+            let writable = flags.contains(VmFlags::VM_WRITE);
+            let stack = suffix_only && range.start < sp && sp <= range.end;
+            for owned_part in owned.intersect(&range) {
+                // Only what another member may also own (see
+                // `AddressSpaceMembership::shared_ranges`); the rest is this process's alone.
+                for part in shared_ranges.intersect(&owned_part) {
+                    if !writable {
+                        save(part.start, part.end, flags, false);
+                        continue;
+                    }
+                    let start = if stack {
+                        part.start.max(live_stack_start)
+                    } else {
+                        part.start
+                    };
+                    save(start, part.end, flags, true);
+                    if stack {
+                        for extra in preserved_stack_ranges.intersect(&part) {
+                            // The main suffix already includes anything at or above `start`.
+                            save(extra.start, extra.end.min(start), flags, true);
+                        }
                     }
                 }
             }
         }
+        let bytes: usize = saved.iter().map(|p| p.bytes.as_ref().map_or(0, |b| b.len())).sum();
+        let elapsed = self.global.platform.now().duration_since(&started);
+        litebox_util_log::debug!(
+            pid:? = self.pid, tid:? = self.tid, pieces:? = saved.len(), bytes,
+            elapsed_us:? = elapsed.as_micros();
+            "address space: saved this process's view"
+        );
+        // GUARD (litebox-fork-family-allocator-reuse): this process's addresses are about to
+        // vanish from `vmas` (a sibling keeps running, and may `execve`, tearing down and
+        // rebuilding the very ranges this snapshot remembers -- `leave_address_space`'s own
+        // doc comment assumes "the new image lives at addresses no other member owns," which
+        // nothing previously enforced). Reserve every saved range so a fresh, flexible placement
+        // is steered elsewhere for as long as this snapshot is outstanding; released by
+        // `restore_address_space` below.
+        for piece in &saved {
+            self.global.pm.reserve_external(piece.start..piece.end);
+        }
         saved
     }
 
-    /// Puts back what [`Task::save_address_space`] took, undoing everything a forked child did to
-    /// its parent's memory.
+    /// Puts back what [`Task::save_address_space`] took, undoing everything another member did
+    /// to this process's view of the shared memory: protections first (a piece another member
+    /// committed while this process had it reserved is dropped back to zero pages and
+    /// `PROT_NONE`; one it decommitted is made writable again), then contents.
     fn restore_address_space(&self, saved: MemoryImage) {
-        for (start, bytes) in saved {
-            if UserPtrMut::<u8>::from_usize(start)
-                .copy_from_slice::<Platform>(0, &bytes)
-                .is_none()
-            {
-                // Only reachable if another member of the address space unmapped or
-                // write-protected memory belonging to this process, which no correct program
-                // does; this process is left with whatever that member made of it.
-                let pm_view = self
-                    .global
-                    .pm
-                    .mappings()
-                    .into_iter()
-                    .find(|(range, _)| range.contains(&start))
-                    .map(|(range, flags)| (range.start, range.end, flags));
+        use litebox_common_linux::{MadviseBehavior, MapFlags, ProtFlags};
+        // GUARD (litebox-fork-family-allocator-reuse): releases what `save_address_space`
+        // reserved. From here on this snapshot is being actively replayed back (or, per the
+        // existing cross-family guard below, refused piece by piece) rather than merely
+        // remembered, so a fresh placement colliding with it is once again this process's own
+        // problem to detect the ordinary way, not something the allocator needs to steer around.
+        for piece in &saved {
+            self.global.pm.release_external(piece.start..piece.end);
+        }
+        let started = self.global.platform.now();
+        // DIAGNOSTIC (musl-fork-struct-pthread-corruption, temporary, additive-only): see
+        // `VmBookkeeping::family_id`.
+        let self_family_id = self.process().vm.current().family_id.load(Ordering::Acquire);
+        let (mut pieces, mut bytes_copied, mut protects, mut drops, mut remaps, mut protected_from_clobber) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for piece in saved {
+            pieces += 1;
+            // GUARD (litebox-restore-stale-mappings-snapshot): re-queried per piece, not once for
+            // the whole restore. A single up-front snapshot went stale the moment any earlier
+            // piece in this same loop actually mutated the address space below
+            // (`sys_mmap`/`sys_mprotect`/`sys_madvise`/`copy_from_slice`) -- and adjacent pieces
+            // from the very same original mapping are routine, not an edge case: the stack-suffix
+            // split above (`save_address_space`'s `preserved_stack_ranges.intersect`) deliberately
+            // emits two directly-touching `SavedRange`s from one VMA. A later piece reconciling
+            // against a stale "what's mapped right now" view can misjudge a range an earlier piece
+            // just re-created or re-protected -- e.g. treating a gap the earlier piece already
+            // filled as still needing a fresh `MAP_FIXED` remap, which zero-fills over content that
+            // piece just wrote. Live-observed downstream symptom: a translation fault reading a
+            // musl heap chunk header 4 bytes before an otherwise-valid pointer, on a page with no
+            // mapping at all, matching exactly what a wrongly-re-mapped-over-real-content gap would
+            // produce for a neighboring allocation.
+            let mappings = self.global.pm.mappings();
+            let SavedRange {
+                start,
+                end,
+                flags: wanted,
+                bytes,
+            } = piece;
+            // GUARD (musl-fork-struct-pthread-corruption): confirmed live during this
+            // investigation -- `Task::restore_address_space` had no check that a saved piece's
+            // addresses still belong to this process's own family before touching them. When a
+            // piece is currently mapped but read-only (this process remembers it writable), the
+            // code just below would `mprotect` it to PROT_READ|PROT_WRITE and then blindly
+            // `copy_from_slice` this process's stale saved bytes into it; when a piece is
+            // currently unmapped, the code just below would `MAP_FIXED`-remap it. Neither check
+            // considered WHO else might legitimately, currently own that address: this platform
+            // has no per-process hardware isolation (`hvf_backend.rs`'s own doc comment -- one
+            // flat, permission-mirrored host address space, guest VA == host VA), so a family's
+            // remembered range that has since been reused by a completely unrelated, live guest
+            // process (e.g. its own fresh `execve`'s interpreter landing at the same top-down
+            // "highest free slot" while this family's member was parked) is real, currently-live
+            // memory belonging to someone else. Live-reproduced: a Chromium browser-process
+            // thread's restore repeatedly `mprotect`+overwrote a 16 KiB slice of an unrelated,
+            // concurrently-running process's just-loaded `ld-musl-aarch64.so.1` mapping this way,
+            // immediately preceding a real guest SIGSEGV inside musl. `overlaps_another_process`
+            // (added this investigation) is the one place in this codebase that checks the
+            // invariant "a process may only ever touch its own memory" before acting -- refusing
+            // this piece entirely (not just the offending sub-range) trades this process's own,
+            // now on its own head, incomplete restore for never writing into a byte that belongs
+            // to someone else: the same "honest, contained failure beats silent cross-process
+            // corruption" preference this whole platform is built on elsewhere.
+            let cross = self
+                .global
+                .processes
+                .overlaps_another_process(self.pid, self_family_id, &(start..end));
+            if !cross.is_empty() {
+                protected_from_clobber += 1;
                 litebox_util_log::error!(
-                    pid:? = self.pid, start:? = start, len:? = bytes.len(), pm_view:? = pm_view;
-                    "failed to restore a mapping when taking the address space back"
+                    pid:? = self.pid, tid:? = self.tid, self_family_id:? = self_family_id,
+                    start:? = start, end:? = end, cross:? = cross, has_bytes:? = bytes.is_some();
+                    "restore_address_space: range now owned by another live process outside this \
+                     family -- refusing to touch it (would silently corrupt that process's live \
+                     memory); this process's own restore for this piece is incomplete"
                 );
+                continue;
+            }
+            // What is at these addresses right now, piece by piece; a gap means another member
+            // unmapped it.
+            let mut cursor = start;
+            let mut current: Vec<(Range<usize>, VmFlags)> = Vec::new();
+            for (range, flags) in &mappings {
+                if range.end <= start || range.start >= end {
+                    continue;
+                }
+                let lo = range.start.max(start);
+                let hi = range.end.min(end);
+                if cursor < lo {
+                    current.push((cursor..lo, VmFlags::empty()));
+                }
+                current.push((lo..hi, *flags));
+                cursor = hi;
+            }
+            if cursor < end {
+                current.push((cursor..end, VmFlags::empty()));
+            }
+            for (range, flags) in current {
+                let mapped = !flags.is_empty() || {
+                    // `mappings()` reports reserved (empty-flag) entries too; a truly unmapped
+                    // gap is what `VmFlags::empty()` with no entry means here.
+                    mappings.iter().any(|(m, _)| m.start <= range.start && range.end <= m.end)
+                };
+                let prot_now = access_bits(flags);
+                if !mapped {
+                    // Re-create the mapping another member removed, with this process's
+                    // protection; contents (if any) follow below.
+                    let initial = if bytes.is_some() {
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE
+                    } else {
+                        prot_of(wanted)
+                    };
+                    remaps += 1;
+                    if let Err(error) = self.sys_mmap(
+                        range.start,
+                        range.end - range.start,
+                        initial,
+                        MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
+                        -1,
+                        0,
+                    ) {
+                        litebox_util_log::error!(
+                            pid:? = self.pid, start:? = range.start, end:? = range.end, error:?;
+                            "failed to re-map a range another member unmapped"
+                        );
+                        continue;
+                    }
+                } else if bytes.is_some() {
+                    if !flags.contains(VmFlags::VM_WRITE) {
+                        protects += 1;
+                    }
+                    if !flags.contains(VmFlags::VM_WRITE)
+                        && let Err(error) = self.sys_mprotect(
+                            UserPtrMut::from_usize(range.start),
+                            range.end - range.start,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        )
+                    {
+                        litebox_util_log::error!(
+                            pid:? = self.pid, start:? = range.start, end:? = range.end, error:?;
+                            "failed to make a range writable when taking the address space back"
+                        );
+                        continue;
+                    }
+                } else if prot_now != wanted {
+                    protects += 1;
+                    if !wanted.contains(VmFlags::VM_READ) {
+                        // Reserved in this process's view, committed and written by another
+                        // member: what Linux hands out on a later commit is zero pages.
+                        drops += 1;
+                        if let Err(error) = self.sys_madvise(
+                            UserPtrMut::from_usize(range.start),
+                            range.end - range.start,
+                            MadviseBehavior::DontNeed,
+                        ) {
+                            litebox_util_log::error!(
+                                pid:? = self.pid, start:? = range.start, end:? = range.end, error:?;
+                                "failed to drop another member's pages from a reserved range"
+                            );
+                        }
+                    }
+                    if let Err(error) = self.sys_mprotect(
+                        UserPtrMut::from_usize(range.start),
+                        range.end - range.start,
+                        prot_of(wanted),
+                    ) {
+                        litebox_util_log::error!(
+                            pid:? = self.pid, start:? = range.start, end:? = range.end, error:?;
+                            "failed to put a range's protection back when taking the address space back"
+                        );
+                    }
+                }
+            }
+            if let Some(bytes) = bytes {
+                bytes_copied += bytes.len();
+                if UserPtrMut::<u8>::from_usize(start)
+                    .copy_from_slice::<Platform>(0, &bytes)
+                    .is_none()
+                {
+                    let pm_view = self
+                        .global
+                        .pm
+                        .mappings()
+                        .into_iter()
+                        .find(|(range, _)| range.contains(&start))
+                        .map(|(range, flags)| (range.start, range.end, flags));
+                    litebox_util_log::error!(
+                        pid:? = self.pid, start:? = start, len:? = bytes.len(), pm_view:? = pm_view;
+                        "failed to restore a mapping when taking the address space back"
+                    );
+                    continue;
+                }
+                let prot = prot_of(wanted);
+                if prot != (ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    && let Err(error) = self.sys_mprotect(
+                        UserPtrMut::from_usize(start),
+                        end - start,
+                        prot,
+                    )
+                {
+                    litebox_util_log::error!(
+                        pid:? = self.pid, start:? = start, end:? = end, error:?;
+                        "failed to put a restored range's protection back"
+                    );
+                }
             }
         }
+        let elapsed = self.global.platform.now().duration_since(&started);
+        litebox_util_log::debug!(
+            pid:? = self.pid, tid:? = self.tid, pieces, bytes_copied, protects, drops, remaps,
+            protected_from_clobber, elapsed_us:? = elapsed.as_micros();
+            "address space: restored this process's view"
+        );
     }
 
     /// Publishes this process in the shim's live-process set so other processes can post signals
@@ -2935,8 +4389,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 // TODO: enforce the following limits:
-pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
-const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+//
+// The soft (`cur`) default is deliberately much lower than the hard ceiling, matching real Linux
+// distros (e.g. systemd's `DefaultLimitNOFILE=1024:524288`-style split): a process that wants
+// more can still raise it via `setrlimit`/`prlimit` up to `RLIMIT_NOFILE_MAX`. This split isn't
+// just convention -- it's load-bearing here. Startup code across many real daemons (observed
+// live via `dbus-daemon`, whose `bus/main.c` closes every fd up to the reported soft
+// `RLIMIT_NOFILE` with one `fcntl(fd, F_GETFD)` syscall per candidate fd) scales the length of
+// that loop directly off this value. With a 1,048,576 soft default that trace showed the guest
+// still counting up through fd 298000+ after 6 real seconds, so dbus-daemon never became ready
+// within any reasonable readiness-probe window; a low soft default keeps that a sub-millisecond,
+// unnoticeable loop, exactly as it is on a real Linux host.
+pub(crate) const RLIMIT_NOFILE_SOFT_DEFAULT: usize = 1024;
+pub(crate) const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 
 struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
@@ -2956,24 +4421,54 @@ pub(crate) struct ResourceLimits {
     limits: [AtomicRlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
 }
 
+/// `RLIMIT_NPROC` and `RLIMIT_SIGPENDING` default. Linux fills both in at boot from
+/// `max_threads / 2`, which lands around here on an ordinary machine; neither is enforced.
+const RLIMIT_NPROC_DEFAULT: usize = 16384;
+/// `RLIMIT_MEMLOCK` default: Linux's `MLOCK_LIMIT`, 8 MiB.
+const RLIMIT_MEMLOCK_DEFAULT: usize = 8 * 1024 * 1024;
+/// `RLIMIT_MSGQUEUE` default: Linux's `MQ_BYTES_MAX`.
+const RLIMIT_MSGQUEUE_DEFAULT: usize = 819_200;
+const RLIM_INFINITY: usize = litebox_common_linux::rlim_t::MAX;
+
 impl ResourceLimits {
+    /// Linux's `INIT_RLIMITS`, plus the boot-time `NPROC`/`SIGPENDING` fill-in. Every resource
+    /// is stored and reported; only `NOFILE` (descriptor table) and `SIGPENDING` (signal queue)
+    /// are actually charged anywhere.
     const fn default() -> Self {
+        use litebox_common_linux::RlimitResource as R;
         seq_macro::seq!(N in 0..16 {
             let mut limits = [
                 #(
-                    AtomicRlimit::new(0, 0),
+                    AtomicRlimit::new(RLIM_INFINITY, RLIM_INFINITY),
                 )*
             ];
         });
-        limits[litebox_common_linux::RlimitResource::NOFILE as usize] = AtomicRlimit {
-            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_CUR),
-            max: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_MAX),
-        };
-        limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
-            cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
-            max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
-        };
+        limits[R::STACK as usize] =
+            AtomicRlimit::new(crate::loader::DEFAULT_STACK_SIZE, RLIM_INFINITY);
+        limits[R::CORE as usize] = AtomicRlimit::new(0, RLIM_INFINITY);
+        limits[R::NPROC as usize] = AtomicRlimit::new(RLIMIT_NPROC_DEFAULT, RLIMIT_NPROC_DEFAULT);
+        limits[R::NOFILE as usize] =
+            AtomicRlimit::new(RLIMIT_NOFILE_SOFT_DEFAULT, RLIMIT_NOFILE_MAX);
+        limits[R::MEMLOCK as usize] =
+            AtomicRlimit::new(RLIMIT_MEMLOCK_DEFAULT, RLIMIT_MEMLOCK_DEFAULT);
+        limits[R::SIGPENDING as usize] =
+            AtomicRlimit::new(RLIMIT_NPROC_DEFAULT, RLIMIT_NPROC_DEFAULT);
+        limits[R::MSGQUEUE as usize] =
+            AtomicRlimit::new(RLIMIT_MSGQUEUE_DEFAULT, RLIMIT_MSGQUEUE_DEFAULT);
+        limits[R::NICE as usize] = AtomicRlimit::new(0, 0);
+        limits[R::RTPRIO as usize] = AtomicRlimit::new(0, 0);
         Self { limits }
+    }
+
+    /// Copies every limit from `parent`: `fork` inherits them, and a shell's `ulimit` is only
+    /// ever observed by the children it then spawns.
+    fn inherit_from(&self, parent: &Self) {
+        for (mine, theirs) in self.limits.iter().zip(&parent.limits) {
+            mine.cur
+                .store(theirs.cur.load(Ordering::Relaxed), Ordering::Relaxed);
+            mine.max
+                .store(theirs.max.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn get_rlimit(
@@ -3010,16 +4505,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<litebox_common_linux::Rlimit>,
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
-        let old_rlimit = match resource {
-            litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {
-                self.thread.process.limits.get_rlimit(resource)
-            }
-            _ => {
-                log_unsupported!("Unsupported resource for get_rlimit: {:?}", resource);
-                return Err(Errno::EINVAL);
-            }
-        };
+        let limits = &self.thread.process.limits;
+        let old_rlimit = limits.get_rlimit(resource);
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {
                 return Err(Errno::EINVAL);
@@ -3034,13 +4521,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if new_limit.rlim_max > old_rlimit.rlim_max {
                 return Err(Errno::EPERM);
             }
+            let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
+            limits.set_rlimit(resource, new_limit);
             if let litebox_common_linux::RlimitResource::NOFILE = resource {
-                let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-                self.thread.process.limits.set_rlimit(resource, new_limit);
                 self.files.borrow().set_max_fd(new_max_fd);
-            } else {
-                log_unsupported!("Unsupported resource for set_rlimit: {:?}", resource);
-                return Err(Errno::EINVAL);
             }
         }
         Ok(old_rlimit)
@@ -3062,7 +4546,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let new_limit = match new_rlim {
             Some(rlim) => {
-                let rlim = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EINVAL)?;
+                let rlim = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 Some(litebox_common_linux::rlimit64_to_rlimit(rlim))
             }
             None => None,
@@ -3072,7 +4556,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(old_rlim) = old_rlim {
             old_rlim
                 .write_at_offset::<Platform>(0, old_limit)
-                .ok_or(Errno::EINVAL)?;
+                .ok_or(Errno::EFAULT)?;
         }
         Ok(())
     }
@@ -3085,7 +4569,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<(), Errno> {
         let old_limit = self.do_prlimit(resource, None)?;
         rlim.write_at_offset::<Platform>(0, old_limit)
-            .ok_or(Errno::EINVAL)
+            .ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `setrlimit`.
@@ -3374,7 +4858,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let new_deadline = if delay.is_zero() {
             None
         } else {
-            Some(now.checked_add(delay).ok_or(Errno::EINVAL)?)
+            Some(now.checked_add(delay).ok_or(Errno::EFAULT)?)
         };
         if alarm.handle.is_none() {
             match self
@@ -3561,8 +5045,55 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// nothing to check. An effective uid of 0 is used as the stand-in,
     /// mirroring the classic pre-capabilities Unix kernel, which gated the
     /// same operations on `suser()` (effective uid 0) alone.
+    /// Whether this task may perform a privileged identity change (`setuid`
+    /// family, `setgroups`).
+    ///
+    /// Real Linux gates these on holding `CAP_SETUID`/`CAP_SETGID` in the
+    /// effective capability set, not literally on `euid == 0` -- the two
+    /// usually coincide (root normally holds every capability), but they
+    /// diverge exactly when a process has called `PR_SET_KEEPCAPS` before
+    /// dropping its uid away from 0: without that flag the kernel would
+    /// clear the permitted set on the uid change, but with it the
+    /// capabilities survive, so a later `setresgid`/`setresuid` from the
+    /// now-unprivileged-looking euid still succeeds. This is the standard
+    /// sequence `setpriv --reuid --regid` uses (`PR_SET_KEEPCAPS(1)` ->
+    /// `capset` -> `setresuid` -> `setresgid`), and LiteBox does not model
+    /// individual capability bits at all (`CapBSetRead`/`capget` always
+    /// report an empty set) -- the same coarse stance extended here: once
+    /// `keep_caps` is set, treat this task as retaining root's implicit
+    /// authority for these calls, mirroring what a real kernel would do for
+    /// a process that actually held (and kept) `CAP_SETUID`/`CAP_SETGID`.
     fn is_privileged(&self) -> bool {
-        self.credentials.borrow().euid == 0
+        let credentials = self.credentials.borrow();
+        credentials.euid == 0 || credentials.keep_caps()
+    }
+
+    /// Install `new` as this task's credentials with the side effects Linux's `commit_creds`
+    /// (`kernel/cred.c`) attaches to a change of *effective* identity: the process becomes
+    /// non-dumpable (`suid_dumpable`'s default 0) and loses its parent-death signal. The kernel's
+    /// test is on `euid`/`egid`/`fsuid`/`fsgid` and the capability sets -- a change of only the
+    /// real or saved ids leaves both alone -- and LiteBox models neither `fsuid` nor capability
+    /// bits, so the effective ids are the whole test. This is what makes a `setuid` helper that
+    /// drops root (`doas`, `chrome-sandbox`) read back `PR_GET_DUMPABLE == 0` afterwards, as on
+    /// Linux, instead of the `1` an unrelated earlier exec left behind.
+    fn commit_credentials(&self, new: Credentials) {
+        let (old_euid, old_egid) = {
+            let old = self.credentials.borrow();
+            (old.euid, old.egid)
+        };
+        let identity_changed = old_euid != new.euid || old_egid != new.egid;
+        let (new_euid, new_egid) = (new.euid, new.egid);
+        *self.credentials.borrow_mut() = Arc::new(new);
+        if identity_changed {
+            litebox_util_log::debug!(
+                pid:? = self.pid, old_euid:? = old_euid, new_euid:? = new_euid,
+                old_egid:? = old_egid, new_egid:? = new_egid;
+                "effective identity changed: process is no longer dumpable, parent-death signal cleared"
+            );
+            self.process().set_dumpable(false);
+            self.thread.parent_death_signal.set(None);
+            self.global.processes.set_parent_death_signal(self.pid, None);
+        }
     }
 
     /// Handle syscall `setuid`.
@@ -3581,7 +5112,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             return Err(Errno::EPERM);
         }
-        *self.credentials.borrow_mut() = Arc::new(new);
+        self.commit_credentials(new);
         Ok(())
     }
 
@@ -3598,14 +5129,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             return Err(Errno::EPERM);
         }
-        *self.credentials.borrow_mut() = Arc::new(new);
+        self.commit_credentials(new);
         Ok(())
     }
 
     /// Handle syscall `setresuid`. `u32::MAX` leaves the corresponding field unchanged.
     pub(crate) fn sys_setresuid(&self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
         let old = self.credentials.borrow().clone();
-        let privileged = old.euid == 0;
+        let privileged = self.is_privileged();
         let allowed = |value: u32| {
             privileged || value == old.uid || value == old.euid || value == old.suid
         };
@@ -3625,14 +5156,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if suid != u32::MAX {
             new.suid = suid;
         }
-        *self.credentials.borrow_mut() = Arc::new(new);
+        self.commit_credentials(new);
         Ok(())
     }
 
     /// Handle syscall `setresgid`; see [`Self::sys_setresuid`], with group IDs.
     pub(crate) fn sys_setresgid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
         let old = self.credentials.borrow().clone();
-        let privileged = old.euid == 0;
+        let privileged = self.is_privileged();
         let allowed = |value: u32| {
             privileged || value == old.gid || value == old.egid || value == old.sgid
         };
@@ -3652,7 +5183,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if sgid != u32::MAX {
             new.sgid = sgid;
         }
-        *self.credentials.borrow_mut() = Arc::new(new);
+        self.commit_credentials(new);
+        Ok(())
+    }
+
+    /// Handle syscall `getresuid`.
+    pub(crate) fn sys_getresuid(
+        &self,
+        ruid: UserPtrMut<u32>,
+        euid: UserPtrMut<u32>,
+        suid: UserPtrMut<u32>,
+    ) -> Result<(), Errno> {
+        let credentials = self.credentials.borrow();
+        ruid.write_at_offset::<Platform>(0, credentials.uid)
+            .ok_or(Errno::EFAULT)?;
+        euid.write_at_offset::<Platform>(0, credentials.euid)
+            .ok_or(Errno::EFAULT)?;
+        suid.write_at_offset::<Platform>(0, credentials.suid)
+            .ok_or(Errno::EFAULT)?;
+        Ok(())
+    }
+
+    /// Handle syscall `getresgid`; see [`Self::sys_getresuid`], with group IDs.
+    pub(crate) fn sys_getresgid(
+        &self,
+        rgid: UserPtrMut<u32>,
+        egid: UserPtrMut<u32>,
+        sgid: UserPtrMut<u32>,
+    ) -> Result<(), Errno> {
+        let credentials = self.credentials.borrow();
+        rgid.write_at_offset::<Platform>(0, credentials.gid)
+            .ok_or(Errno::EFAULT)?;
+        egid.write_at_offset::<Platform>(0, credentials.egid)
+            .ok_or(Errno::EFAULT)?;
+        sgid.write_at_offset::<Platform>(0, credentials.sgid)
+            .ok_or(Errno::EFAULT)?;
         Ok(())
     }
 
@@ -3703,6 +5268,130 @@ impl CpuSet {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Resolves `which`/`who` of `getpriority`/`setpriority` to the threads it names, each with
+    /// the real uid of its process (what `set_one_prio_perm` compares against). `PRIO_PROCESS`
+    /// names one thread (`who == 0` is the caller; a tid selects that thread, in this or any
+    /// live process); `PRIO_PGRP` every thread of every process in the group (`who == 0`: the
+    /// caller's group); `PRIO_USER` every thread of every process with that real uid (`who ==
+    /// 0`: the caller's). Returns `EINVAL` for an unknown `which`, `ESRCH` when nothing matched.
+    fn priority_targets(
+        &self,
+        which: i32,
+        who: i32,
+    ) -> Result<Vec<(Arc<ThreadRemote<Platform>>, u32)>, Errno> {
+        const PRIO_PROCESS: i32 = 0;
+        const PRIO_PGRP: i32 = 1;
+        const PRIO_USER: i32 = 2;
+        let own_uid = self.credentials.borrow().uid;
+        let mut out = Vec::new();
+        match which {
+            PRIO_PROCESS => {
+                let who = if who == 0 { self.tid } else { who };
+                if who == self.tid || self.process().thread_remote(who).is_some() {
+                    let remote = self.process().thread_remote(who).unwrap_or_else(|| self.thread_remote().clone());
+                    out.push((remote, own_uid));
+                } else if let Some((threads, _, uid)) = self.global.processes.priority_targets(who) {
+                    // A tid in another process: Linux resolves `who` as a tid (`find_task_by_vpid`),
+                    // and the table is keyed by pid = leader tid, so this selects that leader.
+                    if let Some(leader) = threads.into_iter().next() {
+                        out.push((leader, uid));
+                    }
+                }
+            }
+            PRIO_PGRP => {
+                let group = if who == 0 { self.process().process_group_id() } else { who };
+                for pid in self.global.processes.live_pids() {
+                    if let Some((threads, pgid, uid)) = self.global.processes.priority_targets(pid)
+                        && pgid == group
+                    {
+                        out.extend(threads.into_iter().map(|t| (t, uid)));
+                    }
+                }
+            }
+            PRIO_USER => {
+                let target = if who == 0 { own_uid } else { who.cast_unsigned() };
+                for pid in self.global.processes.live_pids() {
+                    if let Some((threads, _, uid)) = self.global.processes.priority_targets(pid)
+                        && uid == target
+                    {
+                        out.extend(threads.into_iter().map(|t| (t, uid)));
+                    }
+                }
+            }
+            _ => return Err(Errno::EINVAL),
+        }
+        if out.is_empty() {
+            return Err(Errno::ESRCH);
+        }
+        Ok(out)
+    }
+
+    /// Handle syscall `getpriority`.
+    ///
+    /// Returns the *highest* priority (lowest nice) among the matched threads, encoded as Linux's
+    /// syscall does -- `20 - nice`, so `1..=40` -- for the libc wrapper to turn back into a
+    /// nice value.
+    pub(crate) fn sys_getpriority(&self, which: i32, who: i32) -> Result<usize, Errno> {
+        let targets = self.priority_targets(which, who)?;
+        let lowest_nice = targets
+            .iter()
+            .map(|(thread, _)| thread.nice())
+            .min()
+            .unwrap_or(0);
+        Ok((20 - lowest_nice).cast_unsigned() as usize)
+    }
+
+    /// Handle syscall `setpriority`.
+    ///
+    /// `niceval` is clamped to `-20..=19`. Linux's `set_one_prio` rules: a target owned by a
+    /// different real uid needs the caller to be privileged (`EPERM`); lowering a nice value
+    /// (raising priority) needs `CAP_SYS_NICE` or an `RLIMIT_NICE` that admits it (`EACCES`);
+    /// raising nice is always allowed. One matched thread in error does not stop the others
+    /// (the last error is reported after all are tried), as in the kernel's loop.
+    pub(crate) fn sys_setpriority(&self, which: i32, who: i32, niceval: i32) -> Result<(), Errno> {
+        let niceval = niceval.clamp(-20, 19);
+        let targets = self.priority_targets(which, who)?;
+        let privileged = self.is_privileged();
+        let own_euid = self.credentials.borrow().euid;
+        let own_uid = self.credentials.borrow().uid;
+        // `nice_to_rlimit`: a nice of `n` needs `RLIMIT_NICE >= 20 - n`.
+        let nice_rlim = (20 - niceval).cast_unsigned() as usize;
+        let rlimit_nice = self
+            .process()
+            .limits
+            .get_rlimit_cur(litebox_common_linux::RlimitResource::NICE);
+        let mut error = None;
+        for (thread, target_uid) in targets {
+            if !privileged && target_uid != own_uid && target_uid != own_euid {
+                error = Some(Errno::EPERM);
+                continue;
+            }
+            if niceval < thread.nice() && !privileged && nice_rlim > rlimit_nice {
+                error = Some(Errno::EACCES);
+                continue;
+            }
+            thread.set_nice(niceval);
+        }
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Handle syscall `membarrier`.
+    ///
+    /// Answers as a kernel built with `CONFIG_MEMBARRIER=n` does: `ENOSYS` for every command,
+    /// `MEMBARRIER_CMD_QUERY` included. A membarrier's guarantee is that every *other* thread
+    /// of the process has executed a full barrier before the call returns; the host (no
+    /// `membarrier(2)` on macOS, guest threads running on vCPU lanes) has no primitive for that
+    /// yet, and a command that returned `0` without providing it would be a lie a lock-free
+    /// algorithm could act on. Callers must already handle `ENOSYS` (pre-4.3 kernels, or this
+    /// config). Decoded rather than left to the unknown-syscall path so the log names the
+    /// command the guest asked for.
+    pub(crate) fn sys_membarrier(&self, cmd: i32, flags: u32, cpu_id: i32) -> Result<usize, Errno> {
+        log_unsupported!(
+            "membarrier(cmd = {cmd:#x}, flags = {flags:#x}, cpu_id = {cpu_id}): no cross-thread barrier primitive -> ENOSYS"
+        );
+        Err(Errno::ENOSYS)
+    }
+
     /// Handle syscall `sched_getaffinity`.
     ///
     /// Note this is a dummy implementation that always returns the same CPU set
@@ -3863,7 +5552,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 let count = if (count as i32) <= 0 { 1 } else { count };
                 let count = core::num::NonZeroU32::new(count).unwrap();
-                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
+                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EFAULT)?;
                 let mappings = self.global.pm.lock_mappings();
                 let key = self.futex_key(&mappings, addr, &flags)?;
                 self.process()
@@ -3896,7 +5585,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 timeout,
                 bitmask,
             } => {
-                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EINVAL)?;
+                let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EFAULT)?;
                 let deadline = if let Some(timeout) = timeout.read::<Platform>()? {
                     let clock_id =
                         if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
@@ -4017,6 +5706,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mut argv: alloc::vec::Vec<alloc::ffi::CString>,
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
         let mut recursion = 0;
+        let comm = path
+            .rsplit('/')
+            .next()
+            .unwrap_or("unknown")
+            .as_bytes()
+            .to_vec();
         loop {
             let full_path = self.resolve_path(&path)?;
             let full_path = self.follow_open_path(full_path, litebox::fs::OFlags::RDONLY)?;
@@ -4048,6 +5743,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 None => {
                     let path = full_path.into_string().map_err(|_| Errno::EINVAL)?;
+                    // Linux's `/proc/<pid>/exe` names the image actually mapped: for a `#!`
+                    // script that is the interpreter, which is what `path` is by now.
+                    *self.thread.staged_exec.borrow_mut() = Some(StagedExec {
+                        exe: path.clone(),
+                        comm,
+                    });
                     return Ok((path, argv));
                 }
             }
@@ -4280,8 +5981,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.init_thread_context(ctx);
         // The new image is fully built, at addresses no other member of the old address space
         // owns, so this task no longer needs the shared one. Handing it back here rather than
-        // earlier means no other member ever observes a half-built image.
-        let _ = self.leave_address_space();
+        // earlier means no other member ever observes a half-built image. A vfork child that
+        // forked while on its parent's memory hands its place to the parent it is about to wake
+        // instead: the family is the parent's memory, and the parent runs on it next.
+        if shares_parent_vm {
+            self.hand_address_space_to_vfork_parent();
+        } else {
+            let _ = self.leave_address_space();
+        }
         self.process().complete_vfork();
         Ok(0)
     }
@@ -4306,11 +6013,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         credentials: Arc<Credentials>,
         secure: bool,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        let proc_argv = self.global.proc_handle.as_ref().map(|_| {
-            argv.iter()
-                .map(|arg| arg.as_bytes().to_vec())
-                .collect::<alloc::vec::Vec<_>>()
-        });
+        let mut proc_cmdline = Vec::new();
+        for arg in &argv {
+            proc_cmdline.extend_from_slice(arg.as_bytes());
+            proc_cmdline.push(0);
+        }
 
         // The loader publishes the new image's initial break through the (single, shared) page
         // manager; take it back out into this process's own slot, restoring the manager's
@@ -4319,8 +6026,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let load_info = {
             let _guard = self.global.brk_lock.lock();
             let auxv = self.init_auxv(credentials.as_ref(), secure);
-            let load_info = loader.load(argv, envp, auxv)?;
+            let load_info = loader.load(argv, envp, auxv);
+            // Take the break back out even when the load failed part-way: a loader that already
+            // published one and then bailed would otherwise leave it in the manager for the
+            // next image (any process) to inherit.
             let initial_brk = self.global.pm.swap_brk(0);
+            let load_info = load_info?;
             if initial_brk == 0 {
                 // The loader did not publish a break for this image; the first `brk` this
                 // process makes will fail (see `PageManager::brk`'s zero-break refusal) and
@@ -4334,11 +6045,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // Commit the candidate credentials only after every fallible image-building step succeeded.
         *self.credentials.borrow_mut() = credentials;
-        if let (Some(proc), Some(argv)) = (&self.global.proc_handle, proc_argv) {
-            let argv: alloc::vec::Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
-            proc.set_cmdline(&argv);
+        // Linux: `setup_new_exec` makes an ordinary exec dumpable again and a secure (set-uid/
+        // set-gid) one not, per the default `suid_dumpable` of 0.
+        self.process().set_dumpable(!secure);
+        if secure {
+            // Linux `begin_new_exec`: "Make sure parent cannot signal privileged process."
+            self.thread.parent_death_signal.set(None);
+            self.global.processes.set_parent_death_signal(self.pid, None);
         }
-        self.set_task_comm(loader.comm());
+        let staged = self.thread.staged_exec.borrow_mut().take();
+        let (exe, comm) = staged.map_or((None, None), |staged| (Some(staged.exe), Some(staged.comm)));
+        self.process().set_proc_image(proc_cmdline, exe);
+        self.set_task_comm(comm.as_deref().unwrap_or_else(|| loader.comm()));
+        // Every process with an image is reachable through the live table from here on, so
+        // `/proc/<pid>` and `kill(pid)` work for it whether or not it ever forks.
+        self.register_for_remote_signals();
 
         self.thread
             .init_state
@@ -4415,6 +6136,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 tls,
                 stack,
                 set_child_tid,
+                #[cfg(target_arch = "aarch64")]
+                fp,
             } => {
                 // Set the stack and the return value from clone().
                 #[cfg(target_arch = "x86_64")]
@@ -4440,6 +6163,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .set_arch_specific_register(&GUEST_TLS_REGISTER, tls.as_usize())
                         .expect("failed to set guest TLS for new thread");
                 }
+
+                // Linux's `copy_thread` copies the parent's FPSIMD register
+                // file into the child task at clone/fork time; this new host
+                // OS thread's own per-thread FP shadow otherwise starts
+                // zeroed (correct only for `execve`, see `NewProcess` above),
+                // so seed it here with the snapshot taken on the parent
+                // thread at the `clone`/`fork` syscall itself.
+                #[cfg(target_arch = "aarch64")]
+                self.global.platform.set_fp_state(&fp);
 
                 if let Some(child_tid_ptr) = set_child_tid {
                     // Set the child TID if requested.

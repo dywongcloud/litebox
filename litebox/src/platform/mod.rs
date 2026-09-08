@@ -278,6 +278,15 @@ pub trait IPInterfaceProvider {
     /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
     /// packet.
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
+
+    /// Whether a packet handed to [`Self::send_ip_packet`] can reach anything outside this
+    /// process. `true` by default; a platform with no external interface attached (one that
+    /// silently drops everything it is asked to send) reports `false`, so the network stack
+    /// can fail a connect to a non-local destination immediately (`ENETUNREACH`) instead of
+    /// waiting on a SYN that can never be answered.
+    fn has_external_interface(&self) -> bool {
+        true
+    }
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].

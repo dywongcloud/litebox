@@ -383,7 +383,13 @@ impl From<litebox::mm::linux::MappingError> for Errno {
                 Errno::try_from(errno).unwrap_or(Errno::EIO)
             }
             litebox::mm::linux::MappingError::MapError(e) => e.into(),
-            _ => unimplemented!(),
+            // Real Linux returns `ENOMEM` for the analogous "another thread raced this mmap"
+            // case (e.g. `MAP_FIXED` colliding with a concurrent unmap of the same range).
+            litebox::mm::linux::MappingError::ConcurrentlyRemoved
+            | litebox::mm::linux::MappingError::InitializationIdentityExhausted => Errno::ENOMEM,
+            litebox::mm::linux::MappingError::FinalizeProtection(error) => error.into(),
+            litebox::mm::linux::MappingError::Cleanup { primary, .. } => (*primary).into(),
+            _ => Errno::EIO,
         }
     }
 }
@@ -418,6 +424,7 @@ impl From<litebox::mm::linux::VmemProtectError> for Errno {
             litebox::mm::linux::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
             litebox::mm::linux::VmemProtectError::NoAccess { .. } => Errno::EACCES,
             litebox::mm::linux::VmemProtectError::ProtectError(e) => e.into(),
+            litebox::mm::linux::VmemProtectError::DeferredAllocate(_) => Errno::ENOMEM,
         }
     }
 }

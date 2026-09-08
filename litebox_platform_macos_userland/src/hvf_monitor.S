@@ -35,5 +35,22 @@ _litebox_hvf_monitor_resume:
     LITEBOX_VECTOR 0x4c0d
     LITEBOX_VECTOR 0x4c0e
     LITEBOX_VECTOR 0x4c0f
-    .space 14336
+
+    // x0 carries the target ASID in TTBR format (bits 63:48); x1 carries the
+    // complete target TTBR0_EL1. The first trip executes under the immutable
+    // ASID-zero bootstrap root, invalidates the target ASID, and switches to the
+    // target root before acknowledging completion.
+    .globl _litebox_hvf_monitor_synchronize
+_litebox_hvf_monitor_synchronize:
+    dsb ish
+    ic ialluis
+    dsb ish
+    tlbi aside1is, x0
+    dsb ish
+    msr ttbr0_el1, x1
+    isb
+    hvc #0x4c43
+    b .
+
+    .space 14300
 _litebox_hvf_monitor_end:

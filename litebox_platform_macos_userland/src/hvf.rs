@@ -20,11 +20,15 @@ use std::time::Duration;
 mod sdk;
 
 pub use sdk::{
-    HvfBoundaryReport, HvfError, HvfFeatureRegister, HvfFeatureRegisters, HvfMonitor,
-    HvfSdkResidualReport, HvfStageOneRegisterReport, HvfVmReport, hvf_boundary_probe,
+    HvfArchitecturalState, HvfBoundaryReport, HvfEl1State, HvfError, HvfExceptionExit,
+    HvfFeatureRegister, HvfFeatureRegisters, HvfMonitor, HvfPublishedPanicOperation,
+    HvfPublishedPanicReport, HvfSdkResidualReport, HvfSimd128, HvfStageOneRegisterReport,
+    HvfVcpuCancellation, HvfVcpuExit, HvfVmReport, hvf_boundary_probe, hvf_published_panic_probe,
     publish_hvf_executable_bytes,
 };
-pub(crate) use sdk::{HvfMapPermissions, HvfMapping, HvfVm, process_hvf_vm};
+pub(crate) use sdk::{
+    HvfMapPermissions, HvfMapping, HvfPstateContext, HvfVcpu, HvfVm, process_hvf_vm,
+};
 
 const PAGE_SIZE: usize = 16 * 1024;
 const MAX_BACKING_PAGES: usize = 10;

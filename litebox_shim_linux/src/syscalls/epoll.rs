@@ -64,6 +64,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform, FS: ShimFS> {
     Pipe(WeakEntryHandle<Platform, litebox::pipes::Pipes<Platform>>),
     Unix(WeakEntryHandle<Platform, crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>),
     Netlink(WeakEntryHandle<Platform, crate::syscalls::netlink::NetlinkSubsystem<Platform>>),
+    Inotify(WeakEntryHandle<Platform, super::inotify::InotifySubsystem<Platform>>),
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for EpollDescriptor<Platform, FS> {
@@ -76,6 +77,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for EpollDescriptor<Platform, FS>
             Self::Pipe(pipe) => Self::Pipe(pipe.clone()),
             Self::Unix(unix) => Self::Unix(unix.clone()),
             Self::Netlink(netlink) => Self::Netlink(netlink.clone()),
+            Self::Inotify(inotify) => Self::Inotify(inotify.clone()),
         }
     }
 }
@@ -149,6 +151,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                 .ok_or(Errno::EBADF)?;
             return Ok(Self::Netlink(handle.downgrade()));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::inotify::InotifySubsystem<Platform>>(raw_fd)
+        {
+            let handle = global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(Errno::EBADF)?;
+            return Ok(Self::Inotify(handle.downgrade()));
+        }
         Err(Errno::EBADF)
     }
 
@@ -161,6 +172,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             Self::Pipe(pipe) => pipe.identity(),
             Self::Unix(unix) => unix.identity(),
             Self::Netlink(netlink) => netlink.identity(),
+            Self::Inotify(inotify) => inotify.identity(),
         }
     }
 
@@ -173,6 +185,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
             Self::Pipe(pipe) => pipe.upgrade().is_some(),
             Self::Unix(unix) => unix.upgrade().is_some(),
             Self::Netlink(netlink) => netlink.upgrade().is_some(),
+            Self::Inotify(inotify) => inotify.upgrade().is_some(),
         }
     }
 
@@ -272,6 +285,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                 let handle = fd.upgrade()?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
+            EpollDescriptor::Inotify(fd) => {
+                let handle = fd.upgrade()?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
         }
     }
 
@@ -368,6 +385,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollDescriptor<Platform, FS> {
                 }
             }
             EpollDescriptor::Netlink(fd) => {
+                if let Some(handle) = fd.upgrade() {
+                    handle.with_entry(|entry| unregister(entry));
+                }
+            }
+            EpollDescriptor::Inotify(fd) => {
                 if let Some(handle) = fd.upgrade() {
                     handle.with_entry(|entry| unregister(entry));
                 }
@@ -871,9 +893,41 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                 let registration_target = observer
                     .as_ref()
                     .map(|_| poll_descriptor.transient_registration_target(global));
-                let events = poll_descriptor
-                    .poll(global, entry.mask, observer.clone())
-                    .unwrap_or(Events::NVAL);
+                // poll(2) on a regular file or directory is always ready -- Linux's
+                // `DEFAULT_POLLMASK` (IN | OUT | RDNORM | WRNORM) for any node without its own
+                // `poll` op. Every other FS-backed node keeps its subsystem readiness: stdin's
+                // pump, `/dev/input/event*` queues, and the OUT-only approximation for the rest,
+                // so a queue-backed device never spins on empty reads. BusyBox's `read` builtin
+                // polls its fd before every byte, so an FS-backed file that never reported IN
+                // hung `read x < file` (and every `while read` loop over a file) forever.
+                let always_ready_file = matches!(poll_descriptor, EpollDescriptor::File(_))
+                    && files
+                        .run_on_raw_fd(
+                            entry.fd.reinterpret_as_unsigned() as usize,
+                            |fd| {
+                                files.fs.fd_file_status(fd).is_ok_and(|status| {
+                                    matches!(
+                                        status.file_type,
+                                        litebox::fs::FileType::RegularFile
+                                            | litebox::fs::FileType::Directory
+                                    )
+                                })
+                            },
+                            |_| false,
+                            |_| false,
+                            |_| false,
+                            |_| false,
+                            |_| false,
+                            |_| false,
+                        )
+                        .unwrap_or(false);
+                let events = if always_ready_file {
+                    (Events::IN | Events::OUT) & entry.mask
+                } else {
+                    poll_descriptor
+                        .poll(global, entry.mask, observer.clone())
+                        .unwrap_or(Events::NVAL)
+                };
                 if let (Some(observer), Some(target)) = (observer, registration_target) {
                     registrations.push(PollRegistration { target, observer });
                 }

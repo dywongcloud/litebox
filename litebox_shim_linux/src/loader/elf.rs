@@ -225,6 +225,15 @@ pub(crate) struct ElfLoader<'a, Platform: ShimPlatform, FS: ShimFS> {
 struct FileAndParsed<'a, Platform: ShimPlatform, FS: ShimFS> {
     file: ElfFile<'a, Platform, FS>,
     parsed: ElfParsedFile,
+    /// The path the image was opened with, kept for fault symbolization.
+    path: alloc::string::String,
+}
+
+/// The `PT_LOAD` span of an ELF, in page-aligned vaddrs relative to its load
+/// bias: `lo..hi` covers every loadable segment.
+struct LoadSpan {
+    lo: usize,
+    hi: usize,
 }
 
 impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
@@ -232,6 +241,7 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         task: &'a Task<Platform, FS>,
         path: impl litebox::path::Arg,
     ) -> Result<Self, ElfLoaderError> {
+        let path_name = path.to_rust_str_lossy().into_owned();
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
@@ -253,7 +263,71 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
             }
         }
 
-        Ok(Self { file, parsed })
+        Ok(Self {
+            file,
+            parsed,
+            path: path_name,
+        })
+    }
+
+    /// The image's `PT_LOAD` span, read back from its program headers.
+    ///
+    /// `ElfParsedFile` keeps its headers private and `MappingInfo` reports
+    /// only the bias, so the span is re-derived from the file the same way the
+    /// `mmap` path derives it for shared libraries (`init_elf_patch_state`).
+    /// Best-effort: an unreadable or degenerate table simply leaves the image
+    /// unnamed in a fault line.
+    fn load_span(&self) -> Option<LoadSpan> {
+        use litebox_common_linux::loader::ReadAt as _;
+        use object::elf::{FileHeader64, PT_LOAD, ProgramHeader64};
+        use object::endian::LittleEndian;
+        const ENDIAN: LittleEndian = LittleEndian;
+
+        let mut file = &self.file;
+        let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
+        file.read_at(0, &mut ehdr_buf).ok()?;
+        let (ehdr, _) = object::from_bytes::<FileHeader64<LittleEndian>>(&ehdr_buf).ok()?;
+        let e_phoff = ehdr.e_phoff.get(ENDIAN);
+        let e_phentsize = usize::from(ehdr.e_phentsize.get(ENDIAN));
+        let e_phnum = usize::from(ehdr.e_phnum.get(ENDIAN));
+        if e_phentsize < core::mem::size_of::<ProgramHeader64<LittleEndian>>() {
+            return None;
+        }
+        let phdrs_size = e_phentsize.checked_mul(e_phnum)?;
+        if phdrs_size == 0 || phdrs_size > 0x10000 {
+            return None;
+        }
+        let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
+        file.read_at(e_phoff, &mut phdrs_buf).ok()?;
+
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for chunk in phdrs_buf.chunks_exact(e_phentsize) {
+            let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LittleEndian>>(chunk) else {
+                continue;
+            };
+            if ph.p_type.get(ENDIAN) != PT_LOAD {
+                continue;
+            }
+            let start: usize = ph.p_vaddr.get(ENDIAN).trunc();
+            let end = start.checked_add(ph.p_memsz.get(ENDIAN).trunc())?;
+            lo = lo.min(start & !(PAGE_SIZE - 1));
+            hi = hi.max(end.checked_next_multiple_of(PAGE_SIZE)?);
+        }
+        (lo < hi).then_some(LoadSpan { lo, hi })
+    }
+
+    /// Publish where this image landed for fault symbolization.
+    fn record_loaded(&self, info: &litebox_common_linux::loader::MappingInfo) {
+        if let Some(span) = self.load_span() {
+            let base = info.base_addr;
+            self.file.task.record_loaded_image(
+                &self.path,
+                base,
+                base.wrapping_add(span.lo),
+                base.wrapping_add(span.hi),
+            );
+        }
     }
 
     /// Load the ELF into guest memory.
@@ -283,8 +357,17 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
 
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
-            // e.g., /lib64/ld-linux-x86-64.so.2
-            let mut interp = FileAndParsed::new(task, interp_name)?;
+            // e.g., /lib64/ld-linux-x86-64.so.2 -- a guest-visible path, which `execve`'s own
+            // path was too before `resolve_shebang` resolved it. Resolve it the same way: beneath
+            // the process's `chroot` root, following symlinks with an absolute target restarting
+            // from that root (Linux's `open_exec` walks `nd->root` for the interpreter exactly as
+            // for the main image), so a jail loads its own `ld.so` or fails with `ENOENT`, and
+            // never reaches the interpreter outside it.
+            let interp_path = task
+                .resolve_path(interp_name.as_c_str())
+                .and_then(|path| task.follow_open_path(path, litebox::fs::OFlags::RDONLY))
+                .map_err(ElfLoaderError::OpenError)?;
+            let mut interp = FileAndParsed::new(task, interp_path)?;
             // Linux places the ET_EXEC interpreter high so brk can grow above
             // the fixed-address main image without hitting ld.so.
             interp.file.load_high = true;
@@ -309,12 +392,19 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
 
+        // This load replaces the address space, so anything recorded for the
+        // previous image of this process is stale from here on.
+        self.main.file.task.forget_loaded_images();
+
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self.main.load_mapped(global.platform)?;
+        self.main.record_loaded(&info);
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
-            Some(interp.load_mapped(global.platform)?)
+            let interp_info = interp.load_mapped(global.platform)?;
+            interp.record_loaded(&interp_info);
+            Some(interp_info)
         } else {
             None
         };
