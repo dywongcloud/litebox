@@ -312,9 +312,11 @@ impl LinuxUserland {
     }
 
     fn read_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
-        // TODO: this function is not guaranteed to return all allocated pages, as it may
-        // allocate more pages after the mapping file is read. Missing allocated pages may
-        // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
+        // TODO: this function is not guaranteed to return all allocated pages, as mappings may
+        // be created (or removed) during or after the read, e.g. by another thread starting up
+        // concurrently, or by the global allocator requesting more pages from the host. Missing
+        // allocated pages may cause the program to crash when calling `mmap` or `mremap` with
+        // the `MAP_FIXED` flag later.
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
         let path = c"/proc/self/maps";
@@ -329,36 +331,63 @@ impl LinuxUserland {
         let Ok(fd) = fd else {
             return alloc::vec::Vec::new();
         };
-        let mut buf = [0u8; 8192];
-        let mut total_read = 0;
-        while total_read < buf.len() {
-            let n = unsafe {
+
+        // `/proc/self/maps` has no fixed size limit: it grows with the number of mappings in
+        // the process, so read it in chunks until EOF rather than assuming it fits a fixed-size
+        // buffer. A failure to grow the buffer (e.g. host OOM) is handled by stopping the read
+        // and working with whatever was captured so far, since this function is already
+        // best-effort (see above).
+        let mut data = alloc::vec::Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let Ok(n) = (unsafe {
                 syscalls::syscall3(
                     syscalls::Sysno::read,
                     fd,
-                    buf.as_mut_ptr() as usize + total_read,
-                    buf.len() - total_read,
+                    chunk.as_mut_ptr() as usize,
+                    chunk.len(),
                 )
-            }
-            .expect("read failed");
+            }) else {
+                break;
+            };
             if n == 0 {
                 break;
             }
-            total_read += n;
+            if data.try_reserve(n).is_err() {
+                break;
+            }
+            data.extend_from_slice(&chunk[..n]);
         }
-        assert!(total_read < buf.len(), "buffer too small");
         unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
 
+        // Parse the address range off the front of each line directly from bytes rather than
+        // requiring the whole file to be valid UTF-8: a mapped file's pathname (the last field)
+        // is not guaranteed to be UTF-8, but the address range always is.
         let mut reserved_pages = alloc::vec::Vec::new();
-        let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
-        for line in s.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 5 {
+        for line in data.split(|&b| b == b'\n') {
+            let fields: Vec<&[u8]> = line
+                .split(|&b| b == b' ')
+                .filter(|f| !f.is_empty())
+                .collect();
+            if fields.len() < 5 {
                 continue;
             }
-            let range = parts[0].split('-').collect::<Vec<&str>>();
-            let start = usize::from_str_radix(range[0], 16).expect("invalid start address");
-            let end = usize::from_str_radix(range[1], 16).expect("invalid end address");
+            let Some(sep) = fields[0].iter().position(|&b| b == b'-') else {
+                continue;
+            };
+            let (start_bytes, end_bytes) = (&fields[0][..sep], &fields[0][sep + 1..]);
+            let Ok(start_str) = core::str::from_utf8(start_bytes) else {
+                continue;
+            };
+            let Ok(end_str) = core::str::from_utf8(end_bytes) else {
+                continue;
+            };
+            let Ok(start) = usize::from_str_radix(start_str, 16) else {
+                continue;
+            };
+            let Ok(end) = usize::from_str_radix(end_str, 16) else {
+                continue;
+            };
             reserved_pages.push(start..end);
         }
         reserved_pages
@@ -2461,6 +2490,49 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
+    }
+
+    #[test]
+    fn test_read_maps_handles_more_than_8kib_of_mappings() {
+        // Regression test for https://github.com/microsoft/litebox/issues/1328: push
+        // `/proc/self/maps` past the platform's old fixed 8 KiB read buffer by creating many
+        // small mappings with alternating protections, which the kernel cannot merge into
+        // fewer VMAs, so each one gets its own line.
+        let mut mappings = std::vec::Vec::new();
+        for i in 0..4000 {
+            let prot = if i % 2 == 0 {
+                libc::PROT_READ
+            } else {
+                libc::PROT_READ | libc::PROT_WRITE
+            };
+            let addr = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    prot,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(addr, libc::MAP_FAILED, "mmap failed");
+            mappings.push(addr);
+        }
+
+        let reserved_pages = LinuxUserland::read_maps();
+
+        for addr in &mappings {
+            unsafe {
+                libc::munmap(*addr, 4096);
+            }
+        }
+
+        assert!(
+            reserved_pages.len() > mappings.len(),
+            "expected read_maps to observe the {} extra mappings it created, got {}",
+            mappings.len(),
+            reserved_pages.len()
+        );
     }
 
     #[test]
