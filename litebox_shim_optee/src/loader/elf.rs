@@ -20,7 +20,7 @@
 use crate::{MutPtr, Task, ThreadInitState, UserMutPtr};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _},
     utils::TruncateExt,
 };
 use litebox_common_linux::{
@@ -28,20 +28,16 @@ use litebox_common_linux::{
     errno::Errno,
     loader::{ElfParseError, ElfParsedFile},
 };
-use litebox_common_optee::{LdelfArg, TeeUuid};
+use litebox_common_optee::LdelfArg;
 use thiserror::Error;
 
 /// An ELF file loaded in memory
-struct ElfFileInMemory<'a, Platform: crate::OpteeShimPlatform> {
-    task: &'a Task<Platform>,
+struct ElfFileInMemory<'a> {
+    task: &'a Task,
     buffer: alloc::boxed::Box<[u8]>,
 }
 
-fn read_at<Platform: crate::OpteeShimPlatform>(
-    elf: &ElfFileInMemory<Platform>,
-    offset: u64,
-    buf: &mut [u8],
-) -> Result<(), Errno> {
+fn read_at(elf: &ElfFileInMemory, offset: u64, buf: &mut [u8]) -> Result<(), Errno> {
     if buf.is_empty() {
         return Ok(());
     }
@@ -56,8 +52,8 @@ fn read_at<Platform: crate::OpteeShimPlatform>(
     Ok(())
 }
 
-impl<'a, Platform: crate::OpteeShimPlatform> ElfFileInMemory<'a, Platform> {
-    fn new(task: &'a Task<Platform>, elf_buf: &[u8]) -> Self {
+impl<'a> ElfFileInMemory<'a> {
+    fn new(task: &'a Task, elf_buf: &[u8]) -> Self {
         Self {
             task,
             buffer: elf_buf.into(),
@@ -65,9 +61,7 @@ impl<'a, Platform: crate::OpteeShimPlatform> ElfFileInMemory<'a, Platform> {
     }
 }
 
-impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::ReadAt
-    for &'_ ElfFileInMemory<'_, Platform>
-{
+impl litebox_common_linux::loader::ReadAt for &'_ ElfFileInMemory<'_> {
     type Error = Errno;
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -79,9 +73,7 @@ impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::ReadAt
     }
 }
 
-impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::MapMemory
-    for ElfFileInMemory<'_, Platform>
-{
+impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
@@ -113,12 +105,10 @@ impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::MapMemory
             align,
         );
         if let Some((addr, size)) = regions.head_unmap {
-            self.task
-                .sys_munmap(MutPtr::<Platform, _>::from_usize(addr), size)?;
+            self.task.sys_munmap(MutPtr::from_usize(addr), size)?;
         }
         if let Some((addr, size)) = regions.tail_unmap {
-            self.task
-                .sys_munmap(MutPtr::<Platform, _>::from_usize(addr), size)?;
+            self.task.sys_munmap(MutPtr::from_usize(addr), size)?;
         }
         Ok(regions.aligned_ptr)
     }
@@ -157,18 +147,14 @@ impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::MapMemory
             let available = self.buffer.len() - offset;
             let end = offset + core::cmp::min(len, available);
             let src = &self.buffer[offset..end];
-            let user_ptr = UserMutPtr::<Platform, u8>::from_usize(mapped_addr);
+            let user_ptr = UserMutPtr::<u8>::from_usize(mapped_addr);
             user_ptr
                 .copy_from_slice(0, src)
                 .ok_or(ElfLoaderError::MappingError(MappingError::OutOfMemory))?;
         }
 
         self.task
-            .sys_mprotect(
-                UserMutPtr::<Platform, _>::from_usize(mapped_addr),
-                len,
-                prot.flags(),
-            )
+            .sys_mprotect(UserMutPtr::from_usize(mapped_addr), len, prot.flags())
             .map_err(ElfLoaderError::ProtectError)?;
         Ok(())
     }
@@ -201,28 +187,32 @@ impl<Platform: crate::OpteeShimPlatform> litebox_common_linux::loader::MapMemory
         len: usize,
         prot: &litebox_common_linux::loader::Protection,
     ) -> Result<(), Self::Error> {
-        let addr = crate::MutPtr::<Platform, u8>::from_usize(address);
+        let addr = crate::MutPtr::<u8>::from_usize(address);
         self.task.sys_mprotect(addr, len, prot.flags())
     }
 }
 
 /// Loader for ELF files
-pub(crate) struct ElfLoader<'a, Platform: crate::OpteeShimPlatform> {
-    main: FileAndParsed<'a, Platform>,
+pub(crate) struct ElfLoader<'a> {
+    main: FileAndParsed<'a>,
     is_ldelf: bool,
 }
 
-struct FileAndParsed<'a, Platform: crate::OpteeShimPlatform> {
-    file: ElfFileInMemory<'a, Platform>,
+struct FileAndParsed<'a> {
+    file: ElfFileInMemory<'a>,
     parsed: ElfParsedFile,
 }
 
-impl<'a, Platform: crate::OpteeShimPlatform> FileAndParsed<'a, Platform> {
-    fn new(task: &'a Task<Platform>, elf_buf: &[u8]) -> Result<Self, ElfLoaderError> {
+impl<'a> FileAndParsed<'a> {
+    fn new(task: &'a Task, elf_buf: &[u8]) -> Result<Self, ElfLoaderError> {
         let file = ElfFileInMemory::new(task, elf_buf);
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        match parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point()) {
+        match parsed.parse_trampoline(
+            &mut &file,
+            task.global.platform.get_syscall_entry_point(),
+            task.global.platform.get_guest_tp_slot_offset(),
+        ) {
             Ok(()) | Err(ElfParseError::UnpatchedBinary) => {}
             Err(e) => return Err(e.into()),
         }
@@ -230,35 +220,11 @@ impl<'a, Platform: crate::OpteeShimPlatform> FileAndParsed<'a, Platform> {
     }
 }
 
-impl<'a, Platform: crate::OpteeShimPlatform> ElfLoader<'a, Platform> {
+impl<'a> ElfLoader<'a> {
     /// Parse a given ELF binary in memory.
-    pub fn new(
-        task: &'a Task<Platform>,
-        elf_bin: &[u8],
-        is_ldelf: bool,
-    ) -> Result<Self, ElfLoaderError> {
+    pub fn new(task: &'a Task, elf_bin: &[u8], is_ldelf: bool) -> Result<Self, ElfLoaderError> {
         let main = FileAndParsed::new(task, elf_bin)?;
         Ok(Self { main, is_ldelf })
-    }
-
-    /// The pages the TA's trampoline occupies, relative to the TA's load
-    /// address, or `None` if the TA has no trampoline.
-    ///
-    /// Callers anchor the result at the address `ldelf` maps the first segment
-    /// at, whereas [`Self::load_ta_trampoline`] anchors at
-    /// `entry_point - e_entry`. The two agree as long as the first `PT_LOAD`
-    /// starts at vaddr 0, which `ldelf` assumes too.
-    pub(crate) fn ta_trampoline_relative_page_range(
-        task: &'a Task<Platform>,
-        ta_uuid: &TeeUuid,
-    ) -> Result<Option<core::ops::Range<usize>>, ElfLoaderError> {
-        let ta_bin = task
-            .global
-            .get_ta_bin(ta_uuid)
-            .ok_or(ElfLoaderError::OpenError(Errno::ENOENT))?;
-        // Constructing the loader only parses headers; it maps nothing.
-        let loader = Self::new(task, &ta_bin, false)?;
-        Ok(loader.main.parsed.trampoline_page_range(0))
     }
 
     /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.

@@ -4,8 +4,7 @@
 use crate::syscalls::Cleanup;
 use crate::{Task, UserMutPtr};
 use litebox::mm::linux::PAGE_SIZE;
-use litebox::platform::page_mgmt::PageManagementProvider;
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::platform::{RawConstPointer, RawMutPointer, SystemInfoProvider as _};
 use litebox_common_linux::{MapFlags, ProtFlags};
 use litebox_common_optee::{LdelfMapFlags, TeeResult, TeeUuid};
 
@@ -22,14 +21,14 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// and ownership of the mapping has been transferred to the caller, call
 /// `disarm()` to suppress the unmap.
 #[must_use = "MmapGuard unmaps on drop unless disarm() is called; bind it"]
-struct MmapGuard<'a, Platform: crate::OpteeShimPlatform> {
-    task: &'a Task<Platform>,
-    addr: UserMutPtr<Platform, u8>,
+struct MmapGuard<'a> {
+    task: &'a Task,
+    addr: UserMutPtr<u8>,
     len: usize,
 }
 
-impl<'a, Platform: crate::OpteeShimPlatform> MmapGuard<'a, Platform> {
-    fn new(task: &'a Task<Platform>, addr: UserMutPtr<Platform, u8>, len: usize) -> Self {
+impl<'a> MmapGuard<'a> {
+    fn new(task: &'a Task, addr: UserMutPtr<u8>, len: usize) -> Self {
         Self { task, addr, len }
     }
 
@@ -38,15 +37,15 @@ impl<'a, Platform: crate::OpteeShimPlatform> MmapGuard<'a, Platform> {
     }
 }
 
-impl<Platform: crate::OpteeShimPlatform> Drop for MmapGuard<'_, Platform> {
+impl Drop for MmapGuard<'_> {
     fn drop(&mut self) {
         let _ = self.task.sys_munmap(self.addr, self.len);
     }
 }
 
-impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
+impl Task {
     #[inline]
-    fn checked_map_len(
+    fn checked_map_size(
         num_bytes: usize,
         pad_begin: usize,
         pad_end: usize,
@@ -60,98 +59,26 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
 
     #[inline]
     fn get_aligned_start_of_pad_end(
-        usable_start_addr: usize,
+        padded_start: usize,
         num_bytes: usize,
     ) -> Result<usize, TeeResult> {
-        usable_start_addr
+        padded_start
             .checked_add(num_bytes)
             .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
             .ok_or(TeeResult::BadParameters)
     }
 
-    /// Check that the `pad_begin` bytes below `usable_start_addr` and the
-    /// `pad_end` bytes above `usable_start_addr + segment_len` are free, as
-    /// OP-TEE's `select_va_in_range` does for a caller-named address.
-    ///
-    /// Mapping the segment alone would only validate `ROUNDUP(num_bytes)`. The
-    /// TA's trampoline pages are excluded, since OP-TEE believes that address
-    /// space is unmapped.
-    ///
-    /// Under the userland runner, LiteBox's own mappings (its binary, libc, the
-    /// heap) share this address space; they are tracked as of start-up, but not
-    /// what it allocates afterwards.
-    fn ensure_pads_are_unmapped(
-        &self,
-        usable_start_addr: usize,
-        segment_len: usize,
-        pad_begin: usize,
-        pad_end: usize,
-    ) -> Result<(), TeeResult> {
-        if pad_begin == 0 && pad_end == 0 {
-            return Ok(());
-        }
-        let usable_end_addr = usable_start_addr
-            .checked_add(segment_len)
-            .ok_or(TeeResult::BadParameters)?;
-        // Either gap can be empty, which `RangeSet::insert` rejects.
-        let mut pads = rangemap::RangeSet::new();
-        if pad_begin != 0 {
-            pads.insert(
-                usable_start_addr
-                    .checked_sub(pad_begin)
-                    .ok_or(TeeResult::BadParameters)?..usable_start_addr,
-            );
-        }
-        if pad_end != 0 {
-            pads.insert(
-                usable_end_addr
-                    ..usable_end_addr
-                        .checked_add(pad_end)
-                        .ok_or(TeeResult::BadParameters)?,
-            );
-        }
-        // The gaps must fall inside the task's address range; padding that runs
-        // past either end is an access conflict rather than a fit.
-        if pads.iter().any(|pad| {
-            pad.start < <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN
-                || pad.end > <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX
-        }) {
-            return Err(TeeResult::AccessConflict);
-        }
-        // Cut the trampoline pages out of the gaps rather than skipping the
-        // mappings inside them: `RangeMap` coalesces adjacent ranges that share
-        // flags, so they are routinely merged into a segment's VMA.
-        if let Some((start, end)) = self.ta_trampoline_page_range.get() {
-            pads.remove(start..end);
-        }
-
-        if self
-            .global
-            .pm
-            .mappings()
-            .iter()
-            .any(|(range, _flags)| pads.overlaps(range))
-        {
-            return Err(TeeResult::AccessConflict);
-        }
-        Ok(())
-    }
-
     /// OP-TEE's syscall to map zero-initialized memory with padding.
     ///
-    /// `va` is either `0` (OP-TEE picks the address) or a fixed address. Padding
-    /// only steers that choice: OP-TEE maps and records just
-    /// `ROUNDUP(num_bytes)` and leaves the padding unmapped (see `vm_map_pad()`
-    /// in `core/mm/vm.c`).
+    /// Maps `pad_begin + num_bytes + pad_end` bytes (rounded up to a page) and
+    /// zero-initializes the `num_bytes` usable region. `va` is a page-aligned
+    /// hint for the *base of the whole mapping* (`0` means no hint). The usable
+    /// region thus starts at `start = va + pad_begin`; the `pad_begin`/`pad_end`
+    /// regions are reserved and must not be accessed.
     ///
-    /// The usable region is `num_bytes` long and zero-initialized. With `va ==
-    /// 0` it starts `pad_begin` bytes into the span OP-TEE picked; with a fixed
-    /// `va` it starts at `va` itself and `pad_begin` merely demands that many
-    /// free bytes below it, matching `vm_map_pad`'s in/out `va`.
-    ///
-    /// On success, returns that usable start address plus a [`Cleanup`] that
-    /// unmaps the usable region. The caller communicates the address back to
-    /// userspace and must run the cleanup if that write-back fails.
+    /// On success, returns `start` plus a `Cleanup` that unmaps the usable
+    /// region. The caller communicates the address back to userspace and must
+    /// run the cleanup if that write-back fails.
     pub fn sys_map_zi(
         &self,
         va: usize,
@@ -164,8 +91,6 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         litebox_util_log::debug!(
             va:% = format_args!("{:#x}", va),
             num_bytes:% = num_bytes,
-            pad_begin:% = pad_begin,
-            pad_end:% = pad_end,
             flags:% = format_args!("{:#x}", flags);
             "sys_map_zi"
         );
@@ -184,71 +109,58 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             return Err(TeeResult::AccessConflict);
         }
 
-        let padded_len = Self::checked_map_len(num_bytes, pad_begin, pad_end)?;
-        if va.checked_add(padded_len).is_none() {
+        let total_size = Self::checked_map_size(num_bytes, pad_begin, pad_end)?;
+        if va.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
-        let segment_len = Self::checked_map_len(num_bytes, 0, 0)?;
-
         // `sys_map_zi` always creates read/writeable mapping.
         //
-        // With `va == 0`, map the padded span so LiteBox's allocator picks a gap
-        // wide enough for it, mirroring `select_va_in_range`, then unmap the
-        // padding. With a fixed `va` there is no placement to influence, so map
-        // only the segment and check the gaps instead.
+        // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE.
         let mut flags = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
-        let (map_len, map_pad_begin_len) = if va == 0 {
-            (padded_len, pad_begin)
-        } else {
-            self.ensure_pads_are_unmapped(va, segment_len, pad_begin, pad_end)?;
-            flags |= MapFlags::MAP_FIXED_NOREPLACE;
-            (segment_len, 0)
-        };
+        if va != 0 {
+            flags |= MapFlags::MAP_FIXED;
+        }
 
         let addr = self
-            .sys_mmap(va, map_len, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
-            .map_err(TeeResult::from)?;
-        let guard = MmapGuard::new(self, addr, map_len);
+            .sys_mmap(va, total_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
+            .map_err(|_| TeeResult::OutOfMemory)?;
+        let guard = MmapGuard::new(self, addr, total_size);
 
-        let usable_start_addr = addr
+        let padded_start = addr
             .as_usize()
-            .checked_add(map_pad_begin_len)
+            .checked_add(pad_begin)
             .ok_or(TeeResult::BadParameters)?;
 
         // Unmap the padding regions to free physical memory.
         // Using munmap instead of mprotect(PROT_NONE) actually deallocates the frames.
-        // pad_begin region: [addr, align_down(usable_start_addr, PAGE_SIZE))
-        let pad_begin_end_addr = align_down(usable_start_addr, PAGE_SIZE);
-        if addr.as_usize() < pad_begin_end_addr {
-            let _ = self.sys_munmap(addr, pad_begin_end_addr - addr.as_usize());
+        // pad_begin region: [addr, align_down(padded_start, PAGE_SIZE))
+        let pad_begin_end = align_down(padded_start, PAGE_SIZE);
+        if addr.as_usize() < pad_begin_end {
+            let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
-        // pad_end region: [align_up(usable_start_addr + num_bytes, PAGE_SIZE), addr + map_len)
-        let pad_end_start_addr = Self::get_aligned_start_of_pad_end(usable_start_addr, num_bytes)?;
-        let map_end_addr = addr
+        // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
+        let pad_end_start = Self::get_aligned_start_of_pad_end(padded_start, num_bytes)?;
+        let region_end = addr
             .as_usize()
-            .checked_add(map_len)
+            .checked_add(total_size)
             .ok_or(TeeResult::BadParameters)?;
-        if pad_end_start_addr < map_end_addr {
+        if pad_end_start < region_end {
             let _ = self.sys_munmap(
-                UserMutPtr::<Platform, _>::from_usize(pad_end_start_addr),
-                map_end_addr - pad_end_start_addr,
+                UserMutPtr::from_usize(pad_end_start),
+                region_end - pad_end_start,
             );
         }
 
         guard.disarm();
         let cleanup = Cleanup::Unmap {
-            addr: usable_start_addr,
-            len: pad_end_start_addr - usable_start_addr,
+            addr: padded_start,
+            len: pad_end_start - padded_start,
         };
-        Ok((usable_start_addr, cleanup))
+        Ok((padded_start, cleanup))
     }
 
     /// OP-TEE's syscall to open a TA binary.
-    pub fn sys_open_bin(
-        &self,
-        ta_uuid: TeeUuid,
-        handle: UserMutPtr<Platform, u32>,
-    ) -> Result<(), TeeResult> {
+    pub fn sys_open_bin(&self, ta_uuid: TeeUuid, handle: UserMutPtr<u32>) -> Result<(), TeeResult> {
         #[cfg(debug_assertions)]
         litebox_util_log::debug!(
             ta_uuid:? = ta_uuid,
@@ -282,7 +194,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     #[allow(clippy::too_many_arguments)]
     pub fn sys_map_bin(
         &self,
-        va: UserMutPtr<Platform, usize>,
+        va: UserMutPtr<usize>,
         num_bytes: usize,
         handle: u32,
         offs: usize,
@@ -337,98 +249,69 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             return Err(TeeResult::BadParameters);
         }
 
-        let padded_len = Self::checked_map_len(num_bytes, pad_begin, pad_end)?;
-        if addr.checked_add(padded_len).is_none() {
+        let total_size = Self::checked_map_size(num_bytes, pad_begin, pad_end)?;
+        if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
-        let segment_len = Self::checked_map_len(num_bytes, 0, 0)?;
-
         // We map with PROT_READ_WRITE first, then mprotect padding regions to PROT_NONE as
         // explained in `sys_map_zi`.
         let mut flags_internal = MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS;
+        if addr != 0 {
+            flags_internal |= MapFlags::MAP_FIXED;
+        }
         // TODO: on Arm, check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` to control cache behaviors
 
-        // `pad_begin` is the ASLR offset `ldelf` puts before the image; `pad_end`
-        // covers the segments that follow. Neither is mapped, so every segment's
-        // `pad_end` overlaps the rest of the image and only the last has none.
-        let (map_len, map_pad_begin_len, trampoline_relative_page_range) = if addr == 0 {
-            // The call that establishes the load address is the one that must
-            // also keep the trampoline pages: it has padding and an executable
-            // segment, unlike the bare one-page map `ldelf` makes to read the
-            // ELF header. Only the first such call counts, so that the pages
-            // already kept stay tracked.
-            //
-            // TODO: consider a reliable solution.
-            let trampoline_page_range = if (pad_begin > 0 || pad_end > 0)
-                && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
-                && self.ta_trampoline_page_range.get().is_none()
-            {
-                let ta_uuid = self
-                    .ta_handle_map
-                    .get(handle)
-                    .ok_or(TeeResult::BadParameters)?;
-                // Fail here rather than let `ldelf` allocate over the
-                // trampoline and report something unrelated later.
-                crate::loader::elf::ElfLoader::ta_trampoline_relative_page_range(self, &ta_uuid)
-                    .map_err(|_| TeeResult::BadFormat)?
-            } else {
-                None
-            };
-            (padded_len, pad_begin, trampoline_page_range)
+        // Avoiding TA trampoline address conflict based on heuristics.
+        // Grow the underlying mmap by one page but keep trimming based on
+        // the original total_size so the extra page survives unseen by
+        // ldelf. ldelf reserves the address space for TA ELF via the main
+        // `sys_map_bin` call: addr=0 (PM picks the base), at least one of
+        // pad_begin/pad_end > 0 (reservation room around the first
+        // segment; ASLR-enabled builds put it in pad_begin, ASLR-disabled
+        // may put it entirely in pad_end), and LDELF_MAP_FLAG_EXECUTABLE
+        // (the first segment is .text). Skip on kernel-mode platforms
+        // which don't use a syscall trampoline.
+        //
+        // TODO: consider a reliable solution.
+        let should_extend_ta_reservation = addr == 0
+            && (pad_begin > 0 || pad_end > 0)
+            && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
+            && self.global.platform.get_syscall_entry_point() != 0;
+        let mmap_size = if should_extend_ta_reservation {
+            // The size of OP-TEE TA trampoline is 0x3f8, so one page is enough.
+            total_size
+                .checked_add(PAGE_SIZE)
+                .ok_or(TeeResult::OutOfMemory)?
         } else {
-            // `NOREPLACE` so a segment cannot silently replace an existing
-            // mapping: the padding is unmapped, so nothing guards the span.
-            //
-            // The trampoline pages are cut out of the padding checks but not
-            // out of this map, so a segment overlapping them fails here where
-            // OP-TEE would succeed. `ldelf` never gets that far: they start at
-            // `roundup(max p_vaddr + p_memsz)`, exactly where the last segment
-            // ends. A TA naming such an address via `PTA_SYSTEM_MAP_ZI` would be
-            // mapping over its own trampoline, so refuse this.
-            self.ensure_pads_are_unmapped(addr, segment_len, pad_begin, pad_end)?;
-            flags_internal |= MapFlags::MAP_FIXED_NOREPLACE;
-            (segment_len, 0, None)
+            total_size
         };
-        // `map_len` is the span `ldelf` knows about; `alloc_len` is what we
-        // actually request. The trampoline sits past the image, so it falls
-        // inside `pad_end` or just beyond: widen the request to cover it, so the
-        // allocator finds a gap that fits both. The trim below releases the
-        // padding but leaves the trampoline pages mapped, so they stay free
-        // until `load_ta_context` loads the trampoline into them.
-        let alloc_len = match &trampoline_relative_page_range {
-            Some(range) => map_len.max(
-                pad_begin
-                    .checked_add(range.end)
-                    .ok_or(TeeResult::OutOfMemory)?,
-            ),
-            None => map_len,
-        };
+
         // Currently, we do not support TA binary mapping. So, we create an anonymous mapping and copy
         // the content of the TA binary into it.
-        let map_base_addr = self
+        let addr = self
             .sys_mmap(
                 addr,
-                alloc_len,
+                mmap_size,
                 ProtFlags::PROT_READ_WRITE,
                 flags_internal,
                 -1,
                 0,
             )
-            .map_err(TeeResult::from)?;
-        let guard = MmapGuard::new(self, map_base_addr, alloc_len);
+            .map_err(|_| TeeResult::OutOfMemory)?;
+        let guard = MmapGuard::new(self, addr, mmap_size);
 
-        let usable_start_addr = map_base_addr
+        let padded_start = addr
             .as_usize()
-            .checked_add(map_pad_begin_len)
+            .checked_add(pad_begin)
             .ok_or(TeeResult::BadParameters)?;
-        if usable_start_addr == 0 {
+        if padded_start == 0 {
             return Err(TeeResult::BadFormat);
         }
 
         if self
             .read_ta_bin(
                 handle,
-                UserMutPtr::<Platform, _>::from_usize(usable_start_addr),
+                UserMutPtr::from_usize(padded_start),
                 offs,
                 num_bytes,
             )
@@ -444,18 +327,14 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         } else if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE) {
             prot |= ProtFlags::PROT_EXEC;
         }
-        let prot_start_addr = align_down(usable_start_addr, PAGE_SIZE);
-        let prot_len = usable_start_addr
-            .checked_sub(prot_start_addr)
+        let prot_start = align_down(padded_start, PAGE_SIZE);
+        let prot_len = padded_start
+            .checked_sub(prot_start)
             .and_then(|offset| offset.checked_add(num_bytes))
             .and_then(|len| len.checked_next_multiple_of(PAGE_SIZE))
             .ok_or(TeeResult::BadParameters)?;
         if self
-            .sys_mprotect(
-                UserMutPtr::<Platform, _>::from_usize(prot_start_addr),
-                prot_len,
-                prot,
-            )
+            .sys_mprotect(UserMutPtr::from_usize(prot_start), prot_len, prot)
             .is_err()
         {
             return Err(TeeResult::AccessDenied);
@@ -463,50 +342,26 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
 
         // Unmap the padding regions to free physical memory.
         // Using munmap instead of mprotect(PROT_NONE) actually deallocates the frames.
-        // pad_begin region: [map_base_addr, align_down(usable_start_addr, PAGE_SIZE))
-        let pad_begin_end_addr = align_down(usable_start_addr, PAGE_SIZE);
-        if map_base_addr.as_usize() < pad_begin_end_addr {
-            let _ = self.sys_munmap(map_base_addr, pad_begin_end_addr - map_base_addr.as_usize());
+        // pad_begin region: [addr, align_down(padded_start, PAGE_SIZE))
+        let pad_begin_end = align_down(padded_start, PAGE_SIZE);
+        if addr.as_usize() < pad_begin_end {
+            let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
-        // pad_end region: [align_up(usable_start_addr + num_bytes, PAGE_SIZE), map_base_addr + alloc_len),
-        // except the trampoline pages, which stay mapped.
-        let pad_end_start_addr = Self::get_aligned_start_of_pad_end(usable_start_addr, num_bytes)?;
-        let alloc_end_addr = map_base_addr
+        // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
+        let pad_end_start = Self::get_aligned_start_of_pad_end(padded_start, num_bytes)?;
+        let region_end = addr
             .as_usize()
-            .checked_add(alloc_len)
+            .checked_add(total_size)
             .ok_or(TeeResult::BadParameters)?;
-        let trampoline_page_range = match trampoline_relative_page_range {
-            Some(range) => Some(
-                usable_start_addr
-                    .checked_add(range.start)
-                    .ok_or(TeeResult::BadParameters)?
-                    ..usable_start_addr
-                        .checked_add(range.end)
-                        .ok_or(TeeResult::BadParameters)?,
-            ),
-            None => None,
-        };
-        if pad_end_start_addr < alloc_end_addr {
-            let mut to_release = rangemap::RangeSet::new();
-            to_release.insert(pad_end_start_addr..alloc_end_addr);
-            if let Some(range) = &trampoline_page_range {
-                to_release.remove(range.clone());
-            }
-            for range in to_release.iter() {
-                let _ = self.sys_munmap(
-                    UserMutPtr::<Platform, _>::from_usize(range.start),
-                    range.end - range.start,
-                );
-            }
+        if pad_end_start < region_end {
+            let _ = self.sys_munmap(
+                UserMutPtr::from_usize(pad_end_start),
+                region_end - pad_end_start,
+            );
         }
 
-        let _ = va.write_at_offset(0, usable_start_addr);
+        let _ = va.write_at_offset(0, padded_start);
         guard.disarm();
-        // Record the trampoline pages so the padding checks treat them as unmapped.
-        if let Some(range) = trampoline_page_range {
-            self.ta_trampoline_page_range
-                .set(Some((range.start, range.end)));
-        }
 
         Ok(())
     }
@@ -528,13 +383,8 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             "sys_cp_from_bin"
         );
 
-        self.read_ta_bin(
-            handle,
-            UserMutPtr::<Platform, _>::from_usize(dst),
-            offs,
-            num_bytes,
-        )
-        .ok_or(TeeResult::ShortBuffer)?;
+        self.read_ta_bin(handle, UserMutPtr::from_usize(dst), offs, num_bytes)
+            .ok_or(TeeResult::ShortBuffer)?;
 
         Ok(())
     }
@@ -544,7 +394,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     fn read_ta_bin(
         &self,
         handle: u32,
-        dst: UserMutPtr<Platform, u8>,
+        dst: UserMutPtr<u8>,
         offset: usize,
         count: usize,
     ) -> Option<()> {

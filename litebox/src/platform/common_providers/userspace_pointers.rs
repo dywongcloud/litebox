@@ -110,27 +110,6 @@ impl<V: ValidateAccess, T> UserConstPtr<V, T> {
         }
     }
 
-    /// Copy data from userspace to a raw pointer.
-    ///
-    /// # Safety
-    ///
-    /// `dst` must be either non-Rust memory or Rust memory with exclusive access.
-    pub unsafe fn copy_to_raw(self, dst: *mut T, len: usize) -> Option<()>
-    where
-        T: FromBytes,
-    {
-        if len == 0 {
-            return Some(());
-        }
-        let byte_len = len.checked_mul(core::mem::size_of::<T>())?;
-        self.inner.checked_add(byte_len)?;
-        let src =
-            V::validate_slice(core::ptr::slice_from_raw_parts(self.as_ptr(), len).cast_mut())?
-                .cast_const();
-        V::with_user_memory_access(|| unsafe { memcpy_fallible(dst.cast(), src.cast(), byte_len) })
-            .ok()
-    }
-
     /// Explicitly-private function.  This particular function exists because we
     /// store the `*const T` that would be stored in this struct instead as a
     /// `usize`.  We store `inner` as a `usize` to support
@@ -278,25 +257,6 @@ impl<V: ValidateAccess, T> UserMutPtr<V, T> {
         }
     }
 
-    /// Copy data from a raw pointer to userspace.
-    ///
-    /// # Safety
-    ///
-    /// `src` must be either non-Rust memory or Rust memory without concurrent modification.
-    pub unsafe fn copy_from_raw(self, src: *const T, len: usize) -> Option<()>
-    where
-        T: FromBytes + IntoBytes,
-    {
-        if len == 0 {
-            return Some(());
-        }
-        let byte_len = len.checked_mul(core::mem::size_of::<T>())?;
-        self.inner.checked_add(byte_len)?;
-        let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(self.as_ptr(), len))?;
-        V::with_user_memory_access(|| unsafe { memcpy_fallible(dst.cast(), src.cast(), byte_len) })
-            .ok()
-    }
-
     /// Explicitly-private function.  See equivalent [`UserConstPtr::as_ptr`]
     /// for more details.
     fn as_ptr(&self) -> *mut T {
@@ -376,6 +336,21 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
                     core::mem::size_of::<T>(),
                 ),
             }
+        })
+        .ok()
+    }
+
+    fn compare_exchange_u32(self, current: u32, new: u32) -> Option<Result<u32, u32>>
+    where
+        Self: RawMutPointer<u32>,
+    {
+        let dst = self.as_ptr().cast::<u32>();
+        if dst.is_null() || !dst.is_aligned() {
+            return None;
+        }
+        let dst = V::validate(dst)?;
+        V::with_user_memory_access(|| unsafe {
+            crate::mm::exception_table::compare_exchange_u32_fallible(dst, current, new)
         })
         .ok()
     }

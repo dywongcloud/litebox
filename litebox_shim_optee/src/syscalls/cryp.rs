@@ -17,14 +17,14 @@ use litebox_common_optee::{
 
 use crate::{Cipher, TeeCrypState, TeeObj, UserMutPtr};
 
-impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
+impl Task {
     pub(crate) fn sys_cryp_state_alloc(
         &self,
         algo: TeeAlgorithm,
         mode: TeeOperationMode,
         key1: TeeObjHandle,
         key2: TeeObjHandle,
-        state: UserMutPtr<Platform, TeeCrypStateHandle>,
+        state: UserMutPtr<TeeCrypStateHandle>,
     ) -> Result<(), TeeResult> {
         let tee_cryp_state_map = &self.tee_cryp_state_map;
         let tee_obj_map = &self.tee_obj_map;
@@ -210,7 +210,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     pub(crate) fn sys_cryp_obj_get_info(
         &self,
         obj: TeeObjHandle,
-        info: UserMutPtr<Platform, TeeObjectInfo>,
+        info: UserMutPtr<TeeObjectInfo>,
     ) -> Result<(), TeeResult> {
         let tee_obj_map = &self.tee_obj_map;
         if tee_obj_map.exists(obj) {
@@ -226,7 +226,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         &self,
         typ: TeeObjectType,
         max_size: u32,
-        obj: UserMutPtr<Platform, TeeObjHandle>,
+        obj: UserMutPtr<TeeObjHandle>,
     ) -> Result<(), TeeResult> {
         let tee_obj_map = &self.tee_obj_map;
         let tee_obj = TeeObj::new(typ, max_size);
@@ -273,7 +273,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         if !tee_obj_map.exists(obj) {
             return Err(TeeResult::BadState);
         }
-        tee_obj_map.populate::<Platform>(obj, attrs)
+        tee_obj_map.populate(obj, attrs)
     }
 
     pub(crate) fn sys_cryp_obj_copy(
@@ -307,7 +307,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_cryp_random_number_generate(&self, buf: &mut [u8]) -> Result<(), TeeResult> {
         if !buf.is_empty() {
-            <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
+            <crate::Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
                 self.global.platform,
                 buf,
             );

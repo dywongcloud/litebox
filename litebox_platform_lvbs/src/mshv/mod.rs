@@ -3,40 +3,34 @@
 
 //! Hyper-V-specific code
 
+pub(crate) mod heki;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
+mod mem_integrity;
 pub(crate) mod ringbuffer;
 pub mod vsm;
 pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use litebox_common_linux::vmap::{
-    PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
+    GlobalVmapManager, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
-use litebox_common_lvbs::MAX_CORES;
-use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-/// Adapter for mapping and modifying protected VTL0 frames.
-struct PrivilegedVmap<'a, P> {
-    platform: &'a P,
-}
+/// Provider for MSHV operations authorized to modify protected VTL0 frames.
+struct PrivilegedVmap;
 
-impl<'a, P> PrivilegedVmap<'a, P> {
-    /// Mint the protection-bypassing mapper.
-    fn mint(platform: &'a P) -> Self {
-        Self { platform }
+impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for PrivilegedVmap {
+    type Manager = PrivilegedVmap;
+
+    fn manager() -> &'static Self::Manager {
+        &PrivilegedVmap
     }
 }
 
-unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
-    for PrivilegedVmap<'_, P>
-{
-    type MapInfo = P::MapInfo;
+unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
+    type MapInfo = crate::LvbsPhysPageMapInfo;
 
     unsafe fn vmap(
         &self,
@@ -44,8 +38,8 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
         perms: PhysPageMapPermissions,
     ) -> Result<Self::MapInfo, PhysPointerError> {
         // SAFETY: callers uphold the raw mapping contract. This provider is used only for
-        // writes whose destination the caller has independently authorized.
-        unsafe { self.platform.vmap_privileged(pages, perms) }
+        // independently authorized HEKI patch and ring-buffer writes.
+        unsafe { crate::platform_low().vmap_privileged(pages, perms) }
     }
 
     unsafe fn vunmap(
@@ -54,11 +48,16 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
     ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
         // SAFETY: `map_info` came from the same LVBS mapper and has no outstanding uses beyond the
         // physical-pointer guard that is dropping it.
-        unsafe { self.platform.vunmap(map_info) }
+        unsafe {
+            <crate::host::LvbsLinuxKernel as VmapManager<ALIGN>>::vunmap(
+                crate::platform_low(),
+                map_info,
+            )
+        }
     }
 
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
-        self.platform.validate_unowned(pages)
+        crate::platform_low().validate_unowned(pages)
     }
 
     unsafe fn protect(
@@ -67,28 +66,24 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
         perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
         // SAFETY: callers uphold `VmapManager::protect`; this forwards unchanged to LVBS.
-        unsafe { self.platform.protect(pages, perms) }
+        unsafe { crate::platform_low().protect(pages, perms) }
     }
 }
 
-type Vtl0PhysConstPtr<'a, T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<
-        'a,
-        crate::host::LvbsLinuxKernel,
-        T,
-        ALIGN,
-    >;
+type Vtl0PhysConstPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, crate::Vmap>;
 
-/// Mutable VTL0 pointer reserved for callers that have independently validated the destination.
-/// It bypasses ordinary protected-frame access checks and synchronization. Do not use it for other
+/// Mutable VTL0 pointer reserved for validated HEKI text patching and the fixed-address log ring
+/// buffer. It bypasses ordinary protected-frame access checks and synchronization. Do not use it for other
 /// VTL0 destinations that could enable confused-deputy writes.
-type PrivilegedVtl0PhysMutPtr<'a, T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<
-        'a,
-        PrivilegedVmap<'a, crate::host::LvbsLinuxKernel>,
-        T,
-        ALIGN,
-    >;
+type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, PrivilegedVmap>;
+
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use litebox_common_lvbs::MAX_CORES;
+use modular_bitfield::prelude::*;
+use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;
@@ -197,7 +192,7 @@ pub const MSR_IA32_SYSENTER_EIP: u32 = 0x0000_0176;
 pub const DEFAULT_REG_PIN_MASK: u64 = u64::MAX;
 
 bitflags::bitflags! {
-    #[derive(Debug, PartialEq, Clone, Copy)]
+    #[derive(Debug, PartialEq)]
     pub struct HvPageProtFlags: u8 {
         const HV_PAGE_ACCESS_NONE = 0x0;
         const HV_PAGE_READABLE = 0x1;

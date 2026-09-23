@@ -22,12 +22,13 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, vmap::GlobalVmapManager};
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
     TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
+use litebox_platform_multiplex::Platform;
 
 pub mod loader;
 pub mod session;
@@ -35,6 +36,7 @@ pub(crate) mod syscalls;
 
 pub mod msg_handler;
 
+#[cfg(feature = "platform_lvbs")]
 pub mod idk;
 
 // Re-export session management types for convenience
@@ -42,47 +44,14 @@ pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
-/// Platform capabilities required by the OP-TEE shim.
-pub trait OpteeShimPlatform:
-    litebox::platform::RawPointerProvider
-    + litebox::platform::TimeProvider
-    + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox::mm::linux::VmemPageFaultHandler
-    + litebox::platform::RawMutexProvider
-    + litebox::sync::RawSyncPrimitivesProvider
-    + litebox::platform::CrngProvider
-    + litebox::platform::SystemInfoProvider
-    + litebox::platform::ArchSpecificProvider
-    + litebox::platform::DerivedKeyProvider
-    + litebox_common_linux::vmap::VmapManager<{ PAGE_SIZE }>
-    + 'static
-{
-}
-
-impl<T> OpteeShimPlatform for T where
-    T: litebox::platform::RawPointerProvider
-        + litebox::platform::TimeProvider
-        + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox::mm::linux::VmemPageFaultHandler
-        + litebox::platform::RawMutexProvider
-        + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::CrngProvider
-        + litebox::platform::SystemInfoProvider
-        + litebox::platform::ArchSpecificProvider
-        + litebox::platform::DerivedKeyProvider
-        + litebox_common_linux::vmap::VmapManager<{ PAGE_SIZE }>
-        + 'static
-{
-}
-
-pub struct OpteeShimEntrypoints<Platform: OpteeShimPlatform> {
-    task: Task<Platform>,
+pub struct OpteeShimEntrypoints {
+    task: Task,
     // The task should not be moved once it's bound to a platform thread so that
     // we preserve the ability to use TLS in the future.
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
-impl<Platform: OpteeShimPlatform> litebox::shim::EnterShim for OpteeShimEntrypoints<Platform> {
+impl litebox::shim::EnterShim for OpteeShimEntrypoints {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -136,35 +105,35 @@ impl<Platform: OpteeShimPlatform> litebox::shim::EnterShim for OpteeShimEntrypoi
     }
 }
 
-impl<Platform: OpteeShimPlatform> OpteeShimEntrypoints<Platform> {
+impl OpteeShimEntrypoints {
     fn enter_shim(
         &self,
         _is_init: bool,
         ctx: &mut litebox_common_linux::PtRegs,
-        f: impl FnOnce(&Task<Platform>, &mut litebox_common_linux::PtRegs) -> ContinueOperation,
+        f: impl FnOnce(&Task, &mut litebox_common_linux::PtRegs) -> ContinueOperation,
     ) -> ContinueOperation {
         f(&self.task, ctx)
     }
 }
 
 /// The shim entry point structure.
-pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
+pub struct OpteeShimBuilder {
     platform: &'static Platform,
-    session_manager: &'static session::SessionManager<Platform>,
     litebox: LiteBox<Platform>,
 }
 
-impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
+impl Default for OpteeShimBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpteeShimBuilder {
     /// Returns a new shim builder.
-    ///
-    /// Every shim for this platform instance shares the same `session_manager`.
-    pub fn new(
-        platform: &'static Platform,
-        session_manager: &'static session::SessionManager<Platform>,
-    ) -> Self {
+    pub fn new() -> Self {
+        let platform = litebox_platform_multiplex::platform();
         Self {
             platform,
-            session_manager,
             litebox: LiteBox::new(platform),
         }
     }
@@ -175,14 +144,13 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
     }
 
     /// Build the shim.
-    pub fn build(self) -> OpteeShim<Platform> {
+    pub fn build(self) -> OpteeShim {
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            session_manager: self.session_manager,
             boot_instant: TimeProvider::now(self.platform),
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
-            ta_uuid_map: ta_uuid_map(),
+            ta_uuid_map: TaUuidMap::new(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
         OpteeShim(global)
@@ -190,11 +158,9 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
 }
 
 /// Global shim state, shared across all tasks.
-struct GlobalState<Platform: OpteeShimPlatform> {
+struct GlobalState {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
-    /// The session registry, owned by the composition root (the runner).
-    session_manager: &'static session::SessionManager<Platform>,
     /// Monotonic baseline captured when this instance was created; the
     /// arbitrary origin for GP "system time" (`TEE_GetSystemTime`).
     /// See [`GlobalState::system_time`].
@@ -204,7 +170,7 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// The LiteBox instance used throughout the shim.
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
-    ta_uuid_map: &'static TaUuidMap,
+    ta_uuid_map: TaUuidMap,
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
     /// rather than queued.
@@ -215,7 +181,7 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
 }
 
-impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
+impl GlobalState {
     /// Store the TA binary associated with the given TA UUID.
     ///
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
@@ -225,7 +191,7 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     }
 
     /// Get the TA binary associated with the given TA UUID.
-    pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
+    pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
         if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
             Some(ta_bin)
         } else {
@@ -257,34 +223,28 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     /// to avoid repeated RPCs and memory transfers. We remove it lazily if there is
     /// a memory pressure.
     ///
+    /// TODO: Use something like `Arc` to to ensure no active ldelf/TA holds a handle to
+    /// this TA binary
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         let _ = self.ta_uuid_map.remove(ta_uuid);
     }
 
     /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
-    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
+    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
         None
     }
 }
 
-type UserMutPtr<Platform, T> =
-    <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
-pub type UserConstPtr<Platform, T> =
-    <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
-pub type TaMemrefAddresses = [Option<usize>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS];
+type UserMutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+pub type UserConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 
-type MutPtr<Platform, T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-pub struct OpteeShim<Platform: OpteeShimPlatform>(Arc<GlobalState<Platform>>);
+#[derive(Clone)]
+pub struct OpteeShim(Arc<GlobalState>);
 
-impl<Platform: OpteeShimPlatform> Clone for OpteeShim<Platform> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
+impl OpteeShim {
     /// Load the given `ldelf` binary into memory while making it ready to load the TA binary specified
     /// by `ta_uuid` (and optionally `ta_bin`).
     ///
@@ -297,7 +257,8 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         &self,
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
-    ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
+        ta_bin: Option<&[u8]>,
+    ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
@@ -311,11 +272,15 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                ta_trampoline_page_range: Cell::new(None),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             },
         };
+        if let Some(ta_bin) = ta_bin
+            && !entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin)
+        {
+            return Err(loader::elf::ElfLoaderError::InvalidUuid);
+        }
         let elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin, true)?;
         entrypoints.task.load_ldelf(elf_loader, ta_uuid)?;
         let params_address = if entrypoints.task.get_ta_stack_base_addr().is_some() {
@@ -339,34 +304,9 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         })
     }
 
-    /// The platform this shim was built against.
-    #[must_use]
-    pub fn platform(&self) -> &'static Platform {
-        self.0.platform
-    }
-
-    /// The session registry this shim was built against.
-    #[must_use]
-    pub fn session_manager(&self) -> &'static session::SessionManager<Platform> {
-        self.0.session_manager
-    }
-
     /// Get the global page manager
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
-    }
-
-    /// Store a TA binary associated with the given TA UUID.
-    ///
-    /// Returns `true` if the binary was successfully stored, `false` if the binary's
-    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
-    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        self.0.store_ta_bin(ta_uuid, ta_bin)
-    }
-
-    /// Get the TA binary associated with the given TA UUID.
-    pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        self.0.get_ta_bin(ta_uuid)
     }
 
     /// Release all user-space memory mappings owned by this shim instance.
@@ -379,14 +319,17 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// The caller must ensure that no references to the released memory regions
     /// are held after this call.
     pub unsafe fn release_user_mappings(&self) {
-        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::linux::VmFlags| true;
+        // This shim instance owns every mapping the manager tracks, so each tracked range is
+        // released whole. See `PageManager::release_memory` for why the callback names ranges
+        // rather than answering yes/no.
+        let release = |r: core::ops::Range<usize>, _vm: litebox::mm::linux::VmFlags| Some(r);
         unsafe {
             let _ = self.page_manager().release_memory(release);
         }
     }
 }
 
-impl<Platform: OpteeShimPlatform> OpteeShimEntrypoints<Platform> {
+impl OpteeShimEntrypoints {
     /// Load the CPU context to (re)enter the loaded TA.
     pub fn load_ta_context(
         &self,
@@ -395,37 +338,18 @@ impl<Platform: OpteeShimPlatform> OpteeShimEntrypoints<Platform> {
         func_id: u32,
         cmd_id: Option<u32>,
     ) -> Result<(), loader::elf::ElfLoaderError> {
-        self.load_ta_context_with_shm(params, &[], session_id, func_id, cmd_id)
-            .map(|_| ())
-    }
-
-    /// Load the TA context with shared-memory sources for its input buffers.
-    pub fn load_ta_context_with_shm(
-        &self,
-        params: &[litebox_common_optee::UteeParamOwned],
-        shm_info: &[Option<msg_handler::ShmInfo<PAGE_SIZE>>],
-        session_id: u32,
-        func_id: u32,
-        cmd_id: Option<u32>,
-    ) -> Result<TaMemrefAddresses, loader::elf::ElfLoaderError> {
         let init_state = self
             .task
-            .load_ta_context(params, shm_info, session_id, func_id, cmd_id)?;
-        let ThreadInitState::Ta {
-            memref_addresses, ..
-        } = init_state
-        else {
-            return Err(loader::elf::ElfLoaderError::InvalidStackAddr);
-        };
+            .load_ta_context(params, session_id, func_id, cmd_id)?;
         self.task.thread.init_state.set(init_state);
-        Ok(memref_addresses)
+        Ok(())
     }
 }
 
 /// Information about a loaded TA program.
-pub struct LoadedProgram<Platform: OpteeShimPlatform> {
+pub struct LoadedProgram {
     /// The entrypoints for the TA (syscall handling, context loading, etc.)
-    pub entrypoints: Option<OpteeShimEntrypoints<Platform>>,
+    pub entrypoints: Option<OpteeShimEntrypoints>,
     /// Address where TA parameters (`UteeParams`) are stored on the stack.
     ///
     /// This address is constant for the lifetime of the TA instance because:
@@ -441,7 +365,7 @@ pub struct LoadedProgram<Platform: OpteeShimPlatform> {
     pub ta_flags: TaFlags,
 }
 
-impl<Platform: OpteeShimPlatform> Task<Platform> {
+impl Task {
     /// Handle OP-TEE syscalls
     ///
     /// It dispatches the syscall handling based on the current thread initialization state (ldelf or TA).
@@ -527,9 +451,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
                 name_len,
                 index,
             } => match name.to_owned_slice(name_len) {
-                Some(name) => {
-                    Task::<Platform>::sys_get_property_name_to_index(prop_set, &name, index)
-                }
+                Some(name) => Task::sys_get_property_name_to_index(prop_set, &name, index),
                 None => Err(TeeResult::BadParameters),
             },
             SyscallRequest::OpenTaSession {
@@ -733,7 +655,6 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
                 func_id,
                 entry_point,
                 stack_top,
-                ..
             } => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -855,7 +776,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
     /// Load `ldelf` and prepare the stack and CPU context for it with the given TA UUID.
     fn load_ldelf(
         &self,
-        mut loader: crate::loader::elf::ElfLoader<'_, Platform>,
+        mut loader: crate::loader::elf::ElfLoader<'_>,
         ta_uuid: TeeUuid,
     ) -> Result<(), ElfLoaderError> {
         let ldelf_arg = LdelfArg::new(ta_uuid);
@@ -868,7 +789,6 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
     fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
-        shm_info: &[Option<msg_handler::ShmInfo<PAGE_SIZE>>],
         session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
@@ -894,8 +814,8 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
             )?;
-        let memref_addresses = ta_stack
-            .init(self.global.platform, params, shm_info)
+        ta_stack
+            .init(self.global.platform, params)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ThreadInitState::Ta {
@@ -905,7 +825,6 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
             func_id: func_id as usize,
             entry_point: self.get_ta_entry_point(),
             stack_top: ta_stack.get_cur_stack_top(),
-            memref_addresses,
         })
     }
 
@@ -927,7 +846,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
                 login: TeeLogin::Public,
                 uuid: TeeUuid::NIL,
             },
-            |session_id| self.global.session_manager.client_identity(session_id),
+            |session_id| crate::session::session_manager().client_identity(session_id),
         )
     }
 
@@ -976,12 +895,12 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
     /// every TA entry.
     #[cfg(target_arch = "x86_64")]
     fn restore_guest_tls(&self) {
+        use litebox::platform::ArchSpecificProvider as _;
         let addr = self.tls_base_addr.get();
         if addr == 0 {
             return; // TLS not allocated yet
         }
-        self.global
-            .platform
+        litebox_platform_multiplex::platform()
             .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, addr)
             .expect("requires guaranteed platform support for FsBase");
     }
@@ -995,7 +914,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
             _ => None,
         };
         if let Some(ldelf_arg_address) = ldelf_arg_address {
-            let ldelf_arg_ptr = UserConstPtr::<Platform, LdelfArg>::from_usize(ldelf_arg_address);
+            let ldelf_arg_ptr = UserConstPtr::<LdelfArg>::from_usize(ldelf_arg_address);
             if let Some(ldef_arg) = ldelf_arg_ptr.read_at_offset(0) {
                 let entry_func = ldef_arg.entry_func.trunc();
                 // If `ldelf` has been successfully executed, it loads the given TA and stores the TA's entry
@@ -1026,7 +945,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
     /// Since the TA entry point is provided by `ldelf` which is untrusted, we checks whether
     /// the given `addr` is within the user space.
     pub(crate) fn set_ta_entry_point(&self, addr: usize) {
-        let ptr = UserConstPtr::<Platform, u8>::from_usize(addr);
+        let ptr = UserConstPtr::<u8>::from_usize(addr);
         if ptr.read_at_offset(0).is_some() {
             self.ta_entry_point.set(addr);
         }
@@ -1039,23 +958,17 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
 }
 
 #[inline]
-fn handle_cipher_update_or_final<Platform: OpteeShimPlatform, F>(
-    task: &Task<Platform>,
+fn handle_cipher_update_or_final<F>(
+    task: &Task,
     state: TeeCrypStateHandle,
-    src: UserConstPtr<Platform, u8>,
+    src: UserConstPtr<u8>,
     src_len: usize,
-    dst: UserMutPtr<Platform, u8>,
-    dst_len: UserMutPtr<Platform, u64>,
+    dst: UserMutPtr<u8>,
+    dst_len: UserMutPtr<u64>,
     syscall_fn: F,
 ) -> Result<(), TeeResult>
 where
-    F: Fn(
-        &Task<Platform>,
-        TeeCrypStateHandle,
-        &[u8],
-        &mut [u8],
-        &mut usize,
-    ) -> Result<(), TeeResult>,
+    F: Fn(&Task, TeeCrypStateHandle, &[u8], &mut [u8], &mut usize) -> Result<(), TeeResult>,
 {
     if let Some(src_slice) = src.to_owned_slice(src_len)
         && let Some(length) = dst_len.read_at_offset(0)
@@ -1168,7 +1081,7 @@ impl TeeObjMap {
         inner.insert(handle, tee_obj.clone());
     }
 
-    pub fn populate<Platform: OpteeShimPlatform>(
+    pub fn populate(
         &self,
         handle: TeeObjHandle,
         user_attrs: &[UteeAttribute],
@@ -1188,7 +1101,7 @@ impl TeeObjMap {
                 if key_len > MAX_KERNEL_BUF_SIZE {
                     return Err(TeeResult::BadParameters);
                 }
-                let key_ptr = UserConstPtr::<Platform, u8>::from_usize(key_addr);
+                let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
                 let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
                     return Err(TeeResult::BadParameters);
                 };
@@ -1404,24 +1317,24 @@ impl TaHandleMap {
 /// Entry in the TA UUID map containing binary data and parsed flags.
 struct TaInfo {
     /// The raw TA binary
-    binary: Arc<[u8]>,
+    binary: alloc::boxed::Box<[u8]>,
     /// Parsed TA flags from .ta_head section
     flags: TaFlags,
 }
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
 pub(crate) struct TaUuidMap {
-    inner: spin::rwlock::RwLock<HashMap<TeeUuid, TaInfo>>,
+    inner: spin::mutex::SpinMutex<HashMap<TeeUuid, TaInfo>>,
 }
 
 impl TaUuidMap {
     pub(crate) fn new() -> Self {
         Self {
-            inner: spin::rwlock::RwLock::new(HashMap::new()),
+            inner: spin::mutex::SpinMutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: Arc<[u8]>) -> bool {
+    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
         // Parse TA head from the binary's .ta_head section
         let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
             return false;
@@ -1432,7 +1345,8 @@ impl TaUuidMap {
             return false;
         }
 
-        let _replaced = self.inner.write().insert(
+        let mut inner = self.inner.lock();
+        inner.insert(
             uuid,
             TaInfo {
                 binary: ta_bin,
@@ -1442,32 +1356,26 @@ impl TaUuidMap {
         true
     }
 
-    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        self.inner.read().get(uuid).map(|info| info.binary.clone())
+    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        self.inner.lock().get(uuid).map(|info| info.binary.clone())
     }
 
     /// Get the TA flags for a given UUID.
     pub(crate) fn get_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
-        self.inner.read().get(uuid).map(|info| info.flags)
+        self.inner.lock().get(uuid).map(|info| info.flags)
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
-    pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        self.inner.write().remove(uuid).map(|info| info.binary)
+    pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+        self.inner.lock().remove(uuid).map(|info| info.binary)
     }
-}
-
-/// Get the global TA UUID map.
-fn ta_uuid_map() -> &'static TaUuidMap {
-    static TA_UUID_MAP: once_cell::race::OnceBox<TaUuidMap> = once_cell::race::OnceBox::new();
-    TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
 }
 
 /// Per-instance TA state which can be shared between sessions if it is
 /// a single-instance multi-session TA. The active session id is carried
 /// per entry (see [`Task::current_session_id`]).
-struct Task<Platform: OpteeShimPlatform> {
-    global: Arc<GlobalState<Platform>>,
+struct Task {
+    global: Arc<GlobalState>,
     thread: ThreadState,
     /// TA UUID
     ta_app_id: TeeUuid,
@@ -1485,8 +1393,6 @@ struct Task<Platform: OpteeShimPlatform> {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
-    /// Pages left mapped for the TA's syscall trampoline, if any
-    ta_trampoline_page_range: Cell<Option<(usize, usize)>>,
     /// TLS base address for x86_64 (stored to restore FS before each TA entry)
     #[cfg(target_arch = "x86_64")]
     tls_base_addr: Cell<usize>,
@@ -1509,7 +1415,7 @@ impl ThreadState {
     }
 }
 
-impl<Platform: OpteeShimPlatform> Drop for Task<Platform> {
+impl Drop for Task {
     fn drop(&mut self) {
         self.close_all_pta_sessions();
     }
@@ -1531,7 +1437,6 @@ pub(crate) enum ThreadInitState {
         func_id: usize,
         entry_point: usize,
         stack_top: usize,
-        memref_addresses: TaMemrefAddresses,
     },
 }
 
@@ -1622,18 +1527,28 @@ impl SessionIdPool {
     }
 }
 
-pub type NormalWorldConstPtr<'a, Platform, T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<'a, Platform, T, ALIGN>;
-pub type NormalWorldMutPtr<'a, Platform, T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<'a, Platform, T, ALIGN>;
+/// Type-level marker for the normal-world physical-pointer provider.
+pub enum Vmap {}
+
+impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
+    type Manager = litebox_platform_multiplex::Platform;
+    fn manager() -> &'static Self::Manager {
+        litebox_platform_multiplex::platform()
+    }
+}
+
+pub type NormalWorldConstPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, Vmap>;
+pub type NormalWorldMutPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, Vmap>;
 
 #[cfg(test)]
 mod test_utils {
     use super::*;
 
-    impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
+    impl GlobalState {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(self: Arc<Self>) -> Task<Platform> {
+        pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
@@ -1645,7 +1560,6 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                ta_trampoline_page_range: Cell::new(None),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             }

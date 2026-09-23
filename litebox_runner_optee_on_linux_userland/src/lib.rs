@@ -1,11 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// The OP-TEE shim and its shared definitions are both x86-64 only, so on any
+// other host this runner has nothing to drive and compiles to nothing.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
-use litebox_platform_linux_userland::LinuxUserland as Platform;
-use litebox_shim_optee::session::SessionManager;
+use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
+use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::session::session_manager;
 use std::path::PathBuf;
 
 mod tests;
@@ -80,10 +84,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new(None);
-    // Leaked because the shim requires a `'static` session manager.
-    let session_manager: &'static SessionManager<Platform> =
-        Box::leak(Box::new(SessionManager::new()));
-    let shim_builder = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager);
+    litebox_platform_multiplex::set_platform(platform);
+    let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
     let _litebox = shim_builder.litebox();
     let shim = shim_builder.build();
 
@@ -107,25 +109,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 /// it can be loaded and run. Note that an OP-TEE TA does nothing without
 /// a client invoking commands on it.
 fn run_ta_with_default_commands(
-    shim: &litebox_shim_optee::OpteeShim<Platform>,
+    shim: &litebox_shim_optee::OpteeShim,
     ldelf_bin: &[u8],
     ta_bin: &[u8],
 ) {
-    let ta_uuid = litebox_common_optee::parse_ta_head(ta_bin)
-        .expect("Failed to parse TA header from ta_bin")
-        .uuid;
-    assert!(shim.store_ta_bin(&ta_uuid, ta_bin));
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
         if func_id == UteeEntryFunc::OpenSession {
-            let session_token = shim
-                .session_manager()
-                .try_acquire_open_session_token()
-                .unwrap();
+            let session_token = session_manager().try_acquire_open_session_token().unwrap();
             let session_id = session_token.session_id().unwrap();
             let loaded_program = shim
-                .load_ldelf(ldelf_bin, ta_uuid)
+                .load_ldelf(ldelf_bin, TeeUuid::default(), Some(ta_bin))
                 .map_err(|_| {
                     panic!("Failed to load ldelf");
                 })

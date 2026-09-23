@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Rewrite ELF files to hook syscalls
+//! Rewrite binaries for LiteBox execution.
 //!
 //! This crate sets up a trampoline point for every `syscall` instruction in its input binary,
 //! allowing for conveniently taking control of a binary without ptrace/systrap/seccomp/...
@@ -12,10 +12,22 @@
 //! However, as an explicit goal, it is intended to provide low-overhead hooking of syscalls,
 //! without needing to undergo a user-kernel transition.
 //!
-//! This crate currently only supports x86-64 (i.e., amd64) ELFs.
+//! This crate currently supports x86-64 ELFs for syscall hooking.
+//!
+//! It also supports AArch64 ELFs, for Linux guests on Linux or macOS hosts (see [`Host`]), and
+//! rewrites `SVC #imm` syscalls plus both directions of guest thread-pointer access
+//! (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads): the host owns a per-thread anchor register
+//! and the guest thread pointer is fully virtualized to a host-managed memory slot reached through
+//! it. Which register anchors the host varies by host OS -- [`hook_syscalls_in_elf`] defaults to
+//! [`Host::Linux`]; [`hook_syscalls_in_elf_for_host`] selects explicitly. See the `arm64` module
+//! for details, including a caveat on `Host::MacOs` guests that use `x18`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
+
+mod arm64;
+
+pub use arm64::Host;
 
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -73,6 +85,23 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
+/// The pthread thread-specific-data slot index at which the macOS runtime
+/// keeps each thread's guest thread pointer, as addressed by every gate a
+/// [`Host::MacOs`] rewrite emits (`[TPIDRRO_EL0 + slot * 8]`). The runtime
+/// reserves exactly this slot with `pthread_key_create` at platform init; see
+/// the `arm64` module's `GUEST_TPIDR_OFFSET_MACOS` docs for the verified
+/// Darwin TSD layout this rests on.
+pub const MACOS_GUEST_TPIDR_TSD_SLOT: u16 = arm64::MACOS_GUEST_TPIDR_TSD_SLOT;
+
+/// Byte offset, within an emitted AArch64 trampoline, of the word holding the
+/// guest thread-pointer byte offset.
+///
+/// A loader writes the offset its runtime actually reserved into this word
+/// before making the trampoline executable; gates emitted for a host that reads
+/// the offset at run time load it from here. Exported so a loader names the same
+/// slot the emitter wrote rather than repeating the number.
+pub const TRAMPOLINE_GUEST_TP_SLOT_OFFSET: usize = arm64::HEADER_GUEST_TP_OFFSET_MACOS;
+
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
 #[derive(FromBytes, IntoBytes, Immutable)]
@@ -83,7 +112,7 @@ struct TrampolineHeader64 {
     trampoline_size: u64,
 }
 
-/// Metadata about an executable section, extracted from the read-only ELF parse.
+/// Metadata about an executable section, extracted from a read-only object parse.
 struct TextSectionInfo {
     /// Virtual address of the section
     vaddr: u64,
@@ -91,6 +120,11 @@ struct TextSectionInfo {
     file_offset: u64,
     /// Size of the section data in bytes
     size: u64,
+}
+
+struct SyscallPatchResult {
+    found_syscall: bool,
+    skipped_addrs: Vec<u64>,
 }
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
@@ -108,20 +142,45 @@ struct TextSectionInfo {
 /// - trampoline virtual address (8 bytes)
 /// - trampoline size (8 bytes)
 ///
-/// This layout allows loaders to read just the last 32 bytes to get the metadata. Even when
-/// there is no syscall instruction in the binary, the rewriter still appends the header and the initial
-/// syscall-entry placeholder so the loader/audit path can tell the binary was processed.
+/// This layout allows loaders to read just the last 32 bytes to get the metadata.
+///
+/// When there is nothing to patch, both architectures append only a 32-byte
+/// header carrying a `trampoline_size = 0` *sentinel* (no trampoline body), so a
+/// loader can distinguish "processed, nothing to patch" from "never processed";
+/// no instructions are rewritten in that case.
+///
+/// AArch64 differs in one way: it also rewrites guest thread-pointer accesses
+/// (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads), so a binary containing one
+/// is patched (and gets a non-empty trampoline) even when it has no syscall
+/// (`SVC`) instructions at all. (See the `arm64` module docs.)
 ///
 /// Returns the rewritten binary. Binaries that cannot or do not need to be
 /// patched (relocatable objects, non-ELF files, already-hooked binaries,
-/// binaries without executable sections or syscall instructions) are returned
-/// unchanged — these are not errors.
+/// binaries without executable sections) are returned unchanged — these are
+/// not errors. See the per-architecture behavior above.
 ///
 /// Returns `Err` for genuinely broken inputs (corrupt ELF, unsupported
 /// executables like Bun, arithmetic overflow) and for binaries that contain
-/// syscall instructions that could not be patched (replaced with `icebp; hlt`
-/// so they trap instead of escaping to the host kernel).
+/// patch sites that could not be redirected. An unpatchable site is replaced
+/// with a trapping instruction so it faults instead of escaping to the host
+/// kernel: `icebp; hlt` on x86-64, and `BRK` on AArch64 (where a patch site is
+/// an `SVC`, `MSR TPIDR_EL0`, or `MRS TPIDR_EL0` instruction).
+///
+/// AArch64 gates against [`Host::Linux`]'s anchor (`TPIDR_EL0`); use
+/// [`hook_syscalls_in_elf_for_host`] to target a different host.
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    hook_syscalls_in_elf_for_host(input_binary, trampoline, Host::Linux)
+}
+
+/// As [`hook_syscalls_in_elf`], but selects the AArch64 host anchor explicitly
+/// instead of defaulting to [`Host::Linux`]. A binary rewritten for one host
+/// will not run correctly under another. Ignored for x86-64 input, which has
+/// no per-host anchor concept (and no macOS host at all, by design).
+pub fn hook_syscalls_in_elf_for_host(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    host: Host,
+) -> Result<Vec<u8>> {
     if input_binary.ends_with(BUN_FOOTER_MARKER) {
         return Err(Error::UnsupportedExecutable(
             "Bun-packaged executable".into(),
@@ -131,9 +190,16 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Relocatable object files (.o) must not be patched: they are linker
     // input, not executable code. Rewriting instructions or appending
     // trampoline data would corrupt the object file for the linker.
-    // Check the ELF e_type field (bytes 16..18) before doing any work.
+    // Check the ELF e_type field (bytes 16..18) before doing any work. The
+    // encoding of multi-byte fields is selected by e_ident[EI_DATA] (byte 5),
+    // so decode e_type in that endianness rather than assuming little-endian.
     if input_binary.len() >= 18 {
-        let e_type = u16::from_le_bytes([input_binary[16], input_binary[17]]);
+        let e_type_bytes = [input_binary[16], input_binary[17]];
+        let e_type = if input_binary[5] == object::elf::ELFDATA2MSB {
+            u16::from_be_bytes(e_type_bytes)
+        } else {
+            u16::from_le_bytes(e_type_bytes)
+        };
         if e_type == object::elf::ET_REL {
             return Ok(input_binary.to_vec());
         }
@@ -153,11 +219,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (arch, text_sections, trampoline_base_addr) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
-            object::File::Elf64(_) => Arch::X86_64,
+            object::File::Elf64(_) => match file.architecture() {
+                object::Architecture::X86_64 => Arch::X86_64,
+                object::Architecture::Aarch64 => Arch::Aarch64,
+                _ => return Ok(input_binary.to_vec()),
+            },
             _ => return Ok(input_binary.to_vec()),
         };
 
@@ -172,54 +242,45 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             return Ok(input_binary.to_vec());
         }
 
-        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+        let trampoline_base_addr = find_addr_for_trampoline_code(&file, arch.trampoline_align())?;
 
-        let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
-
-        (
-            arch,
-            text_sections,
-            control_transfer_targets,
-            trampoline_base_addr,
-        )
+        (arch, text_sections, trampoline_base_addr)
     };
 
-    // Build the trampoline code (without header - header goes at the end)
-    // The code starts with the syscall entry point placeholder (8 bytes for x86-64)
-    let mut trampoline_data = vec![];
-    let trampoline = trampoline.unwrap_or(0);
-    trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
-    // Patch syscalls in-place in buf
-    let mut skipped_addrs = Vec::new();
-    let mut syscall_insns_found = false;
-    for s in &text_sections {
-        let section_data = section_slice_mut(buf, s)?;
-        match hook_syscalls_in_section(
-            arch,
-            &control_transfer_targets,
-            s.vaddr,
-            section_data,
+    // AArch64 uses a fully separate rewriting strategy (single-instruction
+    // branch replacement, no instruction borrowing). Dispatch to it before any
+    // x86-only work (iced-x86 decoding would misinterpret AArch64 bytes).
+    // See the `arm64` module docs.
+    if arch == Arch::Aarch64 {
+        return hook_aarch64_elf(
+            input_binary,
+            buf,
+            &text_sections,
             trampoline_base_addr,
-            trampoline_base_addr, // entry point is at offset 0 of trampoline
-            &mut trampoline_data,
-        ) {
-            Ok(addrs) => {
-                skipped_addrs.extend(addrs);
-                syscall_insns_found = true;
-            }
-            Err(InternalError::NoSyscallInstructionsFound) => {}
-            Err(InternalError::Public(e)) => return Err(e),
-            Err(e) => unreachable!("unexpected internal error: {e:?}"),
-        }
+            trampoline.unwrap_or(0),
+            host,
+        );
     }
 
-    if !syscall_insns_found {
-        // No syscall instructions found. Append a header-only marker so the
-        // loader can distinguish "checked by rewriter, nothing to patch" from
-        // "never processed." The trampoline_size=0 sentinel tells the loader
-        // to skip trampoline mapping entirely.
-        // Use the original input (not `buf`) to avoid emitting the phdr
-        // alignment fixup that is only needed for the `object` crate parser.
+    if !matches!(host, Host::Linux) {
+        return Err(Error::UnsupportedExecutable(
+            "x86-64 guests only run under a Linux host".into(),
+        ));
+    }
+
+    let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+    let mut trampoline_data = Vec::from(trampoline.unwrap_or(0).to_le_bytes());
+    let patch_result = patch_syscalls_in_sections(
+        arch,
+        buf,
+        &text_sections,
+        &control_transfer_targets,
+        trampoline_base_addr,
+        trampoline_base_addr,
+        &mut trampoline_data,
+    )?;
+
+    if !patch_result.found_syscall {
         let mut out = input_binary.to_vec();
         let header = TrampolineHeader64 {
             magic: *TRAMPOLINE_MAGIC,
@@ -233,33 +294,150 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
     let mut out = buf.to_vec();
-    let remain = out.len() % 0x1000;
-    out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
+    append_trampoline_footer(
+        &mut out,
+        &mut trampoline_data,
+        trampoline_base_addr,
+        false,
+        Arch::X86_64.trampoline_align(),
+    );
 
-    // Calculate file offset where trampoline code starts
-    let trampoline_file_offset = out.len() as u64;
-    let trampoline_size = trampoline_data.len();
-
-    // Append trampoline code
-    out.extend_from_slice(&trampoline_data);
-
-    // Build the header (goes at the end of the file)
-    // The entry point placeholder is at offset 0 of the trampoline code, not in the header.
-    let header = TrampolineHeader64 {
-        magic: *TRAMPOLINE_MAGIC,
-        file_offset: trampoline_file_offset,
-        vaddr: trampoline_base_addr,
-        trampoline_size: trampoline_size as u64,
-    };
-    out.extend_from_slice(header.as_bytes());
-    if !skipped_addrs.is_empty() {
+    if !patch_result.skipped_addrs.is_empty() {
         return Err(Error::UnpatchableSyscalls(format!(
             "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
-            skipped_addrs.len(),
+            patch_result.skipped_addrs.len(),
+            skipped_addrs = patch_result.skipped_addrs,
         )));
     }
     Ok(out)
 }
+
+fn patch_syscalls_in_sections(
+    arch: Arch,
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+    control_transfer_targets: &BTreeSet<u64>,
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+) -> Result<SyscallPatchResult> {
+    let mut found_syscall = false;
+    let mut skipped_addrs = Vec::new();
+
+    for section in text_sections {
+        let section_data = section_slice_mut(buf, section)?;
+        match hook_syscalls_in_section(
+            arch,
+            control_transfer_targets,
+            section.vaddr,
+            section_data,
+            trampoline_base_addr,
+            syscall_entry_addr,
+            trampoline_data,
+        ) {
+            Ok(addrs) => {
+                found_syscall = true;
+                skipped_addrs.extend(addrs);
+            }
+            Err(InternalError::NoSyscallInstructionsFound) => {}
+            Err(InternalError::Public(e)) => return Err(e),
+            Err(e) => unreachable!("unexpected internal error: {e:?}"),
+        }
+    }
+
+    Ok(SyscallPatchResult {
+        found_syscall,
+        skipped_addrs,
+    })
+}
+
+fn append_trampoline_footer(
+    out: &mut Vec<u8>,
+    trampoline_data: &mut Vec<u8>,
+    header_vaddr: u64,
+    align_trampoline_size: bool,
+    align: u64,
+) {
+    // The file offset has to carry the same alignment as the virtual address:
+    // the loader maps the trampoline straight out of the file at that offset,
+    // and a page-granular file mapping cannot start part-way into a page.
+    let align = usize::try_from(align).expect("trampoline alignment fits a pointer");
+    let remain = out.len() % align;
+    out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { align - remain }]);
+
+    let trampoline_file_offset = out.len() as u64;
+    if align_trampoline_size {
+        let trampoline_size = trampoline_data.len().next_multiple_of(align);
+        trampoline_data.extend_from_slice(&vec![0; trampoline_size - trampoline_data.len()]);
+    }
+    let trampoline_size = trampoline_data.len();
+    out.extend_from_slice(trampoline_data);
+
+    let header = TrampolineHeader64 {
+        magic: *TRAMPOLINE_MAGIC,
+        file_offset: trampoline_file_offset,
+        vaddr: header_vaddr,
+        trampoline_size: trampoline_size as u64,
+    };
+    out.extend_from_slice(header.as_bytes());
+}
+
+/// Rewrite an AArch64 ELF, appending the trampoline and trailing header.
+///
+/// `input_binary` is the original, unmodified ELF; `buf` is the mutable copy
+/// (patched in place by the arm64 module). `callback` is the absolute address
+/// stored in the trampoline's callback slot (0 when the loader fills it in
+/// later).
+///
+/// Like the x86-64 path, a binary with no patch sites is emitted as the
+/// original bytes followed by a size-0 trampoline sentinel header (the arm64
+/// module signals this by returning `None`). Otherwise the output layout is
+/// `[patched ELF][padding to page boundary][trampoline code][header]`.
+fn hook_aarch64_elf(
+    input_binary: &[u8],
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+    trampoline_base_addr: u64,
+    callback: u64,
+    host: Host,
+) -> Result<Vec<u8>> {
+    let Some(outcome) =
+        arm64::hook_syscalls_aarch64(buf, text_sections, trampoline_base_addr, callback, host)?
+    else {
+        // No patch sites: emit the original binary with a size-0 sentinel
+        // header so the loader knows there is no trampoline to map.
+        let mut out = input_binary.to_vec();
+        let header = TrampolineHeader64 {
+            magic: *TRAMPOLINE_MAGIC,
+            file_offset: 0,
+            vaddr: 0,
+            trampoline_size: 0,
+        };
+        out.extend_from_slice(header.as_bytes());
+        return Ok(out);
+    };
+
+    // Build output: [patched ELF][padding to page boundary][trampoline][header].
+    let mut trampoline_data = outcome.trampoline;
+    let mut out = buf.to_vec();
+    append_trampoline_footer(
+        &mut out,
+        &mut trampoline_data,
+        trampoline_base_addr,
+        false,
+        Arch::Aarch64.trampoline_align(),
+    );
+
+    if !outcome.trapped_sites.is_empty() {
+        return Err(Error::UnpatchableSyscalls(format!(
+            "{} unpatchable instruction(s) (SVC / MSR / MRS TPIDR_EL0) at {trapped:?}",
+            outcome.trapped_sites.len(),
+            trapped = outcome.trapped_sites,
+        )));
+    }
+    Ok(out)
+}
+
 /// (private) Get metadata for executable sections
 fn text_sections(
     file: &object::File<'_>,
@@ -296,7 +474,7 @@ fn text_sections(
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
 fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     let header_size = match arch {
-        Arch::X86_64 => size_of::<TrampolineHeader64>(),
+        Arch::X86_64 | Arch::Aarch64 => size_of::<TrampolineHeader64>(),
     };
 
     if input_binary.len() < header_size {
@@ -315,8 +493,9 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         (header.file_offset, header.vaddr, header.trampoline_size);
 
     if trampoline_size == 0 {
-        // Size=0 sentinel: the rewriter processed this binary but found no
-        // syscall instructions. It is already hooked (nothing to do).
+        // Size=0 sentinel: the rewriter processed this binary but found nothing
+        // to patch — no syscall instructions, and on AArch64 no `MSR`/`MRS
+        // TPIDR_EL0` accesses either. It is already hooked (nothing to do).
         return true;
     }
     if file_offset % 0x1000 != 0 {
@@ -325,7 +504,7 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     if vaddr % 0x1000 != 0 {
         return false;
     }
-    if file_offset + trampoline_size != header_start as u64 {
+    if file_offset.checked_add(trampoline_size) != Some(header_start as u64) {
         return false;
     }
 
@@ -335,6 +514,28 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
 enum Arch {
     X86_64,
+    Aarch64,
+}
+
+impl Arch {
+    /// Alignment for the appended trampoline's virtual address, file offset and
+    /// size.
+    ///
+    /// The loader maps the trampoline as its own page-granular mapping and
+    /// rejects a header whose `vaddr` is not aligned to the *host's* page size,
+    /// so this has to satisfy every host the image might be loaded on, not the
+    /// one that rewrote it. x86-64 pages are always 4 KiB. AArch64's are not:
+    /// Apple Silicon uses 16 KiB, and Linux can be built for 16 KiB or 64 KiB,
+    /// so a 4 KiB-aligned trampoline is unloadable on most of them. 64 KiB
+    /// covers all three, and is the maximum page size AArch64 ELF images are
+    /// conventionally linked for anyway (see `docs/macos.md`), so it costs
+    /// address space that the layout already assumed.
+    const fn trampoline_align(self) -> u64 {
+        match self {
+            Arch::X86_64 => 0x1000,
+            Arch::Aarch64 => 0x1_0000,
+        }
+    }
 }
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
@@ -362,6 +563,7 @@ fn hook_syscalls_in_section(
                     continue;
                 }
             }
+            Arch::Aarch64 => unreachable!("AArch64 uses the arm64 module, not iced-x86"),
         }
 
         found_any = true;
@@ -734,7 +936,7 @@ pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usi
     Ok(count)
 }
 
-fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
+fn find_addr_for_trampoline_code(file: &object::File<'_>, align: u64) -> Result<u64> {
     // Find the highest virtual address among all PT_LOAD segments
     let max_virtual_addr = match file {
         object::File::Elf64(elf) => max_load_segment_end(elf),
@@ -742,8 +944,7 @@ fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
     }
     .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
 
-    // Round up to the nearest page (assume 0x1000 page size)
-    checked_add_u64(max_virtual_addr, 0xFFF, "trampoline base").map(|addr| addr & !0xFFF)
+    checked_add_u64(max_virtual_addr, align - 1, "trampoline base").map(|addr| addr & !(align - 1))
 }
 
 /// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.
@@ -802,6 +1003,7 @@ fn decode_section_instructions(
 ) -> Result<Vec<iced_x86::Instruction>> {
     let bitness = match arch {
         Arch::X86_64 => 64,
+        Arch::Aarch64 => unreachable!("AArch64 uses the arm64 module, not iced-x86"),
     };
 
     let mut instructions = Vec::new();
@@ -1016,7 +1218,8 @@ fn hook_syscall_and_after(
     // any RIP-relative memory operands for the new location.
     let syscall_inst_end = syscall_inst.next_ip();
     let postsyscall_bytes = if syscall_inst_end < replace_end {
-        let postsyscall_target = target_addr + preamble_len;
+        let postsyscall_target =
+            checked_add_u64(target_addr, preamble_len, "post-syscall trampoline target")?;
         match reencode_instructions(
             &instructions[(inst_index + 1)..replace_end_idx],
             postsyscall_target,
@@ -1085,6 +1288,26 @@ fn hook_syscall_and_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aarch64_out_of_range_site_is_rejected_as_unpatchable() {
+        // A trampoline mapped 256MB above the text is outside the site's ±128MB
+        // branch reach, so the `SVC` is trapped and the rewrite is rejected,
+        // mirroring the x86-64 unpatchable-syscall contract.
+        let mut buf = 0xD400_0001u32.to_le_bytes().to_vec(); // SVC #0
+        let input = buf.clone();
+        let sections = vec![TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: buf.len() as u64,
+        }];
+        let err =
+            hook_aarch64_elf(&input, &mut buf, &sections, 0x1000_0000, 0, Host::Linux).unwrap_err();
+        assert!(
+            matches!(err, Error::UnpatchableSyscalls(_)),
+            "expected UnpatchableSyscalls, got {err:?}"
+        );
+    }
 
     #[cfg(target_pointer_width = "64")]
     #[test]

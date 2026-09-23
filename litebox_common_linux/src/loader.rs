@@ -67,31 +67,32 @@ struct TrampolineInfo {
     size: usize,
     /// The entry point to jump to in the trampoline.
     syscall_entry_point: usize,
+    /// The guest thread-pointer byte offset to publish to the trampoline, on a
+    /// host whose gates read it rather than baking it in.
+    guest_tp_slot_offset: Option<usize>,
 }
 
 /// The magic number used to identify the LiteBox trampoline.
 /// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter`.
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
 
+/// Byte offset, within the trampoline, of the word holding the guest
+/// thread-pointer offset.
+///
+/// This must match `TRAMPOLINE_GUEST_TP_SLOT_OFFSET` in
+/// `litebox_syscall_rewriter`, which is where the emitter puts it. This crate
+/// cannot depend on the rewriter, so `litebox_shim_linux` asserts the two are
+/// equal at compile time rather than leaving the agreement to this comment.
+pub const TRAMPOLINE_GUEST_TP_SLOT_OFFSET: usize = 8;
+
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
 #[derive(FromBytes)]
-pub struct TrampolineHeader64 {
-    /// The format magic and version.
-    pub magic: u64,
-    /// The file offset of the trampoline code.
-    pub file_offset: u64,
-    /// The virtual address of the trampoline code.
-    pub vaddr: u64,
-    /// The size of the trampoline code.
-    pub trampoline_size: u64,
-}
-
-impl TrampolineHeader64 {
-    /// Returns whether the header contains the supported trampoline magic.
-    pub fn has_valid_magic(&self) -> bool {
-        self.magic == TRAMPOLINE_MAGIC
-    }
+struct TrampolineHeader64 {
+    magic: u64,
+    file_offset: u64,
+    vaddr: u64,
+    trampoline_size: u64,
 }
 
 /// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
@@ -103,13 +104,6 @@ struct TrampolineHeader32 {
     vaddr: u32,
     trampoline_size: u32,
 }
-
-/// Size in bytes of the trampoline header for the target pointer width.
-pub const TRAMPOLINE_HEADER_SIZE: usize = if cfg!(target_pointer_width = "64") {
-    size_of::<TrampolineHeader64>()
-} else {
-    size_of::<TrampolineHeader32>()
-};
 
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
     elf::file::Class::ELF64
@@ -244,20 +238,6 @@ impl ElfParsedFile {
         self.trampoline.is_some()
     }
 
-    /// The pages the trampoline occupies when this ELF is loaded at `base_addr`;
-    /// a zero `base_addr` yields the load-address-relative range.
-    ///
-    /// `None` if the binary has no trampoline or, like [`Self::has_trampoline`],
-    /// if [`Self::parse_trampoline`] has not run yet.
-    pub fn trampoline_page_range(&self, base_addr: usize) -> Option<core::ops::Range<usize>> {
-        let trampoline = self.trampoline.as_ref()?;
-        let start = base_addr.checked_add(trampoline.vaddr)?;
-        let end = start
-            .checked_add(trampoline.size)?
-            .checked_next_multiple_of(PAGE_SIZE)?;
-        Some(start..end)
-    }
-
     /// Parse the LiteBox trampoline data, if any.
     ///
     /// The trampoline header is located at the end of the file (last 32/20 bytes).
@@ -266,6 +246,14 @@ impl ElfParsedFile {
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
+    ///
+    /// `guest_tp_slot_offset` is the byte offset from the host's per-thread
+    /// anchor at which the runtime keeps the guest thread pointer, for a host
+    /// whose rewritten gates read that number rather than carrying it as an
+    /// immediate (see `SystemInfoProvider::get_guest_tp_slot_offset`). It is
+    /// written alongside the entry point at map time. `None` leaves the word the
+    /// rewriter seeded in place, which is correct for every host that decides the
+    /// offset when the image is packaged.
     #[expect(
         clippy::missing_panics_doc,
         reason = "cannot panic: array slices are always the correct size"
@@ -274,6 +262,7 @@ impl ElfParsedFile {
         &mut self,
         file: &mut F,
         syscall_entry_point: usize,
+        guest_tp_slot_offset: Option<usize>,
     ) -> Result<(), ElfParseError<F::Error>> {
         if syscall_entry_point == 0 {
             // Platform running in kernel mode does not need trampoline
@@ -283,7 +272,11 @@ impl ElfParsedFile {
 
         let file_size = file.size().map_err(ElfParseError::Io)?;
 
-        let header_size = TRAMPOLINE_HEADER_SIZE;
+        let header_size = if cfg!(target_pointer_width = "64") {
+            size_of::<TrampolineHeader64>()
+        } else {
+            size_of::<TrampolineHeader32>()
+        };
 
         // File must be large enough to contain the header
         if file_size < header_size as u64 {
@@ -351,21 +344,12 @@ impl ElfParsedFile {
             return Err(ElfParseError::BadTrampoline);
         }
 
-        // Reject a vaddr whose range cannot be represented, so that later
-        // address arithmetic cannot wrap.
-        if vaddr
-            .checked_add(trampoline_size)
-            .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
-            .is_none()
-        {
-            return Err(ElfParseError::BadTrampoline);
-        }
-
         self.trampoline = Some(TrampolineInfo {
             vaddr,
             size: trampoline_size,
             file_offset,
             syscall_entry_point,
+            guest_tp_slot_offset,
         });
         Ok(())
     }
@@ -571,6 +555,20 @@ impl ElfParsedFile {
             trampoline_start,
             &trampoline.syscall_entry_point.to_ne_bytes(),
         )?;
+
+        // Publish the guest thread-pointer offset the runtime actually reserved.
+        // This is the only chance to do it: the trampoline is writable now and
+        // read+execute from the protect call below onwards, so a gate's offset
+        // has to be a number that is fixed for the whole process. Skipped unless
+        // the platform asks for it, since on every other host the emitted gates
+        // carry the offset as an immediate and this word is ordinary code.
+        if let Some(offset) = trampoline.guest_tp_slot_offset {
+            let slot = trampoline_start + TRAMPOLINE_GUEST_TP_SLOT_OFFSET;
+            if TRAMPOLINE_GUEST_TP_SLOT_OFFSET + size_of::<usize>() > trampoline.size {
+                return Err(ElfLoadError::InvalidTrampolineVersion);
+            }
+            mem.write(slot, &offset.to_ne_bytes())?;
+        }
 
         // Now that the write is done, protect the trampoline code as
         // read+execute only.
