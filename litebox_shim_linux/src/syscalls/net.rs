@@ -301,7 +301,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             let old = dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        let old = dt.set_fd_metadata(fd, sock_type);
+        // Entry-scoped, like `SocketOptions`/`SocketOFlags`: `SO_TYPE` belongs to the open file
+        // description, so a `dup`'d descriptor must still answer as a socket after the original
+        // fd is closed. (`duplicate` deliberately does not copy fd-scoped metadata.)
+        let old = dt.set_entry_metadata(fd, sock_type);
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
@@ -3168,15 +3171,6 @@ mod tests {
     }
 
     #[test]
-    // Pre-existing gap (present on `origin/main`, not introduced by this migration): after
-    // `sys_dup`-ing an INET socket fd and closing the original, `do_connect` on the duplicate
-    // fails `ENOTSOCK` instead of proceeding to the expected `ECONNREFUSED` -- the duplicate
-    // stops being recognized as a socket by `with_socket`'s subsystem lookup once the original
-    // fd is closed. Root-causing this needs tracing the fd/subsystem descriptor-table plumbing
-    // shared with every other fd type (`litebox_shim_linux::run_on_raw_fd`/`do_dup_inner`), which
-    // is real, scoped work independent of the macOS support this migration brings over -- left
-    // `#[ignore]`d rather than papering over it by loosening the assertion.
-    #[ignore = "known gap: dup'd INET socket fd loses its subsystem after original fd closes"]
     fn test_tun_tcp_connection_refused() {
         let task = init_platform(Some(TUN_DEVICE_NAME));
         let socket_fd = task
