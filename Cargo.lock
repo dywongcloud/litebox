@@ -1812,6 +1812,7 @@ dependencies = [
  "litebox_platform_windows_userland",
  "litebox_shim_linux",
  "litebox_util_log",
+ "tar",
  "tracing-subscriber",
 ]
 
