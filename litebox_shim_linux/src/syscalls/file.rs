@@ -609,7 +609,7 @@ struct FdPath(CString);
 /// for `/proc/<pid>/fdinfo`'s `flags:` line. (`fcntl(F_GETFL)` on a plain file still answers from
 /// the `Backend` layer -- see `sys_fcntl`.)
 #[derive(Clone, Copy, Debug)]
-struct FdOpenFlags(OFlags);
+pub(super) struct FdOpenFlags(pub(super) OFlags);
 
 /// The calling task's descriptor table as `/proc/<pid>/fd` and `fdinfo` describe it (see
 /// [`litebox::fs::proc::ProcFdTable`]). Weak on both ends: it is published into the `/proc`

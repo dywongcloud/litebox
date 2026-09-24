@@ -207,6 +207,10 @@ pub(crate) struct SharedFileMapping<Platform: ShimPlatform, FS: ShimFS> {
     len: usize,
     offset: usize,
     writable: bool,
+    /// Whether the fd the mapping was created from was open for writing. A `MAP_SHARED`
+    /// mapping of a read-only fd can never become `PROT_WRITE` (Linux never gives such a
+    /// mapping `VM_MAYWRITE`), so `mprotect` must keep refusing it after the fact.
+    fd_writable: bool,
     file: EntryHandle<Platform, FS>,
 }
 
@@ -217,6 +221,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for SharedFileMapping<Platform, F
             len: self.len,
             offset: self.offset,
             writable: self.writable,
+            fd_writable: self.fd_writable,
             file: self.file.clone(),
         }
     }
@@ -619,6 +624,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if writable_shared_file && !fb0_shared_mapping && shared_file_mapping_handle.is_none() {
             return Err(Errno::EINVAL);
         }
+        // `MAP_SHARED | PROT_WRITE` needs an fd open for writing: writes through the mapping
+        // land in the file, so an `O_RDONLY` fd must not be able to smuggle them in.
+        let shared_file_fd_writable =
+            shared_file_mapping_handle.is_none() || self.raw_fd_open_for_writing(fd);
+        if writable_shared_file && !shared_file_fd_writable {
+            return Err(Errno::EACCES);
+        }
 
         if flags.intersects(
             MapFlags::MAP_32BIT
@@ -689,6 +701,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     len: aligned_len,
                     offset,
                     writable: writable_shared_file,
+                    fd_writable: shared_file_fd_writable,
                     file,
                 });
         }
@@ -739,6 +752,42 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .fd_from_raw_integer::<FS>(raw_fd)
             .ok()?;
         self.global.litebox.descriptor_table().entry_handle(&typed)
+    }
+
+    /// Whether raw fd `fd` was opened with write access (`O_WRONLY` or `O_RDWR`), per the
+    /// open-time `FdOpenFlags` record. An fd without that record (nothing `insert_raw_file_fd`
+    /// created) is treated as writable so this check never rejects more than it can prove.
+    fn raw_fd_open_for_writing(&self, fd: i32) -> bool {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return true;
+        };
+        let files = self.files.borrow();
+        let Ok(typed) = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<FS>(raw_fd)
+        else {
+            return true;
+        };
+        self.global
+            .litebox
+            .descriptor_table()
+            .with_metadata(&typed, |super::file::FdOpenFlags(flags)| {
+                flags.intersects(litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::RDWR)
+            })
+            .unwrap_or(true)
+    }
+
+    /// Whether any shared file mapping overlapping `[range_start, range_start + range_len)` was
+    /// created from an fd that lacks write access, in which case `PROT_WRITE` must be refused.
+    fn shared_file_mapping_denies_write(&self, range_start: usize, range_len: usize) -> bool {
+        let range_end = range_start.saturating_add(range_len);
+        let files = self.files.borrow();
+        let mappings = files.shared_file_mappings.lock();
+        mappings.iter().any(|mapping| {
+            let mapping_end = mapping.start.saturating_add(mapping.len);
+            !mapping.fd_writable && mapping.start < range_end && mapping_end > range_start
+        })
     }
 
     /// `mmap(MAP_SHARED | PROT_WRITE)` of `/dev/fb0`: allocate ordinary anonymous pages in the
@@ -876,6 +925,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     len: range_start - mapping.start,
                     offset: mapping.offset,
                     writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
                     file: mapping.file.clone(),
                 });
             }
@@ -885,6 +935,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     len: mapping_end - range_end,
                     offset: mapping.offset + (range_end - mapping.start),
                     writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
                     file: mapping.file,
                 });
             }
@@ -916,6 +967,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     len: old_start - mapping.start,
                     offset: mapping.offset,
                     writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
                     file: mapping.file.clone(),
                 });
             }
@@ -925,6 +977,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     len: mapping_end - old_end,
                     offset: mapping.offset + (old_end - mapping.start),
                     writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
                     file: mapping.file.clone(),
                 });
             }
@@ -933,6 +986,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 len: new_len,
                 offset: moved_offset,
                 writable: mapping.writable,
+                fd_writable: mapping.fd_writable,
                 file: mapping.file,
             });
             moved = true;
@@ -963,6 +1017,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     len: start - mapping.start,
                     offset: mapping.offset,
                     writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
                     file: mapping.file.clone(),
                 });
             }
@@ -971,6 +1026,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 len: end - start,
                 offset: mapping.offset + (start - mapping.start),
                 writable,
+                fd_writable: mapping.fd_writable,
                 file: mapping.file.clone(),
             });
             if mapping_end > end {
@@ -979,6 +1035,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     len: mapping_end - end,
                     offset: mapping.offset + (end - mapping.start),
                     writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
                     file: mapping.file,
                 });
             }
@@ -1044,6 +1101,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
         let writable = prot.contains(ProtFlags::PROT_WRITE);
+        if writable && self.shared_file_mapping_denies_write(addr.as_usize(), aligned_len) {
+            return Err(Errno::EACCES);
+        }
         if !writable {
             self.flush_shared_file_mappings(addr.as_usize(), aligned_len)?;
         }
@@ -2356,17 +2416,6 @@ mod tests {
     }
 
     #[test]
-    // `sys_mprotect` (and `do_mmap_file`'s own `MAP_SHARED | PROT_WRITE` path) never checks
-    // that a `MAP_SHARED` mapping's backing fd was opened with write access before granting
-    // `PROT_WRITE` -- this pre-existing gap (present on `origin/main`, not introduced by this
-    // migration) lets a guest mmap a read-only-opened file `MAP_SHARED | PROT_READ`, then
-    // `mprotect` it writable and dirty the underlying file despite never holding a writable fd
-    // to it. Fixing it needs a new "was this shared mapping's fd writable" property threaded
-    // through `SharedFileMapping` (and enforced by both `do_mmap_file` and `sys_mprotect`), which
-    // is real, scoped, security-relevant work independent of the macOS support this migration
-    // brings over -- left `#[ignore]`d rather than silently weakening this assertion to match the
-    // unenforced behavior.
-    #[ignore = "known gap: mprotect doesn't check MAP_SHARED backing-fd write access, see comment"]
     fn test_map_shared_readonly_file() {
         let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
@@ -2400,6 +2449,19 @@ mod tests {
             )
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
+
+        // MAP_SHARED | PROT_WRITE on a read-only fd is refused up front.
+        assert!(matches!(
+            task.sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            ),
+            Err(Errno::EACCES)
+        ));
 
         // MAP_SHARED with PROT_READ on a file should succeed
         let addr = task
