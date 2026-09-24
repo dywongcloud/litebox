@@ -123,8 +123,10 @@ jobs:
     name: Build and Test macOS (Apple Silicon)
     # `macos-14` and later are AArch64 runners. LiteBox runs guest instructions
     # natively, so an Apple Silicon host is only useful to an AArch64 guest --
-    # there is deliberately no x86-64 macOS configuration.
-    runs-on: macos-14
+    # there is deliberately no x86-64 macOS configuration. The image must ship
+    # the macOS 26 SDK: litebox_platform_macos_userland's Hypervisor.framework
+    # shim (`src/hvf_sdk.c`) refuses to build against anything older.
+    runs-on: macos-26
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
