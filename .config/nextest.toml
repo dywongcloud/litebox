@@ -30,10 +30,3 @@ retries = 2
 [[profile.ci.overrides]]
 filter = 'package(litebox_runner_linux_userland) and test(test_static_exec_with_rewriter)'
 retries = 2
-# Real-threads-plus-fixed-sleep synchronization: under enough concurrent CPU contention from the
-# rest of the suite, the main thread's post-barrier scheduling delay before it reaches its own
-# `sys_futex(Wait, ...)` call can exceed the background thread's fixed wait margin, racing
-# `handle_futex_death`'s one-shot wake against a waiter that has not registered yet.
-[[profile.ci.overrides]]
-filter = 'package(litebox_shim_linux) and test(test_handle_futex_death_wakes_waiter_and_sets_owner_died)'
-retries = 2

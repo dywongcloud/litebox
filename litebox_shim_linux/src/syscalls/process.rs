@@ -7627,14 +7627,30 @@ mod tests {
     /// futex entry correctly mark it dead and wake the waiter, without panicking.
     #[test]
     fn test_handle_futex_death_wakes_waiter_and_sets_owner_died() {
-        use litebox_common_linux::{FutexArgs, FutexFlags, TimeParam};
+        use litebox_common_linux::{FutexArgs, FutexFlags, MapFlags, ProtFlags, TimeParam};
         use std::sync::Barrier;
         use std::sync::atomic::{AtomicU32, Ordering};
 
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = crate::syscalls::tests::init_platform(None);
 
-        let mut futex_word: u32 = 0;
-        let futex_addr = core::ptr::from_mut(&mut futex_word) as usize;
+        // The robust futex word lives in guest memory, as it would for a real guest.
+        // `handle_futex_death` wakes with shared (non-`PRIVATE`) semantics, whose key lookup
+        // resolves the word through the VMM; a host-stack word is only known to the VMM if this
+        // test thread's stack happened to be mapped when the process-wide test platform took its
+        // one-time host-mapping snapshot, so with a stack word the wake `EFAULT`s (and is
+        // swallowed) depending purely on test order -- not on timing.
+        let page = task
+            .sys_mmap(
+                0,
+                super::PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+            .expect("mmap for the futex word failed");
+        let futex_addr = page.as_usize();
         let barrier = std::sync::Arc::new(Barrier::new(2));
 
         let bg = {
@@ -7690,6 +7706,7 @@ mod tests {
         );
 
         bg.join().expect("background thread panicked");
+        task.sys_munmap(page, super::PAGE_SIZE).unwrap();
     }
 
     /// Real process-exit teardown (`prepare_for_exit`), a real pipe, and a real epoll
