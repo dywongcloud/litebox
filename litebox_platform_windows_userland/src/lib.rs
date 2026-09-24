@@ -1734,6 +1734,9 @@ enum FixedAllocationAction {
         reservation: core::ops::Range<usize>,
         commit: core::ops::Range<usize>,
     },
+    /// `Replace` over pages that are already committed: discard them and commit afresh, as
+    /// Linux's `MAP_FIXED` discards the mapping it lands on.
+    RecommitCommitted(core::ops::Range<usize>),
 }
 
 enum AllocationUndo {
@@ -1925,6 +1928,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 }
                 let region = remaining.start..remaining.start + len;
                 match mbi.State {
+                    // `Vmem` only asks for `Replace` when its own mappings cover the whole
+                    // range, so committed pages here are ones it is replacing.
+                    Win32_Memory::MEM_COMMIT
+                        if fixed_address_behavior == FixedAddressBehavior::Replace =>
+                    {
+                        plan.try_reserve(1)
+                            .map_err(|_| AllocationError::OutOfMemory)?;
+                        plan.push(FixedAllocationAction::RecommitCommitted(region.clone()));
+                    }
                     Win32_Memory::MEM_COMMIT => has_committed_page = true,
                     Win32_Memory::MEM_RESERVE => {
                         plan.try_reserve(1)
@@ -1949,9 +1961,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 remaining.start = region.end;
             }
 
-            // There is no reversible implementation of Replace for committed pages: decommitting
-            // would discard their bytes, protection, and backing. Hint may fall back elsewhere;
-            // both fixed behaviors reject the occupied target without touching it.
+            // Committed pages can only be taken over by `Replace` (planned above as
+            // `RecommitCommitted`). Hint may fall back elsewhere; `NoReplace` rejects the occupied
+            // target without touching it.
             if !has_committed_page {
                 let mut journal = alloc::vec::Vec::new();
                 journal
@@ -1968,6 +1980,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         }
                         FixedAllocationAction::ReserveAndCommit { reservation, .. } => {
                             memory_range_is_in_state(reservation.clone(), Win32_Memory::MEM_FREE)
+                        }
+                        FixedAllocationAction::RecommitCommitted(range) => {
+                            memory_range_is_in_state(range.clone(), Win32_Memory::MEM_COMMIT)
                         }
                     }
                     .map_err(fixed_allocation_error)?;
@@ -2042,6 +2057,41 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     return Err(fixed_allocation_error(error));
                                 }
                             }
+                            // Destructive, so applied only after every reversible step below.
+                            FixedAllocationAction::RecommitCommitted(_) => {}
+                        }
+                    }
+
+                    // Replacing committed pages discards their contents and cannot be undone, so
+                    // it runs last. A failure before the first page is discarded rolls back as
+                    // usual; after that, returning would leave the caller believing the old
+                    // mapping is intact, so it is fatal like an incomplete rollback.
+                    let mut discarded_committed_pages = false;
+                    for action in &plan {
+                        let FixedAllocationAction::RecommitCommitted(range) = action else {
+                            continue;
+                        };
+                        if let Err(error) = decommit_reserved_pages(range.clone()) {
+                            if discarded_committed_pages {
+                                std::process::abort();
+                            }
+                            rollback_allocation_or_abort(&mut journal);
+                            return Err(fixed_allocation_error(error));
+                        }
+                        discarded_committed_pages = true;
+                        let committed = unsafe {
+                            VirtualAlloc2(
+                                GetCurrentProcess(),
+                                range.start as *mut c_void,
+                                range.len(),
+                                Win32_Memory::MEM_COMMIT,
+                                flags,
+                                core::ptr::null_mut(),
+                                0,
+                            )
+                        };
+                        if committed.is_null() {
+                            std::process::abort();
                         }
                     }
 
@@ -2049,6 +2099,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                         && let Err(error) =
                             do_prefetch_on_range(suggested_range.start, suggested_range.len())
                     {
+                        if discarded_committed_pages {
+                            std::process::abort();
+                        }
                         rollback_allocation_or_abort(&mut journal);
                         return Err(fixed_allocation_error(error));
                     }
