@@ -2005,8 +2005,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         if rights.len().checked_add(count).ok_or(Errno::EINVAL)? > SCM_MAX_FD {
                             return Err(Errno::EINVAL);
                         }
-                        for raw_fd in data.chunks_exact(size_of::<i32>()) {
-                            let raw_fd = i32::from_ne_bytes(raw_fd.try_into().unwrap());
+                        // Exact by the length check above, so the remainder is empty.
+                        let (fds, _) = data.as_chunks::<{ size_of::<i32>() }>();
+                        for raw_fd in fds {
+                            let raw_fd = i32::from_ne_bytes(*raw_fd);
                             rights.push(self.transfer_fd(raw_fd)?);
                         }
                     }
@@ -3876,7 +3878,7 @@ mod unix_tests {
                 .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::CLOEXEC, 0)
                 .expect("payload socketpair failed");
 
-            let data = [b'F'];
+            let data = *b"F";
             let send_iov = [litebox_common_linux::IoVec {
                 iov_base: UserPtrMut::from_usize(data.as_ptr() as usize),
                 iov_len: data.len(),

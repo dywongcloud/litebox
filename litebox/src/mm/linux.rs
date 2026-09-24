@@ -1726,7 +1726,7 @@ pub enum VmemResetError {
     FileBacked,
 }
 
-/// Error for [`Vmem::set_wipe_on_fork`] (`madvise(MADV_WIPEONFORK|MADV_KEEPONFORK)`).
+/// Error for `Vmem::set_wipe_on_fork` (`madvise(MADV_WIPEONFORK|MADV_KEEPONFORK)`).
 #[derive(Error, Debug)]
 pub enum VmemWipeOnForkError {
     #[error("arg is not aligned")]
@@ -1805,7 +1805,7 @@ pub enum MappingError {
     /// A concurrent operation on this address space (another thread of the same
     /// `CLONE_VM` family unmapping or otherwise invalidating the range) removed a
     /// just-created mapping before its post-creation permission change could apply.
-    /// See [`super::PageManager::create_pages`]'s two-phase create-then-protect
+    /// See `PageManager::create_pages`'s two-phase create-then-protect
     /// sequence, which necessarily drops its lock around the caller-supplied `op`
     /// (which may itself need to re-enter the page-fault handler) between those two
     /// phases.

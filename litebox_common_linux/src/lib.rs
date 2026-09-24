@@ -4473,6 +4473,10 @@ pub mod ptrace {
         /// Applies this register set onto `ctx`, leaving every field `ctx`
         /// owns that is not part of `NT_PRSTATUS` (`orig_x0`, `syscallno`)
         /// untouched.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "this module is aarch64-only, where `u64` and `usize` have the same width"
+        )]
         pub fn write_into(&self, ctx: &mut super::PtRegs) {
             for (dst, src) in ctx.regs.iter_mut().zip(self.regs.iter()) {
                 *dst = *src as usize;

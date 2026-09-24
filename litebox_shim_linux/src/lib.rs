@@ -2185,7 +2185,8 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     pty_registry: Arc<syscalls::file::PtyRegistry<Platform, FS>>,
     /// Guest ELF images recorded at map time, for fault symbolization. Grows
     /// monotonically (never pruned on unmap) and survives the mapping fd's
-    /// close, unlike [`Self::elf_patch_cache`]. See `Task::find_guest_image`.
+    /// close, unlike [`Process::elf_patch_cache`](syscalls::process::Process::elf_patch_cache).
+    /// See `Task::find_guest_image`.
     guest_images: litebox::sync::Mutex<Platform, alloc::vec::Vec<syscalls::mm::GuestImage>>,
     /// Guest ELF images placed by the shim's own loader, for fault
     /// symbolization; see [`LoadedImage`] for why these are not in

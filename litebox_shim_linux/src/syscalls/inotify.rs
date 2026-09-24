@@ -5,8 +5,9 @@
 //!
 //! Real Linux `inotify_init1(2)` creates a dedicated fd backed by an event queue and a
 //! watch-descriptor table; `inotify_add_watch(2)`/`inotify_rm_watch(2)` manage the watch table,
-//! and a `read(2)` on the fd drains queued [`InotifyEvent`] records (variable-length: a fixed
-//! header plus an optional NUL-padded name for watches on a directory).
+//! and a `read(2)` on the fd drains queued [`InotifyEvent`](litebox_common_linux::InotifyEvent)
+//! records (variable-length: a fixed header plus an optional NUL-padded name for watches on a
+//! directory).
 //!
 //! This shim implements the fd, watch-descriptor bookkeeping, and queue/read/poll semantics in
 //! full -- every part of the ABI a caller can observe through the fd itself -- but does not yet

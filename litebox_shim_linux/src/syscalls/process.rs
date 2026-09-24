@@ -2214,8 +2214,11 @@ enum ThreadInitState {
         /// reset is correct only for `execve`, via `NewProcess`).
         ///
         /// [`ThreadProvider::get_fp_state`]: litebox::platform::ThreadProvider::get_fp_state
+        ///
+        /// Boxed: the register file is 528 bytes, which would otherwise make
+        /// this variant dwarf the others (`clippy::large_enum_variant`).
         #[cfg(target_arch = "aarch64")]
-        fp: litebox::platform::FpSimdState64,
+        fp: Box<litebox::platform::FpSimdState64>,
     },
 }
 
@@ -3033,7 +3036,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // file must be read here, before the new host OS thread (with its
             // own zeroed FP shadow) starts running.
             #[cfg(target_arch = "aarch64")]
-            fp: self.global.platform.get_fp_state(),
+            fp: Box::new(self.global.platform.get_fp_state()),
         });
         thread.clear_child_tid.set(clear_child_tid);
 
@@ -3245,7 +3248,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // parent thread, before the child's own OS thread (and its
             // separately zeroed FP shadow) starts running.
             #[cfg(target_arch = "aarch64")]
-            fp: self.global.platform.get_fp_state(),
+            fp: Box::new(self.global.platform.get_fp_state()),
         });
         thread.clear_child_tid.set(clear_child_tid);
 

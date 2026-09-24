@@ -74,15 +74,6 @@ const TCP_RETRANSMIT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration:
 /// slow peer) before it is reset and reaped. Linux: `tcp_fin_timeout`, 60 s.
 const TCP_ORPHAN_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(60);
 
-/// The `Network` provides access to all networking related functionality provided by LiteBox.
-///
-/// A LiteBox `Network` is parametric in the platform it runs on.
-///
-/// An important decision that must be made by a user of a `Network` is decided by
-/// [`set_platform_interaction`](Self::set_platform_interaction), whose docs explain this further.
-///
-/// A user of `Network` who care about [events](crate::event) should call [set_socket_proxy](Self::set_socket_proxy)
-/// to set up a proxy for each socket created, so that events can be notified properly.
 /// Whether a listening socket's child has completed its handshake and belongs in the accept
 /// queue. Linux hands out a connection as soon as it is established, including one whose peer
 /// has already sent FIN (`CloseWait`): a client that writes its request and half-closes before
@@ -93,6 +84,15 @@ fn accept_ready(state: tcp::State) -> bool {
     matches!(state, tcp::State::Established | tcp::State::CloseWait)
 }
 
+/// The `Network` provides access to all networking related functionality provided by LiteBox.
+///
+/// A LiteBox `Network` is parametric in the platform it runs on.
+///
+/// An important decision that must be made by a user of a `Network` is decided by
+/// [`set_platform_interaction`](Self::set_platform_interaction), whose docs explain this further.
+///
+/// A user of `Network` who care about [events](crate::event) should call [set_socket_proxy](Self::set_socket_proxy)
+/// to set up a proxy for each socket created, so that events can be notified properly.
 pub struct Network<Platform>
 where
     Platform:

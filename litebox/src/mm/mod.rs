@@ -1035,7 +1035,7 @@ where
     }
 
     /// Reserves `range` so a flexible (non-`MAP_FIXED`) placement search steers around it even
-    /// though it has no live mapping. See [`linux::Vmem::reserve_external`]'s doc comment for why
+    /// though it has no live mapping. See `linux::Vmem::reserve_external`'s doc comment for why
     /// this exists (a saved-but-currently-unmapped fork-family member's memory).
     pub fn reserve_external(&self, range: Range<usize>) {
         self.vmem.write().reserve_external(range);
