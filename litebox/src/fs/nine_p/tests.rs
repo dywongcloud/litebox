@@ -127,19 +127,62 @@ impl DiodServer {
     ///
     /// Returns `true` if the server is ready, `false` if it exited before
     /// becoming ready (e.g., because the port was already in use).
+    ///
+    /// A successful `connect` to `port` does not show that `child` is listening there. Tests run
+    /// in parallel and [`find_free_port`] releases the port before `diod` binds it, so another
+    /// test's `diod` can already hold `port`: this one then fails to bind, but a `connect` probe
+    /// reaches the other server first, and the test attaches to an export that server does not
+    /// have (`FileSystem::new` fails with `Io`). So readiness is judged by `child` owning the
+    /// listening socket.
     fn wait_until_ready(child: &mut std::process::Child, port: u16) -> bool {
-        let addr = std::format!("127.0.0.1:{port}");
         for _ in 0..50 {
             // If the child already exited, no point waiting further.
             if let Some(_status) = child.try_wait().ok().flatten() {
                 return false;
             }
-            if TcpStream::connect(&addr).is_ok() {
+            if Self::owns_listener(child.id(), port) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         false
+    }
+
+    /// Whether process `pid` holds a TCP (IPv4) socket in the `LISTEN` state on `port`: the
+    /// socket's inode, from `/proc/net/tcp`, must be one of the `socket:[inode]` links under
+    /// `/proc/<pid>/fd`.
+    fn owns_listener(pid: u32, port: u16) -> bool {
+        /// `TCP_LISTEN` as `/proc/net/tcp` prints the `st` column.
+        const TCP_LISTEN: &str = "0A";
+        let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+            return false;
+        };
+        let local_port = std::format!(":{port:04X}");
+        let listeners: std::vec::Vec<std::string::String> = table
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                // sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid
+                // timeout inode ...
+                let fields: std::vec::Vec<&str> = line.split_whitespace().collect();
+                let (local, state, inode) = (fields.get(1)?, fields.get(3)?, fields.get(9)?);
+                (local.ends_with(local_port.as_str()) && *state == TCP_LISTEN)
+                    .then(|| std::format!("socket:[{inode}]"))
+            })
+            .collect();
+        if listeners.is_empty() {
+            return false;
+        }
+        let Ok(fds) = std::fs::read_dir(std::format!("/proc/{pid}/fd")) else {
+            return false;
+        };
+        fds.filter_map(Result::ok).any(|fd| {
+            std::fs::read_link(fd.path()).is_ok_and(|target| {
+                listeners
+                    .iter()
+                    .any(|listener| target.to_str() == Some(listener.as_str()))
+            })
+        })
     }
 
     /// TCP address of the server (e.g., "127.0.0.1:12345").
