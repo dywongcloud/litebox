@@ -99,7 +99,8 @@ fn parse_utun_unit(name: &str) -> Option<u32> {
 }
 
 /// Give `device` the point-to-point address pair `host_ip -> guest_ip` and
-/// bring it up.
+/// bring it up. Install subnet routes so inter-guest routing works across
+/// multiple compose instances.
 ///
 /// Unlike Linux's persistent `ip tuntap`-created TUN devices (which `boxer`
 /// creates and addresses once, ahead of time, then merely attaches to), a
@@ -108,37 +109,20 @@ fn parse_utun_unit(name: &str) -> Option<u32> {
 /// to be set here, immediately after [`open_utun`] succeeds, from inside the
 /// same process.
 ///
-/// `guest_ip` as the peer (not `host_ip` again with a `/24` netmask, tried
-/// first) is load-bearing, not a style choice -- **confirmed on real Apple
-/// Silicon hardware**: a point-to-point `utun` interface only ever routes to
-/// its one configured peer address at the kernel level, no matter what a
-/// broader route table entry says. `ifconfig utunN host_ip host_ip netmask
-/// 255.255.255.0` looks like it should cover the whole `/24` (`netstat -nr`
-/// shows the interface `UP` with the right local address), and manually
-/// adding a matching `route add -net ... -interface utunN` on top makes the
-/// routing table agree, but the guest's own address (`--net-guest-ip`,
-/// always a different host on the same `/24`, never `host_ip` itself)
-/// stayed completely unreachable regardless -- not even a raw ICMP ping got
-/// a reply. The failure is silent besides: a TCP connect that hangs until
-/// it times out, not an immediate, loud refusal, so it reads as an
-/// application-level hang (`boxer run --publish`'s forwarder connecting to
-/// the guest, or `boxer compose` routing one guest to another through the
-/// host kernel) rather than the network layer never having delivered
-/// anything. Since each `utun` device here is dedicated to exactly one
-/// guest anyway (never a real multi-host subnet), a plain point-to-point
-/// pair is both the correct fix and simpler than the netmask/route
-/// workaround it replaces: no netmask, no separate route command, and the
-/// kernel auto-installs a working host route to `guest_ip` from the
-/// `ifconfig` call alone.
+/// For multi-box compose on macOS, each instance runs on a dedicated utun
+/// device with a point-to-point host/guest pair on a separate /24 subnet.
+/// The kernel needs explicit routes to map each /24 back to its utun device,
+/// so inter-guest TCP connections (e.g., app → x11server across subnet
+/// boundaries) can be routed through the host's IP forwarding.
 ///
-/// Shells out to `ifconfig` rather than the raw `SIOCAIFADDR`/`ifaliasreq`
-/// ioctl BSD point-to-point interfaces need: fewer platform-specific struct
-/// layouts to get exactly right for a call this infrequent.
+/// Shells out to `ifconfig` and `route add` rather than raw ioctl: fewer
+/// platform-specific struct layouts to get exactly right for calls this
+/// infrequent.
 ///
 /// # Errors
 ///
-/// Returns the underlying error if `ifconfig` cannot be spawned or exits
-/// non-zero -- most often because the process is not root.
+/// Returns the underlying error if `ifconfig` or `route` cannot be spawned
+/// or exits non-zero -- most often because the process is not root.
 pub(crate) fn configure_utun_address(
     device: &str,
     host_ip: std::net::Ipv4Addr,
@@ -159,6 +143,22 @@ pub(crate) fn configure_utun_address(
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
+
+    let octets = host_ip.octets();
+    let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+    let output = std::process::Command::new("route")
+        .args(["add", "-net", &subnet, "-interface", device])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            return Err(io::Error::other(format!(
+                "route add -net {subnet} -interface {device} failed: {}",
+                stderr.trim()
+            )));
+        }
+    }
+
     Ok(())
 }
 
