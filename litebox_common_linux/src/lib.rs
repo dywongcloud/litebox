@@ -4406,7 +4406,8 @@ pub struct PtRegs {
 /// on-the-wire register layouts a `PTRACE_GETREGSET`/`PTRACE_SETREGSET`
 /// exchanges for each supported `NT_*` type.
 ///
-/// Only [`NT_PRSTATUS`] (general-purpose registers) and [`NT_ARM_TLS`]
+/// Only [`NT_PRSTATUS`](ptrace::NT_PRSTATUS) (general-purpose registers) and
+/// [`NT_ARM_TLS`](ptrace::NT_ARM_TLS)
 /// (`TPIDR_EL0`) are supported. Any other regset is a distinct, real Linux
 /// type this shim does not populate (`NT_PRFPREG`/`NT_ARM_VFP` for FPSIMD
 /// state, `NT_ARM_HW_BREAK`/`NT_ARM_HW_WATCH` for hardware debug state, and

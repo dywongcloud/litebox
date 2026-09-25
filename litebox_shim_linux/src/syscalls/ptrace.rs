@@ -25,7 +25,7 @@
 //! handle (the exact mechanism `tkill`/interrupt already use to reach a thread that may be deep
 //! inside `hv_vcpu_run`). The target only actually parks -- and only then is its register state
 //! read into [`PtraceState`] for the tracer to observe -- from
-//! [`crate::wait::Task::prepare_to_run_guest`], which runs after every `syscall`/`exception`/
+//! [`Task::prepare_to_run_guest`](crate::Task::prepare_to_run_guest), which runs after every `syscall`/`exception`/
 //! `interrupt` return and strictly before the thread re-enters guest code. At that point the
 //! HVF backend has already released the thread's vCPU lane back to the pool (see
 //! `HvfBackend::run_thread`: `release_lane` happens before `dispatch`, which is what eventually
@@ -186,7 +186,7 @@ impl<Platform: ShimPlatform> PtraceState<Platform> {
     }
 
     /// Called only by the tracee's own thread, from
-    /// [`crate::wait::Task::prepare_to_run_guest`] -- the safe rendezvous point where the vCPU
+    /// [`Task::prepare_to_run_guest`](crate::Task::prepare_to_run_guest) -- the safe rendezvous point where the vCPU
     /// lane has already been released and `ctx`/`tpidr_el0` are the authoritative, complete
     /// logical guest state. Parks (genuine host blocking, not a spin) while a stop is requested
     /// or in effect, capturing the snapshot on entry and re-applying any tracer mutation on exit.
@@ -432,7 +432,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    /// Called from [`crate::wait::Task::prepare_to_run_guest`]: parks this thread at the ptrace
+    /// Called from [`Task::prepare_to_run_guest`](crate::Task::prepare_to_run_guest): parks this thread at the ptrace
     /// stop rendezvous if a tracer has requested one, applying any tracer register mutation on
     /// resume. No-op (a single atomic load) when untraced or not currently stop-requested.
     pub(crate) fn ptrace_rendezvous(&self, ctx: &mut litebox_common_linux::PtRegs) {
