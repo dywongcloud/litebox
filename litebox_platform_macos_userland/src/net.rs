@@ -145,15 +145,15 @@ pub(crate) fn configure_utun_address(
     }
 
     let octets = host_ip.octets();
-    let subnet = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+    let subnet = format!("{}.{}.{}.0", octets[0], octets[1], octets[2]);
     let output = std::process::Command::new("route")
-        .args(["add", "-net", &subnet, "-interface", device])
+        .args(["add", "-net", &subnet, "-netmask", "255.255.255.0", "-interface", device])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.contains("File exists") {
             return Err(io::Error::other(format!(
-                "route add -net {subnet} -interface {device} failed: {}",
+                "route add -net {subnet} -netmask 255.255.255.0 -interface {device} failed: {}",
                 stderr.trim()
             )));
         }
