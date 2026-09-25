@@ -10,8 +10,8 @@
 //!
 //! ## Concurrency Model
 //!
-//! TA execution is serialized externally; [`TaInstance`] is shared without
-//! an inner mutex. The exclusivity invariant lives in [`SessionManager`]
+//! TA execution is serialized externally; [`TaInstance<Platform>`] is shared without
+//! an inner mutex. The exclusivity invariant lives in [`SessionManager<Platform>`]
 //! and is acquired through an internal RAII `SessionToken` that bundles
 //! whichever locks the current operation requires — see `SessionToken`'s
 //! doc for the per-case breakdown.
@@ -125,13 +125,13 @@ const ANONYMOUS_CLIENT_IDENTITY: TeeIdentity = TeeIdentity {
 /// TA stays in memory until the last session closes (if it does not have the
 /// `TA_FLAG_INSTANCE_KEEP_ALIVE` flag). Each instance has its own task page
 /// table that provides memory isolation from other TAs.
-pub struct TaInstance {
+pub struct TaInstance<Platform: crate::OpteeShimPlatform> {
     /// The shim must be kept alive to keep the loaded program's memory mappings valid.
-    shim: OpteeShim,
+    shim: OpteeShim<Platform>,
     /// The loaded TA program state including entrypoints.
     /// Boxed to keep it at a fixed heap address - the Task inside must not be moved
     /// after initialization because it contains internal state that may not survive moves.
-    loaded_program: alloc::boxed::Box<LoadedProgram>,
+    loaded_program: alloc::boxed::Box<LoadedProgram<Platform>>,
     /// The task page table ID associated with this TA instance.
     ///
     /// Also serves as the instance's identity for sibling-tracking
@@ -141,16 +141,16 @@ pub struct TaInstance {
     ta_uuid: TeeUuid,
 }
 
-impl TaInstance {
+impl<Platform: crate::OpteeShimPlatform> TaInstance<Platform> {
     pub fn task_page_table_id(&self) -> usize {
         self.task_page_table_id
     }
 
-    pub fn shim(&self) -> &OpteeShim {
+    pub fn shim(&self) -> &OpteeShim<Platform> {
         &self.shim
     }
 
-    pub fn loaded_program(&self) -> &LoadedProgram {
+    pub fn loaded_program(&self) -> &LoadedProgram<Platform> {
         &self.loaded_program
     }
 
@@ -159,25 +159,23 @@ impl TaInstance {
     }
 }
 
-// SAFETY: `TaInstance`'s interior (`shim`, `loaded_program`) is not
-// auto-`Send`/`Sync`, but every access goes through a `SessionToken` that
-// serializes execution on the per-UUID lock (single-instance TAs) or the
-// per-`session_id` marker (multi-instance TAs), so at most one core is
-// ever inside a given instance. See the module-level "Concurrency Model".
-unsafe impl Send for TaInstance {}
-unsafe impl Sync for TaInstance {}
+// SAFETY: `SessionManager` serializes access to each instance's non-`Sync`
+// entrypoints and `Cell` state. The remaining fields are `Send + Sync` under the
+// `OpteeShimPlatform` bound. See the module-level concurrency model.
+unsafe impl<Platform: crate::OpteeShimPlatform> Send for TaInstance<Platform> {}
+unsafe impl<Platform: crate::OpteeShimPlatform> Sync for TaInstance<Platform> {}
 
 /// What an OpenSession should do given the current cache state for a
 /// `uuid`, as decided by [`SessionManager::with_ta`] under its
 /// serialization. The closure dispatches on the variant.
-pub enum OpenSessionTarget<'a> {
+pub enum OpenSessionTarget<'a, Platform: crate::OpteeShimPlatform> {
     /// No cached single-instance instance for this UUID (either it's
     /// not single-instance, or the cache is empty). Closure should load
     /// a fresh TA and call `register_new_session`.
     NewInstance,
     /// A cached single-instance TA is available for sharing. Closure
     /// should reuse it for a sibling session via `register_sibling_session`.
-    Sibling(&'a TaInstance),
+    Sibling(&'a TaInstance<Platform>),
     /// A cached single-instance TA exists but it lacks `TA_FLAG_MULTI_SESSION`
     /// and already has at least one live session. Per OP-TEE OS
     /// `tee_ta_init_session_with_context`, reject with
@@ -188,13 +186,25 @@ pub enum OpenSessionTarget<'a> {
 /// Per-session entry in the session map. The `Dead` variant retains
 /// `(ta_uuid, ta_flags)` so cleanup paths and `try_acquire_for_session`'s
 /// snapshot still have them after the instance is gone.
-#[derive(Clone)]
-enum SessionEntry {
-    Live(Arc<TaInstance>),
+enum SessionEntry<Platform: crate::OpteeShimPlatform> {
+    Live(Arc<TaInstance<Platform>>),
     Dead { ta_uuid: TeeUuid, ta_flags: TaFlags },
 }
 
-impl SessionEntry {
+// Avoid the unnecessary `Platform: Clone` bound added by `derive`.
+impl<Platform: crate::OpteeShimPlatform> Clone for SessionEntry<Platform> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Live(instance) => Self::Live(Arc::clone(instance)),
+            Self::Dead { ta_uuid, ta_flags } => Self::Dead {
+                ta_uuid: *ta_uuid,
+                ta_flags: *ta_flags,
+            },
+        }
+    }
+}
+
+impl<Platform: crate::OpteeShimPlatform> SessionEntry<Platform> {
     fn ta_uuid(&self) -> TeeUuid {
         match self {
             SessionEntry::Live(arc) => arc.ta_uuid,
@@ -213,11 +223,11 @@ impl SessionEntry {
 /// Session map for tracking active sessions.
 ///
 /// Maps runner-allocated session IDs to session entries.
-struct SessionMap {
-    inner: SpinMutex<HashMap<u32, SessionEntry>>,
+struct SessionMap<Platform: crate::OpteeShimPlatform> {
+    inner: SpinMutex<HashMap<u32, SessionEntry<Platform>>>,
 }
 
-impl SessionMap {
+impl<Platform: crate::OpteeShimPlatform> SessionMap<Platform> {
     /// Create a new empty session map.
     fn new() -> Self {
         Self {
@@ -226,19 +236,19 @@ impl SessionMap {
     }
 
     /// Get full session entry by session ID.
-    fn get_entry(&self, session_id: u32) -> Option<SessionEntry> {
+    fn get_entry(&self, session_id: u32) -> Option<SessionEntry<Platform>> {
         self.inner.lock().get(&session_id).cloned()
     }
 
     /// Insert a live session into the map.
-    fn insert_live(&self, session_id: u32, instance: Arc<TaInstance>) {
+    fn insert_live(&self, session_id: u32, instance: Arc<TaInstance<Platform>>) {
         self.inner
             .lock()
             .insert(session_id, SessionEntry::Live(instance));
     }
 
     /// Remove a session from the map.
-    fn remove(&self, session_id: u32) -> Option<SessionEntry> {
+    fn remove(&self, session_id: u32) -> Option<SessionEntry<Platform>> {
         self.inner.lock().remove(&session_id)
     }
 
@@ -272,7 +282,7 @@ impl SessionMap {
     }
 }
 
-impl Default for SessionMap {
+impl<Platform: crate::OpteeShimPlatform> Default for SessionMap<Platform> {
     fn default() -> Self {
         Self::new()
     }
@@ -282,11 +292,11 @@ impl Default for SessionMap {
 ///
 /// Single-instance TAs (with `TA_FLAG_SINGLE_INSTANCE`) share a single TA instance
 /// across all sessions. This cache stores instances by UUID for fast reuse lookup.
-struct SingleInstanceCache {
-    inner: SpinMutex<HashMap<TeeUuid, Arc<TaInstance>>>,
+struct SingleInstanceCache<Platform: crate::OpteeShimPlatform> {
+    inner: SpinMutex<HashMap<TeeUuid, Arc<TaInstance<Platform>>>>,
 }
 
-impl SingleInstanceCache {
+impl<Platform: crate::OpteeShimPlatform> SingleInstanceCache<Platform> {
     /// Create a new empty cache.
     fn new() -> Self {
         Self {
@@ -295,12 +305,12 @@ impl SingleInstanceCache {
     }
 
     /// Get a cached single-instance TA by UUID.
-    fn get(&self, uuid: &TeeUuid) -> Option<Arc<TaInstance>> {
+    fn get(&self, uuid: &TeeUuid) -> Option<Arc<TaInstance<Platform>>> {
         self.inner.lock().get(uuid).cloned()
     }
 
     /// Cache a single-instance TA by UUID.
-    fn insert(&self, uuid: TeeUuid, instance: Arc<TaInstance>) {
+    fn insert(&self, uuid: TeeUuid, instance: Arc<TaInstance<Platform>>) {
         self.inner.lock().insert(uuid, instance);
     }
 
@@ -324,7 +334,7 @@ impl SingleInstanceCache {
     }
 }
 
-impl Default for SingleInstanceCache {
+impl<Platform: crate::OpteeShimPlatform> Default for SingleInstanceCache<Platform> {
     fn default() -> Self {
         Self::new()
     }
@@ -376,10 +386,10 @@ enum HeldUuidLock {
 /// On drop the held UUID-level lock is released first (whether per-UUID
 /// or the global load lock), then the per-session-id marker, then
 /// (if still owned) the session id is recycled.
-pub struct SessionToken<'a> {
-    manager: &'a SessionManager,
+pub struct SessionToken<'a, Platform: crate::OpteeShimPlatform> {
+    manager: &'a SessionManager<Platform>,
     /// Logical UUID-level lock owned by this token. The actual lock state
-    /// lives in `SessionManager`; `Drop` releases it (clears the held flag).
+    /// lives in `SessionManager<Platform>`; `Drop` releases it (clears the held flag).
     uuid_lock: Option<HeldUuidLock>,
     /// `Some(id)` while the token holds the active-session marker for `id`
     /// in [`SessionManager::active_sessions`]. Drop releases the marker.
@@ -394,7 +404,7 @@ pub struct SessionToken<'a> {
     owns_id_recycling: bool,
 }
 
-impl SessionToken<'_> {
+impl<Platform: crate::OpteeShimPlatform> SessionToken<'_, Platform> {
     /// Session id this token reserves the active-session marker for, if any.
     /// Set for tokens minted by
     /// [`SessionManager::try_acquire_open_session_token`] or
@@ -413,7 +423,7 @@ impl SessionToken<'_> {
     }
 }
 
-impl Drop for SessionToken<'_> {
+impl<Platform: crate::OpteeShimPlatform> Drop for SessionToken<'_, Platform> {
     fn drop(&mut self) {
         if let Some(lock) = self.uuid_lock.take() {
             self.manager.release_uuid_lock(lock);
@@ -438,17 +448,19 @@ impl Drop for SessionToken<'_> {
 /// run the caller's closure under an internal `SessionToken`. State
 /// mutations the closure performs on the manager (registration,
 /// sibling-marking, cache eviction) are serialized by that token.
-pub struct SessionManager {
+pub struct SessionManager<Platform: crate::OpteeShimPlatform> {
     /// Active sessions mapped by session ID.
-    sessions: SessionMap,
+    sessions: SessionMap<Platform>,
     /// Cache of single-instance TAs by UUID.
-    single_instance_cache: SingleInstanceCache,
+    single_instance_cache: SingleInstanceCache<Platform>,
     /// Number of instances currently being created (not yet registered).
     /// Added to [`SessionManager::instance_count`] for the capacity check
     /// in [`SessionManager::with_ta`] so two concurrent loads cannot both
     /// pass the limit before either registers.
     pending_count: SpinMutex<usize>,
     /// Cached TA flags by UUID, populated on first successful session registration.
+    /// New entries are published under `ta_load_lock` and are never updated
+    /// or removed; the post-acquire recheck relies on this.
     ///
     /// TODO: a TA's flags (in particular single- vs multi-instance) can
     /// change across a version update of the same UUID. Key this map by
@@ -481,14 +493,7 @@ pub struct SessionManager {
     session_client_identities: SpinMutex<HashMap<u32, TeeIdentity>>,
 }
 
-/// Get the global session manager.
-pub fn session_manager() -> &'static SessionManager {
-    static SESSION_MANAGER: once_cell::race::OnceBox<SessionManager> =
-        once_cell::race::OnceBox::new();
-    SESSION_MANAGER.get_or_init(|| alloc::boxed::Box::new(SessionManager::new()))
-}
-
-impl SessionManager {
+impl<Platform: crate::OpteeShimPlatform> SessionManager<Platform> {
     pub fn new() -> Self {
         Self {
             sessions: SessionMap::new(),
@@ -518,7 +523,9 @@ impl SessionManager {
     ///
     /// # Errors
     /// - `EBusy` if the id pool is exhausted.
-    pub fn try_acquire_open_session_token(&self) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
+    pub fn try_acquire_open_session_token(
+        &self,
+    ) -> Result<SessionToken<'_, Platform>, OpteeSmcReturnCode> {
         let session_id = allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?;
         // The id pool's hint+wrap allocator defers reuse of recycled ids,
         // so a freshly-allocated id can never collide with a marker slot
@@ -544,7 +551,7 @@ impl SessionManager {
     /// Marks every session currently pointing at `instance` as `Dead` and
     /// evicts the matching entry from the single-instance cache. Use when
     /// tearing down a *failed* TA that may still have sibling sessions.
-    pub fn mark_sessions_dead_for_instance(&self, instance: &TaInstance) {
+    pub fn mark_sessions_dead_for_instance(&self, instance: &TaInstance<Platform>) {
         self.sessions
             .mark_sessions_dead_for_pt(instance.task_page_table_id);
         let _ = self.evict_cached_instance(instance);
@@ -553,7 +560,7 @@ impl SessionManager {
     /// Count live sessions currently pointing at `instance` (`Dead` entries
     /// are skipped). Used by the last-close path to detect whether teardown
     /// is appropriate.
-    pub fn count_sessions_for_instance(&self, instance: &TaInstance) -> usize {
+    pub fn count_sessions_for_instance(&self, instance: &TaInstance<Platform>) -> usize {
         self.sessions
             .count_sessions_for_pt(instance.task_page_table_id)
     }
@@ -607,24 +614,40 @@ impl SessionManager {
     ///
     /// - **Known single-instance**: per-UUID lock flag.
     /// - **Known multi-instance**: no lock (each session is independent).
-    /// - **Unknown**: the global `ta_load_lock`. This serializes first-loads
-    ///   of all not-yet-known UUIDs together, but avoids minting a per-UUID
-    ///   lock entry until the TA has been confirmed single-instance. A failed
-    ///   or multi-instance load therefore leaves no stale entry in
-    ///   `single_instance_locks`.
+    /// - **Unknown**: get the global `ta_load_lock`, recheck flags, and transition
+    ///   to the per-UUID lock or no lock if the flags is published.
     ///
     /// Returns `Err(EThreadLimit)` on contention.
-    fn try_acquire_for_open(&self, uuid: TeeUuid) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
+    fn try_acquire_for_open(
+        &self,
+        uuid: TeeUuid,
+    ) -> Result<SessionToken<'_, Platform>, OpteeSmcReturnCode> {
         let uuid_lock = match self.get_known_flags(&uuid) {
             Some(flags) if flags.is_single_instance() => Some(
                 self.try_acquire_uuid_lock(uuid)
                     .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
             ),
             Some(_) => None,
-            None => Some(
-                self.try_acquire_ta_load_lock()
-                    .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
-            ),
+            None => {
+                let load_lock = self
+                    .try_acquire_ta_load_lock()
+                    .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
+
+                // Another concurrent opener might have loaded this TA and published flags.
+                // Recheck to change the lock domain.
+                if let Some(flags) = self.get_known_flags(&uuid) {
+                    if flags.is_single_instance() {
+                        let uuid_lock = self.try_acquire_uuid_lock(uuid);
+                        self.release_uuid_lock(load_lock);
+                        Some(uuid_lock.ok_or(OpteeSmcReturnCode::EThreadLimit)?)
+                    } else {
+                        self.release_uuid_lock(load_lock);
+                        None
+                    }
+                } else {
+                    Some(load_lock)
+                }
+            }
         };
         Ok(SessionToken {
             manager: self,
@@ -667,7 +690,7 @@ impl SessionManager {
     fn try_acquire_for_session(
         &self,
         session_id: u32,
-    ) -> Result<(SessionToken<'_>, SessionEntry), OpteeSmcReturnCode> {
+    ) -> Result<(SessionToken<'_, Platform>, SessionEntry<Platform>), OpteeSmcReturnCode> {
         let entry = self
             .sessions
             .get_entry(session_id)
@@ -712,7 +735,7 @@ impl SessionManager {
 
     /// Drive an Invoke/Close to completion under the right serialization
     /// (see [`SessionToken`] for the locks held). Passes
-    /// `Some(&TaInstance)` to `f` for live sessions, `None` for dead
+    /// `Some(&TaInstance<Platform>)` to `f` for live sessions, `None` for dead
     /// ones. State mutations `f` performs on the manager
     /// (`unregister_session`, `mark_sessions_dead_for_instance`,
     /// `evict_cached_instance`) are serialized against concurrent
@@ -723,7 +746,7 @@ impl SessionManager {
     /// transparently).
     pub fn with_session<F>(&self, session_id: u32, f: F) -> Result<(), OpteeSmcReturnCode>
     where
-        F: for<'a> FnOnce(Option<&'a TaInstance>) -> Result<(), OpteeSmcReturnCode>,
+        F: for<'a> FnOnce(Option<&'a TaInstance<Platform>>) -> Result<(), OpteeSmcReturnCode>,
     {
         let (_token, entry) = self.try_acquire_for_session(session_id)?;
         let instance = match &entry {
@@ -766,8 +789,8 @@ impl SessionManager {
     pub fn register_new_session(
         &self,
         session_id: u32,
-        shim: OpteeShim,
-        loaded_program: alloc::boxed::Box<LoadedProgram>,
+        shim: OpteeShim<Platform>,
+        loaded_program: alloc::boxed::Box<LoadedProgram<Platform>>,
         task_page_table_id: usize,
         ta_uuid: TeeUuid,
     ) {
@@ -801,7 +824,7 @@ impl SessionManager {
     pub fn register_sibling_session(
         &self,
         session_id: u32,
-        instance: &TaInstance,
+        instance: &TaInstance<Platform>,
     ) -> Result<(), OpteeSmcReturnCode> {
         let arc = self
             .single_instance_cache
@@ -867,7 +890,7 @@ impl SessionManager {
     /// cached instance.
     /// Callers on the last-session-close path may skip the mark step — by
     /// that point there are no sibling sessions to fence out.
-    pub fn evict_cached_instance(&self, instance: &TaInstance) -> bool {
+    pub fn evict_cached_instance(&self, instance: &TaInstance<Platform>) -> bool {
         self.single_instance_cache
             .remove_matching_instance(&instance.ta_uuid, instance.task_page_table_id)
     }
@@ -915,7 +938,7 @@ impl SessionManager {
     /// serialized by the UUID-level lock itself.
     pub fn with_ta<F>(&self, uuid: &TeeUuid, f: F) -> Result<(), OpteeSmcReturnCode>
     where
-        F: for<'a> FnOnce(OpenSessionTarget<'a>) -> Result<(), OpteeSmcReturnCode>,
+        F: for<'a> FnOnce(OpenSessionTarget<'a, Platform>) -> Result<(), OpteeSmcReturnCode>,
     {
         let mut token = self.try_acquire_for_open(*uuid)?;
         // Captured before `f` runs so we know whether to perform the
@@ -977,7 +1000,7 @@ impl SessionManager {
     }
 }
 
-impl Default for SessionManager {
+impl<Platform: crate::OpteeShimPlatform> Default for SessionManager<Platform> {
     fn default() -> Self {
         Self::new()
     }
@@ -986,14 +1009,14 @@ impl Default for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syscalls::tests::init_platform;
+    use crate::syscalls::tests::shim_builder;
+    use litebox_platform_linux_userland::LinuxUserland as Platform;
 
-    fn make_shim() -> OpteeShim {
-        let _ = init_platform();
-        crate::OpteeShimBuilder::new().build()
+    fn make_shim() -> OpteeShim<Platform> {
+        shim_builder().build()
     }
 
-    fn make_loaded_program(ta_flags: TaFlags) -> alloc::boxed::Box<LoadedProgram> {
+    fn make_loaded_program(ta_flags: TaFlags) -> alloc::boxed::Box<LoadedProgram<Platform>> {
         alloc::boxed::Box::new(LoadedProgram {
             entrypoints: None,
             params_address: None,
@@ -1013,7 +1036,7 @@ mod tests {
     /// pre-held per-UUID lock state the way `with_ta` would, so subsequent
     /// operations (Invoke/Close, evict, count, etc.) aren't blocked.
     fn register_for_test(
-        manager: &SessionManager,
+        manager: &SessionManager<Platform>,
         session_id: u32,
         ta_flags: TaFlags,
         task_page_table_id: usize,
@@ -1038,7 +1061,7 @@ mod tests {
     /// the stale handle must not evict the new one.
     #[test]
     fn evict_cached_instance_distinguishes_stale_handle() {
-        let manager = SessionManager::new();
+        let manager = SessionManager::<Platform>::new();
         let uuid = make_uuid(0xA4);
 
         register_for_test(&manager, 105, single_instance_flags(), 10, uuid);
@@ -1056,7 +1079,7 @@ mod tests {
     /// and new opens cannot reuse the dead cached instance.
     #[test]
     fn mark_dead_makes_with_session_observe_none() {
-        let manager = SessionManager::new();
+        let manager = SessionManager::<Platform>::new();
         let uuid = make_uuid(0xA6);
         register_for_test(&manager, 108, single_instance_flags(), 55, uuid);
         let arc = manager.single_instance_cache.get(&uuid).unwrap();
@@ -1080,7 +1103,7 @@ mod tests {
     /// turns out to be multi-instance.
     #[test]
     fn with_ta_does_not_mint_lock_entry_for_failed_unknown_load() {
-        let manager = SessionManager::new();
+        let manager = SessionManager::<Platform>::new();
         let uuid = make_uuid(0xA9);
         assert!(manager.get_known_flags(&uuid).is_none());
 
@@ -1094,7 +1117,7 @@ mod tests {
     /// success or failure — across multiple calls it must return to zero.
     #[test]
     fn pending_count_returns_to_zero_across_paths() {
-        let manager = SessionManager::new();
+        let manager = SessionManager::<Platform>::new();
         let uuid_multi = make_uuid(0xC0);
         let uuid_single = make_uuid(0xC1);
 
@@ -1129,7 +1152,7 @@ mod tests {
     /// the same UUID must succeed.
     #[test]
     fn with_ta_releases_per_uuid_lock_after_unknown_load() {
-        let manager = SessionManager::new();
+        let manager = SessionManager::<Platform>::new();
         let uuid = make_uuid(0xD0);
 
         manager
@@ -1160,7 +1183,7 @@ mod tests {
     /// untouched.
     #[test]
     fn unrelated_with_ta_does_not_adopt_other_uuids_lock() {
-        let manager = SessionManager::new();
+        let manager = SessionManager::<Platform>::new();
         let uuid_locked = make_uuid(0xE1);
         let uuid_other = make_uuid(0xE2);
 

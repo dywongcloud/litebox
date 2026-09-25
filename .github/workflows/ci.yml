@@ -362,6 +362,9 @@ jobs:
           #   `litebox_runner_lvbs/x86_64_vtl1.json`, satisfies that
           #   requirement.
           #
+          # - `litebox_service_heki` is excluded for the same reason as
+          #   `litebox_shim_optee` above; it also pulls in crypto dependencies.
+          #
           # - `litebox_syscall_rewriter` is allowed to have `std` access since
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
           #
@@ -412,6 +415,7 @@ jobs:
             -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
+            -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \

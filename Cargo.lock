@@ -1717,12 +1717,8 @@ version = "0.1.0"
 dependencies = [
  "aligned-vec",
  "arrayvec",
- "authenticode",
  "bitflags 2.13.1",
- "cms",
- "const-oid",
  "digest",
- "elf",
  "hashbrown",
  "libc",
  "litebox",
@@ -1731,17 +1727,14 @@ dependencies = [
  "litebox_util_log",
  "modular-bitfield",
  "num_enum",
- "object",
  "once_cell",
  "rand_chacha",
  "rand_core",
  "rangemap",
  "raw-cpuid",
- "rsa",
  "sha2",
  "spin 0.10.0",
  "thiserror",
- "x509-cert",
  "x86_64",
  "zerocopy",
  "zeroize",
@@ -1891,10 +1884,11 @@ dependencies = [
  "litebox_common_lvbs",
  "litebox_common_optee",
  "litebox_platform_lvbs",
- "litebox_platform_multiplex",
+ "litebox_service_heki",
  "litebox_shim_optee",
  "litebox_util_log",
  "log",
+ "once_cell",
  "spin 0.10.0",
  "x86_64",
 ]
@@ -1904,14 +1898,12 @@ name = "litebox_runner_optee_on_linux_userland"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arrayvec",
  "base64",
  "clap",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
  "litebox_platform_linux_userland",
- "litebox_platform_multiplex",
  "litebox_shim_optee",
  "litebox_syscall_rewriter",
  "litebox_util_log",
@@ -1967,6 +1959,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_service_heki"
+version = "0.1.0"
+dependencies = [
+ "authenticode",
+ "cms",
+ "const-oid",
+ "digest",
+ "elf",
+ "hashbrown",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_lvbs",
+ "log",
+ "object",
+ "once_cell",
+ "rangemap",
+ "rsa",
+ "sha2",
+ "spin 0.10.0",
+ "thiserror",
+ "x509-cert",
+ "x86_64",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_shim_darwin"
 version = "0.1.0"
 dependencies = [
@@ -2009,7 +2027,6 @@ name = "litebox_shim_optee"
 version = "0.1.0"
 dependencies = [
  "aes",
- "arrayvec",
  "ctr",
  "elf",
  "hashbrown",
@@ -2017,11 +2034,12 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
- "litebox_platform_multiplex",
+ "litebox_platform_linux_userland",
  "litebox_util_log",
  "num_enum",
  "once_cell",
  "p384",
+ "rangemap",
  "sha2",
  "spin 0.10.0",
  "thiserror",

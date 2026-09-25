@@ -57,7 +57,7 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_packager/", 1),
             ("litebox_platform_linux_kernel/", 6),
             ("litebox_platform_linux_userland/", 5),
-            ("litebox_platform_lvbs/", 24),
+            ("litebox_platform_lvbs/", 22),
             // Was 13 while the guest-entry save area was process-global (a
             // naked callback running on the guest stack could not reach a
             // `thread_local!` without a call, so `HOST_SAVE`, `GUEST_FP`,
@@ -114,7 +114,11 @@ fn ratchet_globals() -> Result<()> {
             // litebox_runner_linux_on_macos_userland's `net_proxy` seeds
             // outgoing DNS query ids from `DNS_QUERY_ID`.
             ("litebox_runner_linux_on_macos_userland/", 1),
-            ("litebox_runner_lvbs/", 5),
+            // 8 with upstream's singleton-free runner: the BSP publishes the
+            // platform (`BOOT_PLATFORM`), and the session registry and HEKI
+            // service live here (`SESSION_MANAGER`, `HEKI`) rather than in
+            // the platform or the shim.
+            ("litebox_runner_lvbs/", 8),
             ("litebox_runner_snp/", 2),
             // 8, not 5: includes the test-only `ADDRESS_SPACE` and
             // `ASYNC_SIGNAL` mutexes that serialize tests (see
@@ -128,10 +132,10 @@ fn ratchet_globals() -> Result<()> {
             // `NEXT_MEMFD_ID`/`NEXT_STAGE_ID`, monotonic id allocators for
             // `memfd_create` and multi-stage file operations.
             ("litebox_shim_linux/", 8),
-            // 5, not 4: `static INIT_FUNC` arrived with the OP-TEE syscall
-            // support in 071841e and the table was never updated, so this count
-            // has been stale since well before the macOS work.
-            ("litebox_shim_optee/", 5),
+            // Upstream's count: the shim's own lazily-initialized tables
+            // (`TA_UUID_MAP`, the session-id `POOL`, `SHM_REF_MAP`, the identity
+            // signing key) plus the two test fixtures in `syscalls/tests.rs`.
+            ("litebox_shim_optee/", 6),
             // The one static is the test-only `PLATFORM` in `src/tests.rs`.
             ("litebox_shim_windows/", 1),
         ],
