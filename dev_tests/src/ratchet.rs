@@ -132,6 +132,8 @@ fn ratchet_globals() -> Result<()> {
             // support in 071841e and the table was never updated, so this count
             // has been stale since well before the macOS work.
             ("litebox_shim_optee/", 5),
+            // The one static is the test-only `PLATFORM` in `src/tests.rs`.
+            ("litebox_shim_windows/", 1),
         ],
         |file| {
             Ok(file

@@ -12,7 +12,8 @@
 //! However, as an explicit goal, it is intended to provide low-overhead hooking of syscalls,
 //! without needing to undergo a user-kernel transition.
 //!
-//! This crate currently supports x86-64 ELFs for syscall hooking.
+//! This crate currently supports x86-64 ELFs for syscall hooking and x86-64 PEs for syscall
+//! hooking plus rewriting Windows TEB accesses from GS segment overrides to FS segment overrides.
 //!
 //! It also supports AArch64 ELFs, for Linux guests on Linux or macOS hosts (see [`Host`]), and
 //! rewrites `SVC #imm` syscalls plus both directions of guest thread-pointer access
@@ -29,13 +30,16 @@ mod arm64;
 
 pub use arm64::Host;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use litebox_common_windows::NtSysno;
+use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::elf::{ElfFile, ProgramHeader as _};
+use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 use object::read::{Object as _, ObjectSection as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -102,6 +106,34 @@ pub const MACOS_GUEST_TPIDR_TSD_SLOT: u16 = arm64::MACOS_GUEST_TPIDR_TSD_SLOT;
 /// slot the emitter wrote rather than repeating the number.
 pub const TRAMPOLINE_GUEST_TP_SLOT_OFFSET: usize = arm64::HEADER_GUEST_TP_OFFSET_MACOS;
 
+/// Rewrite a supported binary for LiteBox.
+///
+/// ELF64 inputs are passed through [`hook_syscalls_in_elf`] (the
+/// [`Host::Linux`] anchor). PE64 inputs have executable-section GS segment
+/// overrides rewritten to FS and `syscall` instructions redirected through a
+/// LiteBox trampoline footer.
+///
+/// Use [`rewrite_binary_for_host`] to target an AArch64 ELF input at a
+/// non-Linux host.
+pub fn rewrite_binary(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    rewrite_binary_for_host(input_binary, trampoline, Host::Linux)
+}
+
+/// As [`rewrite_binary`], but selects the AArch64 host anchor explicitly
+/// instead of defaulting to [`Host::Linux`] -- see [`hook_syscalls_in_elf_for_host`].
+/// Ignored for PE64 input, which has no per-host anchor concept.
+pub fn rewrite_binary_for_host(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    host: Host,
+) -> Result<Vec<u8>> {
+    if is_pe_binary(input_binary) {
+        rewrite_pe_for_litebox(input_binary, trampoline)
+    } else {
+        hook_syscalls_in_elf_for_host(input_binary, trampoline, host)
+    }
+}
+
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
 #[derive(FromBytes, IntoBytes, Immutable)]
@@ -126,6 +158,12 @@ struct SyscallPatchResult {
     found_syscall: bool,
     skipped_addrs: Vec<u64>,
 }
+
+/// Limit on how far backward from a `syscall` we look for the `mov eax, imm32`
+/// that loads its sysno. A real NT stub always sets `eax` within a handful of
+/// instructions of the `syscall`; the bound keeps us from rewriting some
+/// unrelated `mov eax` that happens to share an immediate value with a sysno.
+const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
@@ -312,6 +350,387 @@ pub fn hook_syscalls_in_elf_for_host(
     Ok(out)
 }
 
+/// Rewrite an x86-64 PE for LiteBox's current Windows shim.
+///
+/// The PE file layout is preserved, but executable-section GS segment overrides
+/// are rewritten to FS and `syscall` instructions are redirected through a
+/// LiteBox trampoline appended as a file overlay. The Windows shim loader maps
+/// that overlay by reading the footer this function appends.
+pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    if is_already_hooked(input_binary, Arch::X86_64) {
+        return Ok(input_binary.to_vec());
+    }
+
+    let mut backing = vec![0u64; input_binary.len().div_ceil(8)];
+    let buf: &mut [u8] = zerocopy::IntoBytes::as_mut_bytes(backing.as_mut_slice());
+    buf[..input_binary.len()].copy_from_slice(input_binary);
+    let buf = &mut buf[..input_binary.len()];
+
+    let (text_sections, sysno_map, trampoline_base_rva, trampoline_base_addr) = {
+        let pe = PeFile64::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+        let optional_header = pe.nt_headers().optional_header();
+        let size_of_image = u64::from(optional_header.size_of_image());
+        let trampoline_base_rva =
+            checked_add_u64(size_of_image, 0xfff, "PE trampoline base")? & !0xfff;
+        let trampoline_base_addr = checked_add_u64(
+            optional_header.image_base(),
+            trampoline_base_rva,
+            "PE trampoline virtual address",
+        )?;
+
+        let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+        match file {
+            object::File::Pe64(_) if file.architecture() == object::Architecture::X86_64 => {}
+            _ => return Ok(input_binary.to_vec()),
+        }
+
+        let text_sections = match pe_text_sections(&file) {
+            Ok(sections) => sections,
+            Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+            Err(InternalError::Public(e)) => return Err(e),
+            Err(e) => unreachable!("unexpected internal error: {e:?}"),
+        };
+        let sysno_map = pe_ntdll_sysno_map(&file, buf, &text_sections)?;
+        (
+            text_sections,
+            sysno_map,
+            trampoline_base_rva,
+            trampoline_base_addr,
+        )
+    };
+
+    for section in &text_sections {
+        let section_data = section_slice_mut(buf, section)?;
+        rewrite_gs_to_fs_in_section(Arch::X86_64, section.vaddr, section_data)?;
+    }
+    let control_transfer_targets = get_control_transfer_targets(Arch::X86_64, buf, &text_sections)?;
+    rewrite_nt_sysnos_in_sections(
+        Arch::X86_64,
+        buf,
+        &text_sections,
+        &sysno_map,
+        &control_transfer_targets,
+    )?;
+
+    let mut trampoline_data = Vec::from(trampoline.unwrap_or(0).to_le_bytes());
+    // Windows ntdll packs some syscall stubs too tightly for the generic
+    // five-byte jump patcher; keep that PE-specific shape out of the generic path.
+    let patched_dense_windows_stubs = patch_dense_windows_syscall_stubs_in_sections(
+        Arch::X86_64,
+        buf,
+        &text_sections,
+        &control_transfer_targets,
+        trampoline_base_addr,
+        trampoline_base_addr,
+        &mut trampoline_data,
+    )?;
+    let patch_result = patch_syscalls_in_sections(
+        Arch::X86_64,
+        buf,
+        &text_sections,
+        &control_transfer_targets,
+        trampoline_base_addr,
+        trampoline_base_addr,
+        &mut trampoline_data,
+    )?;
+
+    if !patched_dense_windows_stubs && !patch_result.found_syscall {
+        return Ok(buf.to_vec());
+    }
+
+    let mut out = buf.to_vec();
+    append_trampoline_footer(
+        &mut out,
+        &mut trampoline_data,
+        trampoline_base_rva,
+        true,
+        Arch::X86_64.trampoline_align(),
+    );
+
+    if !patch_result.skipped_addrs.is_empty() {
+        return Err(Error::UnpatchableSyscalls(format!(
+            "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
+            patch_result.skipped_addrs.len(),
+            skipped_addrs = patch_result.skipped_addrs,
+        )));
+    }
+
+    Ok(out)
+}
+
+fn is_pe_binary(input_binary: &[u8]) -> bool {
+    if input_binary.len() < 0x40 || &input_binary[..2] != b"MZ" {
+        return false;
+    }
+    let pe_offset = u32::from_le_bytes(input_binary[0x3c..0x40].try_into().unwrap()) as usize;
+    input_binary
+        .get(pe_offset..pe_offset.saturating_add(4))
+        .is_some_and(|magic| magic == b"PE\0\0")
+}
+
+fn pe_text_sections(
+    file: &object::File<'_>,
+) -> core::result::Result<Vec<TextSectionInfo>, InternalError> {
+    let text_sections: Vec<_> = file
+        .sections()
+        .filter_map(|section| {
+            let object::SectionFlags::Coff { characteristics } = section.flags() else {
+                return None;
+            };
+            if characteristics & IMAGE_SCN_CNT_CODE == 0 {
+                return None;
+            }
+            if characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+                return None;
+            }
+            let (file_offset, size) = section.file_range()?;
+            Some(TextSectionInfo {
+                vaddr: section.address(),
+                file_offset,
+                size,
+            })
+        })
+        .collect();
+    if text_sections.is_empty() {
+        return Err(InternalError::NoTextSectionFound);
+    }
+    Ok(text_sections)
+}
+
+/// For ntdll-like PEs, walks `Nt*` exports of `file`, reads the build-specific
+/// sysno each stub loads into `eax`, and maps it to the stable LiteBox
+/// [`NtSysno`] for that name. `Nt*` and `Zw*` always share sysno numbering
+/// inside ntdll, so a map keyed on the build-specific number lets a later pass
+/// rewrite both flavors (and any internal ntdll helpers that issue the same
+/// syscall inline) uniformly.
+fn pe_ntdll_sysno_map(
+    file: &object::File<'_>,
+    buf: &[u8],
+    text_sections: &[TextSectionInfo],
+) -> Result<BTreeMap<u32, NtSysno>> {
+    let mut map = BTreeMap::new();
+    let mut exports_ntdll_loader_entrypoint = false;
+
+    for export in file
+        .exports()
+        .map_err(|e| Error::ParseError(e.to_string()))?
+    {
+        let Ok(name) = core::str::from_utf8(export.name()) else {
+            continue;
+        };
+        exports_ntdll_loader_entrypoint |= name == "LdrInitializeThunk";
+
+        let Some(sysno) = NtSysno::from_export_name(name) else {
+            continue;
+        };
+
+        let addr = export.address();
+        let Some(section) = text_sections.iter().find(|s| {
+            s.vaddr
+                .checked_add(s.size)
+                .is_some_and(|end| addr >= s.vaddr && addr < end)
+        }) else {
+            continue;
+        };
+
+        let section_data = section_slice(buf, section)?;
+        let stub_offset = usize::try_from(addr - section.vaddr)
+            .map_err(|_| Error::ParseError("export offset out of range".into()))?;
+        if let Some(build_sysno) = read_nt_stub_sysno(section_data, stub_offset) {
+            map.insert(build_sysno, sysno);
+        }
+    }
+
+    if !exports_ntdll_loader_entrypoint {
+        return Ok(BTreeMap::new());
+    }
+
+    Ok(map)
+}
+
+/// Reads the `mov eax, imm32` immediate that precedes a `syscall` instruction
+/// within the first 32 bytes of an NT syscall stub starting at `stub_offset`.
+/// Returns `None` if the bytes do not match the expected stub shape.
+fn read_nt_stub_sysno(section_data: &[u8], stub_offset: usize) -> Option<u32> {
+    let stub = section_data.get(stub_offset..)?;
+    let stub_len = stub.len().min(32);
+    let syscall_offset = stub[..stub_len]
+        .windows(2)
+        .position(|bytes| bytes == [0x0f, 0x05])?;
+    let mov_eax_offset = stub[..syscall_offset]
+        .windows(5)
+        .position(|bytes| bytes[0] == 0xb8)?;
+    let imm = u32::from_le_bytes(
+        stub[mov_eax_offset + 1..mov_eax_offset + 5]
+            .try_into()
+            .ok()?,
+    );
+    Some(imm)
+}
+
+fn rewrite_nt_sysnos_in_sections(
+    arch: Arch,
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+    sysno_map: &BTreeMap<u32, NtSysno>,
+    control_transfer_targets: &BTreeSet<u64>,
+) -> Result<usize> {
+    if sysno_map.is_empty() {
+        return Ok(0);
+    }
+    let mut rewritten = 0;
+    for section in text_sections {
+        let section_data = section_slice_mut(buf, section)?;
+        rewritten += rewrite_nt_sysnos_in_section(
+            arch,
+            section.vaddr,
+            section_data,
+            sysno_map,
+            control_transfer_targets,
+        )?;
+    }
+    Ok(rewritten)
+}
+
+/// For every `syscall` in `section_data`, looks backward up to
+/// [`NT_SYSNO_REWRITE_LOOKBACK`] instructions for the closest `mov r32, imm32`
+/// that targets `eax`. If the immediate is a known build-specific sysno from
+/// `sysno_map`, rewrites it in place to the stable LiteBox sysno.
+///
+/// The backward walk stops at any unconditional control transfer (`jmp`,
+/// `ret`, indirect branch, exception), at any instruction that is itself a
+/// control-transfer target, and at any earlier write to `eax`. Conditional
+/// branches are walked through, because the canonical NT stub has a `test
+/// [...], 1; jne +3; syscall` sequence where execution reaches `syscall` by
+/// falling through `jne`. Syscalls that are themselves jump targets are
+/// skipped entirely — there's no way to know which `mov eax` the jumping code
+/// arrived with.
+fn rewrite_nt_sysnos_in_section(
+    arch: Arch,
+    section_base_addr: u64,
+    section_data: &mut [u8],
+    sysno_map: &BTreeMap<u32, NtSysno>,
+    control_transfer_targets: &BTreeSet<u64>,
+) -> Result<usize> {
+    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
+    let mut info_factory = iced_x86::InstructionInfoFactory::new();
+    let mut rewritten = 0;
+
+    for (i, inst) in instructions.iter().enumerate() {
+        if inst.code() != iced_x86::Code::Syscall {
+            continue;
+        }
+        if control_transfer_targets.contains(&inst.ip()) {
+            continue;
+        }
+        let lookback_start = i.saturating_sub(NT_SYSNO_REWRITE_LOOKBACK);
+        for j in (lookback_start..i).rev() {
+            let prev = &instructions[j];
+            // A `jne`/`je`/etc. between `mov eax, sysno` and `syscall` is normal
+            // (the canonical NT stub has `test ...; jne +3; syscall`), so we
+            // keep walking through conditional branches and calls — they fall
+            // through to the next instruction in the common case. We only stop
+            // at unconditional transfers that prove the linear chain from
+            // `prev → next → ... → syscall` was never the execution path.
+            if matches!(
+                prev.flow_control(),
+                iced_x86::FlowControl::UnconditionalBranch
+                    | iced_x86::FlowControl::IndirectBranch
+                    | iced_x86::FlowControl::Call
+                    | iced_x86::FlowControl::IndirectCall
+                    | iced_x86::FlowControl::Return
+                    | iced_x86::FlowControl::Exception
+            ) {
+                break;
+            }
+            if prev.code() == iced_x86::Code::Mov_r32_imm32
+                && prev.op0_register() == iced_x86::Register::EAX
+            {
+                if let Some(&sysno) = sysno_map.get(&prev.immediate32()) {
+                    let inst_offset = usize::try_from(prev.ip() - section_base_addr)
+                        .map_err(|_| Error::ParseError("instruction offset out of range".into()))?;
+                    // `Mov_r32_imm32` always encodes the 32-bit immediate as the
+                    // last four bytes of the instruction, regardless of any REX
+                    // prefix in front of the opcode.
+                    let imm_end = inst_offset
+                        .checked_add(prev.len())
+                        .ok_or_else(|| Error::AddressOverflow("mov eax end".into()))?;
+                    let imm_start = imm_end
+                        .checked_sub(4)
+                        .ok_or_else(|| Error::ParseError("mov eax length < 4".into()))?;
+                    section_data[imm_start..imm_end].copy_from_slice(&sysno.as_raw().to_le_bytes());
+                    rewritten += 1;
+                }
+                break;
+            }
+            if instruction_writes_eax(&mut info_factory, prev) {
+                break;
+            }
+            if control_transfer_targets.contains(&prev.ip()) {
+                break;
+            }
+        }
+    }
+
+    Ok(rewritten)
+}
+
+/// Returns `true` if `inst` writes (or partially writes) the `eax` register
+/// family — `eax`, `rax`, `ax`, `al`, `ah` (including implicit writes such as
+/// `cpuid`/`mul`/`div`/`cdq`). Used by the sysno rewriter to detect an EAX
+/// clobber between a stale `mov eax, K` and a downstream `syscall`, so a
+/// sequence like `mov eax, K; xor eax, eax; syscall` does not mis-rewrite `K`
+/// as a sysno load.
+fn instruction_writes_eax(
+    info_factory: &mut iced_x86::InstructionInfoFactory,
+    inst: &iced_x86::Instruction,
+) -> bool {
+    use iced_x86::{OpAccess, Register};
+    for used in info_factory.info(inst).used_registers() {
+        if !matches!(
+            used.access(),
+            OpAccess::Write | OpAccess::ReadWrite | OpAccess::CondWrite | OpAccess::ReadCondWrite
+        ) {
+            continue;
+        }
+        if matches!(
+            used.register(),
+            Register::EAX | Register::RAX | Register::AX | Register::AL | Register::AH
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn rewrite_gs_to_fs_in_section(
+    arch: Arch,
+    section_base_addr: u64,
+    section_data: &mut [u8],
+) -> Result<usize> {
+    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
+    let mut rewritten = 0;
+
+    for instruction in &instructions {
+        if instruction.memory_segment() != iced_x86::Register::GS {
+            continue;
+        }
+
+        let offset = usize::try_from(instruction.ip() - section_base_addr).unwrap();
+        let instruction_bytes = &mut section_data[offset..offset + instruction.len()];
+        let Some(segment_prefix) = instruction_bytes.iter_mut().find(|byte| **byte == 0x65) else {
+            return Err(Error::DisassemblyFailure(format!(
+                "GS memory operand at {:#x} has no GS segment prefix",
+                instruction.ip()
+            )));
+        };
+        *segment_prefix = 0x64;
+        rewritten += 1;
+    }
+
+    Ok(rewritten)
+}
+
 fn patch_syscalls_in_sections(
     arch: Arch,
     buf: &mut [u8],
@@ -349,6 +768,41 @@ fn patch_syscalls_in_sections(
         found_syscall,
         skipped_addrs,
     })
+}
+
+fn patch_dense_windows_syscall_stubs_in_sections(
+    arch: Arch,
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+    control_transfer_targets: &BTreeSet<u64>,
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+) -> Result<bool> {
+    let mut patched_any = false;
+
+    for section in text_sections {
+        let section_data = section_slice_mut(buf, section)?;
+        let instructions = decode_section_instructions(arch, section_data, section.vaddr)?;
+        for (i, inst) in instructions.iter().enumerate() {
+            if inst.code() != iced_x86::Code::Syscall {
+                continue;
+            }
+
+            patched_any |= patch_dense_windows_syscall_stub(
+                control_transfer_targets,
+                section.vaddr,
+                section_data,
+                trampoline_base_addr,
+                syscall_entry_addr,
+                trampoline_data,
+                &instructions,
+                i,
+            )?;
+        }
+    }
+
+    Ok(patched_any)
 }
 
 fn append_trampoline_footer(
@@ -860,6 +1314,131 @@ fn replace_with_trap(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn patch_dense_windows_syscall_stub(
+    control_transfer_targets: &BTreeSet<u64>,
+    section_base_addr: u64,
+    section_data: &mut [u8],
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+    instructions: &[iced_x86::Instruction],
+    inst_index: usize,
+) -> Result<bool> {
+    if inst_index < 2 {
+        return Ok(false);
+    }
+
+    let test_inst = &instructions[inst_index - 2];
+    let jne_inst = &instructions[inst_index - 1];
+    let syscall_inst = &instructions[inst_index];
+
+    if !is_dense_windows_syscall_stub_sequence(test_inst, jne_inst, section_base_addr, section_data)
+    {
+        return Ok(false);
+    }
+
+    let stub_addr = test_inst.ip();
+    let fallback_addr = checked_add_u64(
+        jne_inst.ip(),
+        DENSE_WINDOWS_SYSCALL_STUB_TAIL_FALLBACK_OFFSET as u64,
+        "dense Windows syscall fallback address",
+    )?;
+    let stub_end_addr = checked_add_u64(
+        jne_inst.ip(),
+        DENSE_WINDOWS_SYSCALL_STUB_TAIL.len() as u64,
+        "dense Windows syscall stub end address",
+    )?;
+    if control_transfer_targets
+        .iter()
+        .any(|target| (stub_addr..stub_end_addr).contains(target) && *target != fallback_addr)
+    {
+        return Ok(false);
+    }
+
+    let target_addr = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64,
+        "dense Windows syscall trampoline target",
+    )?;
+
+    let return_addr = syscall_inst.next_ip();
+    let jmp_back_base = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64 + 7,
+        "dense Windows syscall trampoline return base",
+    )?;
+    // lea rcx, [rip + disp32]
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]);
+    trampoline_data.extend_from_slice(&rel32_bytes(
+        return_addr,
+        jmp_back_base,
+        "dense Windows syscall trampoline return",
+    )?);
+
+    // jmp qword ptr [rip + disp32]
+    trampoline_data.extend_from_slice(&[0xFF, 0x25]);
+    let entry_base = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64 + 4,
+        "dense Windows syscall trampoline entry base",
+    )?;
+    trampoline_data.extend_from_slice(&rel32_bytes(
+        syscall_entry_addr,
+        entry_base,
+        "dense Windows syscall trampoline entry",
+    )?);
+
+    let stub_offset = usize::try_from(stub_addr - section_base_addr).unwrap();
+    section_data[stub_offset] = 0xe9;
+    let patch_base = checked_add_u64(stub_addr, 5, "dense Windows syscall patch jump base")?;
+    section_data[stub_offset + 1..stub_offset + 5].copy_from_slice(&rel32_bytes(
+        target_addr,
+        patch_base,
+        "dense Windows syscall patch jump",
+    )?);
+
+    let syscall_end_offset = usize::try_from(syscall_inst.next_ip() - section_base_addr).unwrap();
+    for byte in &mut section_data[stub_offset + 5..syscall_end_offset] {
+        *byte = 0x90;
+    }
+
+    let fallback_offset = usize::try_from(fallback_addr - section_base_addr).unwrap();
+    section_data[fallback_offset] = 0xeb;
+    section_data[fallback_offset + 1] =
+        i8::try_from(i128::from(stub_addr) - i128::from(fallback_addr) - 2)
+            .map_err(|_| {
+                Error::AddressOverflow("dense Windows syscall fallback jump out of range".into())
+            })?
+            .to_ne_bytes()[0];
+
+    Ok(true)
+}
+
+fn is_dense_windows_syscall_stub_sequence(
+    test_inst: &iced_x86::Instruction,
+    jne_inst: &iced_x86::Instruction,
+    section_base_addr: u64,
+    section_data: &[u8],
+) -> bool {
+    if !matches!(
+        test_inst.code(),
+        iced_x86::Code::Test_rm8_imm8 | iced_x86::Code::Test_rm8_imm8_F6r1
+    ) || test_inst.immediate8() != 1
+    {
+        return false;
+    }
+
+    let Ok(tail_offset) = usize::try_from(jne_inst.ip() - section_base_addr) else {
+        return false;
+    };
+    let Some(tail_end) = tail_offset.checked_add(DENSE_WINDOWS_SYSCALL_STUB_TAIL.len()) else {
+        return false;
+    };
+
+    section_data.get(tail_offset..tail_end) == Some(DENSE_WINDOWS_SYSCALL_STUB_TAIL)
+}
+
 fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64> {
     base.checked_add(addend)
         .ok_or_else(|| Error::AddressOverflow(format!("{context} address overflow")))
@@ -985,6 +1564,9 @@ fn get_control_transfer_targets(
 const MAX_X86_INSTRUCTION_LEN: usize = 15;
 const CHUNK_OVERLAP_LEN: usize = MAX_X86_INSTRUCTION_LEN - 1;
 const TARGET_DECODE_CHUNK_LEN: usize = 8 * 1024 * 1024;
+// jne +3; syscall; ret; int 0x2e; ret
+const DENSE_WINDOWS_SYSCALL_STUB_TAIL: &[u8] = &[0x75, 0x03, 0x0f, 0x05, 0xc3, 0xcd, 0x2e, 0xc3];
+const DENSE_WINDOWS_SYSCALL_STUB_TAIL_FALLBACK_OFFSET: usize = 5;
 
 fn bytes_until_next_4g_boundary(ptr: *const u8) -> usize {
     let low = (ptr as u64) & 0xFFFF_FFFF;
@@ -1307,6 +1889,148 @@ mod tests {
             matches!(err, Error::UnpatchableSyscalls(_)),
             "expected UnpatchableSyscalls, got {err:?}"
         );
+    }
+
+    const NT_STUB_BUILD_SYSNO: u32 = 0x1234;
+
+    fn nt_stub_bytes() -> [u8; 24] {
+        [
+            0x4c, 0x8b, 0xd1, // mov r10, rcx
+            0xb8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234
+            0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01, // test byte ptr [...], 1
+            0x75, 0x03, // jne +3
+            0x0f, 0x05, // syscall
+            0xc3, // ret
+            0xcd, 0x2e, // int 2e
+            0xc3, // ret
+        ]
+    }
+
+    #[test]
+    fn read_nt_stub_sysno_extracts_build_specific_imm32() {
+        let stub = nt_stub_bytes();
+        assert_eq!(read_nt_stub_sysno(&stub, 0), Some(NT_STUB_BUILD_SYSNO));
+    }
+
+    #[test]
+    fn read_nt_stub_sysno_rejects_stub_without_syscall() {
+        let stub = [0xb8, 0x34, 0x12, 0x00, 0x00, 0xc3];
+        assert_eq!(read_nt_stub_sysno(&stub, 0), None);
+    }
+
+    #[test]
+    fn rewrite_replaces_mov_eax_before_syscall() {
+        let mut stub = nt_stub_bytes();
+        let mut map = BTreeMap::new();
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        let targets = BTreeSet::new();
+
+        let rewritten =
+            rewrite_nt_sysnos_in_section(Arch::X86_64, 0, &mut stub, &map, &targets).unwrap();
+        assert_eq!(rewritten, 1);
+        assert_eq!(
+            &stub[4..8],
+            &NtSysno::NtTerminateProcess.as_raw().to_le_bytes(),
+        );
+    }
+
+    #[test]
+    fn rewrite_covers_zw_alias_with_same_build_sysno() {
+        // Two stubs back-to-back sharing the same build-specific sysno, the way
+        // ntdll's Nt* / Zw* pair often look when emitted as separate stubs.
+        let mut section = Vec::new();
+        section.extend_from_slice(&nt_stub_bytes());
+        section.extend_from_slice(&nt_stub_bytes());
+
+        let mut map = BTreeMap::new();
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        let targets = BTreeSet::new();
+
+        let rewritten =
+            rewrite_nt_sysnos_in_section(Arch::X86_64, 0, &mut section, &map, &targets).unwrap();
+        assert_eq!(rewritten, 2);
+        let expected = NtSysno::NtTerminateProcess.as_raw().to_le_bytes();
+        assert_eq!(&section[4..8], &expected);
+        assert_eq!(
+            &section[nt_stub_bytes().len() + 4..nt_stub_bytes().len() + 8],
+            &expected
+        );
+    }
+
+    #[test]
+    fn rewrite_leaves_mov_eax_with_unknown_imm_alone() {
+        let mut stub = nt_stub_bytes();
+        let map: BTreeMap<u32, NtSysno> = BTreeMap::new();
+        let targets = BTreeSet::new();
+
+        let rewritten =
+            rewrite_nt_sysnos_in_section(Arch::X86_64, 0, &mut stub, &map, &targets).unwrap();
+        assert_eq!(rewritten, 0);
+        assert_eq!(&stub[4..8], &NT_STUB_BUILD_SYSNO.to_le_bytes());
+    }
+
+    #[test]
+    fn rewrite_skips_when_eax_is_clobbered_before_syscall() {
+        // `mov eax, K; xor eax, eax; syscall`. The mov's K matches a known
+        // build sysno, but the xor zeroes eax before the syscall — so K is not
+        // the sysno that feeds the syscall and must not be rewritten.
+        let mut section: Vec<u8> = vec![
+            0xb8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234
+            0x31, 0xc0, // xor eax, eax
+            0x0f, 0x05, // syscall
+        ];
+
+        let mut map = BTreeMap::new();
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        let targets = BTreeSet::new();
+
+        let rewritten =
+            rewrite_nt_sysnos_in_section(Arch::X86_64, 0, &mut section, &map, &targets).unwrap();
+        assert_eq!(rewritten, 0);
+        assert_eq!(&section[1..5], &NT_STUB_BUILD_SYSNO.to_le_bytes());
+    }
+
+    #[test]
+    fn rewrite_does_not_cross_basic_block_boundary() {
+        // `mov eax, K; ret; <next function body> syscall`. The mov's K matches
+        // a known sysno but lives in a previous function (separated by `ret`);
+        // the syscall is reached by control flow that never touched that mov.
+        let mut section: Vec<u8> = vec![
+            0xb8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234   (in prior function)
+            0xc3, // ret                                       (block boundary)
+            0x0f, 0x05, // syscall                            (next function)
+        ];
+
+        let mut map = BTreeMap::new();
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        let targets = BTreeSet::new();
+
+        let rewritten =
+            rewrite_nt_sysnos_in_section(Arch::X86_64, 0, &mut section, &map, &targets).unwrap();
+        assert_eq!(rewritten, 0);
+        assert_eq!(&section[1..5], &NT_STUB_BUILD_SYSNO.to_le_bytes());
+    }
+
+    #[test]
+    fn rewrite_skips_syscall_that_is_jump_target() {
+        // `mov eax, K; syscall` where the syscall is jumped to from elsewhere.
+        // We can't trust that the preceding mov is what set eax for callers that
+        // arrived via the jump.
+        let syscall_offset: u64 = 5;
+        let mut section: Vec<u8> = vec![
+            0xb8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234   (offset 0..5)
+            0x0f, 0x05, // syscall                            (offset 5..7)
+        ];
+
+        let mut map = BTreeMap::new();
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        let mut targets = BTreeSet::new();
+        targets.insert(syscall_offset);
+
+        let rewritten =
+            rewrite_nt_sysnos_in_section(Arch::X86_64, 0, &mut section, &map, &targets).unwrap();
+        assert_eq!(rewritten, 0);
+        assert_eq!(&section[1..5], &NT_STUB_BUILD_SYSNO.to_le_bytes());
     }
 
     #[cfg(target_pointer_width = "64")]
