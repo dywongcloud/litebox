@@ -170,7 +170,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// ## Returns
     ///
-    /// On success it returns a pointer to the new virtual memory area.
+    /// On success it returns a pointer to the new virtual memory area. That need not be
+    /// `new_range.start`: `new_range` is where the caller would like the pages, and a platform may
+    /// place them elsewhere (with the same length) when the host already occupies that range.
     ///
     /// # Safety
     ///
@@ -194,24 +196,32 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         debug_assert!(old_range.start.max(new_range.start) >= old_range.end.min(new_range.end));
         // Default implementation: allocate new pages, copy data, deallocate old pages
         let temp_permissions = permissions | MemoryRegionPermissions::WRITE;
-        let new_ptr = self
-            .allocate_pages(
-                new_range.clone(),
-                temp_permissions,
-                false,
-                true,
-                FixedAddressBehavior::NoReplace,
-            )
-            .map_err(|e| match e {
-                AllocationError::OutOfMemory => RemapError::OutOfMemory,
-                AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
-                    RemapError::AlreadyAllocated
-                }
-                AllocationError::Unaligned
-                | AllocationError::BelowMinAddress
-                | AllocationError::AboveMaxAddress
-                | AllocationError::AddressPartiallyInUse => unreachable!(),
-            })?;
+        let allocate = |behavior| {
+            self.allocate_pages(new_range.clone(), temp_permissions, false, true, behavior)
+        };
+        let new_ptr = match allocate(FixedAddressBehavior::NoReplace) {
+            // `new_range` is free only as far as the caller's bookkeeping knows. A hosted
+            // platform can already hold part of it for the host (on Windows, even the unusable
+            // tail of a host allocation's 64 KiB granule), and failing the move over that would
+            // turn a guest `mremap(MREMAP_MAYMOVE)` into `EFAULT`. Let the platform place the
+            // pages elsewhere instead, as Linux's own `mremap` without `MREMAP_FIXED` does; the
+            // caller records the address returned below.
+            Err(AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform) => {
+                allocate(FixedAddressBehavior::Hint)
+            }
+            result => result,
+        }
+        .map_err(|e| match e {
+            AllocationError::OutOfMemory => RemapError::OutOfMemory,
+            AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
+                RemapError::AlreadyAllocated
+            }
+            AllocationError::Unaligned
+            | AllocationError::BelowMinAddress
+            | AllocationError::AboveMaxAddress
+            | AllocationError::AddressPartiallyInUse => unreachable!(),
+        })?;
+        let new_range = new_ptr.as_usize()..new_ptr.as_usize() + new_range.len();
 
         // Copy memory from old range to new range
         if !permissions.contains(MemoryRegionPermissions::READ) {
@@ -446,4 +456,170 @@ pub enum CowAllocationError {
     Unaligned,
     #[error("internal failure in creating CoW pages")]
     InternalFailure,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::trivial_providers::{TransparentConstPtr, TransparentMutPtr};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    const PAGE: usize = 0x1000;
+
+    /// Backs the default [`PageManagementProvider::remap_pages`] with real memory, and plays a host
+    /// that already owns `occupied` (when set): a `NoReplace` claim there fails the way a hosted
+    /// platform reports a range it holds outside the caller's bookkeeping, and `Hint` then places
+    /// the pages at `fallback`.
+    struct HostBackend {
+        occupied: Option<usize>,
+        fallback: usize,
+        allocations: RefCell<Vec<(usize, FixedAddressBehavior)>>,
+        permission_updates: RefCell<Vec<(Range<usize>, MemoryRegionPermissions)>>,
+        deallocations: RefCell<Vec<Range<usize>>>,
+    }
+
+    impl RawPointerProvider for HostBackend {
+        type RawConstPointer<T: zerocopy::FromBytes> = TransparentConstPtr<T>;
+        type RawMutPointer<T: zerocopy::FromBytes + zerocopy::IntoBytes> = TransparentMutPtr<T>;
+    }
+
+    impl PageManagementProvider<PAGE> for HostBackend {
+        const TASK_ADDR_MIN: usize = PAGE;
+        const TASK_ADDR_MAX: usize = usize::MAX - (PAGE - 1);
+
+        fn allocate_pages(
+            &self,
+            suggested_range: Range<usize>,
+            _initial_permissions: MemoryRegionPermissions,
+            _can_grow_down: bool,
+            _populate_pages_immediately: bool,
+            fixed_address_behavior: FixedAddressBehavior,
+        ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+            self.allocations
+                .borrow_mut()
+                .push((suggested_range.start, fixed_address_behavior));
+            if self.occupied != Some(suggested_range.start) {
+                return Ok(TransparentMutPtr::from_usize(suggested_range.start));
+            }
+            match fixed_address_behavior {
+                FixedAddressBehavior::Hint => Ok(TransparentMutPtr::from_usize(self.fallback)),
+                FixedAddressBehavior::NoReplace => Err(AllocationError::AddressInUseByPlatform),
+                FixedAddressBehavior::Replace => unreachable!("remap never replaces"),
+            }
+        }
+
+        unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError> {
+            self.deallocations.borrow_mut().push(range);
+            Ok(())
+        }
+
+        unsafe fn update_permissions(
+            &self,
+            range: Range<usize>,
+            new_permissions: MemoryRegionPermissions,
+        ) -> Result<(), PermissionUpdateError> {
+            self.permission_updates
+                .borrow_mut()
+                .push((range, new_permissions));
+            Ok(())
+        }
+
+        fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
+            core::iter::empty()
+        }
+    }
+
+    /// Moves one page filled with `0xA5` to a two-page range and returns the arena, the arena
+    /// offset of its first page, the backend and the pointer `remap_pages` returned. The arena's
+    /// pages are: the old page, the two requested pages, and the two fallback pages.
+    fn remap_one_page(
+        host_owns_requested: bool,
+    ) -> (Vec<u8>, usize, HostBackend, TransparentMutPtr<u8>) {
+        let mut arena = vec![0u8; 6 * PAGE];
+        let offset = (arena.as_ptr() as usize).next_multiple_of(PAGE) - arena.as_ptr() as usize;
+        arena[offset..offset + PAGE].fill(0xA5);
+        let base = arena.as_ptr() as usize + offset;
+        let requested = base + PAGE;
+        let backend = HostBackend {
+            occupied: host_owns_requested.then_some(requested),
+            fallback: base + 3 * PAGE,
+            allocations: RefCell::new(Vec::new()),
+            permission_updates: RefCell::new(Vec::new()),
+            deallocations: RefCell::new(Vec::new()),
+        };
+        // SAFETY: every range lies inside `arena`, which outlives the call, and nothing else
+        // uses the old page.
+        let new_ptr = unsafe {
+            backend.remap_pages(
+                base..base + PAGE,
+                requested..requested + 2 * PAGE,
+                MemoryRegionPermissions::READ,
+            )
+        }
+        .unwrap();
+        (arena, offset, backend, new_ptr)
+    }
+
+    #[test]
+    fn remap_pages_claims_the_requested_range_when_it_is_free() {
+        let (arena, offset, backend, new_ptr) = remap_one_page(false);
+        let base = arena.as_ptr() as usize + offset;
+        let requested = base + PAGE;
+
+        assert_eq!(new_ptr.as_usize(), requested);
+        assert_eq!(
+            *backend.allocations.borrow(),
+            [(requested, FixedAddressBehavior::NoReplace)]
+        );
+        assert!(
+            arena[offset + PAGE..offset + 2 * PAGE]
+                .iter()
+                .all(|&b| b == 0xA5)
+        );
+        assert_eq!(
+            *backend.permission_updates.borrow(),
+            [(
+                requested..requested + 2 * PAGE,
+                MemoryRegionPermissions::READ
+            )]
+        );
+        assert_eq!(backend.deallocations.borrow().len(), 1);
+        assert_eq!(backend.deallocations.borrow()[0], base..base + PAGE);
+    }
+
+    #[test]
+    fn remap_pages_falls_back_when_the_host_owns_the_requested_range() {
+        let (arena, offset, backend, new_ptr) = remap_one_page(true);
+        let base = arena.as_ptr() as usize + offset;
+        let requested = base + PAGE;
+        let fallback = base + 3 * PAGE;
+
+        assert_eq!(new_ptr.as_usize(), fallback);
+        assert_eq!(
+            *backend.allocations.borrow(),
+            [
+                (requested, FixedAddressBehavior::NoReplace),
+                (requested, FixedAddressBehavior::Hint),
+            ]
+        );
+        // The data and the final permissions both follow the pages to where they landed.
+        assert!(
+            arena[offset + 3 * PAGE..offset + 4 * PAGE]
+                .iter()
+                .all(|&b| b == 0xA5)
+        );
+        assert!(
+            arena[offset + PAGE..offset + 3 * PAGE]
+                .iter()
+                .all(|&b| b == 0)
+        );
+        assert_eq!(
+            *backend.permission_updates.borrow(),
+            [(fallback..fallback + 2 * PAGE, MemoryRegionPermissions::READ)]
+        );
+        assert_eq!(backend.deallocations.borrow().len(), 1);
+        assert_eq!(backend.deallocations.borrow()[0], base..base + PAGE);
+    }
 }
