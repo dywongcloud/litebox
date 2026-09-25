@@ -2318,8 +2318,15 @@ mod tests {
                 // growth deterministically landed exactly in the just-freed probe range,
                 // exhausting every retry. After a throwaway round trip, the machinery is
                 // allocated and the probe-to-attempt window contains no shim-side heap growth.
+                //
+                // The task is built once, here, for the same reason. Building one maps its CSR
+                // shared section through a fresh page manager, which does not know the sections
+                // earlier tasks left behind, so its preferred spot is taken and the platform lets
+                // the host place the section instead -- and right after a probe is freed, the
+                // host's lowest free range is that probe. A task built inside the loop therefore
+                // took the probe range on every attempt.
+                let task = crate::tests::test_task();
                 {
-                    let task = crate::tests::test_task();
                     let mut warm_base = 0usize;
                     let mut warm_size = 1usize;
                     let warm_status = task.sys_nt_allocate_virtual_memory(
@@ -2401,7 +2408,6 @@ mod tests {
                     };
                     assert_eq!(host_free_status, NtStatus::SUCCESS);
 
-                    let task = crate::tests::test_task();
                     let mut guest_base = requested_base as usize;
                     let mut guest_region_size = 1usize;
                     let guest_allocate_status = task.sys_nt_allocate_virtual_memory(
