@@ -95,35 +95,45 @@ impl WindowsUserland {
     }
 }
 
+/// Resume a faulting guest-memory access in LiteBox code at its exception-table recovery point
+/// (so the access reports failure, e.g. `EFAULT`); leave any other exception to other handlers.
+fn recover_litebox_fault(
+    exception_record: &EXCEPTION_RECORD,
+    context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) -> i32 {
+    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && let Some(recover) =
+            litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
+    {
+        context.Rip = recover as u64;
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
-    let Some(tls) = get_tls_ptr() else {
-        // TLS slot not initialized yet; cannot be in guest
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-    let tls = unsafe { &*tls };
     let (info, exception_record, context);
     unsafe {
         info = *exception_info;
         exception_record = &*info.ExceptionRecord;
         context = &mut *info.ContextRecord;
     }
+    let Some(tls) = get_tls_ptr() else {
+        // No TLS state: this thread has never entered the guest, but it can still be running
+        // LiteBox code that touches guest memory (a syscall handler called directly on a host
+        // thread, as the shim's unit tests do), and such an access must fail recoverably here
+        // exactly as it does on a guest thread.
+        return recover_litebox_fault(exception_record, context);
+    };
+    let tls = unsafe { &*tls };
 
     if !tls.is_in_guest.get() {
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
-        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-            && let Some(recover) =
-                litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
-        {
-            // Found a matching exception table entry.
-            context.Rip = recover as u64;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        } else {
-            // Not one of our exceptions; let other handlers process it.
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
+        return recover_litebox_fault(exception_record, context);
     }
     // Windows clears this thread's FS_BASE MSR back to 0 on its own initiative, apparently as
     // part of ordinary scheduling. A guest `mov %fs:...` hit while FS_BASE is 0 reads/writes
