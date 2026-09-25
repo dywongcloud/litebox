@@ -83,6 +83,15 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+      # rust-cache's post-step cleanup walks target/ and takes rustdoc's page
+      # directory for any module named `tests` (target/doc/<crate>/tests) for a
+      # build profile, then reports ENOENT for the nested build directories it
+      # probes for there. The docs are rebuilt on every run anyway, so drop
+      # them before the cache is saved.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
       - name: Remove transient guest staging before cache save
         if: always()
         timeout-minutes: 5
@@ -152,6 +161,11 @@ jobs:
       - run: cargo test --locked --verbose --doc -p litebox -p litebox_common_linux -p litebox_platform_macos_userland
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+      # See build_and_test: keeps rust-cache's cleanup out of rustdoc output.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
       # Verifies litebox_platform_macos_userland's hand-written Mach/BSD struct
       # layouts against the real SDK headers on this runner -- see the probe
       # file for why this matters and what a failure here means.
@@ -236,6 +250,11 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
+      # See build_and_test: keeps rust-cache's cleanup out of rustdoc output.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
 
   build_and_test_windows:
     name: Build and Test Windows
@@ -266,6 +285,11 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland -p litebox_runner_darwin_on_windows_userland
+      # See build_and_test: keeps rust-cache's cleanup out of rustdoc output.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
 
   build_and_test_snp:
     name: Build and Test SNP
@@ -289,6 +313,11 @@ jobs:
           ./.github/tools/github_actions_run_cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
+      # See build_and_test: keeps rust-cache's cleanup out of rustdoc output.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
 
   confirm_no_std:
     name: Confirm no_std
