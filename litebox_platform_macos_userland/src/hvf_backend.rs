@@ -3297,7 +3297,7 @@ impl HvfBackend {
 /// write+execute stage-2 permission by this mechanism or any other. Instead,
 /// a registered region is granted the guest's *logical* view as RWX (so
 /// `mprotect`/`/proc/self/maps` see exactly what real Linux would show, via
-/// the ordinary `VmArea`/`VmFlags` bookkeeping in `litebox/src/mm/linux.rs`,
+/// the ordinary `VmArea`/`VmFlags` bookkeeping in `litebox/src/mm/vmem.rs`,
 /// which is populated from whatever `MemoryRegionPermissions` this platform's
 /// `update_permissions` returns `Ok` for) while the *real* stage-2 permission
 /// on each page is either read+write or read+execute, flipping a single page

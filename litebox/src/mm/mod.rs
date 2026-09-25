@@ -8,7 +8,7 @@ extern crate std;
 
 pub mod allocator;
 pub mod exception_table;
-pub mod linux;
+pub mod vmem;
 
 #[cfg(test)]
 mod tests;
@@ -17,7 +17,7 @@ use core::ops::Range;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use linux::{
+use vmem::{
     CreatePagesFlags, InitializationId, MappingError, PageFaultError, PageRange,
     SharedFutexBacking, VmArea, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError,
     VmemUnmapError,
@@ -25,7 +25,7 @@ use linux::{
 
 use crate::{
     LiteBox,
-    mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError, VmemWipeOnForkError},
+    mm::vmem::{NonZeroAddress, NonZeroPageSize, VmemResetError, VmemWipeOnForkError},
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{DeallocationError, MemoryRegionPermissions, RemapError},
@@ -120,7 +120,7 @@ where
 {
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
+        let vmem = RwLock::new(vmem::Vmem::new(litebox.x.platform));
         Self { vmem }
     }
 
@@ -560,8 +560,8 @@ where
             return Ok(vmem.brk);
         }
 
-        let old_brk = vmem.brk.next_multiple_of(linux::PAGE_SIZE);
-        let new_brk = brk.next_multiple_of(linux::PAGE_SIZE);
+        let old_brk = vmem.brk.next_multiple_of(vmem::PAGE_SIZE);
+        let new_brk = brk.next_multiple_of(vmem::PAGE_SIZE);
         if vmem.brk >= brk {
             // Shrink the memory region
             if new_brk < old_brk && vmem.has_pending_initialization(&(new_brk..old_brk)) {
@@ -683,11 +683,11 @@ where
         match unsafe {
             vmem.resize_mapping(
                 old_range,
-                linux::NonZeroPageSize::new(new_size).ok_or(RemapError::Unaligned)?,
+                vmem::NonZeroPageSize::new(new_size).ok_or(RemapError::Unaligned)?,
             )
         } {
             Ok(()) => Ok(old_addr),
-            Err(linux::VmemResizeError::RangeOccupied(_)) => {
+            Err(vmem::VmemResizeError::RangeOccupied(_)) => {
                 // trying to remap a subset of an existing mapping
                 if !may_move {
                     return Err(RemapError::OutOfMemory);
@@ -700,12 +700,12 @@ where
                     )
                 } {
                     Ok(new_addr) => Ok(new_addr),
-                    Err(linux::VmemMoveError::OutOfMemory) => Err(RemapError::OutOfMemory),
-                    Err(linux::VmemMoveError::UnAligned) => Err(RemapError::Unaligned),
-                    Err(linux::VmemMoveError::RemapError(err)) => Err(err),
+                    Err(vmem::VmemMoveError::OutOfMemory) => Err(RemapError::OutOfMemory),
+                    Err(vmem::VmemMoveError::UnAligned) => Err(RemapError::Unaligned),
+                    Err(vmem::VmemMoveError::RemapError(err)) => Err(err),
                 }
             }
-            Err(linux::VmemResizeError::NotExist(_)) => {
+            Err(vmem::VmemResizeError::NotExist(_)) => {
                 // The old range's start is not inside a tracked VMA. For a grow,
                 // degrade to `OutOfMemory` (ENOMEM) instead of the fatal
                 // `AlreadyUnallocated` (EFAULT): this is exactly the errno Linux
@@ -720,16 +720,16 @@ where
                     Err(RemapError::AlreadyUnallocated)
                 }
             }
-            Err(linux::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
+            Err(vmem::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
             Err(
-                linux::VmemResizeError::InitializationPending(_)
-                | linux::VmemResizeError::OutOfMemory,
+                vmem::VmemResizeError::InitializationPending(_)
+                | vmem::VmemResizeError::OutOfMemory,
             ) => Err(RemapError::OutOfMemory),
-            Err(linux::VmemResizeError::UnmapError(
+            Err(vmem::VmemResizeError::UnmapError(
                 VmemUnmapError::UnAligned
                 | VmemUnmapError::UnmapError(DeallocationError::Unaligned),
             )) => Err(RemapError::Unaligned),
-            Err(linux::VmemResizeError::UnmapError(VmemUnmapError::UnmapError(
+            Err(vmem::VmemResizeError::UnmapError(VmemUnmapError::UnmapError(
                 DeallocationError::AlreadyUnallocated,
             ))) => Err(RemapError::AlreadyUnallocated),
         }
@@ -1035,7 +1035,7 @@ where
     }
 
     /// Reserves `range` so a flexible (non-`MAP_FIXED`) placement search steers around it even
-    /// though it has no live mapping. See `linux::Vmem::reserve_external`'s doc comment for why
+    /// though it has no live mapping. See `vmem::Vmem::reserve_external`'s doc comment for why
     /// this exists (a saved-but-currently-unmapped fork-family member's memory).
     pub fn reserve_external(&self, range: Range<usize>) {
         self.vmem.write().reserve_external(range);

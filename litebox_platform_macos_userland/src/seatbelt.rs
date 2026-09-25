@@ -548,7 +548,7 @@ fn the_runner_profile_denies_host_access_without_breaking_jit_or_hwcap() {
     // make the whole platform unusable if Seatbelt mediated it. This is byte for
     // byte the `mmap` call `allocate_jit_pages` makes for every executable guest
     // mapping.
-    let page = litebox::mm::linux::PAGE_SIZE;
+    let page = litebox::mm::vmem::PAGE_SIZE;
     // SAFETY: a fresh anonymous `MAP_JIT` mapping request with no fixed address.
     let jit = unsafe {
         libc::mmap(

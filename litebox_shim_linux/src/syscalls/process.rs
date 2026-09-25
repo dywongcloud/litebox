@@ -14,7 +14,7 @@ use core::ops::{Deref, DerefMut, Range};
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
-use litebox::mm::linux::{PAGE_SIZE, VmFlags};
+use litebox::mm::vmem::{PAGE_SIZE, VmFlags};
 use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
@@ -730,7 +730,7 @@ impl<Platform: ShimPlatform> SharedVmAtomicUsize<Platform> {
 /// keeps exactly one of them running on it at a time.
 ///
 /// LiteBox executes guest code natively, so a guest virtual address *is* a host virtual address
-/// (see `litebox::mm::linux::Vmem::insert_mapping`, which passes the guest's own range straight to
+/// (see `litebox::mm::vmem::Vmem::insert_mapping`, which passes the guest's own range straight to
 /// the platform allocator). One host address space therefore cannot hold two guest processes that
 /// both believe they own the same addresses, which is exactly what a copying `fork` would have to
 /// produce. So the child runs in the parent's address space, on the parent's stack.

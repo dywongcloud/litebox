@@ -35,7 +35,7 @@ pub(crate) const DEFAULT_LOW_ADDR: usize = 0x1000_0000;
 pub(crate) fn default_low_addr<Platform: crate::ShimPlatform>() -> usize {
     DEFAULT_LOW_ADDR.max(
         <Platform as litebox::platform::PageManagementProvider<
-            { litebox::mm::linux::PAGE_SIZE },
+            { litebox::mm::vmem::PAGE_SIZE },
         >>::TASK_ADDR_MIN,
     )
 }

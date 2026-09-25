@@ -9,7 +9,7 @@ use crate::{Task, UserConstPtr, UserMutPtr};
 use alloc::vec;
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
-use litebox::mm::linux::PAGE_SIZE;
+use litebox::mm::vmem::PAGE_SIZE;
 use litebox::platform::{
     DerivedKeyError, DerivedKeyProvider, KDFParams, RawConstPointer as _, RawMutPointer as _,
 };

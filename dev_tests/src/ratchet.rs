@@ -49,7 +49,7 @@ fn ratchet_globals() -> Result<()> {
             // line starting with `static`, including the two extern table bounds
             // already in this count, bringing that part of the total to 10.
             // The eleventh is `NEXT_SHARED_FUTEX_BACKING_ID` in
-            // `litebox/src/mm/linux.rs`, the monotonic id allocator backing
+            // `litebox/src/mm/vmem.rs`, the monotonic id allocator backing
             // `VmArea`'s optional shared-futex identity.
             ("litebox/", 11),
             // litebox_packager builds an in-process musl-libc patch cache; the one

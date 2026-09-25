@@ -7,7 +7,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use litebox::{
     fd::EntryHandle,
-    mm::linux::{MappingError, PAGE_SIZE, PageRange},
+    mm::vmem::{MappingError, PAGE_SIZE, PageRange},
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
@@ -245,14 +245,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         clippy::too_many_arguments,
         reason = "each parameter is independently required by the platform allocation contract"
     )]
-    fn do_mmap(
+    pub(crate) fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
         ensure_space_after: bool,
-        shared_futex_backing: Option<(litebox::mm::linux::SharedFutexBacking, usize)>,
+        shared_futex_backing: Option<(litebox::mm::vmem::SharedFutexBacking, usize)>,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
@@ -278,7 +278,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let op = |_| Ok(0);
         let shared_futex_backing = flags
             .contains(MapFlags::MAP_SHARED)
-            .then(|| (litebox::mm::linux::SharedFutexBacking::new(), 0));
+            .then(|| (litebox::mm::vmem::SharedFutexBacking::new(), 0));
         self.do_mmap(
             suggested_addr,
             len,
@@ -302,7 +302,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
-        shared_futex_backing: Option<(litebox::mm::linux::SharedFutexBacking, usize)>,
+        shared_futex_backing: Option<(litebox::mm::vmem::SharedFutexBacking, usize)>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
 
@@ -378,7 +378,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: &MapFlags,
         fd: i32,
         offset: usize,
-        shared_futex_backing: Option<(litebox::mm::linux::SharedFutexBacking, usize)>,
+        shared_futex_backing: Option<(litebox::mm::vmem::SharedFutexBacking, usize)>,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
         if shared_futex_backing.is_some() {
             return None;
@@ -520,7 +520,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
-        shared_futex_backing: Option<(litebox::mm::linux::SharedFutexBacking, usize)>,
+        shared_futex_backing: Option<(litebox::mm::vmem::SharedFutexBacking, usize)>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
             // Note a malicious user may unmap ptr while we are reading.
@@ -732,7 +732,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn raw_fd_shared_futex_backing(
         &self,
         fd: i32,
-    ) -> Option<litebox::mm::linux::SharedFutexBacking> {
+    ) -> Option<litebox::mm::vmem::SharedFutexBacking> {
         let raw_fd = usize::try_from(fd).ok()?;
         let files = self.files.borrow();
         let typed = files
@@ -2728,7 +2728,7 @@ mod tests {
     /// address space back.
     #[test]
     fn release_memory_releases_only_the_named_ranges_of_a_coalesced_mapping() {
-        use litebox::mm::linux::VmFlags;
+        use litebox::mm::vmem::VmFlags;
 
         let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);

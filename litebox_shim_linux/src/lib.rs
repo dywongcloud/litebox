@@ -23,7 +23,7 @@ use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
     fd::TypedFd,
-    mm::{PageManager, linux::PAGE_SIZE},
+    mm::{PageManager, vmem::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
     platform::TimeProvider,
@@ -82,7 +82,7 @@ pub trait ShimPlatform:
     litebox::platform::RawPointerProvider
     + litebox::platform::TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox::mm::linux::VmemPageFaultHandler
+    + litebox::mm::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::CrngProvider
@@ -101,7 +101,7 @@ impl<T> ShimPlatform for T where
     T: litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox::mm::linux::VmemPageFaultHandler
+        + litebox::mm::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::CrngProvider
@@ -282,7 +282,7 @@ pub struct LinuxShimEntrypoints<Platform: ShimPlatform, FS: ShimFS> {
 ///
 /// x86-64 reports the address in `CR2` and the status in the hardware error
 /// code; aarch64 reports them in `FAR_EL1` and `ESR_EL1`. Both are opaque here:
-/// the platform's [`VmemPageFaultHandler`](litebox::mm::linux::VmemPageFaultHandler)
+/// the platform's [`VmemPageFaultHandler`](litebox::mm::vmem::VmemPageFaultHandler)
 /// is what decodes the status word.
 #[cfg(target_arch = "x86_64")]
 fn page_fault_info(info: &litebox::shim::ExceptionInfo) -> Option<(usize, u64)> {
@@ -2196,7 +2196,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// different file descriptions still converge on one backing object.
     shared_file_backings: litebox::sync::Mutex<
         Platform,
-        alloc::collections::BTreeMap<(usize, usize), litebox::mm::linux::SharedFutexBacking>,
+        alloc::collections::BTreeMap<(usize, usize), litebox::mm::vmem::SharedFutexBacking>,
     >,
     /// Handle to the `/proc` backend mounted by [`LinuxShimBuilder::default_fs`], if any --
     /// `None` when the shim was built with a filesystem that doesn't mount one.

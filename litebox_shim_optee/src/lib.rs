@@ -17,7 +17,7 @@ use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
-    mm::{PageManager, linux::PAGE_SIZE},
+    mm::{PageManager, vmem::PAGE_SIZE},
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
     utils::TruncateExt,
@@ -289,7 +289,7 @@ impl OpteeShim {
                 entrypoints.task.get_ta_stack_base_addr(),
             )
             .ok_or(loader::elf::ElfLoaderError::MappingError(
-                litebox::mm::linux::MappingError::OutOfMemory,
+                litebox::mm::vmem::MappingError::OutOfMemory,
             ))?;
             Some(ta_stack.get_params_address())
         } else {
@@ -322,7 +322,7 @@ impl OpteeShim {
         // This shim instance owns every mapping the manager tracks, so each tracked range is
         // released whole. See `PageManager::release_memory` for why the callback names ranges
         // rather than answering yes/no.
-        let release = |r: core::ops::Range<usize>, _vm: litebox::mm::linux::VmFlags| Some(r);
+        let release = |r: core::ops::Range<usize>, _vm: litebox::mm::vmem::VmFlags| Some(r);
         unsafe {
             let _ = self.page_manager().release_memory(release);
         }
@@ -802,7 +802,7 @@ impl Task {
             let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin, false)?;
             elf_loader.load_ta_trampoline(ta_entry_point)?;
             self.allocate_guest_tls(None).map_err(|_| {
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
+                ElfLoaderError::MappingError(litebox::mm::vmem::MappingError::OutOfMemory)
             })?;
             self.ta_prepared.set(true);
         }
@@ -812,7 +812,7 @@ impl Task {
 
         let mut ta_stack =
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
+                ElfLoaderError::MappingError(litebox::mm::vmem::MappingError::OutOfMemory),
             )?;
         ta_stack
             .init(self.global.platform, params)

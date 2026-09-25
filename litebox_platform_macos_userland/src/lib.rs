@@ -18,7 +18,7 @@
 //!
 //! * **16 KiB pages.** Apple Silicon's page size is 16 KiB, not 4 KiB, so every
 //!   fixed mapping and every protection change must be 16 KiB aligned. This is
-//!   why `litebox::mm::linux::PAGE_SIZE` is target-dependent; the guest learns
+//!   why `litebox::mm::vmem::PAGE_SIZE` is target-dependent; the guest learns
 //!   the same value through `AT_PAGESZ`.
 //! * **A 4 GiB `__PAGEZERO`.** The first 4 GiB of an arm64 Mach-O process is
 //!   reserved and permanently unmapped, so no guest mapping can live below it.
@@ -1163,7 +1163,7 @@ fn allocate_jit_pages_hint_honors_the_suggested_address() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let len = litebox::mm::linux::PAGE_SIZE;
+    let len = litebox::mm::vmem::PAGE_SIZE;
 
     // SAFETY: each anonymous mapping with no fixed-address request has no
     // precondition beyond what `mmap` itself checks.
@@ -1571,7 +1571,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             // Every caller in this tree reaches `Hint` only after
             // `Vmem::get_unmmaped_area` has already searched for and vetted
             // `suggested_range` against this process's own address-space
-            // bookkeeping (see `litebox::mm::linux::Vmem::create_mapping`,
+            // bookkeeping (see `litebox::mm::vmem::Vmem::create_mapping`,
             // whose non-fixed path always resolves a concrete candidate
             // *before* calling down here), so when the address Darwin
             // actually chose disagrees with that already-vetted candidate,
@@ -3020,13 +3020,13 @@ fn allocate_pages_no_longer_refuses_shared_anonymous_mappings() {
     use litebox::platform::{PageManagementProvider, RawConstPointer as _};
 
     let platform = MacOsUserland::new(None);
-    let len = litebox::mm::linux::PAGE_SIZE;
+    let len = litebox::mm::vmem::PAGE_SIZE;
     // `FixedAddressBehavior::Hint` makes `suggested_range.start` advisory only (no `MAP_FIXED`),
     // so any aligned address here is fine -- the kernel is free to place it elsewhere.
     let hint = 0x2000_0000_0000usize;
 
     let ptr = <MacOsUserland as PageManagementProvider<
-        { litebox::mm::linux::PAGE_SIZE },
+        { litebox::mm::vmem::PAGE_SIZE },
     >>::allocate_pages(
         platform,
         hint..hint + len,
@@ -3052,7 +3052,7 @@ fn allocate_pages_no_longer_refuses_shared_anonymous_mappings() {
     // SAFETY: `ptr`'s range was returned by the matching `allocate_pages` call above and has
     // not been deallocated yet.
     unsafe {
-        <MacOsUserland as PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>>::deallocate_pages(
+        <MacOsUserland as PageManagementProvider<{ litebox::mm::vmem::PAGE_SIZE }>>::deallocate_pages(
             platform,
             ptr.as_usize()..ptr.as_usize() + len,
         )
@@ -4543,17 +4543,17 @@ static PROBE_ALLOCATOR: signal_handler_alloc_probe::ProbeAllocator =
 
 /// Page faults are serviced by the host kernel, so LiteBox never handles one
 /// itself here. Provided to satisfy the trait bound on `PageManager`.
-impl litebox::mm::linux::VmemPageFaultHandler for MacOsUserland {
+impl litebox::mm::vmem::VmemPageFaultHandler for MacOsUserland {
     unsafe fn handle_page_fault(
         &self,
         _fault_addr: usize,
-        _flags: litebox::mm::linux::VmFlags,
+        _flags: litebox::mm::vmem::VmFlags,
         _error_code: u64,
-    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+    ) -> Result<(), litebox::mm::vmem::PageFaultError> {
         unreachable!("host kernel handles page faults for macOS userland")
     }
 
-    fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
+    fn access_error(_error_code: u64, _flags: litebox::mm::vmem::VmFlags) -> bool {
         unreachable!("host kernel handles page faults for macOS userland")
     }
 }
@@ -4565,7 +4565,7 @@ impl litebox::mm::linux::VmemPageFaultHandler for MacOsUserland {
 /// Guard page below the alternate signal stack, sized to this platform's 16
 /// KiB pages so a stack-overflowing handler faults instead of corrupting
 /// whatever mapping [`with_signal_alt_stack`] happened to place below it.
-const ALT_STACK_GUARD_SIZE: usize = litebox::mm::linux::PAGE_SIZE;
+const ALT_STACK_GUARD_SIZE: usize = litebox::mm::vmem::PAGE_SIZE;
 
 /// Runs `f` with an alternate signal stack installed on the calling thread.
 ///

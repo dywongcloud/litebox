@@ -19,7 +19,7 @@ use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use hashbrown::{HashMap, HashSet};
-use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer, utils::TruncateExt};
+use litebox::{mm::vmem::PAGE_SIZE, platform::RawConstPointer, utils::TruncateExt};
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,

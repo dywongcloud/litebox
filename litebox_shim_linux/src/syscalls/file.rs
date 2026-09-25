@@ -14,7 +14,7 @@ use litebox::{
     event::{Events, wait::WaitError},
     fd::{EntryHandle, FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{AccessCredentials, Mode, OFlags, SeekWhence},
-    mm::linux::PAGE_SIZE,
+    mm::vmem::PAGE_SIZE,
     net::Network,
     path,
     pipes::Pipes,
@@ -363,7 +363,7 @@ const F_SEAL_ALL: u32 =
 #[derive(Debug)]
 pub(crate) struct MemfdBacking {
     seals: AtomicU32,
-    shared_futex_backing: litebox::mm::linux::SharedFutexBacking,
+    shared_futex_backing: litebox::mm::vmem::SharedFutexBacking,
 }
 
 impl Clone for MemfdBacking {
@@ -379,11 +379,11 @@ impl MemfdBacking {
     fn new(allow_sealing: bool) -> Self {
         Self {
             seals: AtomicU32::new(if allow_sealing { 0 } else { F_SEAL_SEAL }),
-            shared_futex_backing: litebox::mm::linux::SharedFutexBacking::new(),
+            shared_futex_backing: litebox::mm::vmem::SharedFutexBacking::new(),
         }
     }
 
-    pub(crate) fn shared_futex_backing(&self) -> litebox::mm::linux::SharedFutexBacking {
+    pub(crate) fn shared_futex_backing(&self) -> litebox::mm::vmem::SharedFutexBacking {
         self.shared_futex_backing
     }
 
@@ -421,7 +421,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         fd: &TypedFd<FS>,
         create: bool,
-    ) -> Option<litebox::mm::linux::SharedFutexBacking> {
+    ) -> Option<litebox::mm::vmem::SharedFutexBacking> {
         if let Ok(backing) = self
             .global
             .litebox
@@ -442,7 +442,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !create {
             return None;
         }
-        let backing = litebox::mm::linux::SharedFutexBacking::new();
+        let backing = litebox::mm::vmem::SharedFutexBacking::new();
         backings.insert(key, backing);
         Some(backing)
     }
