@@ -284,11 +284,11 @@ impl NatEngine {
                 // construction. Packets to the guest's own address loop back
                 // inside litebox's phy and never arrive here; anything else in
                 // the /24 is not ours to NAT.
-                if let Some(gateway) = self.iface.ipv4_addr() {
-                    if gateway.octets()[..3] == dst.octets()[..3] {
-                        litebox_util_log::debug!(dst:% = dst; "nat: dropping guest datagram to the guest fabric");
-                        return;
-                    }
+                if let Some(gateway) = self.iface.ipv4_addr()
+                    && gateway.octets()[..3] == dst.octets()[..3]
+                {
+                    litebox_util_log::debug!(dst:% = dst; "nat: dropping guest datagram to the guest fabric");
+                    return;
                 }
                 let key = FlowKey {
                     proto: 17, // UDP

@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::HvfCompletionCapability;
+use litebox::utils::TruncateExt;
 
 const HVF_PAGE_SIZE: usize = 16 * 1024;
 
@@ -135,7 +136,7 @@ impl Default for HvfArchitecturalState {
     fn default() -> Self {
         Self {
             abi_version: HVF_ABI_VERSION,
-            byte_size: core::mem::size_of::<Self>() as u32,
+            byte_size: core::mem::size_of::<Self>().trunc(),
             x: [0; 31],
             q: [HvfSimd128::default(); 32],
             fpcr: 0,
@@ -260,7 +261,7 @@ impl Default for HvfEl1State {
     fn default() -> Self {
         Self {
             abi_version: HVF_ABI_VERSION,
-            byte_size: core::mem::size_of::<Self>() as u32,
+            byte_size: core::mem::size_of::<Self>().trunc(),
             sctlr_el1: 0,
             cpacr_el1: 0,
             ttbr0_el1: 0,
@@ -694,8 +695,8 @@ impl HvfError {
             Self::PublishedOperationFailure { trigger }
             | Self::MappingCleanup { trigger, .. }
             | Self::VcpuCleanup { trigger, .. }
-            | Self::VcpuQuarantine { trigger, .. } => trigger.stage_one_mismatch(),
-            Self::MappingFinalization { trigger, .. } => trigger.stage_one_mismatch(),
+            | Self::VcpuQuarantine { trigger, .. }
+            | Self::MappingFinalization { trigger, .. } => trigger.stage_one_mismatch(),
             Self::StageOneRegisterReadback { .. } => true,
             _ => false,
         }
@@ -1419,6 +1420,10 @@ pub enum HvfPublishedPanicOperation {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfPublishedPanicReport {
     pub operation: HvfPublishedPanicOperation,
     pub original_payload_preserved: bool,
@@ -1502,7 +1507,7 @@ impl<'vm> HvfOperationFrame<'vm> {
         state: &mut HvfVmOperationState,
         shared: bool,
     ) -> Result<Self, HvfError> {
-        let key = vm as *const HvfVm as usize;
+        let key = std::ptr::from_ref::<HvfVm>(vm) as usize;
         let entered = HVF_OPERATION_STATE.with(|cell| {
             let mut thread = cell.get();
             let empty_is_canonical = thread.total_depth != 0
@@ -1555,7 +1560,7 @@ impl<'vm> HvfOperationFrame<'vm> {
     }
 
     fn top_thread_state(&self, shared: bool) -> Option<HvfOperationThreadState> {
-        let key = self.vm as *const HvfVm as usize;
+        let key = std::ptr::from_ref::<HvfVm>(self.vm) as usize;
         HVF_OPERATION_STATE.with(|cell| {
             let thread = cell.get();
             (thread.vm == key
@@ -1596,7 +1601,7 @@ impl<'vm> HvfOperationFrame<'vm> {
     }
 
     fn mark_capability_returned(&self, shared: bool) -> Result<(), HvfError> {
-        let key = self.vm as *const HvfVm as usize;
+        let key = std::ptr::from_ref::<HvfVm>(self.vm) as usize;
         let marked = HVF_OPERATION_STATE.with(|cell| {
             let thread = cell.get();
             if thread.vm == key
@@ -1663,7 +1668,7 @@ impl<'vm> HvfOperationFrame<'vm> {
         if self.direct_published.get() || self.saved_parent_descendant_published {
             return true;
         }
-        let key = self.vm as *const HvfVm as usize;
+        let key = std::ptr::from_ref::<HvfVm>(self.vm) as usize;
         HVF_OPERATION_STATE.with(|cell| {
             let thread = cell.get();
             thread.vm == key && (thread.admission_published || thread.current_descendant_published)
@@ -1794,9 +1799,10 @@ impl HvfVmOperation<'_> {
         }
 
         let fold = self.frame.prepare_leave(false);
-        let failure_published = fold
-            .map(|fold| fold.admission_published)
-            .unwrap_or_else(|| self.frame.conservative_admission_published());
+        let failure_published = fold.map_or_else(
+            || self.frame.conservative_admission_published(),
+            |fold| fold.admission_published,
+        );
         let class_live = current == self.owner
             && state.owner.as_ref() == Some(&self.owner)
             && state.depth != 0
@@ -2006,7 +2012,7 @@ impl fmt::Debug for HvfVm {
             .field("report", &self.report)
             .field("admitted_features", &self.admitted_features)
             .field("poisoned", &self.is_poisoned())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -2049,7 +2055,7 @@ impl HvfVm {
         {
             return false;
         }
-        let key = self as *const HvfVm as usize;
+        let key = std::ptr::from_ref::<HvfVm>(self) as usize;
         HVF_OPERATION_STATE.with(|cell| {
             let thread = cell.get();
             thread.vm == key && thread.total_depth != 0
@@ -2073,7 +2079,7 @@ impl HvfVm {
             return Err(HvfError::HostTooOld);
         }
         let host_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if host_page_size != HVF_PAGE_SIZE as i64 {
+        if usize::try_from(host_page_size) != Ok(HVF_PAGE_SIZE) {
             return Err(HvfError::HostPageSize(host_page_size));
         }
 
@@ -2302,10 +2308,7 @@ impl HvfVm {
             return Err(HvfError::Poisoned);
         }
         if state.active_vcpu_owners.len() >= self.report.max_vcpu_count as usize
-            || state
-                .active_vcpu_owners
-                .iter()
-                .any(|active| *active == owner)
+            || state.active_vcpu_owners.contains(&owner)
         {
             self.abandon_operation_locked(&mut state);
             return Err(HvfError::ResidualAccounting);
@@ -2335,11 +2338,9 @@ impl HvfVm {
         let mut index = None;
         let mut duplicate = false;
         for (candidate, active) in state.active_vcpu_owners.iter().enumerate() {
-            if *active == owner {
-                if index.replace(candidate).is_some() {
-                    duplicate = true;
-                    break;
-                }
+            if *active == owner && index.replace(candidate).is_some() {
+                duplicate = true;
+                break;
             }
         }
         let index = if std::thread::current().id() == owner && !duplicate {
@@ -2347,9 +2348,10 @@ impl HvfVm {
         } else {
             None
         };
-        let failure_published = fold
-            .map(|fold| fold.admission_published)
-            .unwrap_or_else(|| frame.conservative_admission_published());
+        let failure_published = fold.map_or_else(
+            || frame.conservative_admission_published(),
+            |fold| fold.admission_published,
+        );
         let (Some(fold), Some(index)) = (fold, index) else {
             self.abandon_operation_locked(&mut state);
             frame.disarm_abandoned();
@@ -2489,12 +2491,11 @@ impl HvfVm {
                         self.abandon_operation_locked(&mut state);
                         reject_operation!(HvfError::OperationAbandoned);
                     }
-                    match found {
-                        Some(index) => Some(index),
-                        None => {
-                            self.abandon_operation_locked(&mut state);
-                            reject_operation!(HvfError::OperationAbandoned);
-                        }
+                    if let Some(index) = found {
+                        Some(index)
+                    } else {
+                        self.abandon_operation_locked(&mut state);
+                        reject_operation!(HvfError::OperationAbandoned);
                     }
                 }
             };
@@ -2531,7 +2532,7 @@ impl HvfVm {
                 continue;
             }
 
-            match state.owner.clone() {
+            match state.owner {
                 None if waiter_index == Some(0) => {
                     let Some(ticket) = waiter_ticket.take() else {
                         self.abandon_operation_locked(&mut state);
@@ -2849,9 +2850,10 @@ impl HvfVm {
 
         let fold = frame.prepare_leave(true);
         let shared = state.shared.checked_sub(1);
-        let failure_published = fold
-            .map(|fold| fold.admission_published)
-            .unwrap_or_else(|| frame.conservative_admission_published());
+        let failure_published = fold.map_or_else(
+            || frame.conservative_admission_published(),
+            |fold| fold.admission_published,
+        );
         let (Some(fold), Some(shared)) = (fold, shared) else {
             self.abandon_operation_locked(&mut state);
             frame.disarm_abandoned();
@@ -3257,7 +3259,7 @@ impl HvfVm {
         // with a shared operation that was admitted earlier and is blocked on
         // one of those locks. The outermost admission finish performs the
         // bounded drain after the body and its guards have gone out of scope.
-        let vm = self as *const HvfVm as usize;
+        let vm = std::ptr::from_ref::<HvfVm>(self) as usize;
         let (operation_depth, shared_depth) = HVF_OPERATION_STATE.with(|cell| {
             let thread = cell.get();
             if thread.vm == vm {
@@ -3266,10 +3268,7 @@ impl HvfVm {
                 (0, 0)
             }
         });
-        let owns_active_vcpu = state
-            .active_vcpu_owners
-            .iter()
-            .any(|owner| *owner == current);
+        let owns_active_vcpu = state.active_vcpu_owners.contains(&current);
         if operation_depth != 0 || owns_active_vcpu {
             state.poison_requested = true;
             self.operation_gate.idle.notify_all();
@@ -3370,22 +3369,11 @@ impl HvfVm {
             }));
             match creation {
                 Ok(result) => {
-                    if let Err(cleanup) = self.cancel_unbound_vcpu_creation(&reservation) {
-                        return match result {
-                            Ok(vcpu) => {
-                                dispose_rejected_value(vcpu);
-                                Err(cleanup)
-                            }
-                            Err(trigger) => Err(HvfError::vcpu_quarantine(trigger, cleanup)),
-                        };
-                    }
+                    self.cancel_unbound_vcpu_creation(&reservation);
                     result
                 }
                 Err(payload) => {
-                    if self.cancel_unbound_vcpu_creation(&reservation).is_err() {
-                        self.cleanup_required.store(true, Ordering::Release);
-                        self.request_poison_nonblocking();
-                    }
+                    self.cancel_unbound_vcpu_creation(&reservation);
                     std::panic::resume_unwind(payload);
                 }
             }
@@ -3504,10 +3492,7 @@ impl HvfVm {
         Ok((identifier, exit_area, guard))
     }
 
-    fn cancel_unbound_vcpu_creation(
-        &self,
-        reservation: &HvfVcpuCreationReservation,
-    ) -> Result<(), HvfError> {
+    fn cancel_unbound_vcpu_creation(&self, reservation: &HvfVcpuCreationReservation) {
         let mut ownership = self
             .vcpu_ownership
             .lock()
@@ -3517,16 +3502,15 @@ impl HvfVm {
                 && pending.owner == reservation.owner
                 && Arc::ptr_eq(&pending.handle_state, &reservation.handle_state)
         }) else {
-            return Ok(());
+            return;
         };
         if ownership.pending[index].identifier.is_some() {
-            return Ok(());
+            return;
         }
         ownership.pending.remove(index);
         reservation
             .handle_state
             .store(VCPU_HANDLE_CLOSED, Ordering::Release);
-        Ok(())
     }
 
     fn settle_abandoned_vcpu_creation(
@@ -4089,7 +4073,8 @@ impl HvfVm {
                     return Err(HvfError::ResidualAccounting);
                 };
                 for fragment in &mut record.fragments {
-                    let host_address = host_range.start + (fragment.ipa - ipa) as usize;
+                    let host_address =
+                        host_range.start + TruncateExt::<usize>::trunc(fragment.ipa - ipa);
                     if let Err(error) = operation.mark_published() {
                         mapping_error = Some(error);
                         break;
@@ -4191,12 +4176,10 @@ impl HvfVm {
             }
             None => true,
         };
-        if !residual {
-            if let Some(record) = registry.records.remove(&token) {
-                record
-                    .handle_state
-                    .store(MAPPING_HANDLE_CLOSED, Ordering::Release);
-            }
+        if !residual && let Some(record) = registry.records.remove(&token) {
+            record
+                .handle_state
+                .store(MAPPING_HANDLE_CLOSED, Ordering::Release);
         }
         residual
     }
@@ -4313,18 +4296,15 @@ impl HvfVm {
                 )
             })
             .count();
-        let released = match before.checked_sub(after) {
-            Some(released) => released,
-            None => {
-                Self::quarantine_mapping_record_locked(&mut registry, token);
-                drop(registry);
-                self.cleanup_required.store(true, Ordering::Release);
-                self.request_poison_nonblocking();
-                return Err(HvfError::mapping_cleanup(
-                    token,
-                    HvfError::ResidualAccounting,
-                ));
-            }
+        let Some(released) = before.checked_sub(after) else {
+            Self::quarantine_mapping_record_locked(&mut registry, token);
+            drop(registry);
+            self.cleanup_required.store(true, Ordering::Release);
+            self.request_poison_nonblocking();
+            return Err(HvfError::mapping_cleanup(
+                token,
+                HvfError::ResidualAccounting,
+            ));
         };
         if after == 0 {
             if let Err(trigger) = operation.mark_published() {
@@ -4390,8 +4370,10 @@ impl HvfVm {
                         record.lifecycle,
                         record.handle_state.load(Ordering::Acquire),
                     ) {
-                        (HvfMappingLifecycle::Provisioning, MAPPING_HANDLE_LIVE)
-                        | (HvfMappingLifecycle::Live, MAPPING_HANDLE_LIVE)
+                        (
+                            HvfMappingLifecycle::Provisioning | HvfMappingLifecycle::Live,
+                            MAPPING_HANDLE_LIVE,
+                        )
                         | (
                             HvfMappingLifecycle::Quarantined,
                             MAPPING_HANDLE_CLOSING | MAPPING_HANDLE_RETRY_QUEUED,
@@ -4481,7 +4463,7 @@ impl HvfVm {
                         record.handle_state.load(Ordering::Acquire),
                         record.cleanup_code,
                     ) {
-                        (None, VCPU_HANDLE_LIVE, None) | (Some(_), VCPU_HANDLE_LIVE, None) => {
+                        (None | Some(_), VCPU_HANDLE_LIVE, None) => {
                             checked_residual_add(&mut report.active_vcpus, 1)?;
                         }
                         (Some(_), VCPU_HANDLE_CLOSING | VCPU_HANDLE_RETRY_QUEUED, _) => {
@@ -4598,11 +4580,19 @@ impl HvfVm {
     /// `hv_vcpu_destroy` calls fail with `HV_ERROR` before reaching the SDK,
     /// so the vCPU stays alive and a later owner-thread retry genuinely
     /// destroys it.  Returns the previously armed count.
+    #[expect(
+        clippy::unused_self,
+        reason = "the injected-failure counter is process-global, but arming it is scoped to a VM handle"
+    )]
     pub(crate) fn induce_vcpu_destroy_failures(&self, count: u32) -> u32 {
         // SAFETY: a process-global atomic counter with no preconditions.
         unsafe { litebox_hvf_inject_vcpu_destroy_failures(count) }
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "the injected-failure counter is process-global, but reading it is scoped to a VM handle"
+    )]
     pub(crate) fn remaining_induced_vcpu_destroy_failures(&self) -> u32 {
         // SAFETY: a process-global atomic counter with no preconditions.
         unsafe { litebox_hvf_remaining_vcpu_destroy_failures() }
@@ -4662,6 +4652,10 @@ pub fn hvf_boundary_probe() -> Result<HvfBoundaryReport, HvfError> {
             Err(cleanup) => Err(HvfError::vcpu_quarantine(trigger, cleanup)),
         };
     }
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "`HvfVmOperation::require_live` is not general enough over the operation's lifetime"
+    )]
     vm.with_operation(|operation| operation.require_live())?;
     let sdk_residuals = vm.residual_report()?;
     if !sdk_residuals.is_empty() {
@@ -5067,7 +5061,7 @@ impl fmt::Debug for HvfVcpuCancellation {
                 "live",
                 &(self.handle_state.load(Ordering::Acquire) == VCPU_HANDLE_LIVE),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -5392,7 +5386,8 @@ impl<'vm> HvfMapping<'vm> {
         let host_start = self.host_range.start;
         let ipa = self.ipa;
         let permissions = self.permissions;
-        let result = vm.with_capability_operation(|operation| {
+
+        vm.with_capability_operation(|operation| {
             let mut registry = vm
                 .mapping_registry
                 .lock()
@@ -5475,8 +5470,7 @@ impl<'vm> HvfMapping<'vm> {
                 handle.live = true;
             }
             Ok(handles)
-        });
-        result
+        })
     }
 }
 
@@ -5565,7 +5559,7 @@ impl fmt::Debug for HvfVcpu {
             .field("generation", &self.generation)
             .field("exit_area", &self.exit_area)
             .field("features", &self.features)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -5630,61 +5624,6 @@ impl HvfVcpu {
         match result {
             Ok(result) => vm.finish_operation(result, finish),
             Err(payload) => vm.resume_operation_panic(payload, finish),
-        }
-    }
-
-    fn reject<T>(
-        mut self,
-        operation: &HvfVmOperation<'_>,
-        trigger: HvfError,
-    ) -> Result<T, HvfError> {
-        let cleanup = match self.vm.destroy_registered_vcpu(
-            operation,
-            self.identifier,
-            self.generation,
-            &self.handle_state,
-        ) {
-            Ok(code) => code,
-            Err(error) => {
-                let failure = match self.vm.quarantine_vcpu_without_cleanup(
-                    self.identifier,
-                    self.generation,
-                    self.owner,
-                    &self.handle_state,
-                ) {
-                    Ok(()) => error,
-                    Err(quarantine) => HvfError::vcpu_quarantine(error, quarantine),
-                };
-                self.live = false;
-                self.vm.request_poison_nonblocking();
-                return Err(HvfError::vcpu_quarantine(trigger, failure));
-            }
-        };
-        self.live = false;
-        if succeeded(cleanup) {
-            match self.vm.record_vcpu_cleanup(
-                self.identifier,
-                self.generation,
-                self.owner,
-                &self.handle_state,
-                None,
-            ) {
-                Ok(()) => Err(trigger),
-                Err(accounting) => Err(HvfError::vcpu_quarantine(trigger, accounting)),
-            }
-        } else {
-            let accounting = self
-                .vm
-                .record_vcpu_cleanup(
-                    self.identifier,
-                    self.generation,
-                    self.owner,
-                    &self.handle_state,
-                    Some(cleanup),
-                )
-                .err();
-            self.vm.request_poison_nonblocking();
-            Err(HvfError::vcpu_cleanup(trigger, cleanup, accounting))
         }
     }
 

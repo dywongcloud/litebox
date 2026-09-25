@@ -213,15 +213,15 @@ impl NatEngine {
         // included) is not ours to NAT, so give it the failed-dial
         // treatment: feed the SYN with no listener and let the RST fallback
         // hand the guest a prompt ECONNREFUSED.
-        if let Some(gateway) = self.iface.ipv4_addr() {
-            if gateway.octets()[..3] == dst.octets()[..3] {
-                self.device
-                    .ingress
-                    .lock()
-                    .unwrap()
-                    .push_back(packet.to_vec());
-                return;
-            }
+        if let Some(gateway) = self.iface.ipv4_addr()
+            && gateway.octets()[..3] == dst.octets()[..3]
+        {
+            self.device
+                .ingress
+                .lock()
+                .unwrap()
+                .push_back(packet.to_vec());
+            return;
         }
         let dial_rx = spawn_dial(SocketAddr::from((dst, key.dst_port)));
         let flow = TcpFlow {
@@ -272,7 +272,7 @@ impl NatEngine {
         unsafe {
             libc::kevent(
                 kqueue,
-                &change,
+                &raw const change,
                 1,
                 std::ptr::null_mut(),
                 0,
@@ -313,7 +313,7 @@ impl NatEngine {
                 0,
                 events.as_mut_ptr(),
                 i32::try_from(HOST_READY_EVENTS).unwrap(),
-                &no_wait,
+                &raw const no_wait,
             )
         };
         if ready <= 0 {
@@ -341,7 +341,7 @@ impl NatEngine {
         let mut host_buf = [0u8; HOST_READ_BUF];
         let readable = self.readable_host_streams();
 
-        for (key, flow) in self.tcp_flows.iter_mut() {
+        for (key, flow) in &mut self.tcp_flows {
             // 1. Resolve a pending dial.
             if matches!(flow.state, TcpFlowState::Dialing { .. }) {
                 let outcome = match &flow.state {

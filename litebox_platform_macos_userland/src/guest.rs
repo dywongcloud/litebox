@@ -1944,8 +1944,11 @@ pub(crate) mod tests {
         );
     }
 
+    /// The syscall number and first four arguments the gate reported.
+    type RecordedSyscall = (i32, usize, usize, usize, usize);
+
     struct FaultedGateShim {
-        syscall: core::cell::Cell<Option<(i32, usize, usize, usize, usize)>>,
+        syscall: core::cell::Cell<Option<RecordedSyscall>>,
         delivered: RefCell<Option<(ExceptionInfo, [usize; 31], usize)>>,
     }
 

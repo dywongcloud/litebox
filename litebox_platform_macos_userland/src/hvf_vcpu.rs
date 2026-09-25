@@ -414,10 +414,12 @@ pub enum HvfVcpuLaneError {
     OperationTimeout,
     ThreadSpawn(std::io::Error),
     OwnerPanicked,
-    RejectedExit(HvfVcpuExit),
+    // The exit record and state snapshot are boxed so that this error, returned from nearly
+    // every lane operation, stays small (`clippy::result_large_err`).
+    RejectedExit(Box<HvfVcpuExit>),
     InvalidExecutionState {
-        exit: HvfVcpuExit,
-        state: HvfSynchronizationExitState,
+        exit: Box<HvfVcpuExit>,
+        state: Box<HvfSynchronizationExitState>,
     },
     InvalidContinuation {
         pc: u64,
@@ -425,10 +427,10 @@ pub enum HvfVcpuLaneError {
         esr_el1: u64,
     },
     InvalidSynchronizationExit {
-        exit: HvfVcpuExit,
+        exit: Box<HvfVcpuExit>,
         lane_generation: u64,
-        request: HvfSynchronizationRequest,
-        state: HvfSynchronizationExitState,
+        request: Box<HvfSynchronizationRequest>,
+        state: Box<HvfSynchronizationExitState>,
     },
     Cleanup {
         primary: Box<HvfVcpuLaneError>,
@@ -1591,7 +1593,7 @@ impl RunControl {
                 return Ok(());
             }
         };
-        if let Some(attempt) = state.cancellation.as_ref().cloned() {
+        if let Some(attempt) = state.cancellation.clone() {
             if attempt.key().target != target {
                 self.set_terminal(&mut state);
                 return Err(HvfVcpuLaneError::RegistryAccounting);
@@ -1650,7 +1652,7 @@ impl RunControl {
                 },
                 ExecutionPhase::Running { run_epoch } => CancellationTarget::Run { run_epoch },
             };
-            let pending = if let Some(attempt) = state.cancellation.as_ref().cloned() {
+            let pending = if let Some(attempt) = state.cancellation.clone() {
                 if attempt.key().target != target {
                     self.set_terminal(&mut state);
                     return Err(HvfVcpuLaneError::RegistryAccounting);
@@ -2687,7 +2689,8 @@ impl HvfVcpuLaneHandle {
         attachment.submit(self.generation)?;
         let (reply, response) = mpsc::sync_channel(1);
         let command = Command::Synchronize { attachment, reply };
-        if let Err((command, primary)) = self.admit(command) {
+        if let Err(rejection) = self.admit(command) {
+            let (command, primary) = *rejection;
             return Err(match command {
                 Command::Synchronize { attachment, .. } => {
                     finish_attachment_with_error(attachment, primary)
@@ -2722,11 +2725,12 @@ impl HvfVcpuLaneHandle {
             kind,
             reservation,
             attachment,
-            state: *state,
+            state: Box::new(*state),
             vtimer_deadline,
             reply,
         };
-        if let Err((command, primary)) = self.admit(command) {
+        if let Err(rejection) = self.admit(command) {
+            let (command, primary) = *rejection;
             return Err(match command {
                 Command::Execute {
                     mut reservation,
@@ -2785,7 +2789,8 @@ impl HvfVcpuLaneHandle {
     ) -> Result<T, HvfVcpuLaneError> {
         let deadline = operation_deadline()?;
         let (reply, response) = mpsc::sync_channel(1);
-        if let Err((command, error)) = self.admit(command(reply)) {
+        if let Err(rejection) = self.admit(command(reply)) {
+            let (command, error) = *rejection;
             command.reject(HvfVcpuLaneError::LaneClosed);
             return Err(error);
         }
@@ -2801,18 +2806,22 @@ impl HvfVcpuLaneHandle {
     /// Liveness check plus enqueue.  The queue's own closed flag is what makes
     /// this safe against a concurrent final drain; the admission lock only
     /// orders it against capability minting and close.
-    fn admit(&self, command: Command) -> Result<(), (Command, HvfVcpuLaneError)> {
+    fn admit(&self, command: Command) -> Result<(), Box<(Command, HvfVcpuLaneError)>> {
         let _admission = self
             .admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.lifecycle.load(Ordering::Acquire) != LANE_LIVE {
-            return Err((command, HvfVcpuLaneError::LaneClosed));
+            return Err(Box::new((command, HvfVcpuLaneError::LaneClosed)));
         }
         match self.command_queue.try_push(command) {
             Ok(()) => Ok(()),
-            Err(PushRejection::Closed(command)) => Err((command, HvfVcpuLaneError::LaneClosed)),
-            Err(PushRejection::Full(command)) => Err((command, HvfVcpuLaneError::QueueOverloaded)),
+            Err(PushRejection::Closed(command)) => {
+                Err(Box::new((command, HvfVcpuLaneError::LaneClosed)))
+            }
+            Err(PushRejection::Full(command)) => {
+                Err(Box::new((command, HvfVcpuLaneError::QueueOverloaded)))
+            }
         }
     }
 
@@ -2844,7 +2853,7 @@ impl fmt::Debug for HvfVcpuLane {
             .field("handle", &self.handle)
             .field("completion_pending", &self.completion.is_some())
             .field("reaping_pending", &self.reaping.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -2966,7 +2975,9 @@ enum Command {
         kind: ExecutionKind,
         reservation: HvfVcpuRunReservation,
         attachment: HvfVcpuRunAttachment,
-        state: HvfArchitecturalState,
+        // Boxed: the full register file would otherwise make this variant dwarf the others
+        // (`clippy::large_enum_variant`).
+        state: Box<HvfArchitecturalState>,
         vtimer_deadline: Option<u64>,
         reply: Reply<HvfVcpuRunResult>,
     },
@@ -3015,7 +3026,7 @@ impl Command {
                 reply_result(reply, Err(error));
             }
             Self::Synchronize { attachment, reply } => {
-                reply_result(reply, Err(finish_attachment_with_error(attachment, error)))
+                reply_result(reply, Err(finish_attachment_with_error(attachment, error)));
             }
             Self::SetPendingInterrupt { reply, .. } => reply_result(reply, Err(error)),
             Self::ReadPendingInterrupt { reply, .. } => reply_result(reply, Err(error)),
@@ -3435,6 +3446,10 @@ fn reply_result<T>(reply: Reply<T>, result: Result<T, HvfVcpuLaneError>) {
 // Execution on the owner thread.
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent part of one queued execute command"
+)]
 fn execute_attached(
     vcpu: &mut HvfVcpu,
     control: &RunControl,
@@ -3562,7 +3577,7 @@ fn run_once(
     let (exit, execution_time, run_epoch) =
         execute_once(vcpu, control, lane_generation, run_epoch)?;
     if matches!(exit, HvfVcpuExit::Unknown | HvfVcpuExit::Malformed { .. }) {
-        return Err(HvfVcpuLaneError::RejectedExit(exit));
+        return Err(HvfVcpuLaneError::RejectedExit(Box::new(exit)));
     }
     let raw_state = vcpu.architectural_state_unclassified()?;
     let state = match raw_state.cpsr_context() {
@@ -3576,8 +3591,8 @@ fn run_once(
         }
         _ => {
             return Err(HvfVcpuLaneError::InvalidExecutionState {
-                exit,
-                state: (&raw_state).into(),
+                exit: Box::new(exit),
+                state: Box::new((&raw_state).into()),
             });
         }
     };
@@ -3741,10 +3756,10 @@ fn synchronize_once(
                 && exited.cpsr == 0x3c5;
             if !valid {
                 return Err(HvfVcpuLaneError::InvalidSynchronizationExit {
-                    exit,
+                    exit: Box::new(exit),
                     lane_generation,
-                    request,
-                    state: (&exited).into(),
+                    request: Box::new(request),
+                    state: Box::new((&exited).into()),
                 });
             }
             vcpu.verify_stage_one(request.ttbr0_el1, request.tcr_el1, request.mair_el1)?;

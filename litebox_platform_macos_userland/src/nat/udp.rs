@@ -187,7 +187,7 @@ pub(crate) fn poll_to_guest(flows: &mut HashMap<FlowKey, UdpFlow>, device: &NatD
                     push_reply(device, key, flow.guest_ip, &buf[..n]);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     litebox_util_log::debug!(error:% = e, raw:? = e.raw_os_error(), fd:? = flow.host.as_raw_fd(), revents:? = pfd.revents; "nat: udp host socket reported an error; closing it");
                     dead.push(*key);

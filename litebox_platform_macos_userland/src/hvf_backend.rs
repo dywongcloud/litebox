@@ -135,7 +135,8 @@ struct LaneMaintenanceFailure {
 pub enum HvfBackendError {
     Hvf(HvfError),
     Memory(HvfMemoryError),
-    Lane(HvfVcpuLaneError),
+    // Boxed to keep this error small (`clippy::result_large_err`).
+    Lane(Box<HvfVcpuLaneError>),
     AlreadyInstalled,
     NotInstalled,
     LaneAcquisitionTimeout,
@@ -162,7 +163,7 @@ pub enum HvfBackendError {
     /// (already inside `HvfVcpuExit`'s `Debug` output) and where in the
     /// guest it happened, rather than only the former.
     UnexpectedExit {
-        exit: HvfVcpuExit,
+        exit: Box<HvfVcpuExit>,
         source_pc: Option<u64>,
     },
 }
@@ -243,7 +244,7 @@ impl From<HvfMemoryError> for HvfBackendError {
 
 impl From<HvfVcpuLaneError> for HvfBackendError {
     fn from(value: HvfVcpuLaneError) -> Self {
-        Self::Lane(value)
+        Self::Lane(Box::new(value))
     }
 }
 
@@ -534,12 +535,15 @@ impl<'backend, 'slot> ActiveThreadLaneLease<'backend, 'slot> {
     }
 
     fn lane(&self) -> &LaneGeneration {
-        self.lease.as_ref().map(LaneLease::lane).unwrap_or_else(|| {
-            fatal(
-                "accessing a released vCPU lane checkout",
-                &HvfBackendError::LanePoolCorrupt { index: usize::MAX },
-            )
-        })
+        self.lease.as_ref().map_or_else(
+            || {
+                fatal(
+                    "accessing a released vCPU lane checkout",
+                    &HvfBackendError::LanePoolCorrupt { index: usize::MAX },
+                )
+            },
+            LaneLease::lane,
+        )
     }
 
     fn install(
@@ -639,7 +643,7 @@ impl Drop for OwnedGuestRange<'_> {
             if !matches!(cleaned, Ok(true)) {
                 fatal(
                     "cleaning up an owned HVF guest range",
-                    &HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting),
+                    &HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting),
                 );
             }
         }
@@ -727,7 +731,7 @@ pub fn hvf_sandbox_probe() -> Result<(), HvfBackendError> {
                 }
             };
             Err(HvfBackendError::UnexpectedExit {
-                exit: run.exit,
+                exit: Box::new(run.exit),
                 source_pc: Some(state.pc),
             })
         }
@@ -737,7 +741,7 @@ pub fn hvf_sandbox_probe() -> Result<(), HvfBackendError> {
 }
 
 /// Live, process-terminal-scale witness (it runs for slightly over
-/// [`LANE_ACQUIRE_TIMEOUT`]) that `HvfBackend::acquire_lane`'s 60-second
+/// `LANE_ACQUIRE_TIMEOUT`) that `HvfBackend::acquire_lane`'s 60-second
 /// deadline is a genuine bound under real starvation, not dead code: every
 /// pooled lane is occupied with a real spinning guest run on its own thread,
 /// a fresh acquire is issued against the exhausted pool, and the call must
@@ -781,11 +785,12 @@ pub fn hvf_lane_starvation_probe() -> Result<HvfLaneStarvationReport, HvfBackend
     backend.space.pump_retirements()?;
 
     let lane_count = backend.lanes.len();
-    let outcome = (|| {
+
+    (|| {
         let mut occupied: Vec<ProbeWorker<HvfVcpuRunResult>> = Vec::new();
         occupied
             .try_reserve_exact(lane_count)
-            .map_err(|_| HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting))?;
+            .map_err(|_| HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting))?;
         for _ in 0..lane_count {
             let lease = backend.acquire_lane()?;
             let index = lease.index();
@@ -827,7 +832,7 @@ pub fn hvf_lane_starvation_probe() -> Result<HvfLaneStarvationReport, HvfBackend
                         }
                     }
                 })
-                .map_err(|_| HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting))?;
+                .map_err(|_| HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting))?;
             occupied.push(ProbeWorker {
                 index,
                 stop,
@@ -838,15 +843,15 @@ pub fn hvf_lane_starvation_probe() -> Result<HvfLaneStarvationReport, HvfBackend
         // real run in progress on it) rather than merely marked busy, so this
         // acquire has no lane to receive even if scheduling is adversarial.
         let started = Instant::now();
-        let starved = backend.acquire_lane();
+        let acquisition = backend.acquire_lane();
         let elapsed = started.elapsed();
-        let timed_out = matches!(starved, Err(HvfBackendError::LaneAcquisitionTimeout));
+        let timed_out = matches!(acquisition, Err(HvfBackendError::LaneAcquisitionTimeout));
         // Bounded margin (not exact equality) for scheduling jitter around a
         // real wall-clock deadline; still tight enough to prove the const is
         // honored rather than, say, a near-zero or unbounded wait.
         let timing_bounded = elapsed >= LANE_ACQUIRE_TIMEOUT
             && elapsed < LANE_ACQUIRE_TIMEOUT.saturating_add(Duration::from_secs(10));
-        if let Ok(lease) = starved {
+        if let Ok(lease) = acquisition {
             // Should not happen given every lane is genuinely held, but leave
             // no lane silently checked out if it somehow does.
             drop(lease);
@@ -877,10 +882,13 @@ pub fn hvf_lane_starvation_probe() -> Result<HvfLaneStarvationReport, HvfBackend
         }
         for (stop, cancellation) in cancellations {
             match cancellation.join() {
-                Ok(Ok(_)) => {}
-                Ok(Err(
-                    HvfVcpuLaneError::CancellationTooLate { .. } | HvfVcpuLaneError::VcpuNotRunning,
-                )) => {}
+                Ok(
+                    Ok(_)
+                    | Err(
+                        HvfVcpuLaneError::CancellationTooLate { .. }
+                        | HvfVcpuLaneError::VcpuNotRunning,
+                    ),
+                ) => {}
                 Ok(Err(error)) => cancel_errors.push(format!("{error}")),
                 Err(_) => {
                     stop.store(true, Ordering::Release);
@@ -929,11 +937,14 @@ pub fn hvf_lane_starvation_probe() -> Result<HvfLaneStarvationReport, HvfBackend
             run_errors,
             pool_at_baseline,
         })
-    })();
-    outcome
+    })()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfLaneStarvationReport {
     pub lane_count: usize,
     pub timed_out: bool,
@@ -948,6 +959,10 @@ pub struct HvfLaneStarvationReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfLaneReplacementReport {
     pub lane_count: usize,
     pub lane_index: usize,
@@ -963,7 +978,7 @@ pub struct HvfLaneReplacementReport {
 /// Deterministically exercises the installed backend's complete generational
 /// lane-replacement path. Every pooled generation is checked out so that, once
 /// one target is made non-reusable and retired through
-/// [`ActiveThreadLaneLease`], the next ordinary acquisition can only receive a
+/// `ActiveThreadLaneLease`, the next ordinary acquisition can only receive a
 /// newer generation published into that exact slot.
 ///
 /// # Errors
@@ -987,7 +1002,7 @@ pub fn hvf_lane_replacement_probe() -> Result<HvfLaneReplacementReport, HvfBacke
 
     let mut held = Vec::new();
     held.try_reserve_exact(lane_count)
-        .map_err(|_| HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting))?;
+        .map_err(|_| HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting))?;
     for _ in 0..lane_count {
         held.push(backend.acquire_lane()?);
     }
@@ -1066,7 +1081,7 @@ pub fn hvf_lane_replacement_probe() -> Result<HvfLaneReplacementReport, HvfBacke
             HvfVcpuExitState::DirectGuest(state) | HvfVcpuExitState::LowerElMonitor(state) => state,
         };
         return Err(HvfBackendError::UnexpectedExit {
-            exit: run.exit,
+            exit: Box::new(run.exit),
             source_pc: Some(state.pc),
         });
     }
@@ -1165,7 +1180,7 @@ pub fn hvf_scheduler_latency_probe() -> Result<HvfSchedulerLatencyReport, HvfBac
                     let elapsed = started.elapsed();
                     (index, elapsed)
                 })
-                .map_err(|_| HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting))?;
+                .map_err(|_| HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting))?;
             start_barrier.wait();
             // A short, fixed settle so the waiter thread has genuinely
             // reached `acquire_lane`'s wait before the lane is released;
@@ -1177,7 +1192,7 @@ pub fn hvf_scheduler_latency_probe() -> Result<HvfSchedulerLatencyReport, HvfBac
             drop(served);
             let (lease, elapsed) = thread
                 .join()
-                .map_err(|_| HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting))?;
+                .map_err(|_| HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting))?;
             drop(lease?);
             samples.push(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         }
@@ -1268,7 +1283,7 @@ pub struct HvfSchedulerScalingReport {
 /// Live witness measuring real wall-clock scaling of independent,
 /// non-yielding compute-bound guest threads: for each concurrency level in
 /// `1, 2, 4, ..` up to the lane pool's own size, `concurrency` guest threads
-/// each spin an unbounded ALU loop ([`COMPUTE_LOOP`]) on their own disjoint
+/// each spin an unbounded ALU loop (`COMPUTE_LOOP`) on their own disjoint
 /// mapped page for a fixed wall-clock budget, re-attaching after each VTimer
 /// slice exit exactly as `HvfBackend::run_thread` does in production. The
 /// summed slice count at each level is the scheduler's own throughput unit;
@@ -1370,7 +1385,7 @@ pub fn hvf_scheduler_scaling_probe() -> Result<HvfSchedulerScalingReport, HvfBac
                         }
                     }
                 })
-                .map_err(|_| HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting))?;
+                .map_err(|_| HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting))?;
             occupied.push(ProbeWorker {
                 index,
                 stop,
@@ -1403,6 +1418,10 @@ pub fn hvf_scheduler_scaling_probe() -> Result<HvfSchedulerScalingReport, HvfBac
         });
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a throughput ratio for a diagnostic report; counts beyond 2^53 are not a concern"
+    )]
     let baseline_throughput = levels.first().map_or(0.0, |level| {
         if level.elapsed_millis == 0 {
             0.0
@@ -1410,6 +1429,10 @@ pub fn hvf_scheduler_scaling_probe() -> Result<HvfSchedulerScalingReport, HvfBac
             level.total_slices as f64 / level.elapsed_millis as f64
         }
     });
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a throughput ratio for a diagnostic report; counts beyond 2^53 are not a concern"
+    )]
     let speedup = levels
         .iter()
         .map(|level| {
@@ -1472,8 +1495,8 @@ fn invalid_run_state(run: &HvfVcpuRunResult) -> HvfVcpuLaneError {
         HvfVcpuExitState::DirectGuest(state) | HvfVcpuExitState::LowerElMonitor(state) => state,
     };
     HvfVcpuLaneError::InvalidExecutionState {
-        exit: run.exit,
-        state: state.into(),
+        exit: Box::new(run.exit),
+        state: Box::new(state.into()),
     }
 }
 
@@ -1544,7 +1567,7 @@ impl HvfBackend {
             snapshot.regime.tcr_el1,
             u64::from(snapshot.regime.mair_attr0),
         );
-        let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let parallelism = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         // `LITEBOX_HVF_LANES=<n>` caps the vCPU lane pool below the host's
         // parallelism. A diagnostic knob, not a tuning one: a single lane
         // serializes all guest execution, which is the cleanest way to tell
@@ -1554,12 +1577,9 @@ impl HvfBackend {
         // with a warning rather than refusing to start.
         let requested_lanes = std::env::var("LITEBOX_HVF_LANES")
             .ok()
-            .and_then(|raw| match raw.trim().parse::<usize>() {
-                Ok(n) => Some(n),
-                Err(_) => {
-                    litebox_util_log::warn!(raw:? = raw; "LITEBOX_HVF_LANES is not a number; ignoring");
-                    None
-                }
+            .and_then(|raw| if let Ok(n) = raw.trim().parse::<usize>() { Some(n) } else {
+                litebox_util_log::warn!(raw:? = raw; "LITEBOX_HVF_LANES is not a number; ignoring");
+                None
             })
             .map(|n| n.clamp(1, parallelism.max(1)));
         let lane_count = requested_lanes
@@ -1572,10 +1592,10 @@ impl HvfBackend {
         let mut lanes = Vec::new();
         lanes
             .try_reserve_exact(lane_count)
-            .map_err(|_| HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting))?;
+            .map_err(|_| HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting))?;
         let mut free = Vec::new();
         free.try_reserve_exact(lane_count)
-            .map_err(|_| HvfBackendError::Lane(HvfVcpuLaneError::RegistryAccounting))?;
+            .map_err(|_| HvfBackendError::from(HvfVcpuLaneError::RegistryAccounting))?;
         for index in 0..lane_count {
             let generation = Self::create_lane_generation(&registry, &space, el1)?;
             free.push(FreeLane {
@@ -1746,7 +1766,7 @@ impl HvfBackend {
         }
     }
 
-    fn repair_retired_lane(&self, index: usize) -> Result<bool, LaneMaintenanceFailure> {
+    fn repair_retired_lane(&self, index: usize) -> Result<bool, Box<LaneMaintenanceFailure>> {
         let generation = {
             let slot = self.lanes[index]
                 .state
@@ -1766,7 +1786,7 @@ impl HvfBackend {
                 .lane
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let lane = lane.as_mut().ok_or_else(|| LaneMaintenanceFailure {
+            let lane = lane.as_mut().ok_or(LaneMaintenanceFailure {
                 failure: LaneReplacementFailure {
                     index,
                     generation: old_generation,
@@ -1803,7 +1823,8 @@ impl HvfBackend {
                         stage: "claiming retired lane ownership",
                     },
                     source: HvfBackendError::LanePoolCorrupt { index },
-                });
+                }
+                .into());
             }
             let old =
                 match core::mem::replace(&mut *slot, LaneSlotState::Replacing { old_generation }) {
@@ -1819,7 +1840,8 @@ impl HvfBackend {
                                 stage: "claiming retired lane ownership",
                             },
                             source: HvfBackendError::LanePoolCorrupt { index },
-                        });
+                        }
+                        .into());
                     }
                 };
             drop(slot);
@@ -1846,18 +1868,18 @@ impl HvfBackend {
         drop(handle);
         let participant_id = participant.id();
         let mut participant = Some(participant);
-        let deregistration =
-            self.space
-                .deregister_vcpu_participant(participant.as_mut().ok_or_else(|| {
-                    LaneMaintenanceFailure {
-                        failure: LaneReplacementFailure {
-                            index,
-                            generation: old_generation,
-                            stage: "finding retired participant ownership",
-                        },
-                        source: HvfBackendError::LanePoolCorrupt { index },
-                    }
-                })?);
+        let deregistration = self
+            .space
+            .deregister_vcpu_participant(participant.as_mut().ok_or({
+                LaneMaintenanceFailure {
+                    failure: LaneReplacementFailure {
+                        index,
+                        generation: old_generation,
+                        stage: "finding retired participant ownership",
+                    },
+                    source: HvfBackendError::LanePoolCorrupt { index },
+                }
+            })?);
         match deregistration {
             Ok(()) => {}
             Err(HvfMemoryError::ParticipantBusy(_)) => {
@@ -1888,7 +1910,8 @@ impl HvfBackend {
                             stage: "verifying retired participant recovery",
                         },
                         source: HvfBackendError::LanePoolCorrupt { index },
-                    });
+                    }
+                    .into());
                 }
             }
             Err(error) => {
@@ -1899,7 +1922,8 @@ impl HvfBackend {
                         stage: "deregistering retired participant",
                     },
                     source: error.into(),
-                });
+                }
+                .into());
             }
         }
         drop(participant);
@@ -1931,7 +1955,8 @@ impl HvfBackend {
                     stage: "checking replacement VM state",
                 },
                 source: HvfError::Poisoned.into(),
-            });
+            }
+            .into());
         }
         let replacement = Self::create_lane_generation(&self.registry, &self.space, self.el1)
             .map_err(|error| LaneMaintenanceFailure {
@@ -1971,7 +1996,8 @@ impl HvfBackend {
                     stage: "publishing replacement generation",
                 },
                 source: HvfBackendError::LanePoolCorrupt { index },
-            });
+            }
+            .into());
         }
         *slot = LaneSlotState::Ready(replacement);
         pool.retiring -= 1;
@@ -2246,9 +2272,7 @@ impl HvfBackend {
         if pool.failure.is_some() {
             return None;
         }
-        let Some(position) = pool.free.iter().position(|free| free.index == index) else {
-            return None;
-        };
+        let position = pool.free.iter().position(|free| free.index == index)?;
         let free = pool.free[position];
         let Some(pooled) = self.lanes.get(index) else {
             drop(pool);
@@ -2428,7 +2452,7 @@ impl HvfBackend {
                     .mutations
                     .fetch_add(1, Ordering::Relaxed)
                     .wrapping_add(1);
-                if count % 256 == 0 {
+                if count.is_multiple_of(256) {
                     let usage = self.memory.usage();
                     litebox_util_log::debug!(
                         mutations:? = count,
@@ -3115,7 +3139,7 @@ impl HvfBackend {
                 fatal(
                     "classifying a vCPU exit",
                     &HvfBackendError::UnexpectedExit {
-                        exit: run.exit,
+                        exit: Box::new(run.exit),
                         source_pc: Some(state.pc),
                     },
                 )
@@ -3137,7 +3161,7 @@ impl HvfBackend {
             EC_SVC64 => {
                 *stale_view_reruns = 0;
                 ctx.syscallno =
-                    u32::try_from(state.x[8] & 0xffff_ffff).map_or(-1, |number| number as i32);
+                    u32::try_from(state.x[8] & 0xffff_ffff).map_or(-1, u32::cast_signed);
                 ctx.orig_x0 = ctx.regs[0];
                 shim.syscall(ctx)
             }
@@ -3452,7 +3476,7 @@ fn write_monitor_exit(ctx: &mut PtRegs, state: &HvfArchitecturalState) {
 fn guest_permissions(permissions: MemoryRegionPermissions) -> Option<HvfGuestPermissions> {
     let mut guest = HvfGuestPermissions::NONE;
     if permissions.contains(MemoryRegionPermissions::READ) {
-        guest = guest | HvfGuestPermissions::READ;
+        guest |= HvfGuestPermissions::READ;
     }
     if permissions.contains(MemoryRegionPermissions::WRITE) {
         // Linux grants read with write; the compact manager requires it.

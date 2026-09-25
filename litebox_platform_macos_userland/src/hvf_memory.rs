@@ -5,6 +5,7 @@ use core::cell::Cell;
 use core::fmt;
 use core::mem::ManuallyDrop;
 use core::ops::{BitOr, BitOrAssign, Deref, DerefMut, Range};
+use litebox::utils::TruncateExt;
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -178,7 +179,7 @@ impl HvfTranslationRegime {
             asid_bits: ASID_BITS,
             ipa_bits,
             tcr_el1: tcr_el1(ipa_bits),
-            mair_attr0: MAIR_ATTR0_NORMAL_WB as u8,
+            mair_attr0: TruncateExt::<u8>::trunc(MAIR_ATTR0_NORMAL_WB),
         })
     }
 
@@ -878,6 +879,12 @@ pub struct HvfCallbackOutput<R> {
     value: Option<R>,
 }
 
+impl<R> Default for HvfCallbackOutput<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<R> HvfCallbackOutput<R> {
     pub const fn new() -> Self {
         Self { value: None }
@@ -942,6 +949,10 @@ pub struct HvfRangeMutation {
 /// synchronization between the two beyond what the mirrored address space
 /// itself provides.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfAliasRaceReport {
     /// The racer thread never observed a byte pattern other than one the
     /// owner thread actually stamped in the epoch window the racer's own
@@ -978,7 +989,8 @@ pub struct HvfAliasRaceReport {
     /// oversubscription (many more runnable threads than cores) the racer
     /// can be preempted between them for long enough that the owner
     /// completes several further cycles, producing a false positive with
-    /// [`no_wrong_value_observed`] still `true`. [`no_wrong_value_observed`]
+    /// [`no_wrong_value_observed`](Self::no_wrong_value_observed) still `true`.
+    /// [`no_wrong_value_observed`](Self::no_wrong_value_observed)
     /// is the property that actually matters (no UAF/torn/foreign data);
     /// this field is corroborating evidence, expected to be zero at normal
     /// scheduling load and tolerated as a rare nonzero count only under
@@ -991,6 +1003,10 @@ pub struct HvfAliasRaceReport {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfMirroredViewReport {
     pub mirrored_space_flagged: bool,
     pub plain_space_not_mirrored: bool,
@@ -1235,7 +1251,7 @@ impl fmt::Debug for HvfVcpuRunAttachment {
             .field("lane_generation", &self.lane_generation)
             .field("snapshot", &self.snapshot)
             .field("requires_synchronization", &self.requires_synchronization)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1491,6 +1507,10 @@ impl Drop for HvfAddressSpaceDestroyTicket {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfPoisonConcurrencyReport {
     pub poison_requested_while_owner_live: bool,
     pub normal_rejected_while_owner_live: bool,
@@ -1501,6 +1521,10 @@ pub struct HvfPoisonConcurrencyReport {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfRegisterFailureReport {
     pub programmed_stage_one: HvfStageOneRegisterReport,
     pub stage_one_programming_verified: bool,
@@ -1514,6 +1538,10 @@ pub struct HvfRegisterFailureReport {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfUnmapFailureReport {
     pub poison_observed_before_capability_finish: bool,
     pub committed_capability_returned_after_poison: bool,
@@ -1535,6 +1563,10 @@ pub struct HvfUnmapFailureReport {
     pub vm_poisoned: bool,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent outcome of finishing the unmap capability"
+)]
 struct HvfUnmapCapabilityCompletion<'vm> {
     capability: HvfMapping<'vm>,
     poison_observed_before_capability_finish: bool,
@@ -1555,6 +1587,10 @@ impl HvfCompletionCapability for HvfUnmapCapabilityCompletion<'_> {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfMemoryReport {
     pub configured_ipa_bits: u32,
     pub monitor_ipa: u64,
@@ -1612,6 +1648,10 @@ pub struct HvfQuarantineRetryReport {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfMemoryFailureReport {
     pub rollback_preserved_root: bool,
     pub alias_restore_failure_observed: bool,
@@ -1628,6 +1668,10 @@ pub struct HvfMemoryFailureReport {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfAliasPanicFailureReport {
     pub original_payload_preserved: bool,
     pub restore_failure_quarantined: bool,
@@ -1818,7 +1862,7 @@ impl AsidAllocator {
             .ok_or(HvfMemoryError::AsidExhausted)?;
         self.free[index] = false;
         Ok(HvfAsid {
-            value: index as u8,
+            value: index.trunc(),
             epoch: self.epochs[index],
         })
     }
@@ -2116,52 +2160,49 @@ impl TableArena {
             child_references.push((child, references, updated));
         }
         let mut bytes = StageOneTableBacking::new(bytes);
-        let (ipa, mut bytes, mapping) = match self.pool.pop() {
-            Some(pooled) => {
-                // The pooled page is still stage-2 mapped at its IPA; only its
-                // contents change, and nothing references it until the new
-                // root that carries it is published.
-                let PooledTable {
-                    ipa,
-                    bytes: mut pooled_bytes,
-                    mapping,
-                } = pooled;
-                pooled_bytes.0.copy_from_slice(&bytes.0);
-                drop(bytes);
-                (ipa, pooled_bytes, mapping)
-            }
-            None => {
-                let ipa = allocator.allocate(1)?;
-                bytes.arm_before_mapping();
-                let start = bytes.0.as_ptr() as usize;
-                let mapping = unsafe {
-                    vm.map_host_range(start..start + PAGE_SIZE, ipa.start, HvfMapPermissions::READ)
-                };
-                match mapping {
-                    Ok(mapping) => (ipa, bytes, mapping),
-                    Err(error) => {
-                        let sdk_token = error.residual_mapping_token();
-                        if sdk_token.is_some() {
+        let (ipa, mut bytes, mapping) = if let Some(pooled) = self.pool.pop() {
+            // The pooled page is still stage-2 mapped at its IPA; only its
+            // contents change, and nothing references it until the new
+            // root that carries it is published.
+            let PooledTable {
+                ipa,
+                bytes: mut pooled_bytes,
+                mapping,
+            } = pooled;
+            pooled_bytes.0.copy_from_slice(&bytes.0);
+            drop(bytes);
+            (ipa, pooled_bytes, mapping)
+        } else {
+            let ipa = allocator.allocate(1)?;
+            bytes.arm_before_mapping();
+            let start = bytes.0.as_ptr() as usize;
+            let mapping = unsafe {
+                vm.map_host_range(start..start + PAGE_SIZE, ipa.start, HvfMapPermissions::READ)
+            };
+            match mapping {
+                Ok(mapping) => (ipa, bytes, mapping),
+                Err(error) => {
+                    let sdk_token = error.residual_mapping_token();
+                    if sdk_token.is_some() {
+                        self.quarantined.push(TableQuarantine {
+                            ipa: Some(ipa),
+                            bytes,
+                            sdk_token,
+                            retryable: true,
+                        });
+                    } else {
+                        bytes.disarm_after_exact_absence();
+                        if allocator.release(ipa).is_err() {
                             self.quarantined.push(TableQuarantine {
                                 ipa: Some(ipa),
                                 bytes,
-                                sdk_token,
+                                sdk_token: None,
                                 retryable: true,
                             });
-                        } else {
-                            bytes.disarm_after_exact_absence();
-                            if allocator.release(ipa).is_err() {
-                                self.quarantined.push(TableQuarantine {
-                                    ipa: Some(ipa),
-                                    bytes,
-                                    sdk_token: None,
-                                    retryable: true,
-                                });
-                                vm.poison();
-                            }
+                            vm.poison();
                         }
-                        return Err(error.into());
                     }
+                    return Err(error.into());
                 }
             }
         };
@@ -2186,8 +2227,7 @@ impl TableArena {
                 self.next_token = next_token;
                 Ok(token)
             }
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                drop(entry);
+            std::collections::hash_map::Entry::Occupied(_) => {
                 let mut cleanup_error = None;
                 for (child, original, _) in &child_references {
                     if let Some(record) = self.records.get_mut(child) {
@@ -2599,15 +2639,12 @@ impl TableArena {
                     limit,
                     created,
                 )?;
-                match new_child {
-                    Some(child) => {
-                        bytes.0[index] = table_descriptor(self.ipa(child)?);
-                        children.insert(index, child);
-                    }
-                    None => {
-                        bytes.0[index] = 0;
-                        children.remove(&index);
-                    }
+                if let Some(child) = new_child {
+                    bytes.0[index] = table_descriptor(self.ipa(child)?);
+                    children.insert(index, child);
+                } else {
+                    bytes.0[index] = 0;
+                    children.remove(&index);
                 }
                 start = end;
             }
@@ -2690,6 +2727,10 @@ impl MirrorState {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-slot state flags"
+)]
 struct HostSlotRecord {
     gva: usize,
     slot: Option<HvfHostSlot>,
@@ -3447,6 +3488,10 @@ impl BackingRegistry {
         Ok(index)
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "a page handle is only meaningful relative to the backing registry it names"
+    )]
     fn page(&self, identity: HvfBackingIdentity, index: usize) -> BackingPage {
         BackingPage {
             identity,
@@ -4334,6 +4379,10 @@ struct RetirementReservation {
     table_pages: usize,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-page lease state flags"
+)]
 struct AliasLeasePage {
     slot: HostSlotToken,
     backing: BackingPage,
@@ -4507,18 +4556,17 @@ impl Acknowledgements {
         }
         retired.deferred = true;
         let space = retired.address_space;
-        match self
+        if let Some((_, count)) = self
             .deferred
             .iter_mut()
             .find(|(candidate, _)| *candidate == space)
         {
-            Some((_, count)) => *count += 1,
-            None => {
-                // One entry per address space that has a deferral, and a space
-                // with a retirement is live, so the reserved capacity covers it.
-                debug_assert!(self.deferred.len() < self.deferred.capacity());
-                self.deferred.push((space, 1));
-            }
+            *count += 1;
+        } else {
+            // One entry per address space that has a deferral, and a space
+            // with a retirement is live, so the reserved capacity covers it.
+            debug_assert!(self.deferred.len() < self.deferred.capacity());
+            self.deferred.push((space, 1));
         }
         Ok(())
     }
@@ -5065,7 +5113,7 @@ pub struct HvfMemory {
     limits: HvfMemoryLimits,
     regime: HvfTranslationRegime,
     synchronization_root: SynchronizationRoot,
-    _monitor_mapping: HvfMapping<'static>,
+    monitor_mapping: HvfMapping<'static>,
     spaces: Mutex<HashMap<HvfAddressSpaceId, Arc<AddressSpaceCell>>>,
     arenas: Mutex<Arenas>,
     backings: Mutex<BackingRegistry>,
@@ -5090,7 +5138,7 @@ impl fmt::Debug for HvfMemory {
 impl HvfCompletionCapability for HvfMemory {
     fn validate_hvf_completion(&self, vm: &HvfVm) -> Result<(), HvfError> {
         if !std::ptr::eq(self.vm, vm)
-            || self.manager != vm as *const HvfVm as usize as u64
+            || self.manager != std::ptr::from_ref::<HvfVm>(vm) as usize as u64
             || !self
                 .spaces
                 .lock()
@@ -5104,7 +5152,7 @@ impl HvfCompletionCapability for HvfMemory {
         {
             return Err(HvfError::ResidualAccounting);
         }
-        self._monitor_mapping.validate_hvf_completion(vm)?;
+        self.monitor_mapping.validate_hvf_completion(vm)?;
         let arenas = self
             .arenas
             .lock()
@@ -5178,7 +5226,7 @@ impl Clone for HvfAddressSpace {
 impl HvfCompletionCapability for HvfAddressSpace {
     fn validate_hvf_completion(&self, vm: &HvfVm) -> Result<(), HvfError> {
         if !std::ptr::eq(self.memory.vm, vm)
-            || self.memory.manager != vm as *const HvfVm as usize as u64
+            || self.memory.manager != std::ptr::from_ref::<HvfVm>(vm) as usize as u64
         {
             return Err(HvfError::ResidualAccounting);
         }
@@ -5323,11 +5371,11 @@ impl HvfMemory {
             let (arenas, synchronization_root, monitor_mapping) = custody.complete()?;
             Ok(Self {
                 vm,
-                manager: vm as *const HvfVm as usize as u64,
+                manager: std::ptr::from_ref::<HvfVm>(vm) as usize as u64,
                 limits,
                 regime,
                 synchronization_root,
-                _monitor_mapping: monitor_mapping,
+                monitor_mapping,
                 spaces: Mutex::new(HashMap::new()),
                 arenas: Mutex::new(arenas),
                 backings: Mutex::new(BackingRegistry::new(max_physical_pages)),
@@ -5485,13 +5533,12 @@ impl HvfMemory {
 
             match observation.callback {
                 CallbackOutcome::NotInvoked => {
-                    let trigger = observation
-                        .teardown
-                        .err()
-                        .map(HvfMemoryError::from)
-                        .unwrap_or(HvfMemoryError::Witness(
+                    let trigger = observation.teardown.err().map_or(
+                        HvfMemoryError::Witness(
                             "an alias setup skipped its callback without reporting an error",
-                        ));
+                        ),
+                        HvfMemoryError::from,
+                    );
                     let cleanup = settlement.abort_before_callback();
                     Err(HvfMemoryError::with_cleanup(trigger, cleanup))
                 }
@@ -5700,9 +5747,7 @@ impl HvfMemory {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .live = false;
                 self.vm.poison();
-                if let Err(cleanup) = root_cleanup.and(asid_cleanup).and(pool_cleanup) {
-                    return Err(cleanup);
-                }
+                root_cleanup.and(asid_cleanup).and(pool_cleanup)?;
                 return Err(HvfMemoryError::IpaOwnership);
             }
             arenas.address_spaces += 1;
@@ -5797,6 +5842,10 @@ impl HvfMemory {
         })
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "retirement bookkeeping is an operation of the memory manager that owns it"
+    )]
     fn cancel_retirement_reservation(
         &self,
         acknowledgements: &mut Acknowledgements,
@@ -5819,6 +5868,10 @@ impl HvfMemory {
     /// cannot be using the retiring root, and its next attach already forces a
     /// synchronization because its `last_*_generation` trails the space's.
     /// Otherwise every registered participant is required.
+    #[expect(
+        clippy::unused_self,
+        reason = "retirement bookkeeping is an operation of the memory manager that owns it"
+    )]
     fn prepare_retirement_participants(
         &self,
         state: &AddressSpaceState,
@@ -5845,6 +5898,10 @@ impl HvfMemory {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is a separately produced part of the retired generation this assembles"
+    )]
     fn commit_retirement(
         &self,
         acknowledgements: &mut Acknowledgements,
@@ -6702,10 +6759,10 @@ impl HvfAddressSpace {
         let mut last: Option<HvfRangeMutation> = None;
         let mut published = false;
         for (claim, piece, has_sparse) in pieces {
-            if let Some(previous) = last.take() {
-                if let Err(error) = self.settle_or_defer(previous.retirement) {
-                    return Err(HvfMemoryError::after_publication("range protect", error));
-                }
+            if let Some(previous) = last.take()
+                && let Err(error) = self.settle_or_defer(previous.retirement)
+            {
+                return Err(HvfMemoryError::after_publication("range protect", error));
             }
 
             let mutation = if permissions.contains(HvfGuestPermissions::EXECUTE) {
@@ -6831,20 +6888,20 @@ impl HvfAddressSpace {
                 acknowledgements
                     .retirements
                     .iter()
-                    .filter_map(|(&id, retired)| {
-                        (retired.address_space == self.cell.id
+                    .filter(|(_, retired)| {
+                        retired.address_space == self.cell.id
                             && retired.deferred
                             && retired.required_participants.iter().all(|participant| {
                                 retired.acknowledged_participants.contains(participant)
-                            }))
-                        .then(|| {
-                            HvfRetirementTicket::mint(
-                                self.memory.manager,
-                                retired.address_space,
-                                id,
-                                retired.generation,
-                            )
-                        })
+                            })
+                    })
+                    .map(|(&id, retired)| {
+                        HvfRetirementTicket::mint(
+                            self.memory.manager,
+                            retired.address_space,
+                            id,
+                            retired.generation,
+                        )
                     }),
             );
             tickets
@@ -7027,18 +7084,6 @@ impl HvfAddressSpace {
             });
         }
         Ok(last)
-    }
-
-    fn executable_generation(&self) -> Result<HvfExecutableGeneration, HvfMemoryError> {
-        let state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.live {
-            return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
-        }
-        Ok(state.executable_generation)
     }
 
     /// The claims intersecting `range`, in address order, each with the
@@ -7990,8 +8035,8 @@ impl HvfAddressSpace {
                     &mut acknowledgements,
                     page_count,
                     pages
-                        .iter()
-                        .map(|(_, page)| (page.slot, mirror_state_for(page))),
+                        .values()
+                        .map(|page| (page.slot, mirror_state_for(page))),
                 );
                 let plan = match plan {
                     Ok(mut plan) => {
@@ -8575,25 +8620,22 @@ impl HvfAddressSpace {
                     return Err(HvfMemoryError::with_cleanup(error, cleanup));
                 }
             };
-            let claim_record = match state.claims.get_mut(&claim_start) {
-                Some(record) => record,
-                None => {
-                    let cleanup = cleanup_failed_protect(
-                        self.memory,
-                        &mut arenas,
-                        &mut backings,
-                        &mut acknowledgements,
-                        Some(reservation),
-                        retained_backings,
-                        candidate,
-                        &old_backings,
-                        replacements,
-                    );
-                    return Err(HvfMemoryError::with_cleanup(
-                        HvfMemoryError::ClaimStale,
-                        cleanup,
-                    ));
-                }
+            let Some(claim_record) = state.claims.get_mut(&claim_start) else {
+                let cleanup = cleanup_failed_protect(
+                    self.memory,
+                    &mut arenas,
+                    &mut backings,
+                    &mut acknowledgements,
+                    Some(reservation),
+                    retained_backings,
+                    candidate,
+                    &old_backings,
+                    replacements,
+                );
+                return Err(HvfMemoryError::with_cleanup(
+                    HvfMemoryError::ClaimStale,
+                    cleanup,
+                ));
             };
             // The mirror follows the replacement pages: planned here, applied
             // inside the authority transition (after the retiring stage-two
@@ -8673,7 +8715,8 @@ impl HvfAddressSpace {
             }
             let old_pages = match swap_claim_pages(claim_record, &range, replacements, old_pages) {
                 Ok(old_pages) => old_pages,
-                Err((error, replacements)) => {
+                Err(failure) => {
+                    let (error, replacements) = *failure;
                     self.memory.vm.poison();
                     let plan_cleanup = match mirror_plan.as_mut() {
                         Some(plan) => {
@@ -9027,27 +9070,25 @@ impl HvfAddressSpace {
                     }
                 };
             operation.mark_published()?;
-            let record = match state.claims.remove(&claim_start) {
-                Some(record) => record,
-                None => {
-                    let cleanup = abort_unmap_after_candidate(
-                        self.memory,
-                        &mut arenas,
-                        &mut backings,
-                        &mut acknowledgements,
-                        candidate,
-                        mirror_plan.as_mut(),
-                        Some(reservation),
-                    );
-                    return Err(HvfMemoryError::with_cleanup(
-                        HvfMemoryError::ClaimStale,
-                        cleanup,
-                    ));
-                }
+            let Some(record) = state.claims.remove(&claim_start) else {
+                let cleanup = abort_unmap_after_candidate(
+                    self.memory,
+                    &mut arenas,
+                    &mut backings,
+                    &mut acknowledgements,
+                    candidate,
+                    mirror_plan.as_mut(),
+                    Some(reservation),
+                );
+                return Err(HvfMemoryError::with_cleanup(
+                    HvfMemoryError::ClaimStale,
+                    cleanup,
+                ));
             };
             let transform = match split_claim_for_unmap(record, &range, &survivors) {
                 Ok(transform) => transform,
-                Err((error, record)) => {
+                Err(failure) => {
+                    let (error, record) = *failure;
                     state.claims.insert(record.range.start, record);
                     let cleanup = abort_unmap_after_candidate(
                         self.memory,
@@ -10009,9 +10050,7 @@ impl HvfAddressSpace {
                 let asid_cleanup = arenas.asids.release(asid);
                 child_state.live = false;
                 self.memory.vm.poison();
-                if let Err(cleanup) = root_cleanup.and(claims_cleanup).and(asid_cleanup) {
-                    return Err(cleanup);
-                }
+                root_cleanup.and(claims_cleanup).and(asid_cleanup)?;
                 return Err(HvfMemoryError::IpaOwnership);
             }
             arenas.address_spaces += 1;
@@ -10512,7 +10551,7 @@ struct ProbeFailurePages([u8; 5 * PAGE_SIZE]);
 static PROCESS_HVF_FAILURE_PROBE_PAGES: OnceLock<Box<ProbeFailurePages>> = OnceLock::new();
 
 pub fn hvf_memory_probe() -> Result<HvfMemoryReport, HvfMemoryError> {
-    with_hvf_memory_probe(|report| report.clone())
+    with_hvf_memory_probe(HvfMemoryReport::clone)
 }
 
 pub fn with_hvf_memory_probe<T>(
@@ -11170,7 +11209,7 @@ fn hvf_memory_probe_tracked(
         && sdk_residuals.zero_vcpu_owned_by_current_thread;
     let report = HvfMemoryReport {
         configured_ipa_bits: memory.vm.report().configured_ipa_bits,
-        monitor_ipa: memory._monitor_mapping.ipa(),
+        monitor_ipa: memory.monitor_mapping.ipa(),
         regime: memory.regime,
         monitor_leaf_verified,
         dynamic_tcr_ips_verified,
@@ -11255,7 +11294,7 @@ fn hvf_memory_probe_tracked(
 }
 
 pub fn hvf_memory_failure_probe() -> Result<HvfMemoryFailureReport, HvfMemoryError> {
-    with_hvf_memory_failure_probe(|report| report.clone())
+    with_hvf_memory_failure_probe(HvfMemoryFailureReport::clone)
 }
 
 pub fn with_hvf_memory_failure_probe<T>(
@@ -11298,6 +11337,8 @@ pub fn with_hvf_memory_failure_probe<T>(
 /// tears the address space down after poison.
 impl HvfMemory {
     pub fn alias_panic_failure_probe() -> Result<HvfAliasPanicFailureReport, HvfMemoryError> {
+        struct AliasCallbackPanic;
+
         let memory = process_hvf_memory()?;
         let mut spaces = Vec::new();
         spaces
@@ -11322,8 +11363,6 @@ impl HvfMemory {
                 return Err(error);
             }
         };
-
-        struct AliasCallbackPanic;
 
         memory.inject_failure(FailurePoint::AliasRestore);
         let callback = catch_unwind(AssertUnwindSafe(|| {
@@ -11864,7 +11903,9 @@ pub fn hvf_register_failure_probe() -> Result<HvfRegisterFailureReport, HvfMemor
 
 pub fn hvf_unmap_failure_probe() -> Result<HvfUnmapFailureReport, HvfMemoryError> {
     let process_lifetime_pages = PROCESS_HVF_FAILURE_PROBE_PAGES
-        .get_or_init(|| Box::new(ProbeFailurePages([0; 5 * PAGE_SIZE])));
+        // SAFETY: `ProbeFailurePages` is a plain byte array, for which all-zero bytes are a valid
+        // value. Zeroing it on the heap avoids first building the 80 KiB array on the stack.
+        .get_or_init(|| unsafe { Box::<ProbeFailurePages>::new_zeroed().assume_init() });
     let vm = process_hvf_vm()?;
     let exact_known_mappings = |report: &HvfSdkResidualReport, mapping_count: usize| {
         let Some(mapping_bytes) = mapping_count.checked_mul(PAGE_SIZE) else {
@@ -12563,32 +12604,29 @@ fn hvf_alias_race_probe_tracked(
             // visible at that instant.
             while !stop.load(Ordering::Relaxed) {
                 let before_transition = in_transition.load(Ordering::Acquire);
-                match fallible_read_u64(gva) {
-                    Some(value) => {
-                        if !is_plausible_epoch_value(value) {
-                            wrong_value_seen.store(true, Ordering::Relaxed);
-                            let _ = first_wrong_value.compare_exchange(
-                                0,
-                                value,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            );
-                        }
+                if let Some(value) = fallible_read_u64(gva) {
+                    if !is_plausible_epoch_value(value) {
+                        wrong_value_seen.store(true, Ordering::Relaxed);
+                        let _ = first_wrong_value.compare_exchange(
+                            0,
+                            value,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                     }
-                    None => {
-                        // Read `in_transition` immediately after the fault,
-                        // before any other atomic traffic, to keep this
-                        // checker's own window as tight as possible around
-                        // the actual faulting instruction.
-                        let after_transition = in_transition.load(Ordering::Acquire);
-                        // A fault must correlate with a real unmap window:
-                        // the owner had `in_transition` set either before or
-                        // after the faulting access (never neither).
-                        if !before_transition && !after_transition {
-                            racer_faults_outside_transition.fetch_add(1, Ordering::Relaxed);
-                        }
-                        racer_faults.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // Read `in_transition` immediately after the fault,
+                    // before any other atomic traffic, to keep this
+                    // checker's own window as tight as possible around
+                    // the actual faulting instruction.
+                    let after_transition = in_transition.load(Ordering::Acquire);
+                    // A fault must correlate with a real unmap window:
+                    // the owner had `in_transition` set either before or
+                    // after the faulting access (never neither).
+                    if !before_transition && !after_transition {
+                        racer_faults_outside_transition.fetch_add(1, Ordering::Relaxed);
                     }
+                    racer_faults.fetch_add(1, Ordering::Relaxed);
                 }
                 racer_iterations.fetch_add(1, Ordering::Relaxed);
             }
@@ -13576,11 +13614,8 @@ fn rollback_protect_authorities(
                     first_error.get_or_insert(error);
                 }
             }
-            Some(_) => {
-                first_error.get_or_insert(HvfMemoryError::IpaOwnership);
-            }
             None if old.permissions == HvfGuestPermissions::NONE => {}
-            None => {
+            Some(_) | None => {
                 first_error.get_or_insert(HvfMemoryError::IpaOwnership);
             }
         }
@@ -13777,7 +13812,7 @@ fn apply_protect_authorities(
             claim,
             range,
             replacements,
-            mirror_plan.as_deref_mut(),
+            mirror_plan,
             error,
         ));
     }
@@ -14024,12 +14059,11 @@ fn cleanup_replacements(
             first_error.get_or_insert(HvfMemoryError::ClaimStale);
             continue;
         };
-        let old_backing = match old_backings.get(&gva) {
-            Some(backing) => Some(*backing),
-            None => {
-                first_error.get_or_insert(HvfMemoryError::ClaimStale);
-                None
-            }
+        let old_backing = if let Some(backing) = old_backings.get(&gva) {
+            Some(*backing)
+        } else {
+            first_error.get_or_insert(HvfMemoryError::ClaimStale);
+            None
         };
         let release_backing_reference = old_backing
             .is_some_and(|old_backing| page.backing.is_some() && page.backing != old_backing);
@@ -14122,6 +14156,10 @@ fn cleanup_claim_preparation(
     backing_cleanup
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the locked arenas, backings and acknowledgements are separate guards held by the caller, passed alongside the operation's own inputs"
+)]
 fn cleanup_failed_protect(
     memory: &HvfMemory,
     arenas: &mut Arenas,
@@ -14240,6 +14278,10 @@ fn cleanup_private_copies(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the locked arenas, backings and acknowledgements are separate guards held by the caller, passed alongside the operation's own inputs"
+)]
 fn cleanup_fork_preparation(
     vm: &'static HvfVm,
     arenas: &mut Arenas,
@@ -14763,36 +14805,36 @@ fn plan_mirror(
         if let Err(trigger) = backings.retain(previous.backing) {
             let mut cleanup_error = None;
             for entry in plan.entries[..index].iter_mut().rev() {
-                if entry.previous_pin {
-                    if let Some(previous) = entry.previous {
-                        if let Err(error) = backings.release_reference(previous.backing) {
-                            let range = arenas
-                                .slots
-                                .records
-                                .get(&entry.slot)
-                                .map(|record| record.gva..record.gva + PAGE_SIZE)
-                                .unwrap_or(0..0);
-                            let _ = arenas
-                                .slots
-                                .update(entry.slot, |record| record.alias_quarantined = true);
-                            acknowledgements.alias_quarantine.push(AliasQuarantine {
-                                slot: entry.slot,
-                                physical_exposure: Some(AliasPhysicalExposure {
-                                    backing: previous.backing,
-                                    range,
-                                    restore_pending: false,
-                                    host_writer: false,
-                                    backing_pin: true,
-                                }),
-                                recovery_mirror: None,
-                            });
-                            entry.previous_pin = false;
+                if entry.previous_pin
+                    && let Some(previous) = entry.previous
+                {
+                    if let Err(error) = backings.release_reference(previous.backing) {
+                        let range = arenas
+                            .slots
+                            .records
+                            .get(&entry.slot)
+                            .map(|record| record.gva..record.gva + PAGE_SIZE)
+                            .unwrap_or(0..0);
+                        let _ = arenas
+                            .slots
+                            .update(entry.slot, |record| record.alias_quarantined = true);
+                        acknowledgements.alias_quarantine.push(AliasQuarantine {
+                            slot: entry.slot,
+                            physical_exposure: Some(AliasPhysicalExposure {
+                                backing: previous.backing,
+                                range,
+                                restore_pending: false,
+                                host_writer: false,
+                                backing_pin: true,
+                            }),
+                            recovery_mirror: None,
+                        });
+                        entry.previous_pin = false;
+                        cleanup_error.get_or_insert(error);
+                    } else {
+                        entry.previous_pin = false;
+                        if let Err(error) = backings.reap_if_unowned(previous.backing) {
                             cleanup_error.get_or_insert(error);
-                        } else {
-                            entry.previous_pin = false;
-                            if let Err(error) = backings.reap_if_unowned(previous.backing) {
-                                cleanup_error.get_or_insert(error);
-                            }
                         }
                     }
                 }
@@ -15052,6 +15094,10 @@ fn queue_mirror_quarantine(
 /// will never revisit it, and the caller's own abort/cleanup can still
 /// succeed and return a plain error with no poison of its own -- silently
 /// leaving the claim "live" while its host GVA is physically uncertain.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the locked arenas, backings and acknowledgements are separate guards held by the caller, passed alongside the operation's own inputs"
+)]
 fn transition_mirror(
     vm: &'static HvfVm,
     arenas: &mut Arenas,
@@ -15120,26 +15166,27 @@ fn transition_mirror(
                 vm.poison();
                 return Err(HvfMemoryError::with_cleanup(trigger.into(), cleanup));
             }
-            if current.write && !target.write {
-                if let Err(trigger) = backings.release_host_alias(current.backing, true) {
-                    let pin = take_mirror_pin(arenas, token)?;
-                    let cleanup = queue_mirror_quarantine(
-                        arenas,
-                        acknowledgements,
-                        token,
-                        Some(AliasPhysicalExposure {
-                            backing: current.backing,
-                            range,
-                            restore_pending: true,
-                            host_writer: true,
-                            backing_pin: pin,
-                        }),
-                        failure_recovery,
-                        recovery_pin,
-                    );
-                    vm.poison();
-                    return Err(HvfMemoryError::with_cleanup(trigger, cleanup));
-                }
+            if current.write
+                && !target.write
+                && let Err(trigger) = backings.release_host_alias(current.backing, true)
+            {
+                let pin = take_mirror_pin(arenas, token)?;
+                let cleanup = queue_mirror_quarantine(
+                    arenas,
+                    acknowledgements,
+                    token,
+                    Some(AliasPhysicalExposure {
+                        backing: current.backing,
+                        range,
+                        restore_pending: true,
+                        host_writer: true,
+                        backing_pin: pin,
+                    }),
+                    failure_recovery,
+                    recovery_pin,
+                );
+                vm.poison();
+                return Err(HvfMemoryError::with_cleanup(trigger, cleanup));
             }
             arenas
                 .slots
@@ -15595,32 +15642,40 @@ fn can_coalesce(left: &HvfLedgerEntry, right: &HvfLedgerEntry) -> bool {
         && left.publication_epoch == right.publication_epoch
 }
 
+/// A failed [`swap_claim_pages`]: the error and the replacement pages it did not install, boxed
+/// to keep the `Result` small.
+type SwapClaimPagesError = Box<(HvfMemoryError, HashMap<usize, PageState>)>;
+
+/// A failed [`split_claim_for_unmap`]: the error and the claim record it hands back, boxed to
+/// keep the `Result` small.
+type SplitClaimError = Box<(HvfMemoryError, ClaimRecord)>;
+
 fn swap_claim_pages(
     claim: &mut ClaimRecord,
     range: &Range<usize>,
     mut replacements: HashMap<usize, PageState>,
     mut old_pages: Vec<(usize, PageState)>,
-) -> Result<Vec<(usize, PageState)>, (HvfMemoryError, HashMap<usize, PageState>)> {
+) -> Result<Vec<(usize, PageState)>, SwapClaimPagesError> {
     if old_pages.capacity() < replacements.len()
         || page_addresses(range).any(|gva| !claim.pages.contains_key(&gva))
     {
-        return Err((HvfMemoryError::ClaimStale, replacements));
+        return Err(Box::new((HvfMemoryError::ClaimStale, replacements)));
     }
     for gva in page_addresses(range) {
         let Some(replacement) = replacements.remove(&gva) else {
-            return Err((HvfMemoryError::ClaimStale, replacements));
+            return Err(Box::new((HvfMemoryError::ClaimStale, replacements)));
         };
         let Some(old) = claim.pages.insert(gva, replacement) else {
             let Some(inserted) = claim.pages.remove(&gva) else {
-                return Err((HvfMemoryError::ClaimStale, replacements));
+                return Err(Box::new((HvfMemoryError::ClaimStale, replacements)));
             };
             replacements.insert(gva, inserted);
-            return Err((HvfMemoryError::ClaimStale, replacements));
+            return Err(Box::new((HvfMemoryError::ClaimStale, replacements)));
         };
         old_pages.push((gva, old));
     }
     if !replacements.is_empty() {
-        return Err((HvfMemoryError::ClaimStale, replacements));
+        return Err(Box::new((HvfMemoryError::ClaimStale, replacements)));
     }
     Ok(old_pages)
 }
@@ -15634,10 +15689,10 @@ fn split_claim_for_unmap(
     mut record: ClaimRecord,
     removed: &Range<usize>,
     survivor_specs: &[(Range<usize>, u64)],
-) -> Result<UnmapTransform, (HvfMemoryError, ClaimRecord)> {
+) -> Result<UnmapTransform, SplitClaimError> {
     let expected_ranges = match split_survivors(&record.range, removed) {
         Ok(ranges) => ranges,
-        Err(error) => return Err((error, record)),
+        Err(error) => return Err(Box::new((error, record))),
     };
     if expected_ranges.len() != survivor_specs.len()
         || expected_ranges
@@ -15646,56 +15701,56 @@ fn split_claim_for_unmap(
             .any(|(expected, (actual, _))| expected != actual)
         || page_addresses(removed).any(|gva| !record.pages.contains_key(&gva))
     {
-        return Err((HvfMemoryError::ClaimStale, record));
+        return Err(Box::new((HvfMemoryError::ClaimStale, record)));
     }
     let removed_count = removed.len() / PAGE_SIZE;
     let mut removed_pages = Vec::new();
     if removed_pages.try_reserve_exact(removed_count).is_err() {
-        return Err((
+        return Err(Box::new((
             HvfMemoryError::MetadataAllocation("removed claim pages"),
             record,
-        ));
+        )));
     }
     let mut removed_result = Vec::new();
     if removed_result.try_reserve_exact(removed_count).is_err() {
-        return Err((
+        return Err(Box::new((
             HvfMemoryError::MetadataAllocation("removed page ownership"),
             record,
-        ));
+        )));
     }
     let mut survivor_pages = Vec::new();
     if survivor_pages
         .try_reserve_exact(survivor_specs.len())
         .is_err()
     {
-        return Err((
+        return Err(Box::new((
             HvfMemoryError::MetadataAllocation("survivor page maps"),
             record,
-        ));
+        )));
     }
     for (range, _) in survivor_specs {
         let mut pages = HashMap::new();
         if pages.try_reserve(range.len() / PAGE_SIZE).is_err() {
-            return Err((
+            return Err(Box::new((
                 HvfMemoryError::MetadataAllocation("survivor claim pages"),
                 record,
-            ));
+            )));
         }
         survivor_pages.push(pages);
     }
     let mut survivors = Vec::new();
     if survivors.try_reserve_exact(survivor_specs.len()).is_err() {
-        return Err((
+        return Err(Box::new((
             HvfMemoryError::MetadataAllocation("survivor claims"),
             record,
-        ));
+        )));
     }
     for gva in page_addresses(removed) {
         let Some(page) = record.pages.remove(&gva) else {
             for (restored_gva, page) in removed_pages {
                 record.pages.insert(restored_gva, page);
             }
-            return Err((HvfMemoryError::ClaimStale, record));
+            return Err(Box::new((HvfMemoryError::ClaimStale, record)));
         };
         removed_pages.push((gva, page));
     }
@@ -15709,7 +15764,7 @@ fn split_claim_for_unmap(
             for (restored_gva, page) in removed_pages {
                 record.pages.insert(restored_gva, page);
             }
-            return Err((HvfMemoryError::ClaimStale, record));
+            return Err(Box::new((HvfMemoryError::ClaimStale, record)));
         };
         let Some(index) = survivor_specs
             .iter()
@@ -15723,7 +15778,7 @@ fn split_claim_for_unmap(
             for (restored_gva, page) in removed_pages {
                 record.pages.insert(restored_gva, page);
             }
-            return Err((HvfMemoryError::ClaimStale, record));
+            return Err(Box::new((HvfMemoryError::ClaimStale, record)));
         };
         survivor_pages[index].insert(gva, page);
     }

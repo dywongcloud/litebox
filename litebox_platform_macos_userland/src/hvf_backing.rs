@@ -238,6 +238,10 @@ impl std::error::Error for HvfHostBackingError {}
 /// the process through Box's default alloc-error handler. Stable Rust has no
 /// `Box::try_new` (it is gated behind the nightly `allocator_api` feature),
 /// so this mirrors `HostResourceRef::try_new`'s own raw-allocation pattern.
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "the allocation uses `Layout::new::<HvfHostBackingError>()`, so it is aligned for that type"
+)]
 fn try_box_error(value: HvfHostBackingError) -> Option<Box<HvfHostBackingError>> {
     let pointer = NonNull::new(
         unsafe { alloc(Layout::new::<HvfHostBackingError>()) }.cast::<HvfHostBackingError>(),
@@ -1133,7 +1137,8 @@ fn queue_resource(record: &HostResourceRecord) {
             RESOURCE_REGISTERING => RESOURCE_CLOSED,
             RESOURCE_OWNED => RESOURCE_RETRY_OWNED,
             RESOURCE_ALIAS_ACTIVE => RESOURCE_RETRY_ALIAS,
-            RESOURCE_RETRY_OWNED | RESOURCE_RETRY_ALIAS | RESOURCE_CLOSED => return,
+            // Already retrying or closed (`RESOURCE_RETRY_OWNED`, `RESOURCE_RETRY_ALIAS`,
+            // `RESOURCE_CLOSED`), or not a lifecycle phase at all.
             _ => return,
         };
         let Ok(next) = next_lifecycle_word(record, current, next_phase) else {
@@ -1195,7 +1200,7 @@ pub fn hvf_host_resource_report() -> Result<HvfHostResourceReport, HvfHostBackin
             | RESOURCE_PROTECTING_ALIAS
             | RESOURCE_RESTORING => report.alias_active += 1,
             RESOURCE_CLOSING | RESOURCE_RETRY_OWNED | RESOURCE_RESETTING_OWNED_RETRY => {
-                report.retry_owned += 1
+                report.retry_owned += 1;
             }
             RESOURCE_RETRY_ALIAS | RESOURCE_RESETTING_ALIAS_RETRY => report.retry_alias += 1,
             _ => {
@@ -1926,6 +1931,10 @@ pub(crate) fn with_contiguous_alias(
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfHostBackingReport {
     pub hidden_backing: Range<usize>,
     pub coherent_alias: Range<usize>,

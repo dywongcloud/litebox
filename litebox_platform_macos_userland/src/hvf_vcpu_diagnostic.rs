@@ -55,7 +55,8 @@ const STALE_KICK_MAX_ITERATIONS: usize = 4096;
 pub enum HvfVcpuDiagnosticError {
     Hvf(HvfError),
     Memory(HvfMemoryError),
-    Lane(HvfVcpuLaneError),
+    // Boxed to keep this error small (`clippy::result_large_err`).
+    Lane(Box<HvfVcpuLaneError>),
     ThreadSpawn(std::io::Error),
     ThreadPanicked,
     Timeout(&'static str),
@@ -154,11 +155,15 @@ impl From<HvfMemoryError> for HvfVcpuDiagnosticError {
 
 impl From<HvfVcpuLaneError> for HvfVcpuDiagnosticError {
     fn from(value: HvfVcpuLaneError) -> Self {
-        Self::Lane(value)
+        Self::Lane(Box::new(value))
     }
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfVcpuDiagnosticReport {
     pub lane_generation: u64,
     pub queue_capacity: usize,
@@ -203,6 +208,10 @@ pub struct HvfVcpuDiagnosticReport {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfVcpuCustodyReport {
     pub lane_generation: u64,
     pub injected_destroy_failures: u32,
@@ -223,6 +232,10 @@ pub struct HvfVcpuCustodyReport {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfVcpuTotalityReport {
     pub lane_generation: u64,
     pub queue_capacity: usize,
@@ -244,6 +257,10 @@ pub struct HvfVcpuTotalityReport {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 pub struct HvfVcpuFailureReport {
     pub lane_generation: u64,
     pub unexpected_cancellation_terminal: bool,
@@ -595,6 +612,10 @@ fn diagnostic_inner(
     })
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 struct ReservationSemanticsWitness {
     epoch_a: u64,
     epoch_b: u64,
@@ -694,7 +715,7 @@ fn reservation_semantics(
     let cancellation_during_completion = completion_reached
         .as_ref()
         .ok()
-        .map(|_| cancellation_d.request());
+        .map(|()| cancellation_d.request());
     completion_barrier.release();
     let completion_result = completion_run
         .join()
@@ -738,7 +759,7 @@ fn reservation_semantics(
     let cancellation_during_synchronization = reached
         .as_ref()
         .ok()
-        .map(|_| handle.cancellation().cancel());
+        .map(|()| handle.cancellation().cancel());
     barrier.release();
     let synchronized = synchronization
         .join()
@@ -939,7 +960,7 @@ fn authenticated_lower_el_monitor_cancellation(
     state.pc == MONITOR_LOWER_EL_SYNC_OFFSET
         && state.spsr_el1 == initial.cpsr
         && (state.esr_el1 >> 26) & 0x3f == SVC64_EXCEPTION_CLASS
-        && state.esr_el1 & 0xffff == 0
+        && state.esr_el1.trailing_zeros() >= 16
         && state.elr_el1 == CODE_GVA as u64 + 4
         && state.far_el1 == 0
 }
@@ -1013,12 +1034,13 @@ fn stale_kick(resources: &DiagnosticResources) -> Result<StaleKickWitness, HvfVc
                 applied += 1;
             }
             (
-                Some(Err(HvfVcpuLaneError::CancellationTooLate { .. })),
+                Some(Err(
+                    HvfVcpuLaneError::CancellationTooLate { .. } | HvfVcpuLaneError::VcpuNotRunning,
+                ))
+                | None,
                 HvfVcpuExit::Exception(_),
                 _,
-            )
-            | (Some(Err(HvfVcpuLaneError::VcpuNotRunning)), HvfVcpuExit::Exception(_), _)
-            | (None, HvfVcpuExit::Exception(_), _) => {
+            ) => {
                 if hvc_immediate(&run) != Some(SYSCALL_HVC_IMMEDIATE) {
                     return Err(HvfVcpuDiagnosticError::Witness(
                         "too-late race delivered a non-monitor exit",
@@ -1426,7 +1448,7 @@ fn custody_inner(
 /// exercise: the bounded per-lane command queue rejects its `capacity + 1`th
 /// command cleanly (`QueueOverloaded`, not a panic, hang, or silent drop),
 /// and a genuine Rust panic inside the owner thread's command dispatch is
-/// contained by `catch_unwind` in [`crate::hvf_vcpu::owner_thread`] rather
+/// contained by `catch_unwind` in `owner_thread` rather
 /// than aborting the process, with cleanup still running to completion and
 /// the lane correctly reporting `OwnerPanicked`.
 pub fn hvf_vcpu_totality_probe() -> Result<HvfVcpuTotalityReport, HvfVcpuDiagnosticError> {
@@ -1472,6 +1494,10 @@ pub fn hvf_vcpu_totality_probe() -> Result<HvfVcpuTotalityReport, HvfVcpuDiagnos
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field records an independent property the diagnostic verified"
+)]
 struct QueueOverloadWitness {
     handle: HvfVcpuLaneHandle,
     lane: HvfVcpuLane,

@@ -2038,14 +2038,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                 FixedAddressBehavior::NoReplace,
             )
             .map_err(|error| match error {
-                AllocationError::OutOfMemory => RemapError::OutOfMemory,
                 AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
                     RemapError::AlreadyAllocated
                 }
                 AllocationError::Unaligned => RemapError::Unaligned,
-                AllocationError::BelowMinAddress
-                | AllocationError::AboveMaxAddress
-                | AllocationError::AddressPartiallyInUse => RemapError::OutOfMemory,
+                // `OutOfMemory`, and a destination below/above the task range or partially
+                // in use.
                 _ => RemapError::OutOfMemory,
             })?;
 
@@ -3722,7 +3720,7 @@ impl MacOsUserland {
     /// that terminates guest TCP flows and relays guest UDP datagrams over
     /// ordinary host sockets, so outbound guest connectivity works with
     /// neither a `utun` device (which needs root) nor proxy environment
-    /// variables in the guest. See the [`nat`] module docs.
+    /// variables in the guest. See the `nat` module docs.
     ///
     /// Idempotent: the first call builds and installs the engine; later calls
     /// are no-ops. The engine is driven entirely inside
@@ -3807,6 +3805,7 @@ static GUEST_TP_TSD_KEY: OnceLock<libc::pthread_key_t> = OnceLock::new();
 /// the hard limit is unlimited, so the request backs off by halving; whatever
 /// limit stands on entry is kept if even that fails.
 fn raise_nofile_limit() {
+    const TARGET: libc::rlim_t = 65536;
     let mut limits = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -3815,7 +3814,6 @@ fn raise_nofile_limit() {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limits) } != 0 {
         return;
     }
-    const TARGET: libc::rlim_t = 65536;
     if limits.rlim_cur >= TARGET {
         litebox_util_log::debug!(nofile:% = limits.rlim_cur; "nat: RLIMIT_NOFILE soft limit already sufficient");
         return;
