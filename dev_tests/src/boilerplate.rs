@@ -127,6 +127,7 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
     ("json", ""),
     ("ld", ""),
     ("lock", ""),
+    ("macho", ""),
     ("md", ""),
     ("png", ""),
     ("snap", ""),

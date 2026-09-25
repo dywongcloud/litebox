@@ -1793,6 +1793,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_darwin_on_linux_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_linux_userland",
+ "litebox_shim_darwin",
+ "litebox_util_log",
+ "tar",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "litebox_runner_darwin_on_windows_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_windows_userland",
+ "litebox_shim_darwin",
+ "litebox_util_log",
+ "tar",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "litebox_runner_linux_on_macos_userland"
 version = "0.1.0"
 dependencies = [
@@ -1934,6 +1964,18 @@ dependencies = [
  "litebox_util_log",
  "tar",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "litebox_shim_darwin"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "litebox_common_linux",
+ "litebox_syscall_rewriter",
+ "litebox_util_log",
+ "object",
+ "thiserror",
 ]
 
 [[package]]
