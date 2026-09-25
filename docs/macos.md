@@ -292,9 +292,23 @@ needs before it can land.
   platform has no `wait_on_tun`-style efficient blocking wait yet, so it
   plain polls (a fixed 1ms sleep when there's nothing to do immediately) --
   correctness first, since without any of this there was no networking on
-  macOS ARM whatsoever. **Not yet re-verified end to end after this fix**
-  (see the caveat this whole entry is nested under); the diagnosis is
-  hardware-confirmed, this specific fix is not yet.
+  macOS ARM whatsoever. **Verified end-to-end on real hardware**: multi-box
+  composition with inter-guest TCP routing works; see `examples/multibox-x11-composition/`.
+
+- **Multi-box routing on separate utun subnets -- fixed.** `boxer compose`
+  instances on different `utun` interfaces (e.g., utun90, utun91, utun92)
+  weren't able to reach each other across subnets. macOS utun interfaces are
+  point-to-point and don't auto-install subnet routes like Linux TUN does.
+  Inter-guest packets reached the host but the host kernel had no route
+  mapping each /24 subnet to its interface, causing cross-subnet connections
+  to hang indefinitely (e.g., a VNC client getting "Reading version failed").
+  Fixed: `configure_utun_address()` now calls `route add -net 10.90.X.0
+  -netmask 255.255.255.0 -interface utunX` immediately after `ifconfig`,
+  telling the kernel how to bridge packets between subnets. Routes are
+  automatically cleaned up when the utun interface is destroyed (control
+  socket closes). **Verified end-to-end on real Apple Silicon hardware**:
+  three-box X11/VNC composition with real pixels flowing across all three
+  subnets works reliably.
 - **Guest stdout/stderr not forwarded:** The native runner (`litebox_runner_linux_on_macos_userland`)
   executes guest processes but does not connect their stdout/stderr to the host.
   Guest output is lost. Workaround: use WASM workloads (WASI stdio works), or
