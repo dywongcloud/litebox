@@ -233,9 +233,8 @@ fn proxy_icmp_echo(host: &OwnedFd, frame: &[u8]) -> Option<Vec<u8>> {
                 &raw mut source_len,
             )
         };
-        let received = match usize::try_from(received) {
-            Ok(received) => received,
-            Err(_) => continue,
+        let Ok(received) = usize::try_from(received) else {
+            continue;
         };
         if Ipv4Addr::from(source.sin_addr.s_addr.to_ne_bytes()) != target {
             continue;
@@ -267,13 +266,17 @@ fn proxy_icmp_echo(host: &OwnedFd, frame: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the carry-folding loop leaves `sum` within 16 bits before the final cast"
+)]
 fn icmp_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    for chunk in chunks {
+        sum += u32::from(u16::from_be_bytes(*chunk));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += u32::from(*last) << 8;
     }
     while sum >> 16 != 0 {
@@ -482,6 +485,10 @@ impl Resolver {
 /// records of a `NOERROR` answer (possibly none). Name compression only needs to be skipped
 /// here; the proxy does not need to reconstruct owner names. `None` for a packet that is not a
 /// response to `id` at all.
+#[expect(
+    clippy::similar_names,
+    reason = "`qdcount`/`ancount`/`nscount`/`arcount` are the DNS header's own field names"
+)]
 fn parse_dns_response(msg: &[u8], id: [u8; 2]) -> Option<Lookup> {
     if msg.len() < 12 || msg.get(..2)? != id.as_slice() {
         return None;
@@ -556,7 +563,9 @@ type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 
 enum Upstream {
     Plain(TcpStream),
-    Tls(TlsStream),
+    // Boxed: a TLS stream carries the whole rustls connection state, which would otherwise make
+    // every `Upstream` that large (`clippy::large_enum_variant`).
+    Tls(Box<TlsStream>),
 }
 
 impl std::io::Read for Upstream {
@@ -824,9 +833,7 @@ fn open_upstream(
         return None;
     };
     let rest = target.get(scheme_end + 3..)?;
-    let authority_end = rest
-        .find(|character| matches!(character, '/' | '?' | '#'))
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = rest.get(..authority_end)?;
     let (host, port) = split_host_port(authority, default_port)?;
     let suffix = rest.get(authority_end..).unwrap_or_default();
@@ -1220,10 +1227,7 @@ fn open_origin(
                         io::ErrorKind::Interrupted
                             | io::ErrorKind::WouldBlock
                             | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    continue;
-                }
+                    ) => {}
                 Err(error) => break Err(error),
             }
         };
@@ -1237,7 +1241,7 @@ fn open_origin(
         {
             continue;
         }
-        return Some(Upstream::Tls(stream));
+        return Some(Upstream::Tls(Box::new(stream)));
     }
     None
 }
