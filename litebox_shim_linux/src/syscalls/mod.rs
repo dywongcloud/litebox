@@ -13,6 +13,8 @@ pub(crate) mod net;
 pub(crate) mod netlink;
 pub(crate) mod pipe;
 pub mod process;
+pub(crate) mod seccomp_bpf;
+pub(crate) mod seccomp_chain;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod ptrace;
 pub(crate) mod unix;
@@ -61,6 +63,37 @@ fn write_to_user<T: FromBytes + IntoBytes + Immutable, Platform: crate::ShimPlat
         .ok_or(litebox_common_linux::errno::Errno::EFAULT)?;
     Ok(length)
 }
+/// Reads `buf.len()` bytes of user memory starting at address `base` into `buf`: one bulk access
+/// per page the range touches instead of one access per byte. A page-contained access is admitted
+/// or refused exactly as each of its bytes would be (mapping permissions, fork-COW preparation and
+/// host redirects are all per page), and a page whose bulk read still fails is re-read byte by
+/// byte, so the outcome -- including where a fault stops the read -- is the same as reading every
+/// byte on its own. `None` for an address range that wraps.
+///
+/// Every guest-memory access pays the page manager's admission check and the platform's per-page
+/// preparation; the byte-at-a-time loops this replaces (`writev`/`pwritev*` and `sendmsg` payloads)
+/// paid them per byte -- 16384 admissions per page -- which made those calls take seconds under
+/// lock contention (hvf-t1g-remainder-multisecond-service-guest-memory-access-convoy).
+pub(crate) fn read_user_bytes<Platform: crate::ShimPlatform>(base: usize, buf: &mut [u8]) -> Option<()> {
+    const PAGE: usize = litebox::mm::linux::PAGE_SIZE;
+    let mut done = 0;
+    while done < buf.len() {
+        let addr = base.checked_add(done)?;
+        let page_end = (addr & !(PAGE - 1)).checked_add(PAGE)?;
+        let len = (page_end - addr).min(buf.len() - done);
+        let piece = &mut buf[done..done + len];
+        if let Some(bytes) = UserPtr::<u8>::from_usize(addr).to_owned_slice::<Platform>(len) {
+            piece.copy_from_slice(&bytes);
+        } else {
+            for (index, byte) in piece.iter_mut().enumerate() {
+                *byte = UserPtr::<u8>::from_usize(addr + index).read_at_offset::<Platform>(0)?;
+            }
+        }
+        done += len;
+    }
+    Some(())
+}
+
 /// Helper function to read a value of type T from user memory.
 /// If the buffer size (i.e., provided `optlen`) is smaller than `size_of::<T>()`, return EINVAL.
 fn read_from_user<T: FromBytes, Platform: crate::ShimPlatform>(

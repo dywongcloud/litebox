@@ -136,6 +136,22 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
     }
 
+    /// Reports whether `fd` is currently the only descriptor referencing its entry, i.e. whether
+    /// removing/closing it right now would be that entry's true last close (the same
+    /// strong-count check [`Self::remove`] and [`Self::close_and_duplicate_if_shared`] make
+    /// internally). Returns `None` if `fd` is already closed.
+    ///
+    /// A plain point-in-time read with no side effect: calling it does not change what a
+    /// subsequent `remove`/close on the same `fd` returns. A caller that also wants to read
+    /// entry-scoped metadata (e.g. to learn what a true last close should release) should do so
+    /// before the real close -- a unique entry's metadata does not survive it.
+    pub fn is_unique_reference<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: &TypedFd<Subsystem>,
+    ) -> Option<bool> {
+        Some(Arc::strong_count(&self.entries[fd.x.as_usize()?].as_ref()?.x) == 1)
+    }
+
     /// Close the provided `fd`, and remove the corresponding entry if it is unique.
     /// If not unique, duplicate the `fd` for future closure.
     ///

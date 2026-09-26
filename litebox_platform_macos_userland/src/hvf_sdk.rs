@@ -234,6 +234,212 @@ impl HvfArchitecturalState {
                 value: self.spsr_el1,
             })
     }
+
+    /// The install-mask bits of every non-SIMD register in `bits` whose value differs between
+    /// `self` and `other` (straight-line compares: this runs on every resident install).
+    fn scalar_differences(&self, other: &Self, bits: u64) -> u64 {
+        let mut differences = 0;
+        for (index, (mine, theirs)) in self.x.iter().zip(other.x.iter()).enumerate() {
+            if mine != theirs {
+                differences |= 1 << index;
+            }
+        }
+        for (bit, mine, theirs) in [
+            (install_mask::SP_EL0, self.sp_el0, other.sp_el0),
+            (install_mask::PC, self.pc, other.pc),
+            (install_mask::CPSR, self.cpsr, other.cpsr),
+            (install_mask::TPIDR_EL0, self.tpidr_el0, other.tpidr_el0),
+            (install_mask::SP_EL1, self.sp_el1, other.sp_el1),
+            (install_mask::SPSR_EL1, self.spsr_el1, other.spsr_el1),
+            (install_mask::ELR_EL1, self.elr_el1, other.elr_el1),
+            (install_mask::ESR_EL1, self.esr_el1, other.esr_el1),
+            (install_mask::FAR_EL1, self.far_el1, other.far_el1),
+        ] {
+            if mine != theirs {
+                differences |= bit;
+            }
+        }
+        differences & bits & install_mask::SCALAR
+    }
+
+    /// Copies the non-SIMD registers selected by `bits` from `source`.
+    fn copy_scalars(&mut self, source: &Self, bits: u64) {
+        if bits & install_mask::X_ALL == install_mask::X_ALL {
+            self.x = source.x;
+        } else {
+            for (index, (mine, theirs)) in self.x.iter_mut().zip(source.x.iter()).enumerate() {
+                if bits & (1 << index) != 0 {
+                    *mine = *theirs;
+                }
+            }
+        }
+        for (bit, mine, theirs) in [
+            (install_mask::SP_EL0, &mut self.sp_el0, source.sp_el0),
+            (install_mask::PC, &mut self.pc, source.pc),
+            (install_mask::CPSR, &mut self.cpsr, source.cpsr),
+            (install_mask::TPIDR_EL0, &mut self.tpidr_el0, source.tpidr_el0),
+            (install_mask::SP_EL1, &mut self.sp_el1, source.sp_el1),
+            (install_mask::SPSR_EL1, &mut self.spsr_el1, source.spsr_el1),
+            (install_mask::ELR_EL1, &mut self.elr_el1, source.elr_el1),
+            (install_mask::ESR_EL1, &mut self.esr_el1, source.esr_el1),
+            (install_mask::FAR_EL1, &mut self.far_el1, source.far_el1),
+        ] {
+            if bits & bit != 0 {
+                *mine = theirs;
+            }
+        }
+    }
+}
+
+/// FXR resident-register cache: the install mask shared with `hvf_sdk.c`
+/// (`LITEBOX_HVF_INSTALL_*`). Bits 0..=30 select X0..X30; every other bit one guest-visible
+/// register, or (`SIMD`) the whole SIMD/FP file.
+pub(crate) mod install_mask {
+    pub(crate) const X_ALL: u64 = (1 << 31) - 1;
+    pub(crate) const SP_EL0: u64 = 1 << 31;
+    pub(crate) const PC: u64 = 1 << 32;
+    pub(crate) const CPSR: u64 = 1 << 33;
+    pub(crate) const TPIDR_EL0: u64 = 1 << 34;
+    /// Q0-Q31, FPCR and FPSR.
+    pub(crate) const SIMD: u64 = 1 << 35;
+    pub(crate) const SP_EL1: u64 = 1 << 36;
+    pub(crate) const SPSR_EL1: u64 = 1 << 37;
+    pub(crate) const ELR_EL1: u64 = 1 << 38;
+    pub(crate) const ESR_EL1: u64 = 1 << 39;
+    pub(crate) const FAR_EL1: u64 = 1 << 40;
+    /// Every register a guest thread's EL0 execution owns, SIMD/FP excepted: what the exit
+    /// read refreshes and what a resident install compares.
+    pub(crate) const INTEGER: u64 = X_ALL | SP_EL0 | PC | CPSR | TPIDR_EL0;
+    /// The EL1 exception registers litebox installs as 0 and never reads before hardware
+    /// rewrites them: exception entry writes ELR/SPSR/ESR (and FAR on aborts) before the
+    /// monitor's first instruction, and the monitor never uses SP_EL1. Dead between exits.
+    pub(crate) const DEAD_EL1: u64 = SP_EL1 | SPSR_EL1 | ELR_EL1 | ESR_EL1 | FAR_EL1;
+    /// Every non-SIMD register.
+    pub(crate) const SCALAR: u64 = INTEGER | DEAD_EL1;
+    /// What the exit read (`litebox_hvf_vcpu_read_exit_state`, 39 gets) refreshes.
+    pub(crate) const EXIT_READ: u64 = INTEGER | SPSR_EL1 | ELR_EL1 | ESR_EL1 | FAR_EL1;
+    pub(crate) const ALL: u64 = SCALAR | SIMD;
+}
+
+/// A guest thread's SIMD/FP register file (Q0-Q31, FPCR, FPSR), the part of its architectural
+/// state the resident-register cache reads lazily.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HvfGuestFp {
+    pub(crate) q: [HvfSimd128; 32],
+    pub(crate) fpcr: u64,
+    pub(crate) fpsr: u64,
+}
+
+impl HvfGuestFp {
+    pub(crate) fn of(state: &HvfArchitecturalState) -> Self {
+        Self {
+            q: state.q,
+            fpcr: state.fpcr,
+            fpsr: state.fpsr,
+        }
+    }
+
+    pub(crate) fn write_into(&self, state: &mut HvfArchitecturalState) {
+        state.q = self.q;
+        state.fpcr = self.fpcr;
+        state.fpsr = self.fpsr;
+    }
+}
+
+/// How [`HvfVcpu::install_guest_state`] treats the SIMD/FP file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HvfFpInstall {
+    /// Leave the vCPU's Q/FPCR/FPSR as they are: the caller has established that they already
+    /// hold this thread's current values.
+    Keep,
+    /// Install the desired state's Q/FPCR/FPSR. Refused while the vCPU holds unsaved guest FP
+    /// state ([`HvfVcpu::fp_unsaved`]): the caller must first read it out or discard it.
+    Install,
+}
+
+/// What one [`HvfVcpu::install_guest_state`] did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HvfInstallReport {
+    /// The install mask actually issued (0: no SDK call and no operation admission at all).
+    pub(crate) mask: u64,
+    /// Every register of the thread's state (all of `INTEGER` and the SIMD file) was installed.
+    pub(crate) full: bool,
+}
+
+/// `LITEBOX_HVF_VERIFY_STATE=1`: every resident install is followed by the full 74-register
+/// readback compare (and the exit read also captures the SIMD file for it). Read once.
+pub(crate) fn state_verify_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LITEBOX_HVF_VERIFY_STATE").is_some_and(|value| value == "1")
+    })
+}
+
+/// Installs between two sampled cache-vs-hardware comparisons outside verify mode.
+const RESIDENT_SAMPLE_INTERVAL: u32 = 64;
+
+/// FXR: what the host knows about the values this vCPU's guest-visible register file holds.
+/// Maintained by every [`HvfVcpu`] method that installs, reads or runs, so a partial install can
+/// only ever be computed against registers whose values are known, and no install can overwrite
+/// guest SIMD/FP state that no host copy holds.
+#[derive(Clone, Copy)]
+struct HvfResidentRegisters {
+    /// The last installed or read value of each non-SIMD register named in `known`.
+    shadow: HvfArchitecturalState,
+    /// [`install_mask::SCALAR`] bits whose `shadow` value is exactly what the vCPU holds.
+    known: u64,
+    /// The vCPU's Q/FPCR/FPSR hold values its guest execution produced that no host copy has
+    /// (set by every run, cleared by a full read, a SIMD read or an explicit discard).
+    fp_unsaved: bool,
+    /// Verify mode only: the SIMD/FP file as of the last exit read.
+    verify_fp: Option<HvfGuestFp>,
+    /// Countdown to the next sampled comparison (outside verify mode).
+    installs_until_sample: u32,
+}
+
+impl HvfResidentRegisters {
+    const fn new() -> Self {
+        Self {
+            shadow: HvfArchitecturalState {
+                abi_version: HVF_ABI_VERSION,
+                byte_size: core::mem::size_of::<HvfArchitecturalState>() as u32,
+                x: [0; 31],
+                q: [HvfSimd128 { bytes: [0; 16] }; 32],
+                fpcr: 0,
+                fpsr: 0,
+                tpidr_el0: 0,
+                sp_el0: 0,
+                sp_el1: 0,
+                pc: 0,
+                cpsr: 0,
+                spsr_el1: 0,
+                elr_el1: 0,
+                esr_el1: 0,
+                far_el1: 0,
+            },
+            known: 0,
+            fp_unsaved: false,
+            verify_fp: None,
+            installs_until_sample: RESIDENT_SAMPLE_INTERVAL,
+        }
+    }
+
+    /// Guest execution may have changed every register the guest or exception entry can write;
+    /// only SP_EL1 (used by neither EL0 nor the monitor) keeps its known value.
+    fn ran(&mut self) {
+        self.known &= install_mask::SP_EL1;
+        self.fp_unsaved = true;
+        self.verify_fp = None;
+    }
+
+    fn installed(&mut self, state: &HvfArchitecturalState, mask: u64) {
+        self.shadow.copy_scalars(state, mask);
+        self.known |= mask & install_mask::SCALAR;
+    }
+
+    fn read(&mut self, state: &HvfArchitecturalState, mask: u64) {
+        self.installed(state, mask);
+    }
 }
 
 #[repr(C)]
@@ -474,6 +680,21 @@ unsafe extern "C" {
         state: *const HvfArchitecturalState,
         readback: *mut HvfArchitecturalState,
     ) -> HvReturn;
+    fn litebox_hvf_vcpu_install_arch_state(
+        identifier: u64,
+        state: *const HvfArchitecturalState,
+        mask: u64,
+    ) -> HvReturn;
+    fn litebox_hvf_vcpu_arm_and_install_arch_state(
+        identifier: u64,
+        state: *const HvfArchitecturalState,
+        mask: u64,
+        cval: u64,
+    ) -> HvReturn;
+    fn litebox_hvf_vcpu_read_exit_state(identifier: u64, state: *mut HvfArchitecturalState)
+    -> HvReturn;
+    fn litebox_hvf_vcpu_get_simd_state(identifier: u64, state: *mut HvfArchitecturalState)
+    -> HvReturn;
     fn litebox_hvf_vcpu_initialize_el1(
         identifier: u64,
         configuration: *const HvfEl1State,
@@ -536,6 +757,9 @@ pub enum HvfError {
     },
     InvalidArchitectureState,
     ArchitectureStateReadback,
+    /// An install would overwrite SIMD/FP values the vCPU holds for a guest thread that no host
+    /// copy has; the caller must read them out (or discard them) first.
+    ResidentFpUnsaved,
     InvalidEl1State,
     El1RegisterReadback {
         register: &'static str,
@@ -787,6 +1011,10 @@ impl fmt::Display for HvfError {
             Self::ArchitectureStateReadback => {
                 write!(f, "the HVF architectural state did not read back exactly")
             }
+            Self::ResidentFpUnsaved => write!(
+                f,
+                "an HVF state install would overwrite a guest thread's unsaved SIMD/FP registers"
+            ),
             Self::InvalidEl1State => write!(f, "the HVF EL1-state ABI header is invalid"),
             Self::El1RegisterReadback {
                 register,
@@ -1496,6 +1724,7 @@ struct HvfOperationFrame<'vm> {
     direct_published: Cell<bool>,
     direct_capability_returned: Cell<bool>,
     finished: bool,
+    site: u16,
     not_send: PhantomData<Rc<()>>,
 }
 
@@ -1504,6 +1733,7 @@ impl<'vm> HvfOperationFrame<'vm> {
         vm: &'vm HvfVm,
         state: &mut HvfVmOperationState,
         shared: bool,
+        site: u16,
     ) -> Result<Self, HvfError> {
         let key = vm as *const HvfVm as usize;
         let entered = HVF_OPERATION_STATE.with(|cell| {
@@ -1553,6 +1783,7 @@ impl<'vm> HvfOperationFrame<'vm> {
             direct_published: Cell::new(false),
             direct_capability_returned: Cell::new(false),
             finished: false,
+            site,
             not_send: PhantomData,
         })
     }
@@ -1576,12 +1807,11 @@ impl<'vm> HvfOperationFrame<'vm> {
         cleanup: bool,
         class_live: impl FnOnce(&HvfVmOperationState) -> bool,
     ) -> Result<(), HvfError> {
-        let mut state = self
-            .vm
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &self.vm.operation_gate.state,
+            crate::diagnostics_counters::GATE_PUBLISH,
+            self.site,
+        );
         let Some(mut thread) = self.top_thread_state(shared) else {
             self.vm.abandon_operation_locked(&mut state);
             return Err(HvfError::OperationAbandoned);
@@ -1714,6 +1944,9 @@ pub(crate) struct HvfVmOperation<'vm> {
     frame: HvfOperationFrame<'vm>,
     owner: std::thread::ThreadId,
     cleanup: bool,
+    admitted_at: u64,
+    origin: u8,
+    nested: bool,
 }
 
 impl HvfVmOperation<'_> {
@@ -1743,13 +1976,11 @@ impl HvfVmOperation<'_> {
             return Err(HvfError::OperationAbandoned);
         }
         let current = std::thread::current().id();
-        let mut state = self
-            .frame
-            .vm
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &self.frame.vm.operation_gate.state,
+            crate::diagnostics_counters::GATE_EXCLUSIVE_REQUIRE_LIVE,
+            self.frame.site,
+        );
         let class_live = current == self.owner
             && state.owner.as_ref() == Some(&self.owner)
             && state.depth != 0
@@ -1784,11 +2015,11 @@ impl HvfVmOperation<'_> {
     ) -> Result<HvfOperationFinish, HvfError> {
         let vm = self.frame.vm;
         let current = std::thread::current().id();
-        let mut state = vm
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &vm.operation_gate.state,
+            crate::diagnostics_counters::GATE_EXCLUSIVE_FINISH,
+            self.frame.site,
+        );
         if !self.cleanup && !state.poisoned && vm.cleanup_required.load(Ordering::Acquire) {
             state.poison_requested = true;
         }
@@ -1860,6 +2091,13 @@ impl HvfVmOperation<'_> {
             }
         };
         drop(state);
+        if !self.nested {
+            crate::diagnostics_counters::record_exclusive_hold(
+                self.frame.site,
+                self.origin,
+                crate::diagnostics_counters::ticks().wrapping_sub(self.admitted_at),
+            );
+        }
         dispose_secondary_panic(observer_panic);
         if self.cleanup && poison_requested && !body_panicked {
             vm.poison();
@@ -1917,6 +2155,7 @@ impl HvfExistingVcpuOperation<'_> {
 
 pub(crate) struct HvfVmSharedOperation<'vm> {
     frame: HvfOperationFrame<'vm>,
+    begun_at: u64,
 }
 
 impl HvfVmSharedOperation<'_> {
@@ -1934,13 +2173,11 @@ impl HvfVmSharedOperation<'_> {
         {
             return Err(HvfError::OperationAbandoned);
         }
-        let mut state = self
-            .frame
-            .vm
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &self.frame.vm.operation_gate.state,
+            crate::diagnostics_counters::GATE_SHARED_REQUIRE_LIVE,
+            self.frame.site,
+        );
         if self.frame.vm.cleanup_required.load(Ordering::Acquire)
             || state.poison_requested
             || state.poisoned
@@ -2234,6 +2471,21 @@ impl HvfVm {
             .poison_requested
     }
 
+    /// Whether the calling thread currently owns this VM's exclusive operation (it is inside a
+    /// `with_operation`-class body, at any nesting depth). The retirement pump asks this only when
+    /// an address space's `retirement_pump` mutex is contended: a gate owner must never wait for
+    /// that mutex, whose holder may itself be waiting in the gate FIFO for this very owner
+    /// (hvf-retirement-pump-exclusive-gate-lock-order-inversion).
+    pub(crate) fn current_thread_owns_exclusive_operation(&self) -> bool {
+        let current = std::thread::current().id();
+        self.operation_gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owner
+            .is_some_and(|owner| owner == current)
+    }
+
     fn wait_for_operation_state<'a>(
         &self,
         state: MutexGuard<'a, HvfVmOperationState>,
@@ -2281,7 +2533,10 @@ impl HvfVm {
         Ok(())
     }
 
-    fn begin_existing_vcpu_operation(&self) -> Result<HvfExistingVcpuOperation<'_>, HvfError> {
+    fn begin_existing_vcpu_operation(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+    ) -> Result<HvfExistingVcpuOperation<'_>, HvfError> {
         if self.operation_gate.abandoned.load(Ordering::Acquire) {
             return Err(HvfError::OperationAbandoned);
         }
@@ -2289,11 +2544,16 @@ impl HvfVm {
             return Err(HvfError::Poisoned);
         }
         let owner = std::thread::current().id();
-        let mut state = self
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let site = crate::diagnostics_counters::site_index(
+            caller,
+            crate::diagnostics_counters::SITE_KIND_EXISTING,
+        );
+        crate::diagnostics_counters::record_existing_op();
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &self.operation_gate.state,
+            crate::diagnostics_counters::GATE_EXISTING_BEGIN,
+            site,
+        );
         if self.operation_gate.abandoned.load(Ordering::Acquire) {
             return Err(HvfError::OperationAbandoned);
         }
@@ -2310,7 +2570,7 @@ impl HvfVm {
             self.abandon_operation_locked(&mut state);
             return Err(HvfError::ResidualAccounting);
         }
-        let frame = HvfOperationFrame::enter(self, &mut state, false)?;
+        let frame = HvfOperationFrame::enter(self, &mut state, false, site)?;
         state.active_vcpu_owners.push(owner);
         Ok(HvfExistingVcpuOperation { frame, owner })
     }
@@ -2322,11 +2582,11 @@ impl HvfVm {
         body_panicked: bool,
         on_published_panic_latched: impl FnOnce(),
     ) -> Result<HvfOperationFinish, HvfError> {
-        let mut state = self
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &self.operation_gate.state,
+            crate::diagnostics_counters::GATE_EXISTING_FINISH,
+            frame.site,
+        );
         if !state.poisoned && self.cleanup_required.load(Ordering::Acquire) {
             state.poison_requested = true;
         }
@@ -2410,6 +2670,7 @@ impl HvfVm {
         &self,
         cleanup: bool,
         wait_timeout: Duration,
+        caller: &'static std::panic::Location<'static>,
     ) -> Result<HvfVmOperation<'_>, HvfError> {
         if self.operation_gate.abandoned.load(Ordering::Acquire) && !cleanup {
             return Err(HvfError::OperationAbandoned);
@@ -2417,15 +2678,22 @@ impl HvfVm {
         if self.cleanup_required.load(Ordering::Acquire) && !cleanup {
             return Err(HvfError::Poisoned);
         }
+        let requested_at = crate::diagnostics_counters::ticks();
+        let origin = crate::diagnostics_counters::current_origin();
+        let site = crate::diagnostics_counters::site_index(
+            caller,
+            crate::diagnostics_counters::SITE_KIND_EXCLUSIVE,
+        );
+        let mut wait_rounds = 0u64;
         let deadline = Instant::now()
             .checked_add(wait_timeout)
             .ok_or(HvfError::OperationWaitTimeout)?;
         let current = std::thread::current().id();
-        let mut state = self
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &self.operation_gate.state,
+            crate::diagnostics_counters::GATE_EXCLUSIVE_BEGIN,
+            site,
+        );
         let mut waiter_ticket = None;
         if state.owner.as_ref() != Some(&current) {
             if state.waiters.len() >= MAX_OPERATION_WAITERS {
@@ -2519,6 +2787,7 @@ impl HvfVm {
                 && self.operation_gate.abandoned.load(Ordering::Acquire)
                 && !self.abandoned_cleanup_ready(&state, current)
             {
+                wait_rounds += 1;
                 let (next, timed_out) = self.wait_for_operation_state(state, deadline);
                 state = next;
                 if timed_out {
@@ -2542,15 +2811,27 @@ impl HvfVm {
                         self.abandon_operation_locked(&mut state);
                         return Err(HvfError::OperationAbandoned);
                     }
-                    let frame = HvfOperationFrame::enter(self, &mut state, false)?;
+                    let frame = HvfOperationFrame::enter(self, &mut state, false, site)?;
                     state.owner = Some(current);
                     state.depth = 1;
                     state.cleanup_depth = usize::from(cleanup);
                     self.operation_gate.idle.notify_all();
+                    drop(state);
+                    let admitted_at = crate::diagnostics_counters::ticks();
+                    crate::diagnostics_counters::record_exclusive_admission(
+                        site,
+                        origin,
+                        false,
+                        admitted_at.wrapping_sub(requested_at),
+                        wait_rounds,
+                    );
                     return Ok(HvfVmOperation {
                         frame,
                         owner: current,
                         cleanup,
+                        admitted_at,
+                        origin,
+                        nested: false,
                     });
                 }
                 Some(owner) if owner == current && waiter_ticket.is_none() => {
@@ -2569,16 +2850,29 @@ impl HvfVm {
                         self.abandon_operation_locked(&mut state);
                         return Err(HvfError::OperationAbandoned);
                     };
-                    let frame = HvfOperationFrame::enter(self, &mut state, false)?;
+                    let frame = HvfOperationFrame::enter(self, &mut state, false, site)?;
                     state.depth = depth;
                     state.cleanup_depth = cleanup_depth;
+                    drop(state);
+                    let admitted_at = crate::diagnostics_counters::ticks();
+                    crate::diagnostics_counters::record_exclusive_admission(
+                        site,
+                        origin,
+                        true,
+                        admitted_at.wrapping_sub(requested_at),
+                        wait_rounds,
+                    );
                     return Ok(HvfVmOperation {
                         frame,
                         owner: current,
                         cleanup,
+                        admitted_at,
+                        origin,
+                        nested: true,
                     });
                 }
                 None | Some(_) => {
+                    wait_rounds += 1;
                     let (next, timed_out) = self.wait_for_operation_state(state, deadline);
                     state = next;
                     if timed_out {
@@ -2769,6 +3063,7 @@ impl HvfVm {
     /// other shared operations and with the exclusive owner.  Used by the
     /// per-run vCPU attach/submit/acknowledge paths so guest syscalls on many
     /// vCPUs never serialize on the exclusive gate.
+    #[track_caller]
     pub(crate) fn with_shared_operation<T, E>(
         &self,
         body: impl FnOnce(&HvfVmSharedOperation<'_>) -> Result<T, E>,
@@ -2776,16 +3071,24 @@ impl HvfVm {
     where
         E: HvfOperationError,
     {
-        let operation = self.begin_shared_operation().map_err(E::from)?;
+        let operation = self
+            .begin_shared_operation(std::panic::Location::caller())
+            .map_err(E::from)?;
+        let (site, begun_at) = (operation.frame.site, operation.begun_at);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&operation)));
         let body_panicked = result.is_err();
         let finish = operation.finish(body_panicked);
+        crate::diagnostics_counters::record_shared_op(
+            site,
+            crate::diagnostics_counters::ticks().wrapping_sub(begun_at),
+        );
         match result {
             Ok(result) => self.finish_operation(result, finish),
             Err(payload) => self.resume_operation_panic(payload, finish),
         }
     }
 
+    #[track_caller]
     fn with_shared_operation_observed<T, E>(
         &self,
         body: impl FnOnce(&HvfVmSharedOperation<'_>) -> Result<T, E>,
@@ -2794,28 +3097,43 @@ impl HvfVm {
     where
         E: HvfOperationError,
     {
-        let operation = self.begin_shared_operation().map_err(E::from)?;
+        let operation = self
+            .begin_shared_operation(std::panic::Location::caller())
+            .map_err(E::from)?;
+        let (site, begun_at) = (operation.frame.site, operation.begun_at);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&operation)));
         let body_panicked = result.is_err();
         let finish = operation.finish_observed(body_panicked, on_published_panic_latched);
+        crate::diagnostics_counters::record_shared_op(
+            site,
+            crate::diagnostics_counters::ticks().wrapping_sub(begun_at),
+        );
         match result {
             Ok(result) => self.finish_operation(result, finish),
             Err(payload) => self.resume_operation_panic(payload, finish),
         }
     }
 
-    fn begin_shared_operation(&self) -> Result<HvfVmSharedOperation<'_>, HvfError> {
+    fn begin_shared_operation(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+    ) -> Result<HvfVmSharedOperation<'_>, HvfError> {
         if self.operation_gate.abandoned.load(Ordering::Acquire) {
             return Err(HvfError::OperationAbandoned);
         }
         if self.cleanup_required.load(Ordering::Acquire) {
             return Err(HvfError::Poisoned);
         }
-        let mut state = self
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let begun_at = crate::diagnostics_counters::ticks();
+        let site = crate::diagnostics_counters::site_index(
+            caller,
+            crate::diagnostics_counters::SITE_KIND_SHARED,
+        );
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &self.operation_gate.state,
+            crate::diagnostics_counters::GATE_SHARED_BEGIN,
+            site,
+        );
         if self.operation_gate.abandoned.load(Ordering::Acquire) {
             return Err(HvfError::OperationAbandoned);
         }
@@ -2827,9 +3145,9 @@ impl HvfVm {
             self.abandon_operation_locked(&mut state);
             return Err(HvfError::OperationAbandoned);
         };
-        let frame = HvfOperationFrame::enter(self, &mut state, true)?;
+        let frame = HvfOperationFrame::enter(self, &mut state, true, site)?;
         state.shared = shared;
-        Ok(HvfVmSharedOperation { frame })
+        Ok(HvfVmSharedOperation { frame, begun_at })
     }
 
     fn finish_shared_operation(
@@ -2838,11 +3156,11 @@ impl HvfVm {
         body_panicked: bool,
         on_published_panic_latched: impl FnOnce(),
     ) -> Result<HvfOperationFinish, HvfError> {
-        let mut state = self
-            .operation_gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = crate::diagnostics_counters::lock_gate(
+            &self.operation_gate.state,
+            crate::diagnostics_counters::GATE_SHARED_FINISH,
+            frame.site,
+        );
         if !state.poisoned && self.cleanup_required.load(Ordering::Acquire) {
             state.poison_requested = true;
         }
@@ -2908,6 +3226,7 @@ impl HvfVm {
         }
     }
 
+    #[track_caller]
     pub(crate) fn with_operation<T, E>(
         &self,
         body: impl FnOnce(&HvfVmOperation<'_>) -> Result<T, E>,
@@ -2918,6 +3237,7 @@ impl HvfVm {
         self.with_operation_inner(false, OPERATION_WAIT_TIMEOUT, body)
     }
 
+    #[track_caller]
     pub(crate) fn with_operation_timeout<T, E>(
         &self,
         wait_timeout: Duration,
@@ -2929,6 +3249,7 @@ impl HvfVm {
         self.with_operation_inner(false, wait_timeout, body)
     }
 
+    #[track_caller]
     pub(crate) fn with_cleanup_operation<T, E>(
         &self,
         body: impl FnOnce(&HvfVmOperation<'_>) -> Result<T, E>,
@@ -2939,6 +3260,7 @@ impl HvfVm {
         self.with_operation_inner(true, OPERATION_WAIT_TIMEOUT, body)
     }
 
+    #[track_caller]
     pub(crate) fn with_capability_operation<T, E>(
         &self,
         body: impl FnOnce(&HvfVmOperation<'_>) -> Result<T, E>,
@@ -2948,7 +3270,7 @@ impl HvfVm {
         E: HvfOperationError,
     {
         let operation = self
-            .begin_operation_inner(false, OPERATION_WAIT_TIMEOUT)
+            .begin_operation_inner(false, OPERATION_WAIT_TIMEOUT, std::panic::Location::caller())
             .map_err(E::from)?;
         // Validation and capability-return marking run inside the same
         // catch_unwind as `body`: either can panic (an invariant check in
@@ -2984,6 +3306,7 @@ impl HvfVm {
         }
     }
 
+    #[track_caller]
     fn with_operation_inner<T, E>(
         &self,
         cleanup: bool,
@@ -2994,7 +3317,7 @@ impl HvfVm {
         E: HvfOperationError,
     {
         let operation = self
-            .begin_operation_inner(cleanup, wait_timeout)
+            .begin_operation_inner(cleanup, wait_timeout, std::panic::Location::caller())
             .map_err(E::from)?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&operation)));
         let body_panicked = result.is_err();
@@ -3005,6 +3328,7 @@ impl HvfVm {
         }
     }
 
+    #[track_caller]
     fn with_operation_inner_observed<T, E>(
         &self,
         cleanup: bool,
@@ -3016,7 +3340,7 @@ impl HvfVm {
         E: HvfOperationError,
     {
         let operation = self
-            .begin_operation_inner(cleanup, wait_timeout)
+            .begin_operation_inner(cleanup, wait_timeout, std::panic::Location::caller())
             .map_err(E::from)?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&operation)));
         let body_panicked = result.is_err();
@@ -3027,6 +3351,7 @@ impl HvfVm {
         }
     }
 
+    #[track_caller]
     pub(crate) fn with_zero_vcpu_operation<T, E>(
         &self,
         body: impl FnOnce(&HvfVmOperation<'_>) -> Result<T, E>,
@@ -3364,6 +3689,10 @@ impl HvfVm {
                         owner: reservation.owner,
                         handle_state: Arc::clone(&reservation.handle_state),
                         live: true,
+                        installs_since_run: 0,
+                        last_run_raw_ticks: 0,
+                        last_run_installs_before: 0,
+                        resident: HvfResidentRegisters::new(),
                         not_send: PhantomData,
                     };
                     creation_guard.disarm();
@@ -5552,6 +5881,11 @@ pub(crate) struct HvfVcpu {
     owner: std::thread::ThreadId,
     handle_state: Arc<HvfVcpuControl>,
     live: bool,
+    installs_since_run: u32,
+    last_run_raw_ticks: u64,
+    last_run_installs_before: u32,
+    /// FXR resident-register cache; see [`HvfResidentRegisters`].
+    resident: HvfResidentRegisters,
     not_send: PhantomData<Rc<()>>,
 }
 
@@ -5619,12 +5953,13 @@ impl HvfVcpu {
         }
     }
 
+    #[track_caller]
     fn with_existing_operation<T>(
         &mut self,
         body: impl FnOnce(&mut Self, &HvfExistingVcpuOperation<'_>) -> Result<T, HvfError>,
     ) -> Result<T, HvfError> {
         let vm = self.vm;
-        let operation = vm.begin_existing_vcpu_operation()?;
+        let operation = vm.begin_existing_vcpu_operation(std::panic::Location::caller())?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.require_owner_live()?;
             body(self, &operation)
@@ -5637,13 +5972,14 @@ impl HvfVcpu {
         }
     }
 
+    #[track_caller]
     fn with_existing_operation_observed<T>(
         &mut self,
         body: impl FnOnce(&mut Self, &HvfExistingVcpuOperation<'_>) -> Result<T, HvfError>,
         on_published_panic_latched: impl FnOnce(),
     ) -> Result<T, HvfError> {
         let vm = self.vm;
-        let operation = vm.begin_existing_vcpu_operation()?;
+        let operation = vm.begin_existing_vcpu_operation(std::panic::Location::caller())?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.require_owner_live()?;
             body(self, &operation)
@@ -5773,9 +6109,10 @@ impl HvfVcpu {
         self.live
     }
 
+    #[track_caller]
     pub(crate) fn cancellation(&self) -> Result<HvfVcpuCancellation, HvfError> {
         let vm = self.vm;
-        let operation = vm.begin_existing_vcpu_operation()?;
+        let operation = vm.begin_existing_vcpu_operation(std::panic::Location::caller())?;
         let result = self.require_owner_live().map(|()| HvfVcpuCancellation {
             identifier: self.identifier,
             generation: self.generation,
@@ -5786,6 +6123,8 @@ impl HvfVcpu {
         vm.finish_operation(result, operation.finish(false))
     }
 
+    /// The full 74-register read (Q/FPCR/FPSR included). Every register becomes known to the
+    /// resident cache and the SIMD file host-held.
     pub(crate) fn architectural_state_unclassified(
         &mut self,
     ) -> Result<HvfArchitecturalState, HvfError> {
@@ -5803,10 +6142,22 @@ impl HvfVcpu {
             if !state.has_valid_header() {
                 return Err(vcpu.quarantine(operation, HvfError::InvalidArchitectureState));
             }
+            vcpu.resident.read(&state, install_mask::SCALAR);
+            vcpu.resident.fp_unsaved = false;
+            vcpu.resident.verify_fp = state_verify_enabled().then(|| HvfGuestFp::of(&state));
+            crate::diagnostics_counters::record_resident(
+                crate::diagnostics_counters::RESIDENT_FULL_READS,
+                1,
+            );
             Ok(state)
         })
     }
 
+    /// The full 74-register install of `state` (the synchronization trip's scratch state and every
+    /// full-mode lane run). Refused, before anything is published, while the vCPU holds a guest
+    /// thread's unsaved SIMD/FP file. With `LITEBOX_HVF_VERIFY_STATE=1` the install is followed
+    /// by the full readback compare (a mismatch quarantines, as it always did); by default it is
+    /// the install alone (T2a: the readback self-check cost 74 gets on every run).
     pub(crate) fn set_architectural_state(
         &mut self,
         state: &HvfArchitecturalState,
@@ -5817,10 +6168,18 @@ impl HvfVcpu {
                 return Err(HvfError::InvalidArchitectureState);
             }
             state.validate_install(context)?;
-            let mut readback = HvfArchitecturalState::default();
+            if vcpu.resident.fp_unsaved {
+                return Err(HvfError::ResidentFpUnsaved);
+            }
             operation.mark_published()?;
-            let result = unsafe {
-                litebox_hvf_vcpu_set_arch_state(vcpu.identifier, state, &raw mut readback)
+            let verify = state_verify_enabled();
+            let mut readback = HvfArchitecturalState::default();
+            let result = if verify {
+                unsafe { litebox_hvf_vcpu_set_arch_state(vcpu.identifier, state, &raw mut readback) }
+            } else {
+                unsafe {
+                    litebox_hvf_vcpu_install_arch_state(vcpu.identifier, state, install_mask::ALL)
+                }
             };
             if !succeeded(result) {
                 let trigger = HvfError::Call {
@@ -5829,11 +6188,273 @@ impl HvfVcpu {
                 };
                 return Err(vcpu.quarantine(operation, trigger));
             }
-            if readback != *state {
-                return Err(vcpu.quarantine(operation, HvfError::ArchitectureStateReadback));
+            if verify {
+                let exact = readback == *state;
+                crate::diagnostics_counters::record_resident_verify(exact);
+                if !exact {
+                    return Err(vcpu.quarantine(operation, HvfError::ArchitectureStateReadback));
+                }
             }
+            vcpu.resident.installed(state, install_mask::SCALAR);
+            vcpu.resident.verify_fp = verify.then(|| HvfGuestFp::of(state));
+            vcpu.installs_since_run = vcpu.installs_since_run.saturating_add(1);
+            crate::diagnostics_counters::record_resident(
+                crate::diagnostics_counters::RESIDENT_INSTALLS_FULL_STATE,
+                1,
+            );
             Ok(())
         })
+    }
+
+    /// Declares the vCPU's unsaved SIMD/FP file dead: the caller either holds a newer copy that
+    /// supersedes it or has already handed it to its owner. The only way past
+    /// [`HvfError::ResidentFpUnsaved`] other than [`Self::read_guest_fp`].
+    pub(crate) fn discard_unsaved_fp(&mut self) {
+        self.resident.fp_unsaved = false;
+    }
+
+    /// FXR resident install (Start shape, validated exactly like
+    /// [`Self::set_architectural_state`]): brings the vCPU to `desired` issuing only the
+    /// registers the cache does not already know to hold their `desired` value -- every
+    /// [`install_mask::INTEGER`] register that differs or is unknown and every
+    /// [`install_mask::DEAD_EL1`] register that differs or is unknown (so the EL1 exception
+    /// registers are returned to the zeroed pre-FXR shape on every exit that changed them), and
+    /// the SIMD file iff `fp` is [`HvfFpInstall::Install`]. Release and verify mode install the
+    /// same set, so verify-mode evidence covers the release path. `vtimer_cval` arms the
+    /// run's time slice in the same entry point and operation (exactly [`Self::arm_vtimer`]), so
+    /// a run's whole per-run install is one admission. Nothing to install, no arm and no
+    /// verification due: no SDK call and no operation admission at all.
+    pub(crate) fn install_guest_state(
+        &mut self,
+        desired: &HvfArchitecturalState,
+        context: HvfPstateContext,
+        fp: HvfFpInstall,
+        vtimer_cval: Option<u64>,
+    ) -> Result<HvfInstallReport, HvfError> {
+        if !desired.has_valid_header() {
+            return Err(HvfError::InvalidArchitectureState);
+        }
+        desired.validate_install(context)?;
+        if !self.live {
+            return Err(HvfError::VcpuNotLive);
+        }
+        // Review fix-up (FXR-c1): the compared set is [`install_mask::SCALAR`] in *both* modes.
+        // It used to narrow to [`install_mask::INTEGER`] outside verify mode, which left the five
+        // EL1 exception registers ([`install_mask::DEAD_EL1`]) installed once per lane and then
+        // holding whatever hardware last wrote -- FAR_EL1 especially, which the architecture
+        // updates only on aborts, so a post-abort SVC run entered the monitor with a stale FAR_EL1
+        // where a pre-FXR run always entered with 0. Nobody has ever read those stale values (the
+        // host takes FAR_EL1 only from the fresh 39-get exit read), but "dead between exits" was an
+        // unwitnessed assumption, and it meant the 3.35M-readback / 0-mismatch verify result did
+        // NOT witness the release install mask. Comparing them in release mode makes release
+        // install exactly what verify installs, so that evidence transfers. The extra cost is a
+        // host-side compare over five more registers, plus one `hv_vcpu_set_sys_reg` each for
+        // SPSR/ELR/ESR/FAR_EL1 on exits that changed them -- measured, see the FXR witness.
+        let verify = state_verify_enabled();
+        let compared = install_mask::SCALAR;
+        let known = self.resident.known;
+        let mut mask = (install_mask::SCALAR & !known)
+            | self
+                .resident
+                .shadow
+                .scalar_differences(desired, compared & known);
+        if fp == HvfFpInstall::Install {
+            if self.resident.fp_unsaved {
+                return Err(HvfError::ResidentFpUnsaved);
+            }
+            mask |= install_mask::SIMD;
+        }
+        let thread_state = install_mask::INTEGER | install_mask::SIMD;
+        let report = HvfInstallReport {
+            mask,
+            full: mask & thread_state == thread_state,
+        };
+        let sample = !verify && {
+            self.resident.installs_until_sample =
+                self.resident.installs_until_sample.saturating_sub(1);
+            if self.resident.installs_until_sample == 0 {
+                self.resident.installs_until_sample = RESIDENT_SAMPLE_INTERVAL;
+                true
+            } else {
+                false
+            }
+        };
+        crate::diagnostics_counters::record_resident_install(mask, report.full);
+        if mask == 0 && vtimer_cval.is_none() && !verify && !sample {
+            return Ok(report);
+        }
+        self.with_existing_operation(|vcpu, operation| {
+            if mask != 0 || vtimer_cval.is_some() {
+                operation.mark_published()?;
+                let result = match vtimer_cval {
+                    Some(cval) => unsafe {
+                        litebox_hvf_vcpu_arm_and_install_arch_state(
+                            vcpu.identifier,
+                            desired,
+                            mask,
+                            cval,
+                        )
+                    },
+                    None => unsafe {
+                        litebox_hvf_vcpu_install_arch_state(vcpu.identifier, desired, mask)
+                    },
+                };
+                if !succeeded(result) {
+                    let trigger = HvfError::Call {
+                        operation: "hv_vcpu_set_reg/FP/sys_reg (resident install)",
+                        code: result,
+                    };
+                    return Err(vcpu.quarantine(operation, trigger));
+                }
+                vcpu.resident.installed(desired, mask);
+                if mask & install_mask::SIMD != 0 {
+                    vcpu.resident.verify_fp = verify.then(|| HvfGuestFp::of(desired));
+                }
+            }
+            if verify || sample {
+                let mut readback = HvfArchitecturalState::default();
+                let result =
+                    unsafe { litebox_hvf_vcpu_get_arch_state(vcpu.identifier, &raw mut readback) };
+                if !succeeded(result) {
+                    let trigger = HvfError::Call {
+                        operation: "hv_vcpu_get_reg/FP/sys_reg (resident verify)",
+                        code: result,
+                    };
+                    return Err(vcpu.quarantine(operation, trigger));
+                }
+                let scalar_mismatch = vcpu
+                    .resident
+                    .shadow
+                    .scalar_differences(&readback, vcpu.resident.known)
+                    | desired.scalar_differences(&readback, compared);
+                let expected_fp = if mask & install_mask::SIMD != 0 {
+                    Some(HvfGuestFp::of(desired))
+                } else {
+                    vcpu.resident.verify_fp
+                };
+                let fp_mismatch = expected_fp.is_some_and(|fp| fp != HvfGuestFp::of(&readback));
+                let exact = scalar_mismatch == 0 && !fp_mismatch;
+                if verify {
+                    crate::diagnostics_counters::record_resident_verify(exact);
+                    if !exact {
+                        litebox_util_log::error!(
+                            scalar_mismatch:? = scalar_mismatch, fp_mismatch:? = fp_mismatch,
+                            install_mask:? = mask;
+                            "HVF resident-register verify: the vCPU does not hold the installed state"
+                        );
+                        return Err(vcpu.quarantine(operation, HvfError::ArchitectureStateReadback));
+                    }
+                } else {
+                    crate::diagnostics_counters::record_resident_sampled(exact);
+                    if !exact {
+                        // A cache bug, never expected: say so loudly, then restore the whole
+                        // scalar file (and the SIMD file when this install set it) from the
+                        // authoritative desired state so the next run cannot build on it.
+                        litebox_util_log::error!(
+                            scalar_mismatch:? = scalar_mismatch, fp_mismatch:? = fp_mismatch,
+                            install_mask:? = mask;
+                            "HVF resident-register sampled verify: cache and vCPU disagree; reinstalling"
+                        );
+                        let repair = install_mask::SCALAR | (mask & install_mask::SIMD);
+                        operation.mark_published()?;
+                        let result = unsafe {
+                            litebox_hvf_vcpu_install_arch_state(vcpu.identifier, desired, repair)
+                        };
+                        if !succeeded(result) {
+                            let trigger = HvfError::Call {
+                                operation: "hv_vcpu_set_reg/FP/sys_reg (resident repair)",
+                                code: result,
+                            };
+                            return Err(vcpu.quarantine(operation, trigger));
+                        }
+                        vcpu.resident.installed(desired, repair);
+                    }
+                }
+            }
+            if report.full {
+                vcpu.installs_since_run = vcpu.installs_since_run.saturating_add(1);
+            }
+            Ok(report)
+        })
+    }
+
+    /// FXR exit read: the 39 registers [`install_mask::EXIT_READ`] names -- X0..X30, SP_EL0, PC,
+    /// CPSR, SPSR/ELR/ESR/FAR_EL1 and TPIDR_EL0 -- in one entry point. The SIMD file stays in the
+    /// vCPU, unsaved: the returned state's Q/FPCR/FPSR are zero and must not be read (the caller
+    /// materializes them with [`Self::read_guest_fp`] when a path needs them); its SP_EL1 is the
+    /// cache's known value.
+    pub(crate) fn read_guest_exit_state(&mut self) -> Result<HvfArchitecturalState, HvfError> {
+        self.with_existing_operation(|vcpu, operation| {
+            let mut state = HvfArchitecturalState::default();
+            if vcpu.resident.known & install_mask::SP_EL1 != 0 {
+                state.sp_el1 = vcpu.resident.shadow.sp_el1;
+            }
+            let result =
+                unsafe { litebox_hvf_vcpu_read_exit_state(vcpu.identifier, &raw mut state) };
+            if !succeeded(result) {
+                let trigger = HvfError::Call {
+                    operation: "hv_vcpu_get_reg/sys_reg (exit read)",
+                    code: result,
+                };
+                return Err(vcpu.quarantine(operation, trigger));
+            }
+            vcpu.resident.read(&state, install_mask::EXIT_READ);
+            if state_verify_enabled() {
+                let mut simd = HvfArchitecturalState::default();
+                let result =
+                    unsafe { litebox_hvf_vcpu_get_simd_state(vcpu.identifier, &raw mut simd) };
+                if !succeeded(result) {
+                    let trigger = HvfError::Call {
+                        operation: "hv_vcpu_get_simd_fp_reg (verify capture)",
+                        code: result,
+                    };
+                    return Err(vcpu.quarantine(operation, trigger));
+                }
+                vcpu.resident.verify_fp = Some(HvfGuestFp::of(&simd));
+            }
+            crate::diagnostics_counters::record_resident(
+                crate::diagnostics_counters::RESIDENT_EXIT_READS,
+                1,
+            );
+            Ok(state)
+        })
+    }
+
+    /// FXR lazy SIMD read (34 gets): the SIMD/FP file as the vCPU holds it. Afterwards the vCPU's
+    /// SIMD file is no longer unsaved -- the caller holds the copy.
+    pub(crate) fn read_guest_fp(&mut self) -> Result<HvfGuestFp, HvfError> {
+        self.with_existing_operation(|vcpu, operation| {
+            let mut state = HvfArchitecturalState::default();
+            let result =
+                unsafe { litebox_hvf_vcpu_get_simd_state(vcpu.identifier, &raw mut state) };
+            if !succeeded(result) {
+                let trigger = HvfError::Call {
+                    operation: "hv_vcpu_get_simd_fp_reg (materialize)",
+                    code: result,
+                };
+                return Err(vcpu.quarantine(operation, trigger));
+            }
+            let fp = HvfGuestFp::of(&state);
+            if let Some(expected) = vcpu.resident.verify_fp {
+                let exact = expected == fp;
+                crate::diagnostics_counters::record_resident_verify(exact);
+                if !exact {
+                    return Err(vcpu.quarantine(operation, HvfError::ArchitectureStateReadback));
+                }
+            }
+            vcpu.resident.fp_unsaved = false;
+            crate::diagnostics_counters::record_resident(
+                crate::diagnostics_counters::RESIDENT_FP_READS,
+                1,
+            );
+            Ok(fp)
+        })
+    }
+
+    /// The raw `litebox_hvf_vcpu_run` ticks of the most recent [`Self::run`] (0 when it never
+    /// reached the call) and how many full architectural-state installs preceded it.
+    pub(crate) fn last_run_profile(&self) -> (u64, u32) {
+        (self.last_run_raw_ticks, self.last_run_installs_before)
     }
 
     pub(crate) fn initialize_el1(
@@ -5943,12 +6564,18 @@ impl HvfVcpu {
     }
 
     pub(crate) fn run(&mut self) -> Result<HvfVcpuExit, HvfError> {
+        self.last_run_installs_before = core::mem::take(&mut self.installs_since_run);
+        self.last_run_raw_ticks = 0;
         self.with_existing_operation(|vcpu, operation| {
             let mut exit = HvfExitPayload::default();
             operation.mark_published()?;
+            // FXR: from here the guest owns every register it (or exception entry) can write.
+            vcpu.resident.ran();
+            let raw_start = crate::diagnostics_counters::ticks();
             let result = unsafe {
                 litebox_hvf_vcpu_run(vcpu.identifier, vcpu.exit_area.as_ptr(), &raw mut exit)
             };
+            vcpu.last_run_raw_ticks = crate::diagnostics_counters::ticks().wrapping_sub(raw_start);
             if succeeded(result) {
                 Ok(exit.decode())
             } else {

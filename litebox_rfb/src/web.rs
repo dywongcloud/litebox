@@ -11,16 +11,36 @@
 //! so this sidesteps RFB client compatibility entirely.
 //!
 //! Wire protocol, deliberately simpler than RFB:
-//! * server -> client, binary: `[u16 width BE][u16 height BE][width*height*4 RGBA bytes]` --
-//!   one whole frame per message, sent only when the frame content changed, at most every
-//!   `FRAME_INTERVAL` (50ms), and only once the browser has acknowledged the previous frame:
-//!   each frame is followed by a WebSocket ping carrying the frame's sequence number, and every
-//!   browser answers pings with a pong automatically (RFC 6455 §5.5.2), so the pong is a
-//!   frame-consumed signal that needs nothing from the page's own script (see `FrameAcks`).
+//! * server -> client, binary: `[u16 width BE][u16 height BE][u16 rect count BE]` then, per
+//!   rect, `[u16 y BE][u16 height BE][width*height*4 RGBA bytes]` -- only the full-width bands
+//!   that actually changed since the last frame sent to *this* client (the same incremental-
+//!   update banding the native RFB server already does; see `server.rs`'s `dirty_bands`, reused
+//!   here), sent as soon as one of the pusher's polls (every `POLL_INTERVAL`) finds a changed band,
+//!   never two frames closer together than `MIN_FRAME_SPACING`, and only once the browser has
+//!   acknowledged the previous frame: each frame is followed by a
+//!   WebSocket ping carrying the frame's sequence number, and every browser answers pings with a
+//!   pong automatically (RFC 6455 §5.5.2), so the pong is a frame-consumed signal that needs
+//!   nothing from the page's own script (see `FrameAcks`). Banding, not full-frame resends, matters
+//!   here for more than bandwidth: the pusher thread's own encode+write work runs on the same host
+//!   process (and competes for the same host CPU) as the guest's vCPU threads in this userland
+//!   hypervisor, so a full 1024x768+ frame re-encoded on every changed tick -- which a single
+//!   blinking cursor or one typed character triggered just as often as a full repaint -- was
+//!   directly taking host CPU away from the guest making forward progress.
 //! * client -> server, binary: `[1u8][down u8][keysym u32 BE]` for keys (X11 keysyms, same
 //!   values RFB uses, so the runner's existing translation applies unchanged), and
 //!   `[2u8][button_mask u8][x u16 BE][y u16 BE]` for pointer state (RFB-style mask: bit 0
 //!   left, bit 1 middle, bit 2 right, bits 3/4 wheel up/down edges).
+//! * latency trace only (`LITEBOX_LATENCY_TRACE` set in the runner's environment, see
+//!   [`crate::trace`]; unset, every byte above stays exactly as documented): each server ->
+//!   client frame message ends with a trailer `[u64 frame seq BE]` after its last band -- the
+//!   same number the frame's ping carries -- placed there rather than in the header so a client
+//!   that walks the bands by count (this page before the trailer existed, the Python harnesses)
+//!   never sees it; the embedded page recognizes it as exactly 8 bytes remaining after the bands
+//!   and answers every such frame, once its bands are painted, with `[3u8][u64 frame seq BE][f64
+//!   display ms BE][f64 receive ms BE]` (25 bytes; the `f64`s are the page's `performance.now()`
+//!   in the `requestAnimationFrame` callback after the frame's `putImageData` calls, and at
+//!   `onmessage` entry). The server accepts opcode 3 whether or not tracing is on and records it
+//!   (`VIEWER_RECEIVED`, `VIEWER_DISPLAYED`) only when it is.
 //!
 //! Hand-rolled HTTP/WebSocket (RFC 6455) rather than a crate dependency, for the same reason
 //! the RFB server is hand-rolled (see the crate docs): the handshake needs only SHA-1 +
@@ -31,16 +51,27 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::server::{
-    FramebufferSource, InputClient, InputEvent, InputHandler, InputMessage, KeyEvent, PointerEvent,
+    dirty_bands, FramebufferSource, InputClient, InputEvent, InputHandler, InputMessage, KeyEvent,
+    PointerEvent,
 };
+use crate::trace;
 
-/// Interval between frame pushes to a connected browser. Same cadence as the RFB server's
-/// `UPDATE_INTERVAL`; unchanged frames are skipped entirely, so idle cost is one
-/// snapshot+compare per tick.
-const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+/// How often the pusher looks for a changed band while it has nothing to send. The framebuffer
+/// is plain guest RAM that Xorg stores into directly (nothing traps per write), so a change can
+/// only be discovered by diffing, and this period bounds how long a visual update waits before it
+/// is noticed: at most one poll, ~5ms on average. One quiet poll is one snapshot plus band
+/// compare, ~0.1-0.25ms at 1024x768 on an Apple Silicon host, so polling at 100 Hz costs ~1-2.5%
+/// of one host core per connected client. (The fixed 50ms tick this replaces paid 25ms of mean
+/// latency on every update, and a 20 fps ceiling on any motion, to save that ~2%.)
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Minimum spacing between two frames sent to one client: the frame-rate ceiling (~60 Hz) a
+/// browser is asked to paint at. Only ever waited for right after a frame went out; a quiet
+/// screen never pays it.
+const MIN_FRAME_SPACING: Duration = Duration::from_millis(16);
 
 /// Longest the pusher waits for the pong acknowledging the previous frame before sending the next
 /// one regardless. Bounds the damage a client that never answers pings can do to its own frame
@@ -333,9 +364,19 @@ impl FrameAcks {
     }
 
     fn ack(&self, seq: u64) {
-        let mut state = self.lock();
-        state.acked = state.acked.max(seq);
-        self.changed.notify_all();
+        // Latency trace: stamp the pong's arrival before taking the lock, write the line after
+        // the pusher has been woken (one relaxed load when tracing is off).
+        let received_ns = trace::enabled().then(trace::now_ns);
+        let previously_acked = {
+            let mut state = self.lock();
+            let previously_acked = state.acked;
+            state.acked = previously_acked.max(seq);
+            self.changed.notify_all();
+            previously_acked
+        };
+        if let Some(t_ns) = received_ns {
+            trace::record_at(trace::FRAME_ACKED, seq, previously_acked, t_ns);
+        }
     }
 
     fn stop(&self) {
@@ -373,34 +414,131 @@ fn serve_websocket<F: FramebufferSource>(
         let acks = Arc::clone(&acks);
         std::thread::spawn(move || {
             let mut pixels = Vec::new();
-            // Pixels of the last frame sent, so unchanged frames are skipped outright.
+            // Pixels of the last frame sent to this client, so the next tick's diff is always
+            // against exactly what is currently on its screen (not just "did anything change").
             let mut sent = Vec::new();
+            let mut sent_dims = (0u16, 0u16);
             let mut message = Vec::new();
             let mut seq = 0u64;
+            let mut last_sent: Option<Instant> = None;
+            // Latency trace only: when the previous poll's snapshot began (`trace::now_ns`
+            // units), carried by a dirty frame's `FRAME_SNAPSHOT` record to bracket the guest's
+            // write between two looks at the framebuffer.
+            let mut previous_poll_ns = 0u64;
             loop {
-                std::thread::sleep(FRAME_INTERVAL);
+                // The previous frame's ack comes first, ahead of any snapshot work: a client that
+                // has not consumed that frame yet gets nothing done on its behalf (at most one
+                // frame in flight, see `FrameAcks`), and the snapshot below is then taken at the
+                // moment the browser is ready for it rather than a poll earlier.
                 if !acks.wait_acked(seq, FRAME_ACK_TIMEOUT) {
                     break;
                 }
-                let (width, height) = framebuffer.dimensions();
+                if let Some(at) = last_sent {
+                    std::thread::sleep(MIN_FRAME_SPACING.saturating_sub(at.elapsed()));
+                }
+                // One relaxed load per poll while tracing is off; the clock is read only when on.
+                let traced = trace::enabled();
+                let poll_ns = if traced { trace::now_ns() } else { 0 };
+                let dims = framebuffer.dimensions();
                 framebuffer.snapshot_into(&mut pixels);
-                if pixels == sent {
+                let stride = usize::from(dims.0) * 4;
+                // Defensive against a transient dims/buffer-length mismatch, matching
+                // `serve_updates`'s identical guard: never index past what was actually snapshotted.
+                let rows = pixels
+                    .len()
+                    .checked_div(stride)
+                    .map_or(0, |rows| u16::try_from(rows).unwrap_or(u16::MAX).min(dims.1));
+                let full = dims != sent_dims || pixels.len() != sent.len();
+                let rects: Vec<(u16, u16)> = if rows == 0 {
+                    Vec::new()
+                } else if full {
+                    vec![(0, rows)]
+                } else {
+                    dirty_bands(&sent, &pixels, stride, rows)
+                };
+                if rects.is_empty() && !full {
+                    // Quiet screen: look again one poll later. Nothing else paces this loop, so
+                    // this wait is all a change ever waits for before it is noticed.
+                    previous_poll_ns = poll_ns;
+                    std::thread::sleep(POLL_INTERVAL);
                     continue;
                 }
-                message.clear();
-                message.extend_from_slice(&width.to_be_bytes());
-                message.extend_from_slice(&height.to_be_bytes());
-                // XRGB8888 little-endian memory order is B,G,R,X; the canvas wants R,G,B,A.
-                for px in pixels.as_chunks::<4>().0 {
-                    message.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
-                }
                 seq += 1;
+                if traced {
+                    trace::record_at(trace::FRAME_SNAPSHOT, seq, previous_poll_ns, poll_ns);
+                    let (first_y, first_height) = rects.first().copied().unwrap_or((0, 0));
+                    trace::record(
+                        trace::FRAME_DIRTY,
+                        seq,
+                        trace::bands_extra(rects.len(), first_y, first_height),
+                    );
+                }
+                previous_poll_ns = poll_ns;
+                message.clear();
+                // Exact size up front: the 6-byte header, then per band its 4-byte header plus
+                // its pixels (RGBA out is the same byte count as BGRX in), then the 8-byte
+                // frame-sequence trailer while tracing is on.
+                message.reserve(
+                    6 + usize::from(traced) * 8
+                        + rects
+                            .iter()
+                            .map(|&(_, band_height)| 4 + usize::from(band_height) * stride)
+                            .sum::<usize>(),
+                );
+                message.extend_from_slice(&dims.0.to_be_bytes());
+                message.extend_from_slice(&dims.1.to_be_bytes());
+                message.extend_from_slice(&u16::try_from(rects.len()).unwrap_or(u16::MAX).to_be_bytes());
+                for &(y, band_height) in &rects {
+                    message.extend_from_slice(&y.to_be_bytes());
+                    message.extend_from_slice(&band_height.to_be_bytes());
+                    let band =
+                        &pixels[usize::from(y) * stride..usize::from(y + band_height) * stride];
+                    // XRGB8888 little-endian memory order is B,G,R,X; the canvas wants R,G,B,A.
+                    // Swizzled as whole little-endian u32 pixels into the band's pre-sized tail
+                    // rather than pushed four bytes at a time: the per-pixel `extend_from_slice`
+                    // was a capacity check plus a 4-byte copy per pixel that never vectorized,
+                    // ~4x the cost of this loop for a full 1024x768 frame (measured on the host).
+                    let start = message.len();
+                    message.resize(start + band.len(), 0);
+                    for (out, px) in message[start..]
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(band.as_chunks::<4>().0)
+                    {
+                        let bgrx = u32::from_le_bytes(*px);
+                        let rgba = ((bgrx >> 16) & 0xff)
+                            | (bgrx & 0xff00)
+                            | ((bgrx & 0xff) << 16)
+                            | 0xff00_0000;
+                        *out = rgba.to_le_bytes();
+                    }
+                }
+                if traced {
+                    // The trace-only trailer (module docs): the frame's sequence number after the
+                    // last band, where a client walking the bands by count never looks.
+                    message.extend_from_slice(&seq.to_be_bytes());
+                    trace::record(
+                        trace::FRAME_ENCODED,
+                        seq,
+                        u64::try_from(message.len()).unwrap_or(u64::MAX),
+                    );
+                }
                 if writer.write_binary(&message).is_err()
                     || writer.write_control(0x9, &seq.to_be_bytes()).is_err()
                 {
                     break;
                 }
+                if traced {
+                    trace::record(
+                        trace::FRAME_SENT,
+                        seq,
+                        u64::try_from(message.len()).unwrap_or(u64::MAX),
+                    );
+                }
+                last_sent = Some(Instant::now());
                 std::mem::swap(&mut sent, &mut pixels);
+                sent_dims = dims;
             }
         })
     };
@@ -459,6 +597,16 @@ fn read_ws_loop(
     acks: &FrameAcks,
     input_client: &mut InputClient<'_>,
 ) -> io::Result<()> {
+    // Latency trace only: this connection's input count, the `seq` of its `INPUT_*` records.
+    let mut input_seq = 0u64;
+    // Permanent guard: this connection's own view of which keysyms are currently down. A
+    // keyup for a keysym that is not down means some link in the chain lost a keydown (or
+    // delivered a release twice) -- the exact failure that leaves a modifier stuck down in
+    // the guest. Counting it here catches it for every client, including ones that do not
+    // run our own viewer page, and the count lands in the runner log rather than in a
+    // browser console nobody has open.
+    let mut held_keysyms = std::collections::HashSet::<u32>::new();
+    let mut stray_keyups = 0u64;
     loop {
         let mut hdr = [0u8; 2];
         match stream.read_exact(&mut hdr) {
@@ -500,22 +648,39 @@ fn read_ws_loop(
             *b ^= mask[i % 4];
         }
         match opcode {
-            // Binary: our input messages.
+            // Binary: our input messages, plus the trace-aware page's display reports.
             0x2 => match payload.first() {
                 Some(1) if payload.len() == 6 => {
+                    let down = payload[1] != 0;
                     let key = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]);
-                    input_client.send(InputEvent::Key(KeyEvent {
-                        down: payload[1] != 0,
-                        key,
-                    }));
+                    if down {
+                        held_keysyms.insert(key);
+                    } else if !held_keysyms.remove(&key) {
+                        stray_keyups += 1;
+                        litebox_util_log::debug!(
+                            keysym:% = key, stray_keyups;
+                            "rfb: keyup for a keysym this client never pressed (lost keydown)"
+                        );
+                    }
+                    deliver_input(
+                        input_client,
+                        InputEvent::Key(KeyEvent { down, key }),
+                        trace::enabled().then(|| trace::key_extra(down, key)),
+                        &mut input_seq,
+                    );
                 }
                 Some(2) if payload.len() == 6 => {
-                    input_client.send(InputEvent::Pointer(PointerEvent {
-                        button_mask: payload[1],
-                        x: u16::from_be_bytes([payload[2], payload[3]]),
-                        y: u16::from_be_bytes([payload[4], payload[5]]),
-                    }));
+                    let button_mask = payload[1];
+                    let x = u16::from_be_bytes([payload[2], payload[3]]);
+                    let y = u16::from_be_bytes([payload[4], payload[5]]);
+                    deliver_input(
+                        input_client,
+                        InputEvent::Pointer(PointerEvent { button_mask, x, y }),
+                        trace::enabled().then(|| trace::pointer_extra(button_mask, x, y)),
+                        &mut input_seq,
+                    );
                 }
+                Some(3) if payload.len() == 25 => record_viewer_report(&payload),
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -527,6 +692,12 @@ fn read_ws_loop(
             0x9 => writer.write_control(0xa, &payload)?,
             // Close -> close with the same payload.
             0x8 => {
+                if !held_keysyms.is_empty() {
+                    litebox_util_log::debug!(
+                        count = held_keysyms.len(), stray_keyups;
+                        "rfb: client closed with keys still down (released by the handler)"
+                    );
+                }
                 input_client.disconnect();
                 writer.try_write_control(0x8, &payload)?;
                 return Ok(());
@@ -552,6 +723,60 @@ fn read_ws_loop(
                 ));
             }
         }
+    }
+}
+
+/// Hands one parsed input message to the runner's handler, wrapped in the latency trace's
+/// `INPUT_RECV` / `INPUT_HANDLED` pair when tracing is on (`extra` is `Some` exactly then, packed
+/// by `trace::key_extra` / `trace::pointer_extra`). The handler runs synchronously on this thread
+/// (the runner's `InputRouter::handle`), so the pair brackets the whole host-side injection, and
+/// `trace::last_input_seq` -- set just before the call -- lets that handler tag its own records
+/// with the same `seq`.
+fn deliver_input(
+    input_client: &InputClient<'_>,
+    event: InputEvent,
+    extra: Option<u64>,
+    input_seq: &mut u64,
+) {
+    let Some(extra) = extra else {
+        input_client.send(event);
+        return;
+    };
+    *input_seq += 1;
+    trace::record(trace::INPUT_RECV, *input_seq, extra);
+    trace::set_last_input_seq(*input_seq);
+    input_client.send(event);
+    trace::record(trace::INPUT_HANDLED, *input_seq, extra);
+}
+
+/// Opcode-3 client message (module docs): `[3u8][u64 frame seq BE][f64 display ms BE][f64 receive
+/// ms BE]`, the trace-aware page's report that a traced frame's bands are painted. Recorded as
+/// `VIEWER_RECEIVED` and `VIEWER_DISPLAYED` (both stamped with the report's arrival here, each
+/// carrying its own page-clock reading in `extra`); ignored while tracing is off. `payload` is
+/// exactly 25 bytes.
+fn record_viewer_report(payload: &[u8]) {
+    if !trace::enabled() {
+        return;
+    }
+    let field = |at: usize| -> [u8; 8] { payload[at..at + 8].try_into().unwrap_or([0; 8]) };
+    let seq = u64::from_be_bytes(field(1));
+    let displayed_us = client_ms_to_us(f64::from_be_bytes(field(9)));
+    let received_us = client_ms_to_us(f64::from_be_bytes(field(17)));
+    let arrived_ns = trace::now_ns();
+    trace::record_at(trace::VIEWER_RECEIVED, seq, received_us, arrived_ns);
+    trace::record_at(trace::VIEWER_DISPLAYED, seq, displayed_us, arrived_ns);
+}
+
+/// The page's `performance.now()` milliseconds as whole microseconds (finer than any browser's
+/// resolution for it); 0 for anything that is not a finite, non-negative number.
+fn client_ms_to_us(ms: f64) -> u64 {
+    if ms.is_finite() && ms >= 0.0 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            (ms * 1000.0) as u64
+        }
+    } else {
+        0
     }
 }
 

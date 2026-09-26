@@ -71,6 +71,15 @@ pub enum WriteError {
     NotForWriting,
     #[error("write would require copy-up into a read-only filesystem")]
     ReadOnlyFileSystem,
+    /// The caller lacks whatever this file's own semantics require of it right now (distinct from
+    /// [`Self::ReadOnlyFileSystem`], which is a property of the mount, not the caller) -- e.g.
+    /// `/proc/[pid]/gid_map` written before `setgroups` denies.
+    #[error("write not permitted by this file's own semantics")]
+    PermissionDenied,
+    /// The written content, or the ordering of this write against earlier ones, violates the
+    /// file's own format -- e.g. a second write to a virtual file only ever accepted once.
+    #[error("write content or ordering is invalid for this file")]
+    InvalidArgument,
     #[error("I/O error")]
     Io,
 }

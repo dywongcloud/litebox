@@ -245,6 +245,7 @@ fn test_vmm_mapping() {
                 NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
                 CreatePagesFlags::empty(),
+                None,
             )
         }
         .unwrap()
@@ -269,6 +270,7 @@ fn test_vmm_mapping() {
                 NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
                 CreatePagesFlags::FIXED_ADDR,
+                None,
             )
         }
         .unwrap()
@@ -395,6 +397,7 @@ fn test_top_down_search_ignores_reserved_page_above_ceiling() {
             NonZeroPageSize::new(PAGE_SIZE).unwrap(),
             VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
             CreatePagesFlags::empty(),
+            None,
         )
     }
     .expect("the entire guest range below TASK_ADDR_MAX is free, so the top-down search should succeed rather than failing outright")

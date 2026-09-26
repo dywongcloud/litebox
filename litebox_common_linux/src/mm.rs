@@ -362,11 +362,18 @@ pub fn sys_madvise<
 
     let addr = addr.to_platform_ptr::<Platform>();
     match advice {
-        crate::MadviseBehavior::Normal
-        | crate::MadviseBehavior::DontFork
-        | crate::MadviseBehavior::DoFork => {
-            // No-op for now, as we don't support fork yet.
-            Ok(())
+        crate::MadviseBehavior::Normal => Ok(()),
+        crate::MadviseBehavior::DontFork | crate::MadviseBehavior::DoFork => {
+            // Records `VM_DONTCOPY` on the mappings; the actual removal from the child's
+            // view happens at fork (`PageManager::dont_fork_child`). Same error contract as
+            // Linux's `madvise_vma_behavior`: `ENOMEM` for a hole in the range. Unlike
+            // `WipeOnFork`/`KeepOnFork`, legal on any mapping, so there is no `EINVAL` arm.
+            let enable = matches!(advice, crate::MadviseBehavior::DontFork);
+            pm.set_dont_fork(addr, aligned_len, enable)
+                .map_err(|error| match error {
+                    litebox::mm::linux::VmemDontForkError::UnAligned => Errno::EINVAL,
+                    litebox::mm::linux::VmemDontForkError::Unmapped(_) => Errno::ENOMEM,
+                })
         }
         // No `mlock` here, so `MADV_DONTNEED_LOCKED` is plain `MADV_DONTNEED`.
         crate::MadviseBehavior::DontNeed | crate::MadviseBehavior::DontNeedLocked => {
@@ -375,7 +382,12 @@ pub fn sys_madvise<
             // from the up-to-date contents of the underlying mapped file (for shared file mappings, shared anonymous mappings,
             // and shmem-based techniques such as System V shared memory segments) or zero-fill-on-demand pages for anonymous private mappings.
             //
-            // Note we do not support shared memory yet, so this is just to discard the pages without removing the mapping.
+            // `Vmem::reset_pages` (litebox/src/mm/linux.rs) implements this per VMA: shared
+            // mappings (file-backed or anonymous) are left untouched since their content is
+            // never discarded, private anonymous pages are dropped and refault zero, and
+            // private file-backed pages return `FileBacked` (mapped to `EINVAL` below)
+            // rather than either panicking or silently substituting zero-fill for real file
+            // content this layer cannot yet refault (see that function's own doc comment).
             unsafe { pm.reset_pages(addr, aligned_len, false) }.map_err(Errno::from)
         }
         crate::MadviseBehavior::Free => {

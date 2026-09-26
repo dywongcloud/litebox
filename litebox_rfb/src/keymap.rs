@@ -12,6 +12,11 @@
 //! Remmina, macOS Screen Sharing) send the `Shift_L`/`Shift_R` keysym down *before* a shifted
 //! symbol's keysym, so the guest's own keymap applies the shift -- the bridge never needs to
 //! synthesize modifier presses itself, only pass them through.
+//!
+//! The three lock keys (`CapsLock` 0xffe5, `NumLock` 0xff7f, `ScrollLock` 0xff14) are here
+//! because the guest is the only thing that can hold lock state: a client sends a press and
+//! a release and the guest's X server latches the lock itself. There is nothing for the
+//! bridge to track.
 
 /// Linux `KEY_*` codes used by the table (`linux/input-event-codes.h`).
 mod key {
@@ -99,6 +104,8 @@ mod key {
     pub const KPENTER: u16 = 96;
     pub const LEFTMETA: u16 = 125;
     pub const RIGHTMETA: u16 = 126;
+    pub const NUMLOCK: u16 = 69;
+    pub const SCROLLLOCK: u16 = 70;
 }
 
 /// Map an X11 keysym (as delivered by an RFB `KeyEvent`) to the evdev `KEY_*` code of the US
@@ -192,10 +199,15 @@ pub fn keysym_to_evdev(keysym: u32) -> Option<u16> {
         0xffe3 => k::LEFTCTRL,
         0xffe4 => k::RIGHTCTRL,
         0xffe5 => k::CAPSLOCK,
+        0xff7f => k::NUMLOCK,
+        0xff14 => k::SCROLLLOCK,
         0xffe9 => k::LEFTALT,
         0xffea => k::RIGHTALT,
-        0xffeb => k::LEFTMETA,
-        0xffec => k::RIGHTMETA,
+        // Both conventions reach the guest's Meta: `XK_Meta_L/R` (0xffe7/0xffe8) is what a
+        // browser reports as Meta, `XK_Super_L/R` (0xffeb/0xffec) is what Linux keymaps
+        // emit. A viewer that sent plain `Meta` (0xffe7) used to be dropped outright.
+        0xffe7 | 0xffeb => k::LEFTMETA,
+        0xffe8 | 0xffec => k::RIGHTMETA,
         0xffff => k::DELETE,
         _ => return None,
     })

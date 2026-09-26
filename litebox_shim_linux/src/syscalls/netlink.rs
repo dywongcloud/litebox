@@ -42,6 +42,12 @@ pub(crate) struct NetlinkSocket<Platform: RawSyncPrimitivesProvider> {
     pollee: Pollee<Platform>,
     interface_addr: [u8; 4],
     gateway_addr: [u8; 4],
+    /// Whether the task that opened this socket belongs to an isolated `CLONE_NEWNET` namespace
+    /// (see PRD row `chromium-netns-isolated-loopback`). When set, every dump answers with that
+    /// namespace's complete, correct view -- `lo` alone, administratively down, no addresses or
+    /// routes -- regardless of `interface_addr`/`gateway_addr`, which then describe a host
+    /// interface this socket's own task cannot see.
+    isolated: bool,
 }
 
 // rtnetlink constants (see `linux/rtnetlink.h`, `linux/netlink.h`, `linux/if.h`).
@@ -172,6 +178,19 @@ fn build_link_dump(out: &mut Vec<u8>, seq: u32) {
     push_msg(out, NLMSG_DONE, seq, &0i32.to_ne_bytes());
 }
 
+/// Build the `RTM_GETLINK` reply inside an isolated `CLONE_NEWNET` namespace (see PRD row
+/// `chromium-netns-isolated-loopback`): `lo` alone, administratively down -- `IFF_LOOPBACK` only,
+/// no `IFF_UP`/`IFF_RUNNING` -- matching a freshly created namespace Chromium never brings up
+/// because it never needs to, then `NLMSG_DONE`.
+fn build_isolated_link_dump(out: &mut Vec<u8>, seq: u32) {
+    let mut body = ifinfomsg(ARPHRD_LOOPBACK, 1, IFF_LOOPBACK);
+    push_attr(&mut body, IFLA_IFNAME, b"lo\0");
+    push_attr(&mut body, IFLA_ADDRESS, &[0u8; 6]);
+    push_msg(out, RTM_NEWLINK, seq, &body);
+
+    push_msg(out, NLMSG_DONE, seq, &0i32.to_ne_bytes());
+}
+
 /// Build the `RTM_GETADDR` reply: one `RTM_NEWADDR` per address, then `NLMSG_DONE`.
 fn build_addr_dump(out: &mut Vec<u8>, seq: u32, eth_addr: [u8; 4]) {
     // lo: 127.0.0.1/8, host scope
@@ -243,12 +262,17 @@ fn build_route_dump(out: &mut Vec<u8>, seq: u32, eth_addr: [u8; 4], gateway: [u8
 }
 
 impl<Platform: ShimPlatform> NetlinkSocket<Platform> {
-    pub(crate) fn new(interface_ip: core::net::Ipv4Addr, gateway_ip: core::net::Ipv4Addr) -> Self {
+    pub(crate) fn new(
+        interface_ip: core::net::Ipv4Addr,
+        gateway_ip: core::net::Ipv4Addr,
+        isolated: bool,
+    ) -> Self {
         Self {
             pending: Mutex::new(Vec::new()),
             pollee: Pollee::new(),
             interface_addr: interface_ip.octets(),
             gateway_addr: gateway_ip.octets(),
+            isolated,
         }
     }
 
@@ -267,7 +291,15 @@ impl<Platform: ShimPlatform> NetlinkSocket<Platform> {
             // The request family (`rtgenmsg`/`rtmsg` both start with it) follows the header.
             let family = req.get(off + 16).copied().unwrap_or(AF_UNSPEC);
             match nlmsg_type {
+                RTM_GETLINK if self.isolated => build_isolated_link_dump(&mut out, seq),
                 RTM_GETLINK => build_link_dump(&mut out, seq),
+                // An isolated namespace has no addresses and no routes at all (see
+                // `build_isolated_link_dump`'s own doc comment) -- an empty dump for either dump
+                // type, exactly like a request for a route family this model never populates
+                // (`AF_INET6`) already answers with below.
+                RTM_GETADDR | RTM_GETROUTE if self.isolated => {
+                    push_msg(&mut out, NLMSG_DONE, seq, &0i32.to_ne_bytes());
+                }
                 RTM_GETADDR => build_addr_dump(&mut out, seq, self.interface_addr),
                 RTM_GETROUTE if family != AF_INET6 => {
                     build_route_dump(&mut out, seq, self.interface_addr, self.gateway_addr);

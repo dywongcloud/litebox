@@ -132,6 +132,9 @@ pub(super) const NO_EXCEPTION: ExceptionInfo = ExceptionInfo {
     fault_address: 0,
     esr: 0,
     kernel_mode: false,
+    // Sentinel "no exception yet" value, not a fault-time capture site --
+    // `EMPTY` (not `Default::default()`) because this is a top-level `const`.
+    backtrace: litebox::shim::FrameBacktrace::EMPTY,
 };
 
 /// Maps an aarch64 exception class to the signal Linux raises for it, together
@@ -193,6 +196,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        frame_sigmask: SigSet,
     ) -> Result<(), DeliverFault> {
         // The kernel falls back to the vDSO's `sigtramp` when the guest
         // supplies no `sa_restorer`. LiteBox exposes no vDSO to the guest, but
@@ -221,7 +225,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 flags: 0,
                 link: 0, // core::ptr::null_mut()
                 stack: self.altstack.get(),
-                sigmask: self.blocked.get(),
+                sigmask: frame_sigmask,
                 __unused: [0; 1024 / 8 - size_of::<SigSet>()],
                 __align_pad: [0; 8],
                 mcontext: Sigcontext {

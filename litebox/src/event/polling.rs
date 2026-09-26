@@ -137,6 +137,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
         self.subject.unregister_observer(observer);
     }
 
+    /// Whether at least one live observer is registered (see [`Subject::has_observers`]).
+    pub fn has_observers(&self) -> bool {
+        self.subject.has_observers()
+    }
+
     /// Notify all registered observers with the given events.
     pub fn notify_observers(&self, events: Events) {
         self.subject.notify_observers(events);

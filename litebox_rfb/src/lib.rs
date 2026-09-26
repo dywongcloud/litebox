@@ -24,6 +24,7 @@
 pub mod keymap;
 mod proto;
 mod server;
+pub mod trace;
 pub mod web;
 
 pub use server::{

@@ -189,14 +189,24 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             futex_addr,
             expected_value,
             bitset,
+            move || futex_addr.read_at_offset(0),
             || {},
         )
     }
 
-    /// Performs a futex wait using `key` as the wait-queue identity and `futex_addr` only for the
-    /// atomic value check. `after_register` runs after the waiter is visible but before this method
-    /// blocks, allowing a caller to release a mapping lock that made key derivation and insertion
-    /// atomic with respect to unmap/remap.
+    /// Performs a futex wait using `key` as the wait-queue identity and `futex_addr` only for
+    /// alignment; `read_current_value` performs the actual atomic value check. `after_register`
+    /// runs after the waiter is visible but before this method blocks, allowing a caller to
+    /// release a mapping lock that made key derivation and insertion atomic with respect to
+    /// unmap/remap.
+    ///
+    /// `read_current_value` is called from inside that same atomic region (before
+    /// `after_register`), so a caller already holding a mapping-lock proof of validity across
+    /// this whole call (as `after_register` implies) should read through that proof directly
+    /// (e.g. [`crate::mm::MappingReadGuard::read_u32_unlocked`]) rather than through a path that
+    /// takes the same lock again -- doing so would self-deadlock behind a concurrently queued
+    /// writer the moment a second, nested read share is refused. [`Self::wait`] has no such proof
+    /// to reuse and reads normally instead.
     pub fn wait_keyed(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -204,6 +214,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         futex_addr: Platform::RawMutPointer<u32>,
         expected_value: u32,
         bitset: Option<NonZeroU32>,
+        read_current_value: impl FnOnce() -> Option<u32>,
         after_register: impl FnOnce(),
     ) -> Result<(), FutexError> {
         let bitset = bitset.unwrap_or(ALL_BITS).get();
@@ -230,7 +241,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // written before that wake.
         {
             let _transaction = bucket.transaction.lock();
-            let value = futex_addr.read_at_offset(0).ok_or(FutexError::Fault)?;
+            let value = read_current_value().ok_or(FutexError::Fault)?;
             if value != expected_value {
                 return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
             }

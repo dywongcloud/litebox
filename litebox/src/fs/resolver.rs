@@ -620,11 +620,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 if isize::try_from(new_position).is_err() {
                     return Err(SeekError::InvalidOffset);
                 }
-                // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
-                // file types may not. Model that distinction instead of using one resolver rule.
-                if new_position > file_len {
-                    return Err(SeekError::InvalidOffset);
-                }
+                // Linux lets a regular file's offset be set past its current size for any
+                // whence (SEEK_SET/SEEK_CUR/SEEK_END alike): a later read there just returns
+                // EOF, a later write there leaves a hole. Rejecting that here used to break
+                // every position-based backend whose `file_status().size` does not track its
+                // real readable length -- `/proc`'s computed files report a fixed `size: 0`
+                // (see `proc.rs`'s own `file_status`, deliberately: real `/proc` does the same,
+                // since content is computed rather than stored), so seeking to any real,
+                // in-bounds offset on one of them -- e.g. the offset-restoring `lseek` a large
+                // chunked `read()` issues after a successful `pread` -- would spuriously fail.
                 entry.entry.position = new_position;
                 Ok(new_position)
             }

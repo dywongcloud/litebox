@@ -10,6 +10,7 @@
 // NOTE: There is a separate `utilities` module in this crate meant for crate-internal utilities.
 
 pub mod id_pool;
+pub mod ids;
 pub mod rng;
 
 /// An extension trait that adds `trunc` to truncate integers to a specific size of the same

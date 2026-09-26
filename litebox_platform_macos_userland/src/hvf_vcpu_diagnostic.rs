@@ -356,7 +356,7 @@ impl DiagnosticResources {
             address_space.deregister_vcpu_participant(&mut participant)?;
         }
         if let Some(claim) = self.claim.take() {
-            let mut unmap = address_space.unmap(&claim, claim.range())?;
+            let mut unmap = address_space.unmap(&claim, claim.range(), false)?;
             address_space.acknowledge_retirement(&mut unmap.retirement)?;
         }
         address_space.destroy()?;
@@ -759,7 +759,7 @@ fn reservation_semantics(
         && hvc_immediate(&ordinary_after_synchronization) == Some(SYSCALL_HVC_IMMEDIATE)
         && handle.is_live();
 
-    let mut unmap = address_space.unmap(&mutation.claim, mutation.claim.range())?;
+    let mut unmap = address_space.unmap(&mutation.claim, mutation.claim.range(), false)?;
     handle.synchronize(resources.attachment()?)?;
     address_space.acknowledge_retirement(&mut unmap.retirement)?;
 
@@ -800,7 +800,7 @@ fn stale_attachment(resources: &DiagnosticResources) -> Result<bool, HvfVcpuDiag
     let fresh = handle.run(resources.attachment()?, &diagnostic_architectural_state())?;
     let resumed = hvc_immediate(&fresh) == Some(SYSCALL_HVC_IMMEDIATE);
     address_space.acknowledge_retirement(&mut mutation.retirement)?;
-    let mut unmap = address_space.unmap(&mutation.claim, mutation.claim.range())?;
+    let mut unmap = address_space.unmap(&mutation.claim, mutation.claim.range(), false)?;
     let settled = handle.run(resources.attachment()?, &diagnostic_architectural_state())?;
     address_space.acknowledge_retirement(&mut unmap.retirement)?;
     if rejected
@@ -891,7 +891,7 @@ fn collective_retirement(resources: &DiagnosticResources) -> Result<bool, HvfVcp
     }
     let claimed = address_space.acknowledge_retirement(&mut mutation.retirement)?;
 
-    let mut unmap = address_space.unmap(&mutation.claim, mutation.claim.range())?;
+    let mut unmap = address_space.unmap(&mutation.claim, mutation.claim.range(), false)?;
     let unmap_pending_rejected = matches!(
         address_space.acknowledge_retirement(&mut unmap.retirement),
         Err(HvfMemoryError::RetirementParticipantsPending { pending: 1, .. })

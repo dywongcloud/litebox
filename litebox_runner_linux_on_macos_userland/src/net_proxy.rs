@@ -588,6 +588,15 @@ impl std::io::Write for Upstream {
 enum ConnState {
     /// Accumulating the request head until `\r\n\r\n`.
     ReadingRequest(Vec<u8>),
+    /// The request head is complete and a helper thread is running `open_upstream` (DNS lookup,
+    /// `TcpStream::connect_timeout`, and -- for HTTPS/`CONNECT` -- the TLS handshake) off the
+    /// shared relay loop, so a slow or unreachable origin cannot stall every other connection's
+    /// `step`. `body` is whatever request-body bytes had already arrived past the head in the
+    /// same read that completed it; it is queued onto the upstream once dialing lands.
+    Dialing {
+        result: std::sync::mpsc::Receiver<Option<(Upstream, Vec<u8>, Vec<u8>)>>,
+        body: Vec<u8>,
+    },
     /// Pumping bytes both ways.
     Relaying,
 }
@@ -615,7 +624,11 @@ struct Conn {
 /// Drive the proxy forever. Runs on its own host thread, spawned before the sandbox comes up
 /// (thread creation is unmediated, and the widened profile keeps `connect` working after).
 pub fn serve(listener: &GuestListener<Platform>, resolvers: Vec<Ipv4Addr>, tls: Arc<ClientConfig>) {
-    let resolver = Resolver::new(resolvers);
+    // `Arc` (rather than a plain local) so each new connection's dial can be cloned into its own
+    // short-lived helper thread -- see `ConnState::Dialing`. `Resolver`'s only mutable state is
+    // its `Mutex`-guarded cache, already safe to share across threads (`serve_dns` below already
+    // does exactly this, across a fixed worker pool).
+    let resolver = Arc::new(Resolver::new(resolvers));
     let mut conns: Vec<Conn> = Vec::new();
     let mut scratch = vec![0u8; 64 * 1024];
     loop {
@@ -655,7 +668,7 @@ enum StepOutcome {
 
 fn step(
     conn: &mut Conn,
-    resolver: &Resolver,
+    resolver: &Arc<Resolver>,
     tls: &Arc<ClientConfig>,
     scratch: &mut [u8],
 ) -> StepOutcome {
@@ -671,18 +684,21 @@ fn step(
                         head:% = String::from_utf8_lossy(&head);
                         "net-proxy: request head complete"
                     );
-                    let Some((stream, forward, reply)) = open_upstream(&head, resolver, tls) else {
-                        let _ = conn
-                            .guest
-                            .try_write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
-                        return StepOutcome::Done;
-                    };
-                    litebox_util_log::debug!("net-proxy: upstream dialed");
-                    conn.host = Some(stream);
-                    conn.to_host = forward;
-                    conn.to_host.extend_from_slice(&body);
-                    conn.to_guest = reply;
-                    conn.state = ConnState::Relaying;
+                    // DNS + `connect` + (for HTTPS) the TLS handshake can each take real wall
+                    // time (up to `open_upstream`'s own 20s total deadline) and must not run on
+                    // this thread: every other connection's `step` is called from the same
+                    // `retain_mut` pass in `serve`, so a blocking call here would freeze all of
+                    // them until this one dial finishes. Run it on a short-lived helper thread
+                    // instead and pick the result back up, non-blockingly, from `ConnState::
+                    // Dialing` below. `resolver`'s cache is `Mutex`-guarded and `tls` is already
+                    // `Arc`, so both are safe to share with the helper.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let resolver = Arc::clone(resolver);
+                    let tls = Arc::clone(tls);
+                    std::thread::spawn(move || {
+                        let _ = tx.send(open_upstream(&head, &resolver, &tls));
+                    });
+                    conn.state = ConnState::Dialing { result: rx, body };
                 } else if head.len() > 64 * 1024 {
                     // A request head this large is not a real browser's; drop it.
                     return StepOutcome::Done;
@@ -691,6 +707,35 @@ fn step(
             }
             StreamRead::Empty => StepOutcome::Idle,
             StreamRead::Closed => StepOutcome::Done,
+        },
+        ConnState::Dialing { result, body } => match result.try_recv() {
+            Ok(Some((stream, forward, reply))) => {
+                litebox_util_log::debug!("net-proxy: upstream dialed");
+                let mut to_host = forward;
+                to_host.extend_from_slice(body);
+                conn.host = Some(stream);
+                conn.to_host = to_host;
+                conn.to_guest = reply;
+                conn.state = ConnState::Relaying;
+                StepOutcome::Progressed
+            }
+            Ok(None) => {
+                let _ = conn
+                    .guest
+                    .try_write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+                StepOutcome::Done
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => StepOutcome::Idle,
+            // The helper thread is gone without sending a result (it can only panic on a `?`-free
+            // path that itself doesn't unwind, so this is defensive, not expected) -- fail the
+            // connection the same way a real dial failure would rather than leaving it in
+            // `Dialing` forever.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let _ = conn
+                    .guest
+                    .try_write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+                StepOutcome::Done
+            }
         },
         ConnState::Relaying => {
             let Some(host) = conn.host.as_mut() else {

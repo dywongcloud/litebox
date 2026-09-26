@@ -347,6 +347,12 @@ impl GuestThreadState {
                 fault_address: 0,
                 esr: 0,
                 kernel_mode: false,
+                // This is just a placeholder sentinel value for "no exception
+                // pending" (overwritten with a real `ExceptionInfo` before
+                // ever being read) -- not a fault-time capture site, so there
+                // is nothing to walk here. `EMPTY` (not `Default::default()`)
+                // because this is a `const fn`.
+                backtrace: litebox::shim::FrameBacktrace::EMPTY,
             },
         }
     }

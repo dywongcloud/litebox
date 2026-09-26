@@ -170,13 +170,18 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
     }
 
     /// Initialize the stack for the new process.
+    ///
+    /// Returns the exact final auxiliary vector written onto the stack (including the
+    /// stack-address-dependent `AT_RANDOM`, only known once its 16 bytes are actually pushed) --
+    /// the shim stashes this per-process for `/proc/<pid>/auxv` to render later, since it is
+    /// otherwise fully consumed here and never seen again.
     pub(super) fn init(
         &mut self,
         argv: Vec<CString>,
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
         platform: &impl litebox::platform::CrngProvider,
-    ) -> Option<()> {
+    ) -> Option<AuxVec> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
         self.stack_top
@@ -204,12 +209,13 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         let final_pos = self.pos.checked_sub(size)?;
         self.pos -= final_pos - align_down(final_pos, Self::STACK_ALIGNMENT);
 
+        let final_aux = aux.clone();
         self.push_aux(aux)?;
         self.push_pointers(envp)?;
         self.push_pointers(argvp)?;
 
         self.push_usize(argv.len())?;
         assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
-        Some(())
+        Some(final_aux)
     }
 }

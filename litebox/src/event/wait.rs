@@ -226,6 +226,21 @@ pub struct ThreadHandle<Platform: RawSyncPrimitivesProvider + ThreadProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform> {
+    /// Whether the thread is currently blocked in [`WaitContext::wait_until`] (or
+    /// [`WaitContext::sleep`]) -- an interruptible sleep, as opposed to running guest or host
+    /// code. A point-in-time reading with no synchronization guarantee beyond the load itself:
+    /// meant for reporting (a `/proc/<pid>/stat` state letter), never for a decision that has to
+    /// stay true afterwards.
+    pub fn is_waiting(&self) -> bool {
+        ThreadState(
+            self.waker
+                .0
+                .condvar
+                .underlying_atomic()
+                .load(Ordering::Relaxed),
+        ) == ThreadState::WAITING
+    }
+
     /// Interrupts the thread, whether it is waiting or running guest code.
     ///
     /// If it is waiting in [`WaitContext::wait_until`] or

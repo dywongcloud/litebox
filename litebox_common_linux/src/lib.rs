@@ -2311,6 +2311,12 @@ pub enum PrctlArg {
     SetKeepCaps(bool),
     /// `PR_GET_KEEPCAPS`: see `SetKeepCaps`.
     GetKeepCaps,
+    /// `PR_SET_CHILD_SUBREAPER`: marks (or unmarks) the calling process as a reaper of its own
+    /// orphaned descendants, matching Linux's `signal->is_child_subreaper`. Not inherited by
+    /// `fork`/`clone`; preserved across `execve`.
+    SetChildSubreaper(bool),
+    /// `PR_GET_CHILD_SUBREAPER`: writes back `0`/`1` through the pointer.
+    GetChildSubreaper(UserPtrMut<i32>),
 }
 
 #[repr(i32)]
@@ -3194,6 +3200,18 @@ pub enum SyscallRequest {
         options: i32,
         rusage: usize,
     },
+    /// `waitid(idtype, id, infop, options, rusage)`: like `wait4`, but selects children by kind
+    /// (`P_ALL`/`P_PID`/`P_PGID`) rather than one overloaded `pid`, can report a match without
+    /// reaping it (`WNOWAIT`), and always fills a `siginfo_t` rather than an `int` status word.
+    /// `rusage` is carried as a raw address for the same reason `Wait4::rusage` is -- see
+    /// `Task::sys_waitid`.
+    Waitid {
+        idtype: i32,
+        id: i32,
+        infop: UserPtrMut<signal::Siginfo>,
+        options: i32,
+        rusage: usize,
+    },
     Getuid,
     Geteuid,
     Getgid,
@@ -3725,6 +3743,13 @@ impl SyscallRequest {
                 options,
                 rusage
             }),
+            Sysno::waitid => sys_req!(Waitid {
+                idtype,
+                id,
+                infop:*,
+                options,
+                rusage
+            }),
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
@@ -3892,6 +3917,15 @@ impl SyscallRequest {
                                 args: PrctlArg::GetKeepCaps,
                             }
                         }
+                        PrctlOption::SetChildSubreaper => {
+                            let value: usize = ctx.sys_req_arg(1);
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetChildSubreaper(value != 0),
+                            }
+                        }
+                        PrctlOption::GetChildSubreaper => SyscallRequest::Prctl {
+                            args: PrctlArg::GetChildSubreaper(ctx.sys_req_ptr(1)),
+                        },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
@@ -4392,12 +4426,13 @@ pub struct PtRegs {
 /// on-the-wire register layouts a `PTRACE_GETREGSET`/`PTRACE_SETREGSET`
 /// exchanges for each supported `NT_*` type.
 ///
-/// Only [`NT_PRSTATUS`] (general-purpose registers) and [`NT_ARM_TLS`]
-/// (`TPIDR_EL0`) are supported. Any other regset is a distinct, real Linux
-/// type this shim does not populate (`NT_PRFPREG`/`NT_ARM_VFP` for FPSIMD
-/// state, `NT_ARM_HW_BREAK`/`NT_ARM_HW_WATCH` for hardware debug state, and
-/// so on) -- callers must reject those explicitly (`ENODEV`), never return
-/// zeroed or partially-populated data for them.
+/// [`NT_PRSTATUS`] (general-purpose registers), [`NT_ARM_TLS`]
+/// (`TPIDR_EL0`), and [`NT_PRFPREG`] (FPSIMD state) are supported. Any other
+/// regset is a distinct, real Linux type this shim does not populate
+/// (`NT_ARM_VFP`'s 32-bit-compat cousin, `NT_ARM_HW_BREAK`/`NT_ARM_HW_WATCH`
+/// for hardware debug state, and so on) -- callers must reject those
+/// explicitly (`ENODEV`), never return zeroed or partially-populated data for
+/// them.
 #[cfg(target_arch = "aarch64")]
 pub mod ptrace {
     use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -4417,6 +4452,13 @@ pub mod ptrace {
     pub const PTRACE_GETREGSET: i64 = 0x4204;
     /// Write a register set (`data` is a `struct iovec *`).
     pub const PTRACE_SETREGSET: i64 = 0x4205;
+    /// Read one machine word from the tracee's address space at `addr`; the raw kernel syscall
+    /// (unlike the historical glibc wrapper) writes the result through `data`, a pointer in the
+    /// tracer's own address space.
+    pub const PTRACE_PEEKDATA: i64 = 2;
+    /// Write one machine word (`data`, taken as a value here, not a pointer) into the tracee's
+    /// address space at `addr`.
+    pub const PTRACE_POKEDATA: i64 = 5;
 
     /// General-purpose registers: `x0`-`x30`, `sp`, `pc`, `pstate` -- Linux's
     /// `struct user_pt_regs`, 34 64-bit words / 272 bytes. Field-for-field
@@ -4425,6 +4467,9 @@ pub mod ptrace {
     pub const NT_PRSTATUS: i32 = 1;
     /// A single `u64`: the thread pointer, `TPIDR_EL0`.
     pub const NT_ARM_TLS: i32 = 0x401;
+    /// FPSIMD register file: `v0`-`v31` plus `FPSR`/`FPCR` -- Linux's
+    /// `struct user_fpsimd_state`, 528 bytes.
+    pub const NT_PRFPREG: i32 = 2;
 
     /// The `NT_PRSTATUS` wire layout: Linux's `struct user_pt_regs`.
     #[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
@@ -4466,6 +4511,45 @@ pub mod ptrace {
             ctx.sp = self.sp as usize;
             ctx.pc = self.pc as usize;
             ctx.pstate = self.pstate;
+        }
+    }
+
+    /// The `NT_PRFPREG` wire layout: Linux's `struct user_fpsimd_state`.
+    /// Vector registers precede `fpsr`/`fpcr` -- the ptrace ABI order, distinct
+    /// from the guest-facing signal-frame `fpsimd_context` record (which puts
+    /// `fpsr`/`fpcr` first).
+    #[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+    #[repr(C)]
+    pub struct UserFpsimdState {
+        pub vregs: [u128; 32],
+        pub fpsr: u32,
+        pub fpcr: u32,
+        pub __reserved: [u32; 2],
+    }
+
+    const _: () = assert!(core::mem::size_of::<UserFpsimdState>() == 528);
+
+    impl UserFpsimdState {
+        pub const SIZE: usize = core::mem::size_of::<Self>();
+    }
+
+    impl From<&litebox::platform::FpSimdState64> for UserFpsimdState {
+        fn from(state: &litebox::platform::FpSimdState64) -> Self {
+            Self {
+                vregs: state.v,
+                fpsr: state.fpsr,
+                fpcr: state.fpcr,
+                __reserved: [0; 2],
+            }
+        }
+    }
+
+    impl UserFpsimdState {
+        /// Applies this register set onto `fp`.
+        pub fn write_into(&self, fp: &mut litebox::platform::FpSimdState64) {
+            fp.v = self.vregs;
+            fp.fpsr = self.fpsr;
+            fp.fpcr = self.fpcr;
         }
     }
 }

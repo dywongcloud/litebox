@@ -562,42 +562,142 @@ hv_return_t litebox_hvf_vcpu_get_arch_state(
     return hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &state->far_el1);
 }
 
+/*
+ * Resident-register cache install mask (mirrored by `hvf_sdk.rs`'s
+ * `install_mask`): bits 0..30 select X0..X30, the rest one guest-visible
+ * register (group) each. A masked install issues only the hv_vcpu_set_* calls
+ * its mask selects, in the order of the full install below; every register it
+ * does not select keeps the value the vCPU already holds.
+ */
+#define LITEBOX_HVF_INSTALL_SP_EL0 (UINT64_C(1) << 31)
+#define LITEBOX_HVF_INSTALL_PC (UINT64_C(1) << 32)
+#define LITEBOX_HVF_INSTALL_CPSR (UINT64_C(1) << 33)
+#define LITEBOX_HVF_INSTALL_TPIDR_EL0 (UINT64_C(1) << 34)
+#define LITEBOX_HVF_INSTALL_SIMD (UINT64_C(1) << 35) /* Q0-Q31, FPCR, FPSR */
+#define LITEBOX_HVF_INSTALL_SP_EL1 (UINT64_C(1) << 36)
+#define LITEBOX_HVF_INSTALL_SPSR_EL1 (UINT64_C(1) << 37)
+#define LITEBOX_HVF_INSTALL_ELR_EL1 (UINT64_C(1) << 38)
+#define LITEBOX_HVF_INSTALL_ESR_EL1 (UINT64_C(1) << 39)
+#define LITEBOX_HVF_INSTALL_FAR_EL1 (UINT64_C(1) << 40)
+#define LITEBOX_HVF_INSTALL_ALL ((UINT64_C(1) << 41) - 1)
+
+hv_return_t litebox_hvf_vcpu_install_arch_state(
+    uint64_t identifier, const litebox_hvf_arch_state_t *state, uint64_t mask) {
+    if (!litebox_hvf_arch_state_valid(state) ||
+        (mask & ~LITEBOX_HVF_INSTALL_ALL) != 0) {
+        return HV_BAD_ARGUMENT;
+    }
+    hv_vcpu_t vcpu = (hv_vcpu_t)identifier;
+    for (size_t index = 0; index < 31; ++index) {
+        if ((mask & (UINT64_C(1) << index)) != 0) {
+            LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, litebox_general_regs[index],
+                                            state->x[index]));
+        }
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_SIMD) != 0) {
+        for (size_t index = 0; index < 32; ++index) {
+            hv_simd_fp_uchar16_t value;
+            memcpy(&value, state->q[index].bytes, sizeof(value));
+            LITEBOX_HVF_TRY(
+                hv_vcpu_set_simd_fp_reg(vcpu, litebox_simd_regs[index], value));
+        }
+        LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, HV_REG_FPCR, state->fpcr));
+        LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, HV_REG_FPSR, state->fpsr));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_TPIDR_EL0) != 0) {
+        LITEBOX_HVF_TRY(
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, state->tpidr_el0));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_SP_EL0) != 0) {
+        LITEBOX_HVF_TRY(
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, state->sp_el0));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_SP_EL1) != 0) {
+        LITEBOX_HVF_TRY(
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, state->sp_el1));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_PC) != 0) {
+        LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, HV_REG_PC, state->pc));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_CPSR) != 0) {
+        LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, state->cpsr));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_SPSR_EL1) != 0) {
+        LITEBOX_HVF_TRY(
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, state->spsr_el1));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_ELR_EL1) != 0) {
+        LITEBOX_HVF_TRY(
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, state->elr_el1));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_ESR_EL1) != 0) {
+        LITEBOX_HVF_TRY(
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, state->esr_el1));
+    }
+    if ((mask & LITEBOX_HVF_INSTALL_FAR_EL1) != 0) {
+        LITEBOX_HVF_TRY(
+            hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, state->far_el1));
+    }
+    return HV_SUCCESS;
+}
+
+/* The full install followed by the full 74-register readback (verify mode). */
 hv_return_t litebox_hvf_vcpu_set_arch_state(
     uint64_t identifier, const litebox_hvf_arch_state_t *state,
     litebox_hvf_arch_state_t *readback) {
     if (!litebox_hvf_arch_state_valid(state) || readback == NULL) {
         return HV_BAD_ARGUMENT;
     }
+    LITEBOX_HVF_TRY(litebox_hvf_vcpu_install_arch_state(
+        identifier, state, LITEBOX_HVF_INSTALL_ALL));
+    return litebox_hvf_vcpu_get_arch_state(identifier, readback);
+}
+
+/*
+ * The exit read: X0..X30, SP_EL0, PC, CPSR, SPSR_EL1, ELR_EL1, ESR_EL1,
+ * FAR_EL1 and TPIDR_EL0 (39 gets) into an already-initialized *state. Q0-Q31,
+ * FPCR, FPSR and SP_EL1 are left exactly as the caller passed them.
+ */
+hv_return_t litebox_hvf_vcpu_read_exit_state(
+    uint64_t identifier, litebox_hvf_arch_state_t *state) {
+    if (!litebox_hvf_arch_state_valid(state)) {
+        return HV_BAD_ARGUMENT;
+    }
     hv_vcpu_t vcpu = (hv_vcpu_t)identifier;
     for (size_t index = 0; index < 31; ++index) {
         LITEBOX_HVF_TRY(
-            hv_vcpu_set_reg(vcpu, litebox_general_regs[index], state->x[index]));
+            hv_vcpu_get_reg(vcpu, litebox_general_regs[index], &state->x[index]));
     }
+    LITEBOX_HVF_TRY(
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, &state->tpidr_el0));
+    LITEBOX_HVF_TRY(
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &state->sp_el0));
+    LITEBOX_HVF_TRY(hv_vcpu_get_reg(vcpu, HV_REG_PC, &state->pc));
+    LITEBOX_HVF_TRY(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &state->cpsr));
+    LITEBOX_HVF_TRY(
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &state->spsr_el1));
+    LITEBOX_HVF_TRY(
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &state->elr_el1));
+    LITEBOX_HVF_TRY(
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &state->esr_el1));
+    return hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &state->far_el1);
+}
+
+/* The lazily read SIMD/FP file: Q0-Q31, FPCR and FPSR (34 gets). */
+hv_return_t litebox_hvf_vcpu_get_simd_state(
+    uint64_t identifier, litebox_hvf_arch_state_t *state) {
+    if (!litebox_hvf_arch_state_valid(state)) {
+        return HV_BAD_ARGUMENT;
+    }
+    hv_vcpu_t vcpu = (hv_vcpu_t)identifier;
     for (size_t index = 0; index < 32; ++index) {
         hv_simd_fp_uchar16_t value;
-        memcpy(&value, state->q[index].bytes, sizeof(value));
         LITEBOX_HVF_TRY(
-            hv_vcpu_set_simd_fp_reg(vcpu, litebox_simd_regs[index], value));
+            hv_vcpu_get_simd_fp_reg(vcpu, litebox_simd_regs[index], &value));
+        memcpy(state->q[index].bytes, &value, sizeof(value));
     }
-    LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, HV_REG_FPCR, state->fpcr));
-    LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, HV_REG_FPSR, state->fpsr));
-    LITEBOX_HVF_TRY(
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, state->tpidr_el0));
-    LITEBOX_HVF_TRY(
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, state->sp_el0));
-    LITEBOX_HVF_TRY(
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, state->sp_el1));
-    LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, HV_REG_PC, state->pc));
-    LITEBOX_HVF_TRY(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, state->cpsr));
-    LITEBOX_HVF_TRY(
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, state->spsr_el1));
-    LITEBOX_HVF_TRY(
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, state->elr_el1));
-    LITEBOX_HVF_TRY(
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, state->esr_el1));
-    LITEBOX_HVF_TRY(
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, state->far_el1));
-    return litebox_hvf_vcpu_get_arch_state(identifier, readback);
+    LITEBOX_HVF_TRY(hv_vcpu_get_reg(vcpu, HV_REG_FPCR, &state->fpcr));
+    return hv_vcpu_get_reg(vcpu, HV_REG_FPSR, &state->fpsr);
 }
 
 static hv_return_t litebox_hvf_vcpu_read_el1(
@@ -800,6 +900,22 @@ hv_return_t litebox_hvf_vcpu_arm_vtimer(uint64_t identifier, uint64_t cval) {
         return result;
     }
     return hv_vcpu_set_vtimer_mask(vcpu, false);
+}
+
+/*
+ * One run's whole per-run install in one entry point: the time-slice arm
+ * (exactly litebox_hvf_vcpu_arm_vtimer) followed by the masked register
+ * install (exactly litebox_hvf_vcpu_install_arch_state).
+ */
+hv_return_t litebox_hvf_vcpu_arm_and_install_arch_state(
+    uint64_t identifier, const litebox_hvf_arch_state_t *state, uint64_t mask,
+    uint64_t cval) {
+    if (!litebox_hvf_arch_state_valid(state) ||
+        (mask & ~LITEBOX_HVF_INSTALL_ALL) != 0) {
+        return HV_BAD_ARGUMENT;
+    }
+    LITEBOX_HVF_TRY(litebox_hvf_vcpu_arm_vtimer(identifier, cval));
+    return litebox_hvf_vcpu_install_arch_state(identifier, state, mask);
 }
 
 hv_return_t litebox_hvf_vcpu_get_vtimer_mask(uint64_t identifier,

@@ -35,8 +35,13 @@
 //! * **No `MAP_FIXED_NOREPLACE`, no `MAP_POPULATE`, no `MAP_GROWSDOWN`.** The
 //!   first is emulated with an atomic `mach_vm_allocate` reservation, the second
 //!   with `madvise(MADV_WILLNEED)`, and the third has no equivalent.
-//! * **No vDSO.** `SystemInfoProvider::get_vdso_address` reports `None`, which
-//!   means a guest signal handler must supply its own `sa_restorer`.
+//! * **No host vDSO.** The host's `commpage` is not a Linux vDSO, so
+//!   `SystemInfoProvider::get_vdso_address` reports `None` for the rewritten
+//!   (non-HVF) path, which means a guest signal handler must supply its own
+//!   `sa_restorer`. Under HVF the backend builds its own vDSO (`vdso.rs`):
+//!   `clock_gettime`/`gettimeofday`/`clock_getres` then run in the guest
+//!   without an exit, off the same `mach_absolute_time` counter the vCPUs
+//!   expose as `CNTVCT_EL0`.
 //! * **Seatbelt instead of seccomp.** The second line of defense behind
 //!   LiteBox's own guest/host boundary is a `(deny default)` Seatbelt profile
 //!   installed by `enable_seatbelt_sandbox`, the counterpart of the Linux
@@ -84,6 +89,7 @@ use zerocopy::{FromBytes, IntoBytes};
 extern crate alloc;
 
 mod darwin;
+pub mod diagnostics_counters;
 mod guest;
 mod hvf;
 mod hvf_backend;
@@ -96,6 +102,7 @@ mod hvf_vcpu_diagnostic;
 mod nat;
 mod net;
 mod seatbelt;
+mod vdso;
 
 pub(crate) trait HvfCompletionCapability {
     fn validate_hvf_completion(&self, vm: &hvf::HvfVm) -> Result<(), hvf::HvfError>;
@@ -111,10 +118,11 @@ pub use hvf::{
     hvf_smoke_retry_residual, publish_hvf_executable_bytes,
 };
 pub use hvf_backend::{
-    HvfBackendError, HvfLaneReplacementReport, HvfLaneStarvationReport, HvfSchedulerLatencyReport,
-    HvfSchedulerScalingLevel, HvfSchedulerScalingReport, hvf_lane_replacement_probe,
-    hvf_lane_starvation_probe, hvf_sandbox_probe, hvf_scheduler_latency_probe,
-    hvf_scheduler_scaling_probe,
+    HvfBackendError, HvfLaneReplacementReport, HvfLaneStarvationReport,
+    HvfLifecycleResidualSnapshot, HvfSchedulerLatencyReport, HvfSchedulerScalingLevel,
+    HvfSchedulerScalingReport, HvfVtimerMonitorRaceReport, hvf_lane_replacement_probe,
+    hvf_lane_starvation_probe, hvf_lifecycle_residual_snapshot, hvf_sandbox_probe,
+    hvf_scheduler_latency_probe, hvf_scheduler_scaling_probe, hvf_vtimer_monitor_race_probe,
 };
 pub use hvf_backing::{
     HvfHostBackingError, HvfHostBackingReport, HvfHostResourceReport,
@@ -127,14 +135,16 @@ pub use hvf_memory::{
     HvfClaim, HvfExecutableGeneration, HvfForkResult, HvfGuestPermissions, HvfLedgerEntry,
     HvfMemory, HvfMemoryError, HvfMemoryFailureReport, HvfMemoryLimits, HvfMemoryReport,
     HvfMemoryUsage, HvfMirroredViewReport, HvfMutation, HvfParticipantRecoveryReceipt,
-    HvfPoisonConcurrencyReport, HvfPublicationEpoch, HvfPublicationTicket,
-    HvfQuarantineRetryReport, HvfRangeMutation, HvfRegisterFailureReport, HvfRetirementReport,
+    HvfPoisonConcurrencyReport, PageSettlementReceipt, HvfPublicationEpoch, HvfPublicationTicket,
+    HvfPumpOwnerBypassReport, HvfQuarantineRetryReport, HvfRangeMutation, HvfRegisterFailureReport,
+    HvfRetirementReport,
     HvfRetirementTicket, HvfRootGeneration, HvfSharedBackingKey, HvfSharing, HvfTlbiGeneration,
     HvfTranslationRegime, HvfUnmapFailureReport, HvfUnmapResult, HvfVcpuMemorySnapshot,
     HvfVcpuParticipant, HvfVcpuParticipantId, HvfVcpuRunAttachment, HvfWriteEpoch,
     hvf_alias_panic_failure_probe, hvf_alias_race_probe, hvf_memory_failure_probe,
     hvf_memory_probe, hvf_mirrored_view_probe, hvf_poison_concurrency_probe,
-    hvf_register_failure_probe, hvf_unmap_failure_probe, with_hvf_memory_failure_probe,
+    hvf_pump_owner_bypass_probe, hvf_register_failure_probe, hvf_unmap_failure_probe,
+    with_hvf_memory_failure_probe,
     with_hvf_memory_probe,
 };
 pub use hvf_vcpu::{
@@ -794,11 +804,17 @@ impl MacOsUserland {
 
     /// The task parameters a runner should start the initial guest thread with.
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
-        // TODO: these are synthetic, matching the other userland platforms.
-        // Passing the host's real identity through is a separate decision about
-        // what the guest is allowed to observe.
+        // TODO: uid/gid are still synthetic, matching the other userland platforms. `pid` is
+        // `INIT_PID` (see `litebox_shim_linux::syscalls::process`): the reparenting-precedence
+        // root-init fallback (`checked-task-tid-thread-admission`), `kill(-1)`, and
+        // `has_other_live_process` all compare a live process's pid against that same hardcoded
+        // constant to recognize "the real root process" -- a synthetic value here that didn't
+        // match it (1000, before this fix) silently made every one of those checks never
+        // recognize the root process as itself, live-reproduced via a throwaway guest diagnostic
+        // this wave (P's own `getpid()` read back 1000, so the fallback and `kill(-1)` exclusion
+        // never fired for it).
         litebox_common_linux::TaskParams {
-            pid: 1000,
+            pid: 1,
             ppid: 0,
             uid: 1000,
             gid: 1000,
@@ -808,7 +824,15 @@ impl MacOsUserland {
     }
 }
 
-impl litebox::platform::Provider for MacOsUserland {}
+impl litebox::platform::Provider for MacOsUserland {
+    fn seccomp_mediation_capability(&self) -> litebox::platform::SeccompMediationCapability {
+        if hvf_backend::active().is_some() {
+            litebox::platform::SeccompMediationCapability::Complete
+        } else {
+            litebox::platform::SeccompMediationCapability::Incomplete
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Memory
@@ -1481,8 +1505,28 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         // if a future host-level fork model needs to distinguish them: nothing below this comment
         // treats `SHARED` differently already.
         if let Some(backend) = hvf_backend::active() {
+            let view = current_guest_view();
+            // FIX (hvf-fork-cow-retention-exhausts-live-data-pages): only a descendant that still
+            // inherits this view's pages by lineage (not yet exec'd) can ever resolve a retired
+            // page through `retired_mirrored_pages`; the plain live-descendant predicate kept
+            // stashing every page a long-lived, constantly-spawning parent (Chromium's browser
+            // process) unmapped for as long as ANY child was alive -- the same exec-aware predicate
+            // `PageManager::range_is_foreign_held` already applies to this exact decision one
+            // layer up.
+            let keep_mirror_for_descendant = view.is_some_and(|view| {
+                <MacOsUserland as litebox::platform::PageManagementProvider<ALIGN>>::guest_va_domain(
+                    self,
+                )
+                .family_has_live_inheriting_descendant_of(view)
+            });
             return backend
-                .allocate_pages(suggested_range, initial_permissions, fixed_address_behavior)
+                .allocate_pages(
+                    suggested_range,
+                    initial_permissions,
+                    fixed_address_behavior,
+                    view,
+                    keep_mirror_for_descendant,
+                )
                 .map(|start| UserMutPtr::from_ptr(start as *mut u8));
         }
         if !suggested_range.start.is_multiple_of(ALIGN)
@@ -1660,6 +1704,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     suggested_range,
                     initial_permissions,
                     fixed_address_behavior,
+                    current_guest_view(),
                 )
                 .map(|start| UserMutPtr::from_ptr(start as *mut u8));
         }
@@ -1993,6 +2038,136 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         Ok(())
     }
 
+    fn forget_shared_backing(&self, backing_identity: usize) -> Result<(), SharedPageIoError> {
+        if let Some(backend) = hvf_backend::active() {
+            return backend.forget_shared_backing(backing_identity);
+        }
+        // The generic (non-HVF) `shared_page_registry` fallback has no per-object pin to drop --
+        // its extents are backed by a real host file the OS reclaims through ordinary fd/mapping
+        // lifetime, so there is nothing this platform needs to do here.
+        Ok(())
+    }
+
+    /// Overrides the trait's default `remap_pages` (used for a private,
+    /// non-shared-futex `mremap` move) to avoid a guaranteed self-deadlock.
+    ///
+    /// The default body copies the moved range's bytes through
+    /// `RawConstPointer`/`RawMutPointer`, which on this platform alias
+    /// `ViewConfinedAccess` and so call back into
+    /// `PageManager::checked_guest_range`, which takes `self.vmem.read()`.
+    /// The only caller of this method for a private mapping,
+    /// `Vmem::move_mappings`, is itself invoked from
+    /// `PageManager::remap_pages` while that same `PageManager`'s
+    /// `self.vmem.write()` guard is still held on this OS thread -- so the
+    /// default body deadlocks the instant a guest `mremap(...,
+    /// MREMAP_MAYMOVE)` is actually forced to move (litebox's `RwLock` is
+    /// not reentrant).
+    ///
+    /// Both `old_range` (asserted live and stable by the caller, which holds
+    /// the `vmem` write lock over it for the duration of this call) and
+    /// `new_range` (freshly allocated by `self.allocate_pages` below with
+    /// `FixedAddressBehavior::NoReplace`, not yet visible to any other view
+    /// or thread) are host-privileged bookkeeping addresses `PageManager`
+    /// itself already authorized -- not untrusted guest syscall-argument
+    /// pointers -- so this override performs the copy with a direct,
+    /// unchecked pointer `memcpy` instead, bypassing
+    /// `ViewConfinedAccess`/`checked_guest_range` entirely and eliminating
+    /// the self-deadlock at its source. Guest addresses are already plain
+    /// host-process-virtual addresses on this platform in both execution
+    /// modes (the checked path itself ends in a raw `memcpy_fallible` on the
+    /// same exposed-provenance address), so the raw copy below touches the
+    /// identical bytes the checked copy would have.
+    unsafe fn remap_pages(
+        &self,
+        old_range: core::ops::Range<usize>,
+        new_range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+        debug_assert!(old_range.start.is_multiple_of(ALIGN));
+        debug_assert!(new_range.start.is_multiple_of(ALIGN));
+        debug_assert!(old_range.len().is_multiple_of(ALIGN));
+        debug_assert!(new_range.len().is_multiple_of(ALIGN));
+        debug_assert!(new_range.len() > old_range.len());
+        debug_assert!(old_range.start.max(new_range.start) >= old_range.end.min(new_range.end));
+
+        let temp_permissions = permissions | MemoryRegionPermissions::WRITE;
+        let new_ptr = <Self as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
+            self,
+            new_range.clone(),
+            temp_permissions,
+            false,
+            true,
+            FixedAddressBehavior::NoReplace,
+        )
+        .map_err(|e| match e {
+            AllocationError::OutOfMemory => RemapError::OutOfMemory,
+            AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
+                RemapError::AlreadyAllocated
+            }
+            AllocationError::Unaligned
+            | AllocationError::BelowMinAddress
+            | AllocationError::AboveMaxAddress
+            | AllocationError::AddressPartiallyInUse => unreachable!(),
+            _ => unreachable!(),
+        })?;
+
+        if !permissions.contains(MemoryRegionPermissions::READ) {
+            (unsafe {
+                <Self as litebox::platform::PageManagementProvider<ALIGN>>::update_permissions(
+                    self,
+                    old_range.clone(),
+                    permissions | MemoryRegionPermissions::READ,
+                )
+            })
+            .expect("failed to update permissions on old range for copying");
+        }
+
+        if let Some(backend) = hvf_backend::active() {
+            // A per-view page may live behind a redirect (a promoted shadow, a file alias onto
+            // a shared origin) or hold nothing physical yet (an untouched file window page, whose
+            // GVA has no host mirror at all): copied page by page from where the content
+            // really is, never through the raw mirror at the GVA.
+            backend
+                .copy_range_for_remap(current_guest_view(), old_range.clone(), new_range.start)
+                .expect("failed to copy the old range for remap");
+        } else {
+            // SAFETY: `old_range` is a live mapping the caller (`Vmem::move_mappings`)
+            // holds its `PageManager`'s `vmem` write lock over for the duration of this
+            // call, so it is stable and not concurrently mutated by this same thread.
+            // `new_range` was just allocated above with `NoReplace`, so it is mapped
+            // read+write at exactly `new_range.start` and not yet visible to any other
+            // view or thread. The two ranges do not overlap (asserted above, and
+            // guaranteed by the caller's contract) and are exactly the same length.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    old_range.start as *const u8,
+                    new_range.start as *mut u8,
+                    old_range.len(),
+                );
+            }
+        }
+
+        if temp_permissions != permissions {
+            (unsafe {
+                <Self as litebox::platform::PageManagementProvider<ALIGN>>::update_permissions(
+                    self,
+                    new_range.clone(),
+                    permissions,
+                )
+            })
+            .expect("failed to restore permissions on new range");
+        }
+
+        (unsafe {
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::deallocate_pages(
+                self, old_range,
+            )
+        })
+        .expect("failed to deallocate old range");
+
+        Ok(new_ptr)
+    }
+
     unsafe fn remap_shared_pages(
         &self,
         backing_identity: usize,
@@ -2009,6 +2184,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
                     old_range,
                     new_range,
                     permissions,
+                    current_guest_view(),
                 )
                 .map(|start| UserMutPtr::from_ptr(start as *mut u8));
         }
@@ -2075,7 +2251,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         range: core::ops::Range<usize>,
     ) -> Result<(), DeallocationError> {
         if let Some(backend) = hvf_backend::active() {
-            return backend.deallocate_pages(range);
+            let view = current_guest_view();
+            // Exec-aware, same as `allocate_pages` above (see the comment there).
+            let keep_mirror_for_descendant = view.is_some_and(|view| {
+                <MacOsUserland as litebox::platform::PageManagementProvider<ALIGN>>::guest_va_domain(
+                    self,
+                )
+                .family_has_live_inheriting_descendant_of(view)
+            });
+            return backend.deallocate_pages(range, view, keep_mirror_for_descendant);
         }
         if !range.start.is_multiple_of(ALIGN) || !range.len().is_multiple_of(ALIGN) {
             return Err(DeallocationError::Unaligned);
@@ -2111,7 +2295,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), PermissionUpdateError> {
         if let Some(backend) = hvf_backend::active() {
-            return backend.update_permissions(range, new_permissions);
+            return backend.update_permissions(range, new_permissions, current_guest_view());
         }
         if !range.start.is_multiple_of(ALIGN) || !range.len().is_multiple_of(ALIGN) {
             return Err(PermissionUpdateError::Unaligned);
@@ -2174,10 +2358,71 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::CowAllocationError> {
         use litebox::platform::page_mgmt::CowAllocationError;
 
-        if hvf_backend::active().is_some() {
-            // The compact HVF manager owns every backing page; the memcpy
-            // fallback path lands in it through `allocate_pages`.
-            return Err(CowAllocationError::UnsupportedSourceRegion);
+        if let Some(backend) = hvf_backend::active() {
+            // Under HVF a private file mapping becomes a window onto one shared, read-only,
+            // page-aligned origin copy of the static slice (see `HvfBackend::
+            // allocate_file_cow_pages`): no per-process copy, every page aliased lazily and
+            // promoted to a private shadow on its first write. Every refusal here is counted
+            // and takes the memcpy path, which lands in the compact manager through
+            // `allocate_pages` exactly as before origins existed.
+            let counters = &hvf_memory::FILE_COW_COUNTERS;
+            if !backend.file_cow_enabled() {
+                hvf_memory::file_cow_count(&counters.fallback_disabled);
+                return Err(CowAllocationError::UnsupportedSourceRegion);
+            }
+            if source_data.is_empty()
+                || !source_data.len().is_multiple_of(ALIGN)
+                || !suggested_start.is_multiple_of(ALIGN)
+            {
+                hvf_memory::file_cow_count(&counters.fallback_unaligned);
+                return Err(CowAllocationError::Unaligned);
+            }
+            let Some(mapped_end) = suggested_start.checked_add(source_data.len()) else {
+                return Err(CowAllocationError::InternalFailure);
+            };
+            let mapped_range = suggested_start..mapped_end;
+            if fixed_address_behavior != FixedAddressBehavior::Replace {
+                // Phase 1 places nothing itself: only a `MAP_FIXED` replace of memory this view
+                // already holds (the exec loader's segment maps over its own reservation).
+                hvf_memory::file_cow_count(&counters.fallback_not_replace);
+                return Err(CowAllocationError::UnsupportedSourceRegion);
+            }
+            let Some((view, _task, pm)) =
+                <Self as litebox::platform::PageManagementProvider<ALIGN>>::current_guest_access()
+            else {
+                hvf_memory::file_cow_count(&counters.fallback_no_view);
+                return Err(CowAllocationError::UnsupportedSourceRegion);
+            };
+            let domain = pm.guest_va_domain();
+            // The whole range must be in this view's OWN `Present` custody: a range held only
+            // by lineage (a never-exec'd fork child mapping over inherited memory) keeps the
+            // memcpy path, whose replace teardown is the one the domain already understands.
+            let mut covered = mapped_range.start;
+            for (fragment, custody) in domain.custody_fragments(view, mapped_range.clone()) {
+                let own = matches!(
+                    &custody,
+                    litebox::mm::domain::Custody::Present { view: holder, .. } if *holder == view
+                );
+                if fragment.start != covered || !own {
+                    covered = usize::MAX;
+                    break;
+                }
+                covered = fragment.end;
+            }
+            if covered != mapped_range.end {
+                hvf_memory::file_cow_count(&counters.fallback_custody);
+                return Err(CowAllocationError::UnsupportedSourceRegion);
+            }
+            let keep_mirror_for_descendant = domain.family_has_live_inheriting_descendant_of(view);
+            return backend
+                .allocate_file_cow_pages(
+                    mapped_range,
+                    source_data,
+                    permissions,
+                    view,
+                    keep_mirror_for_descendant,
+                )
+                .map(|start| UserMutPtr::from_ptr(start as *mut u8));
         }
         if permissions.contains(MemoryRegionPermissions::EXEC) {
             // A file-backed `PROT_EXEC` mapping on Apple Silicon must pass
@@ -2307,6 +2552,233 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         unsafe { libc::close(fd) };
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
+
+    fn current_guest_access() -> Option<(
+        litebox::utils::ids::VmViewId,
+        litebox::utils::ids::TaskInstanceId,
+        &'static litebox::mm::PageManager<Self, ALIGN>,
+    )> {
+        GUEST_MEMORY_ACCESS_CONTEXT.with(|cell| {
+            cell.get().map(|(view, task, addr)| {
+                // SAFETY: `addr` was stored by `set_current_guest_access` as the address of a
+                // real, live `&'static PageManager<MacOsUserland, ALIGN>` -- the shim only ever
+                // calls that setter with the one process-global page manager it owns, at the
+                // same `ALIGN` (`litebox::mm::linux::PAGE_SIZE`) this getter is monomorphized
+                // for, since that is the only concrete instantiation wired into this platform's
+                // `UserConstPtr`/`UserMutPtr` aliases below.
+                let pm = unsafe { &*(addr as *const litebox::mm::PageManager<Self, ALIGN>) };
+                (view, task, pm)
+            })
+        })
+    }
+
+    fn set_current_guest_access(
+        context: Option<(
+            litebox::utils::ids::VmViewId,
+            litebox::utils::ids::TaskInstanceId,
+            &'static litebox::mm::PageManager<Self, ALIGN>,
+        )>,
+    ) {
+        GUEST_MEMORY_ACCESS_CONTEXT.with(|cell| {
+            cell.set(context.map(|(view, task, pm)| (view, task, core::ptr::from_ref(pm) as usize)));
+        });
+    }
+
+    fn current_guest_stack_rlimit() -> Option<usize> {
+        GUEST_STACK_RLIMIT.with(|cell| cell.get())
+    }
+
+    fn set_current_guest_stack_rlimit(rlimit_bytes: Option<usize>) {
+        GUEST_STACK_RLIMIT.with(|cell| cell.set(rlimit_bytes));
+    }
+
+    fn record_guest_fault_serviced() {
+        hvf_backend::record_guest_fault_serviced();
+    }
+
+    fn record_guest_fault_delivered(task: litebox::utils::ids::TaskInstanceId) {
+        hvf_backend::record_guest_fault_delivered(task);
+    }
+
+    unsafe fn commit_wx_flip(
+        page: usize,
+        want_execute: bool,
+        expected_generation: u64,
+    ) -> litebox::shim::WxFlipOutcome {
+        match hvf_backend::active() {
+            // The calling OS thread IS the guest thread whose view applies here (this always
+            // runs synchronously inside that thread's own `shim.memory_service` call, never
+            // handed off to another thread), so resolving it fresh here -- rather than adding a
+            // `view` parameter to this fixed trait method signature -- is correct and matches
+            // every other page-management call site's own idiom.
+            Some(backend) => backend.commit_wx_flip_host(
+                page,
+                want_execute,
+                expected_generation,
+                current_guest_view(),
+            ),
+            None => litebox::shim::WxFlipOutcome::HostFailure,
+        }
+    }
+
+    fn resolve_promoted_host_page(view: litebox::utils::ids::VmViewId, page: usize) -> Option<usize> {
+        hvf_backend::active()?.resolve_host_redirect(Some(view), page)
+    }
+
+    fn resolve_promoted_host_pages(
+        view: litebox::utils::ids::VmViewId,
+        first_page: usize,
+        last_page: usize,
+        out: &mut alloc::vec::Vec<Option<usize>>,
+    ) {
+        match hvf_backend::active() {
+            Some(backend) => backend.resolve_host_redirects(Some(view), first_page, last_page, out),
+            None => {
+                let mut page = first_page;
+                while page <= last_page {
+                    out.push(None);
+                    match page.checked_add(ALIGN) {
+                        Some(next) => page = next,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fn any_host_redirect_active() -> bool {
+        hvf_backend::any_host_redirect_active_hint()
+    }
+
+    fn prepare_guest_access(
+        view: litebox::utils::ids::VmViewId,
+        range: core::ops::Range<usize>,
+        write: bool,
+        ancestor_of: &dyn Fn(usize) -> Option<litebox::utils::ids::VmViewId>,
+    ) -> litebox::platform::page_mgmt::GuestAccessPreparation {
+        match hvf_backend::active() {
+            Some(backend) => backend.prepare_guest_access(view, range, write, ancestor_of),
+            None => litebox::platform::page_mgmt::GuestAccessPreparation::default(),
+        }
+    }
+
+    fn materialize_inherited_range(
+        view: litebox::utils::ids::VmViewId,
+        range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+        ancestor_of: &dyn Fn(usize) -> Option<litebox::utils::ids::VmViewId>,
+    ) -> Result<(), PermissionUpdateError> {
+        match hvf_backend::active() {
+            Some(backend) => backend.materialize_inherited_range(view, range, permissions, ancestor_of),
+            None => Err(PermissionUpdateError::Unallocated),
+        }
+    }
+
+    fn has_independent_view_space(view: litebox::utils::ids::VmViewId) -> bool {
+        hvf_backend::active().is_some_and(|backend| backend.has_view_space(view))
+    }
+
+    fn release_view_space(
+        view: litebox::utils::ids::VmViewId,
+        family: Option<litebox::utils::ids::FamilyId>,
+        domain: &litebox::mm::domain::GuestVaDomain,
+    ) {
+        if let Some(backend) = hvf_backend::active() {
+            backend.release_view_space(view, family, domain);
+        }
+    }
+
+    fn eagerly_diverge_fork_child_range(
+        child_view: litebox::utils::ids::VmViewId,
+        ancestor_view: litebox::utils::ids::VmViewId,
+        range: core::ops::Range<usize>,
+    ) {
+        if let Some(backend) = hvf_backend::active() {
+            backend.eagerly_diverge_fork_child_range(child_view, ancestor_view, range);
+        }
+    }
+
+    fn fork_time_ancestor_protect(
+        child_view: litebox::utils::ids::VmViewId,
+        ancestor_view: litebox::utils::ids::VmViewId,
+        range: core::ops::Range<usize>,
+    ) {
+        if let Some(backend) = hvf_backend::active() {
+            backend.fork_time_ancestor_protect(child_view, ancestor_view, range);
+        }
+    }
+
+    fn exec_sever_file_windows(view: litebox::utils::ids::VmViewId, keep_for_descendant: bool) {
+        if let Some(backend) = hvf_backend::active() {
+            backend.exec_sever_file_windows(view, keep_for_descendant);
+        }
+    }
+
+    fn record_host_access_multi_run() {
+        hvf_memory::file_cow_count(&hvf_memory::FILE_COW_COUNTERS.host_access_multi_run);
+    }
+
+    #[inline]
+    fn mapping_lock_event(
+        event: litebox::platform::page_mgmt::MappingLockEvent,
+        site: &'static core::panic::Location<'static>,
+    ) {
+        diagnostics_counters::mapping_lock_event(event, site);
+    }
+
+    fn record_host_access_efault_after_runs() {
+        hvf_memory::file_cow_count(&hvf_memory::FILE_COW_COUNTERS.host_access_efault_after_runs);
+    }
+
+    fn guest_access_fault_trace() -> bool {
+        hvf_backend::guest_access_fault_trace()
+    }
+
+    fn fork_generation() -> u64 {
+        hvf_backend::fork_generation()
+    }
+
+    fn describe_guest_page(view: litebox::utils::ids::VmViewId, page: usize) -> alloc::string::String {
+        match hvf_backend::active() {
+            Some(backend) => backend.describe_page_state(view, page),
+            None => alloc::string::String::new(),
+        }
+    }
+}
+
+/// The calling OS thread's current guest view, if any -- a thin wrapper around
+/// [`PageManagementProvider::current_guest_access`](litebox::platform::PageManagementProvider::current_guest_access)
+/// fixed to this platform's one real `ALIGN` instantiation (`litebox::mm::linux::PAGE_SIZE`, the
+/// same one every `UserConstPtr`/`UserMutPtr` alias below uses), so `hvf_backend.rs`'s
+/// `run_thread` -- a method on a different struct entirely, with no `PageManagementProvider`
+/// generic parameter of its own -- can resolve the calling guest thread's view once per
+/// lease-acquire iteration without needing to know about that trait's generics at all.
+pub(crate) fn current_guest_view() -> Option<litebox::utils::ids::VmViewId> {
+    <MacOsUserland as litebox::platform::PageManagementProvider<
+        { litebox::mm::linux::PAGE_SIZE },
+    >>::current_guest_access()
+    .map(|(view, _, _)| view)
+}
+
+thread_local! {
+    /// The calling OS thread's current guest task's `RLIMIT_STACK` current limit in bytes, if
+    /// known -- see `PageManagementProvider::current_guest_stack_rlimit`.
+    static GUEST_STACK_RLIMIT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// The calling OS thread's current guest-memory-access context: which `VmViewId` its
+    /// userspace pointer accesses should be confined to, the `TaskInstanceId` of that same task,
+    /// and the address of the (process-global, effectively `'static`) `PageManager` that admits
+    /// it. The pointer is stored type-erased (`usize`) because
+    /// `PageManagementProvider::current_guest_access`/`set_current_guest_access` are generic over
+    /// `ALIGN`, and one non-generic `thread_local!` shared by every instantiation is simpler than
+    /// a family of monomorphized ones -- sound because the shim only ever calls the setter at the
+    /// single `ALIGN` (`PAGE_SIZE`) this platform's `UserConstPtr`/`UserMutPtr` aliases use, which
+    /// is the same `ALIGN` `current_guest_access` reinterprets it back as.
+    static GUEST_MEMORY_ACCESS_CONTEXT: core::cell::Cell<
+        Option<(litebox::utils::ids::VmViewId, litebox::utils::ids::TaskInstanceId, usize)>,
+    > = const { core::cell::Cell::new(None) };
 }
 
 /// Enumerate the process's existing mappings so the guest is never offered an
@@ -2323,6 +2795,19 @@ fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
 
 impl litebox::platform::RawMutexProvider for MacOsUserland {
     type RawMutex = RawMutex;
+
+    /// hvf-exit-overhead-instrumentation: `WaitContext::start_wait`/`end_wait` bracket every
+    /// interruptible guest-condition wait (futex, poll/epoll, blocking read, nanosleep, ...) with
+    /// `Some`/`None` here, which is exactly the blocked span the HVF syscall histogram needs to
+    /// subtract to report shim *service* time. Two thread-local cell writes and one monotonic
+    /// clock read per wait; nothing is stored beyond that (the wake path never needed the waker
+    /// from here -- `Waker::wake` signals the raw mutex directly).
+    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>) {
+        match waker {
+            Some(_) => diagnostics_counters::wait_started(),
+            None => diagnostics_counters::wait_ended(),
+        }
+    }
 }
 
 /// A futex-equivalent built on Darwin's `ulock` compare-and-wait primitives.
@@ -2445,6 +2930,15 @@ impl litebox::platform::TimeProvider for MacOsUserland {
         }
     }
 
+    fn publish_monotonic_epoch(&self, epoch: Self::Instant) {
+        // The HVF vDSO serves `CLOCK_MONOTONIC` as `now() - epoch` with the
+        // very same `Instant` arithmetic the shim uses, so the two never
+        // disagree; see `vdso.rs`.
+        if let Some(backend) = hvf_backend::active() {
+            backend.publish_vdso_monotonic_epoch(epoch.0);
+        }
+    }
+
     fn thread_cpu_time(&self) -> core::time::Duration {
         // Real per-thread CPU-time accounting from the host: Darwin's `clock_gettime` has
         // supported `CLOCK_THREAD_CPUTIME_ID` since macOS 10.12, and it genuinely stops
@@ -2535,11 +3029,17 @@ impl litebox::platform::ArchSpecificProvider for MacOsUserland {
 // ---------------------------------------------------------------------------
 
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
-    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    litebox::platform::common_providers::userspace_pointers::ViewConfinedAccess<
+        MacOsUserland,
+        { litebox::mm::linux::PAGE_SIZE },
+    >,
     T,
 >;
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
-    litebox::platform::common_providers::userspace_pointers::NoValidation,
+    litebox::platform::common_providers::userspace_pointers::ViewConfinedAccess<
+        MacOsUserland,
+        { litebox::mm::linux::PAGE_SIZE },
+    >,
     T,
 >;
 
@@ -2793,6 +3293,13 @@ impl litebox::platform::SystemInfoProvider for MacOsUserland {
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
+        // Under HVF the backend maps its own vDSO image into every guest
+        // address space (see `vdso.rs`), so the libc serves the time syscalls
+        // from it instead of exiting. It carries no sigreturn trampoline; that
+        // stays `get_sigreturn_trampoline_address`'s job.
+        if let Some(backend) = hvf_backend::active() {
+            return Some(backend.vdso_address());
+        }
         // A Linux guest's vDSO would have to be a LiteBox-provided image; the
         // host's own `commpage` is not one. Reporting `None` means the guest
         // falls back to real syscalls, which is what the shim wants anyway --
@@ -4382,6 +4889,18 @@ unsafe extern "C" fn fault_handler(
             // This platform's guest always runs at EL0; there is no
             // "kernel-mode access faulted" case for a userland host to model.
             kernel_mode: false,
+            // Not populated on this (legacy, non-HVF) native-execution
+            // backend: this handler runs as a strict async-signal-safe POSIX
+            // exception handler (see `fault_handler`'s own doc comment, just
+            // below), and more to the point this backend is out of scope for
+            // this capability -- litebox's own `--hvf` HVF backend
+            // (`hvf_backend.rs`) is this project's mandatory, live-verified
+            // configuration; only its exception paths populate a real walk.
+            // Extending this backend the same way is architecturally
+            // possible (the same guest-VA-is-host-VA assumption already
+            // holds here, per this same function's `core::ptr::read` use
+            // just above) but was not attempted or verified this wave.
+            backtrace: litebox::shim::FrameBacktrace::EMPTY,
         };
         // SAFETY: `guest_owns_cpu` just returned true, which also means
         // `guest_state` is this thread's own non-null live state -- this
@@ -4543,20 +5062,130 @@ mod signal_handler_alloc_probe {
 static PROBE_ALLOCATOR: signal_handler_alloc_probe::ProbeAllocator =
     signal_handler_alloc_probe::ProbeAllocator::new();
 
-/// Page faults are serviced by the host kernel, so LiteBox never handles one
-/// itself here. Provided to satisfy the trait bound on `PageManager`.
+/// ESR_EL1\[31:26\]: the Exception Class. Decoded here (rather than reusing
+/// `hvf_backend`'s private copies of the same constants) since this impl must
+/// stay correct independent of which backend's `ExceptionInfo.esr` reaches it.
+const EC_SHIFT: u64 = 26;
+const EC_MASK: u64 = 0x3f;
+const EC_INSTRUCTION_ABORT_LOWER_EL: u64 = 0x20;
+const EC_INSTRUCTION_ABORT_CURRENT_EL: u64 = 0x21;
+const EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
+const EC_DATA_ABORT_CURRENT_EL: u64 = 0x25;
+/// ESR_EL1\[6\]: Write-not-Read, valid for a Data Abort.
+const ESR_WNR: u64 = 1 << 6;
+
+/// Bounds how many times in a row [`MacOsUserland::handle_page_fault`]'s own terminal fallback
+/// can see the exact same `(page, error_code)` pair before concluding that no earlier stage of
+/// the COW/W^X materialization chain actually installed a real fix, and refusing instead of
+/// resuming the guest into the same fault again -- see that method's own doc comment. Matches the
+/// magnitude of `hvf_backend.rs`'s own `ALIAS_CONFLICT_RERUN_LIMIT`, the same bounded-retry-then-
+/// fail-loudly discipline applied to this fallback's own, separate failure mode.
+const PAGE_FAULT_FALLBACK_RETRY_LIMIT: u32 = 64;
+
+/// The most recent `(page, error_code, consecutive count)` [`MacOsUserland::handle_page_fault`]'s
+/// fallback observed. A single global slot rather than one entry per key: a distinct or genuinely
+/// resolved fault simply overwrites it (so this can never grow unbounded the way a per-key map
+/// would across a long-running process's many ordinary, one-shot mmap/stack-growth faults), and
+/// only a real, tight repeat of the identical fault -- the guest re-executing the same
+/// instruction against memory nothing actually fixed -- survives long enough in a row to reach
+/// [`PAGE_FAULT_FALLBACK_RETRY_LIMIT`]. A coincidental interleaving from an unrelated concurrent
+/// fault sharing the same address and ESR merely resets the run (detected a little later, never
+/// incorrectly), not a correctness hazard.
+static PAGE_FAULT_FALLBACK_LAST: std::sync::Mutex<Option<(usize, u64, u32)>> =
+    std::sync::Mutex::new(None);
+
+/// `error_code` here is the raw `ESR_EL1` value of the aborting exception,
+/// forwarded unmodified all the way from `litebox_shim_linux`'s
+/// `page_fault_info` (aarch64 arm). On the plain (non-HVF) backend this trait
+/// stays unreached: `kernel_mode` is always false there, so
+/// `litebox_shim_linux::lib::exception()`'s gate never calls
+/// `PageManager::handle_page_fault` at all, and every guest fault goes through
+/// the host kernel's own normal signal delivery instead. On the HVF backend it
+/// is reached once `ExceptionInfo::kernel_mode` is set to a real abort
+/// classification (a separate, sibling fix) for every guest memory abort --
+/// both a genuine `VM_GROWSDOWN` stack-growth demand (already granted by
+/// `PageManager::handle_page_fault`'s own growth block by the time this runs)
+/// and an ordinary in-VMA permission violation (`PROT_NONE`, a write to a
+/// read-only mapping, an exec attempt outside `VM_EXEC` -- including a W^X
+/// mismatch `HvfBackend::try_resolve_wx_fault` did not already resolve
+/// transparently at the earlier VM-exit level, before this call path is ever
+/// reached).
 impl litebox::mm::linux::VmemPageFaultHandler for MacOsUserland {
+    /// No separate page-table/stage-1 install step is ordinarily left to perform here: by the
+    /// time `access_error` has permitted the access, the real host-side backing was already
+    /// installed either by the ordinary `insert_mapping` at `mmap` time, or, for a stack-growth
+    /// demand, by `install_into_owned_hole`'s own platform callback one level up inside
+    /// `PageManager::handle_page_fault`'s growth block.
+    ///
+    /// That premise is not always true, though: a gap anywhere earlier in the COW/W^X
+    /// materialization chain (`HvfBackend::try_resolve_cow_fault`/`try_resolve_wx_fault` and
+    /// their `hvf_memory.rs` primitives) can reach this point having classified and "handled" the
+    /// fault without ever installing a real fix, in which case returning `Ok(())` unconditionally
+    /// resumes the guest straight back into the identical fault forever -- silently, since nothing
+    /// upstream of this call counts it. Rather than trust the premise blindly, this refuses (a
+    /// real, diagnosable `SIGSEGV` via `deliver_page_fault_segv`, never a host panic -- see
+    /// `litebox_shim_linux`'s `exception` handler) once the exact same `(page, error_code)` pair
+    /// has recurred [`PAGE_FAULT_FALLBACK_RETRY_LIMIT`] times in a row, via
+    /// [`PAGE_FAULT_FALLBACK_LAST`] -- a handful of retries is still allowed first, so a
+    /// genuinely transient, self-resolving race (the reason this returned `Ok(())`
+    /// unconditionally before) keeps working exactly as before; only a real, tight livelock ever
+    /// reaches the limit.
     unsafe fn handle_page_fault(
         &self,
-        _fault_addr: usize,
+        fault_addr: usize,
         _flags: litebox::mm::linux::VmFlags,
-        _error_code: u64,
+        error_code: u64,
     ) -> Result<(), litebox::mm::linux::PageFaultError> {
-        unreachable!("host kernel handles page faults for macOS userland")
+        let page = fault_addr & !(litebox::mm::linux::PAGE_SIZE - 1);
+        let mut last = PAGE_FAULT_FALLBACK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let repeats = match *last {
+            Some((last_page, last_error_code, count))
+                if last_page == page && last_error_code == error_code =>
+            {
+                count + 1
+            }
+            _ => 1,
+        };
+        if repeats > PAGE_FAULT_FALLBACK_RETRY_LIMIT {
+            *last = None;
+            return Err(litebox::mm::linux::PageFaultError::AccessError(
+                "page fault fallback made no forward progress on a repeated fault",
+            ));
+        }
+        *last = Some((page, error_code, repeats));
+        Ok(())
     }
 
-    fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
-        unreachable!("host kernel handles page faults for macOS userland")
+    /// Classify the attempted access from ESR_EL1's Exception Class and, for a
+    /// Data Abort, its `WnR` bit, and deny it (return `true`) when the VMA's
+    /// own flags lack the bit that access requires. This correctly denies
+    /// `PROT_NONE` (no access bits at all), a write to a read-only mapping,
+    /// and any exec attempt into a region without `VM_EXEC`, while correctly
+    /// permitting an ordinary write into a freshly-grown `VM_GROWSDOWN` range
+    /// right after a successful stack-growth demand, since that new mapping
+    /// shares the stack VMA's own rw flags.
+    fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
+        use litebox::mm::linux::VmFlags;
+
+        let class = (error_code >> EC_SHIFT) & EC_MASK;
+        match class {
+            EC_INSTRUCTION_ABORT_LOWER_EL | EC_INSTRUCTION_ABORT_CURRENT_EL => {
+                !flags.contains(VmFlags::VM_EXEC)
+            }
+            EC_DATA_ABORT_LOWER_EL | EC_DATA_ABORT_CURRENT_EL => {
+                if error_code & ESR_WNR != 0 {
+                    !flags.contains(VmFlags::VM_WRITE)
+                } else {
+                    !flags.contains(VmFlags::VM_READ)
+                }
+            }
+            // Reached only via a raw ESR that isn't a recognized abort class --
+            // not expected from `page_fault_info`'s own `is_abort` filter, but
+            // deny rather than silently permit if it ever is.
+            _ => true,
+        }
     }
 }
 

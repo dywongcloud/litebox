@@ -15,6 +15,7 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_macos_userland::MacOsUserland as Platform;
 
+mod counters_publisher;
 mod net_proxy;
 use std::path::PathBuf;
 
@@ -62,7 +63,7 @@ pub struct CliArgs {
     /// `--initial-files`. All binaries must be pre-rewritten with the syscall
     /// rewriter.
     #[arg(
-        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling"],
+        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling", "hvf_vtimer_monitor_race", "hvf_pump_owner_bypass", "counters"],
         trailing_var_arg = true,
         value_hint = clap::ValueHint::CommandWithArguments
     )]
@@ -80,13 +81,26 @@ pub struct CliArgs {
     #[arg(
         long = "initial-files",
         value_name = "PATH_TO_TAR",
-        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling"],
+        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling", "hvf_vtimer_monitor_race", "hvf_pump_owner_bypass", "counters"],
         value_hint = clap::ValueHint::FilePath
     )]
     pub initial_files: Option<PathBuf>,
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
+    /// Read a running (or previously running) instance's published counters snapshot from its
+    /// run directory and print it as JSON, then exit. No network, no new process privileges, no
+    /// guest execution, no `com.apple.security.hypervisor` entitlement needed: this just mmaps
+    /// and reads a plain file. Pass the same directory a live instance was given via
+    /// `--run-dir` (or `--vnc`'s/etc. own default under `$TMPDIR`, printed to the log at
+    /// startup). See `diagnostics-counter-readout-surface`.
+    #[arg(long = "counters", value_name = "RUN_DIR", requires = "unstable", help_heading = "Unstable Options")]
+    pub counters: Option<PathBuf>,
+    /// Directory a live instance publishes its counters snapshot file into (see `--counters`).
+    /// Defaults to a fresh temporary directory under `$TMPDIR` (printed to the log at startup)
+    /// when unset.
+    #[arg(long = "run-dir", requires = "unstable", help_heading = "Unstable Options")]
+    pub run_dir: Option<PathBuf>,
     /// Run the bounded Hypervisor.framework architecture probe and exit.
     ///
     /// This does not run the requested Linux program and does not select the
@@ -166,6 +180,18 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub hvf_poison: bool,
+    /// Stage the retirement-pump / exclusive-gate lock-order inversion and prove
+    /// it is gone: while this thread owns the exclusive gate, a helper holds an
+    /// address space's retirement-pump mutex and queues for the gate behind it;
+    /// the owner's pump of that space must release its deferred retirement
+    /// without waiting for the mutex, and the helper is admitted afterwards.
+    #[arg(
+        long = "hvf-pump-owner-bypass",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_pump_owner_bypass: bool,
     /// Inject a stage-one register readback mismatch and prove that the partially
     /// programmed vCPU is destroyed and the diagnostic process is poisoned.
     #[arg(
@@ -356,6 +382,25 @@ pub struct CliArgs {
         help_heading = "HVF diagnostics"
     )]
     pub hvf_scheduler_scaling: bool,
+    /// Run the `HvfBackend::dispatch` vtimer/EL1-monitor race witness and exit.
+    ///
+    /// Reproduces the exact `(VtimerActivated, LowerElMonitor)` combination at
+    /// the monitor's sync-vector entry behind
+    /// `hvf-vtimeractivated-lowerelmonitor-exit-aborts-runner` (live-witnessed
+    /// twice during real interactive VNC keyboard input, both times ending the
+    /// runner via `std::process::abort()`): first a bounded number of genuine
+    /// attempts to win the real race (a real EL0 `SVC` raced against a
+    /// virtual-timer deadline), then a deterministic construction of the exact
+    /// combination fed straight into `dispatch()`. Proves the runner no longer
+    /// aborts on it. The runner executable must carry the
+    /// `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-vtimer-monitor-race",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_vtimer_monitor_race: bool,
     /// Connect to a `utun` device with this name (e.g. `utun4`).
     ///
     /// Creating the interface needs root on this host, so the guest has no
@@ -559,12 +604,20 @@ impl InputRouter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut tty_bytes = None;
+        let mut evdev_owns_keyboard = false;
         match message {
             litebox_rfb::InputMessage::Connected(client) => {
                 state.clients.entry(client).or_default();
             }
             litebox_rfb::InputMessage::Event { client, event } => match event {
                 litebox_rfb::InputEvent::Key(key) => {
+                    // Sampled BEFORE the evdev injection below: a consumer parked in a blocking
+                    // `read`/`poll` on `event0` only holds its observer while it is parked, and
+                    // `inject_key`'s wakeup lets it drain and return (dropping the observer)
+                    // before this handler gets to the stdin decision at the bottom. Xorg's epoll
+                    // interest is registered for as long as it owns the device, so it reads the
+                    // same either way.
+                    evdev_owns_keyboard = registry.keyboard_has_readers();
                     if let Some(code) = litebox_rfb::keymap::keysym_to_evdev(key.key) {
                         let Some(client_state) = state.clients.get_mut(&client) else {
                             return;
@@ -694,7 +747,14 @@ impl InputRouter {
             }
         }
         drop(state);
-        if let Some(bytes) = tty_bytes {
+        // Typed keys reach the guest's stdin only while no evdev consumer holds the keyboard:
+        // a console program (links2 -g) reads them from the tty, but once Xorg owns `event0`
+        // the same keystrokes would otherwise ALSO pile up in the stdin pump -- one extra wake
+        // per key, and a transcript of everything typed into the desktop for any guest process
+        // that ever reads fd 0. A VT goes quiet the same way once X takes the console.
+        if let Some(bytes) = tty_bytes
+            && !evdev_owns_keyboard
+        {
             let _ = self.platform.inject_stdin(&bytes);
         }
     }
@@ -739,6 +799,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 .from_env_lossy(),
         )
         .init();
+
+    // diagnostics-counter-readout-surface: a plain read-and-exit, ahead of every other unstable
+    // mode below -- it needs no HVF entitlement and never launches a guest, so it should work
+    // even when this process cannot install the HVF backend at all.
+    if let Some(run_dir) = &cli_args.counters {
+        let json = counters_publisher::read_published(run_dir)?;
+        println!("{json}");
+        return Ok(());
+    }
 
     if cli_args.hvf_smoke {
         let report = litebox_platform_macos_userland::hvf_smoke_probe()
@@ -799,6 +868,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let report = litebox_platform_macos_userland::hvf_poison_concurrency_probe()
             .map_err(|error| anyhow!("HVF poison serialization failed: {error}"))?;
         println!("HVF poison serialization passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_pump_owner_bypass {
+        let report = litebox_platform_macos_userland::hvf_pump_owner_bypass_probe()
+            .map_err(|error| anyhow!("HVF pump owner-bypass witness failed: {error}"))?;
+        println!("HVF pump owner-bypass witness passed:\n{report:#?}");
         return Ok(());
     }
 
@@ -900,6 +976,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         return Ok(());
     }
 
+    if cli_args.hvf_vtimer_monitor_race {
+        Platform::new_with_hvf(cli_args.tun_device_name.as_deref(), false)
+            .map_err(|error| anyhow!("failed to install the HVF guest backend: {error}"))?;
+        let report = litebox_platform_macos_userland::hvf_vtimer_monitor_race_probe()
+            .map_err(|error| anyhow!("HVF vtimer/EL1-monitor race witness failed: {error}"))?;
+        println!("HVF vtimer/EL1-monitor race witness passed:\n{report:#?}");
+        return Ok(());
+    }
+
     let tar_file = cli_args
         .initial_files
         .as_ref()
@@ -909,6 +994,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
     let tar_data = std::fs::read(tar_file)
         .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
+
+    // diagnostics-counter-readout-surface: record the guest image path for `image_hash` now
+    // (the tar is only ever read here); the publisher itself starts later, once the HVF
+    // backend and shim task diagnostics both exist, so its very first snapshot is already
+    // fully populated rather than transiently `null` (a guest command shorter than one publish
+    // interval must still see real content, not just the pre-init placeholder).
+    litebox_platform_macos_userland::diagnostics_counters::set_image_path(tar_file.clone());
+    let counters_run_dir = cli_args.run_dir.clone().unwrap_or_else(counters_publisher::default_run_dir);
 
     // `--vnc`/`--vnc-web` make the viewer keyboard a second stdin producer, so a
     // closed/redirected host stdin must not read as EOF to the guest (a console program
@@ -964,7 +1057,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             in_mem.set_current_user(0, 0);
         }
 
-        shim_builder.default_fs(in_mem, tar_data.into())
+        // Leaked for the process lifetime: `TarRo::get_static_backing_data` hands out
+        // `'static` payload slices only for a borrowed archive, and those slices are what the
+        // HVF platform's shared read-only file origins key on (one page-aligned copy per
+        // mapped slice instead of one copy per guest process). The bytes would have lived
+        // exactly as long anyway -- the file system owns them until exit.
+        let tar_data: &'static [u8] = tar_data.leak();
+        shim_builder.default_fs(in_mem, std::borrow::Cow::Borrowed(tar_data))
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
@@ -978,6 +1077,33 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // (confirmed live: "sudo: sorry, you are not allowed to set the
     // following environment variables") but always passes argv through.
     let shim = shim_builder.build_with_net_config(cli_args.guest_ip, cli_args.gateway_ip);
+
+    // diagnostics-counter-readout-surface / desktop-peak-task-count-witness: wire the shim's own
+    // task/thread counters into the combined snapshot (see `SHIM_TASK_DIAGNOSTICS`'s own doc
+    // comment for why this indirection exists), then publish the same snapshot
+    // `full_snapshot_json` builds for the host mmap file at `/proc/litebox/counters` too, so a
+    // guest-side reader (the seccomp attester, an acceptance monitor running as uid 1000) can
+    // take start/end snapshots without host access.
+    {
+        let shim_for_diagnostics = shim.clone();
+        litebox_platform_macos_userland::diagnostics_counters::register_shim_task_diagnostics(
+            move || shim_for_diagnostics.task_diagnostics_json(),
+        );
+    }
+    if let Some(proc_handle) = shim.proc_handle() {
+        proc_handle.set_counters(std::sync::Arc::new(
+            litebox_platform_macos_userland::diagnostics_counters::GuestCountersProvider,
+        ));
+    }
+    if let Err(error) =
+        counters_publisher::spawn_publisher(counters_run_dir.clone(), std::time::Duration::from_millis(250))
+    {
+        litebox_util_log::warn!(
+            run_dir:? = counters_run_dir, error:? = error;
+            "diagnostics-counter-readout-surface: failed to start the counters publisher; \
+             --counters against this run-dir will find nothing"
+        );
+    }
 
     // Bind AND run the VNC server's whole accept loop before the Seatbelt sandbox below, which
     // denies every syscall not explicitly allowed -- and unlike a plain read/write on an
@@ -1232,6 +1358,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         })
     };
 
+    // Read before the root guest task ever executes a single instruction, and again after
+    // `wait()` below returns (the whole spawned tree, including every fork/vfork/thread this
+    // one root process created, has exited and been reaped by then): the umbrella lifecycle
+    // acceptance witness diffs these two lines directly out of `LITEBOX_LOG=debug` output. `None`
+    // under the native (non-`--hvf`) backend, which has none of these resources.
+    if let Some(snapshot) = litebox_platform_macos_userland::hvf_lifecycle_residual_snapshot() {
+        litebox_util_log::debug!(snapshot:? = snapshot; "hvf lifecycle residual snapshot (pre-workload)");
+    }
     // SAFETY: `load_program` produced the entry context, so its `pc` and `sp`
     // describe a loaded, runnable guest image.
     unsafe {
@@ -1241,6 +1375,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
     let exit_code = program.process.wait();
+    if let Some(snapshot) = litebox_platform_macos_userland::hvf_lifecycle_residual_snapshot() {
+        litebox_util_log::debug!(snapshot:? = snapshot; "hvf lifecycle residual snapshot (post-workload)");
+    }
+    // diagnostics-counter-readout-surface: guarantee one fully post-workload publish even for a
+    // guest run shorter than the periodic publisher's own interval -- see `publish_final`'s own
+    // doc comment.
+    counters_publisher::publish_final(&counters_run_dir);
     shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
     let _ = net_worker.join();
     if let Some((worker, shutdown_handle)) = vnc_worker {

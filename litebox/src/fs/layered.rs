@@ -1057,6 +1057,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                                 WriteError::ClosedFd
                                 | WriteError::NotAFile
                                 | WriteError::NotForWriting
+                                | WriteError::PermissionDenied
+                                | WriteError::InvalidArgument
                                 | WriteError::Io => MigrationError::Io,
                             })?;
                         if count == 0 || count > read - written {

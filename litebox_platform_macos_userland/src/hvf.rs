@@ -27,7 +27,8 @@ pub use sdk::{
     publish_hvf_executable_bytes,
 };
 pub(crate) use sdk::{
-    HvfMapPermissions, HvfMapping, HvfPstateContext, HvfVcpu, HvfVm, process_hvf_vm,
+    HvfFpInstall, HvfGuestFp, HvfMapPermissions, HvfMapping, HvfPstateContext, HvfVcpu, HvfVm,
+    HvfVmOperation, process_hvf_vm, state_verify_enabled,
 };
 
 const PAGE_SIZE: usize = 16 * 1024;

@@ -36,6 +36,7 @@ use crate::syscalls::{
     file::TransferredFd,
     unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
 };
+use crate::wait::SyscallRestart;
 use crate::{GlobalState, ShimFS, ShimPlatform, Task};
 use crate::{UserPtr, UserPtrMut, syscalls::signal};
 
@@ -1376,7 +1377,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let net = self.global.net.lock();
                     (net.interface_ip(), net.gateway_ip())
                 };
-                let socket = crate::syscalls::netlink::NetlinkSocket::new(interface_ip, gateway_ip);
+                // A task inside its own `CLONE_NEWNET` namespace gets the namespace's own
+                // complete view (`lo` alone, administratively down) regardless of the host's real
+                // interface addresses above; see PRD row `chromium-netns-isolated-loopback`.
+                let isolated = self.net_ns.borrow().is_some();
+                let socket =
+                    crate::syscalls::netlink::NetlinkSocket::new(interface_ip, gateway_ip, isolated);
                 let mut status = OFlags::RDWR;
                 status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
                 let mut descriptors = self.global.litebox.descriptor_table_mut();
@@ -1617,18 +1623,60 @@ fn copy_iovs_to_vec<Platform: ShimPlatform>(
             continue;
         }
         let end = offset + iov.iov_len;
-        for (byte_offset, byte) in (0_isize..).zip(data[offset..end].iter_mut()) {
-            *byte = iov
-                .iov_base
-                .read_at_offset::<Platform>(byte_offset)
-                .ok_or(Errno::EFAULT)?;
-        }
+        // One bulk read per page, not one guest-memory access per byte (see `read_user_bytes`).
+        let iov_base = iov.iov_base;
+        super::read_user_bytes::<Platform>(iov_base.as_usize(), &mut data[offset..end])
+            .ok_or(Errno::EFAULT)?;
         offset = end;
     }
     Ok(data)
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Linux's `sock_intr_errno`: a blocking socket wait interrupted with no `SO_RCVTIMEO`
+    /// (`SO_SNDTIMEO` on the send side, `connect` included) is `ERESTARTSYS`; with one set it
+    /// stays a plain, never-restarted `EINTR`. `result` must carry `EINTR` only from its own
+    /// wait's `WaitError::Interrupted`.
+    pub(crate) fn socket_restart_on_eintr<T>(
+        &self,
+        sockfd: u32,
+        send: bool,
+        result: Result<T, Errno>,
+    ) -> Result<T, Errno> {
+        if !matches!(result, Err(Errno::EINTR)) {
+            return result;
+        }
+        let timeout_set = self.files.borrow().with_socket(
+            &self.global,
+            sockfd,
+            |fd| {
+                Ok(self
+                    .global
+                    .with_socket_options(fd, |opt| {
+                        if send {
+                            opt.send_timeout
+                        } else {
+                            opt.recv_timeout
+                        }
+                    })
+                    .is_some())
+            },
+            |file| {
+                Ok(if send {
+                    file.send_timeout()
+                } else {
+                    file.recv_timeout()
+                }
+                .is_some())
+            },
+        );
+        if timeout_set == Ok(false) {
+            self.restart_on_eintr(SyscallRestart::Sys, result)
+        } else {
+            result
+        }
+    }
+
     /// Handle syscall `accept`
     pub(crate) fn sys_accept(
         &self,
@@ -1641,7 +1689,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let mut remote_addr = addr.is_some().then(SocketAddress::default);
-        let fd = self.do_accept(sockfd, remote_addr.as_mut(), flags)?;
+        let fd = self.socket_restart_on_eintr(
+            sockfd,
+            false,
+            self.do_accept(sockfd, remote_addr.as_mut(), flags),
+        )?;
         if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
             let addrlen = addrlen.ok_or(Errno::EFAULT)?;
             if let Err(err) = write_sockaddr_to_user::<Platform>(remote_addr, addr, addrlen) {
@@ -1721,7 +1773,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let sockaddr = read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?;
-        self.do_connect(fd, sockaddr)
+        self.socket_restart_on_eintr(fd, true, self.do_connect(fd, sockaddr))
     }
     fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         self.files.borrow().with_socket(
@@ -1729,6 +1781,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
+                self.reject_non_loopback_in_net_ns(&addr, false)?;
                 self.global.connect(&self.wait_cx(), fd, addr)
             },
             |file| {
@@ -1764,6 +1817,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
+                self.reject_non_loopback_in_net_ns(&addr, true)?;
                 self.global.bind(fd, addr)
             },
             |file| {
@@ -1771,6 +1825,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 file.bind(self, addr)
             },
         )
+    }
+
+    /// Refuses `connect`/`bind` to a real, non-loopback address from inside this task's own
+    /// `CLONE_NEWNET` namespace (see PRD row `chromium-netns-isolated-loopback`): that namespace's
+    /// complete guest-visible contract is "only `lo`, administratively down, no addresses or
+    /// routes", so anything else must fail exactly as it would over an empty real routing table --
+    /// never silently reach the host's own real interface. A task outside any such namespace
+    /// (`net_ns` is `None`) is completely unaffected, matching this shim's behavior before this
+    /// row existed. `allow_unspecified` is set only for `bind`, where Linux's `INADDR_ANY`/
+    /// `in6addr_any` legitimately means "every local address" -- which inside a loopback-only
+    /// namespace still resolves to `lo` alone -- and never for `connect`, where an unspecified
+    /// peer is nonsensical (and already refused with `ECONNREFUSED` before this check can run).
+    fn reject_non_loopback_in_net_ns(
+        &self,
+        addr: &core::net::SocketAddr,
+        allow_unspecified: bool,
+    ) -> Result<(), Errno> {
+        if self.net_ns.borrow().is_none() {
+            return Ok(());
+        }
+        let ip = addr.ip();
+        if ip.is_loopback() || (allow_unspecified && ip.is_unspecified()) {
+            return Ok(());
+        }
+        Err(Errno::ENETUNREACH)
     }
 
     /// If `sockfd` is a `NETLINK_ROUTE` socket, return its typed fd; otherwise
@@ -1852,7 +1931,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map(|addr| read_sockaddr_from_user::<Platform>(addr, addrlen as usize))
             .transpose()?;
         let buf = buf.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT)?;
-        self.do_sendto(fd, &buf, flags, sockaddr)
+        self.socket_restart_on_eintr(fd, true, self.do_sendto(fd, &buf, flags, sockaddr))
     }
     fn do_sendto(
         &self,
@@ -1902,7 +1981,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let msg = msg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        self.do_sendmsg(fd, &msg, flags)
+        self.socket_restart_on_eintr(fd, true, self.do_sendmsg(fd, &msg, flags))
     }
     fn do_sendmsg(
         &self,
@@ -2120,7 +2199,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let mut sent: usize = 0;
         for i in 0..vlen {
-            let bail = |e: Errno| if sent > 0 { Ok(sent) } else { Err(e) };
+            let bail = |e: Errno| {
+                if sent > 0 {
+                    Ok(sent)
+                } else {
+                    self.socket_restart_on_eintr(sockfd, true, Err(e))
+                }
+            };
             let Some(mmh) = msgvec.read_at_offset::<Platform>(isize::try_from(i).unwrap()) else {
                 return bail(Errno::EFAULT);
             };
@@ -2159,15 +2244,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut source_addr = None;
         let mut buffer = [0u8; MAX_LEN];
         let recv_buf = &mut buffer[..MAX_LEN.min(len)];
-        let size = self.do_recvfrom(
+        let size = self.socket_restart_on_eintr(
             sockfd,
-            recv_buf,
-            flags,
-            if addr.is_some() {
-                Some(&mut source_addr)
-            } else {
-                None
-            },
+            false,
+            self.do_recvfrom(
+                sockfd,
+                recv_buf,
+                flags,
+                if addr.is_some() {
+                    Some(&mut source_addr)
+                } else {
+                    None
+                },
+            ),
         )?;
         let capped_size = size.min(recv_buf.len());
         buf.copy_from_slice::<Platform>(0, &recv_buf[..capped_size])
@@ -2294,7 +2383,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
-        self.do_recvmsg(sockfd, msg_ptr, flags)
+        self.socket_restart_on_eintr(sockfd, false, self.do_recvmsg(sockfd, msg_ptr, flags))
     }
     fn do_recvmsg(
         &self,
@@ -2428,7 +2517,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             msg_controllen
         };
         let mut control = alloc::vec::Vec::new();
-        if let Some(ucred) = credentials {
+        if let Some(mut ucred) = credentials {
+            // Translate the sender's real (root-view) pid into this (the receiving) task's own
+            // pid-namespace view -- a no-op unless the receiver is inside one (see
+            // `Task::translate_pid_for_current_ns`), matching real Linux's own per-namespace
+            // `SCM_CREDENTIALS` translation.
+            ucred.pid = self
+                .translate_pid_for_current_ns(ucred.pid.cast_signed())
+                .cast_unsigned();
             let mut payload = [0u8; 3 * size_of::<u32>()];
             payload[..4].copy_from_slice(&ucred.pid.to_ne_bytes());
             payload[4..8].copy_from_slice(&ucred.uid.to_ne_bytes());
@@ -2466,6 +2562,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let _ = self.do_close(raw_fd);
                         break;
                     };
+                    // Diagnostic-only, same investigation and `debug!`-gating discipline as
+                    // `syscalls::file::fd_audit_log_open_entry`
+                    // (`chromium-browser-process-late-fd-ownership-cascade-death`, see
+                    // `.gm/prd.yml`): this is the one place a brand-new guest fd is allocated for
+                    // a fd transferred in over `SCM_RIGHTS`, the one fd-creating path that hook's
+                    // other 8 call sites (openat/socket/socketpair/pipe2/dup/eventfd2/
+                    // memfd_create/fcntl-DUPFD, all at the real syscall-entry dispatch in
+                    // `lib.rs`) cannot cover, since the new fd number here is chosen deep inside
+                    // this helper rather than being `do_syscall`'s own return value. No
+                    // guest_pc/guest_lr: `do_recvmsg` (called from both `sys_recvmsg` and
+                    // `sys_recvmmsg`, both real syscall-entry paths, nothing synthetic) has no
+                    // `PtRegs` in hand, and this is diagnostic-only, so that is left out rather
+                    // than threading `ctx` through an extra layer for it.
+                    litebox_util_log::debug!(
+                        pid:? = self.pid, tid:? = self.tid.get(), fd:? = guest_fd;
+                        "fd_audit open (scm_rights, no ctx)"
+                    );
                     installed.push((raw_fd, guest_fd));
                 }
                 Err(Errno::EMFILE) => break,
@@ -2631,7 +2744,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // The only way to exit the loop with received=0 is via an inner
             // recvmsg error; EAGAIN is the conservative fallback for the
             // structurally unreachable case.
-            return Err(last_err.unwrap_or(Errno::EAGAIN));
+            return self.socket_restart_on_eintr(
+                sockfd,
+                false,
+                Err(last_err.unwrap_or(Errno::EAGAIN)),
+            );
         }
 
         // Stash the suppressed async socket error back onto the socket.
@@ -2722,7 +2839,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &self.global,
             sockfd,
             |fd| self.global.getsockopt(fd, optname, optval, len),
-            |file| file.getsockopt(&self.global, optname, optval, len),
+            |file| {
+                file.getsockopt(&self.global, optname, optval, len, |pid| {
+                    self.translate_pid_for_current_ns(pid)
+                })
+            },
         )
     }
 

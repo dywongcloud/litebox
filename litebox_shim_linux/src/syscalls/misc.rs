@@ -57,8 +57,10 @@ const fn to_fixed_size_array<const N: usize>(s: &str) -> [u8; N] {
 const SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::Utsname {
     sysname: to_fixed_size_array::<65>("Linux"),
     nodename: to_fixed_size_array::<65>("litebox"),
-    release: to_fixed_size_array::<65>("5.11.0"), // libc seems to expect this to be not too old
-    version: to_fixed_size_array::<65>("5.11.0"),
+    // Shared with `/proc/version` (`litebox::fs::proc`) so `uname()` and a `/proc/version` reader
+    // can't observe the two sources drifting apart. libc seems to expect this to be not too old.
+    release: to_fixed_size_array::<65>(litebox::fs::proc::SYNTHETIC_KERNEL_RELEASE),
+    version: to_fixed_size_array::<65>(litebox::fs::proc::SYNTHETIC_KERNEL_RELEASE),
     #[cfg(target_arch = "x86_64")]
     machine: to_fixed_size_array::<65>("x86_64"),
     #[cfg(target_arch = "aarch64")]

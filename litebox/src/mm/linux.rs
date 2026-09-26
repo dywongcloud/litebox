@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 use rangemap::RangeMap;
 use thiserror::Error;
 
@@ -19,6 +20,7 @@ use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
+use crate::utils::ids::VmViewId;
 
 /// Page size in bytes.
 ///
@@ -82,6 +84,13 @@ bitflags::bitflags! {
         /// the VMA it belonged to. See [`Vmem::set_wipe_on_fork`] and
         /// [`Vmem::wipe_on_fork_ranges`].
         const VM_WIPEONFORK = 1 << 10;
+
+        /// `MADV_DONTFORK`: this range is entirely absent from a forked child's view of
+        /// memory (Linux: dropped from the child's `mm`, never even reserved there).
+        /// `MADV_DOFORK` clears it. Legal on any mapping, unlike `VM_WIPEONFORK` -- real
+        /// Linux does not require a private anonymous backing for this one. See
+        /// [`Vmem::set_dont_fork`] and [`Vmem::dont_fork_ranges`].
+        const VM_DONTCOPY = 1 << 11;
 
         const VM_ACCESS_FLAGS = Self::VM_READ.bits()
             | Self::VM_WRITE.bits()
@@ -382,6 +391,192 @@ impl VmArea {
     }
 }
 
+/// A pre-effect-staged record of what one [`Vmem`] mutation is about to do to a `vmas` fragment,
+/// mirroring `mm/domain.rs`'s `Custody::Installing`/`Custody::Retiring` transient overlay values
+/// but scoped to [`Vmem`]'s own single-writer-lock model: every `Vmem` mutation runs under one
+/// [`crate::mm::mod::PageManager`]-level write lock held by the caller across the whole call
+/// (including the platform effect), so -- unlike `GuestVaDomain`'s lock, which is dropped across
+/// every platform callback -- no concurrent reader can ever observe this map's contents. Its job
+/// is not concurrency visibility, but recording each affected fragment's pre-effect state before
+/// the platform call runs, so a panic mid-effect (e.g. inside the platform's own
+/// `allocate_pages`/`deallocate_pages`, which this module cannot guard against panicking) leaves a
+/// forensic record of what was in flight rather than silent, unrecorded loss -- the entry is
+/// always cleared again, on both the commit and rollback paths, once the platform call returns.
+///
+/// Scope note (deliberately not extended further): `self.vmas`'s own `RangeMap` mutation at
+/// commit time (the `self.vmas.insert`/`self.vmas.remove` calls that follow every platform
+/// effect) remains itself post-effect by design, and is *not* what this type protects against.
+/// A sentinel-based pre-split of `vmas` (inserting a poisoned placeholder before the real
+/// commit, mirroring this type) would not actually deliver a non-restructuring commit either:
+/// `RangeMap::insert`'s internal remove-then-insert on its backing `BTreeMap` does not
+/// guarantee node reuse (`alloc::collections::BTreeMap` deallocates a leaf node when it empties
+/// on `remove` and allocates fresh on `insert` -- these are decoupled, so re-inserting the exact
+/// same key range immediately after removing it is not proven allocation-free by the crate's
+/// public API or by `BTreeMap`'s documented guarantees). Attempting it would add real
+/// complexity (a poisoned-marker `VmArea` variant, careful `PartialEq` breakage to prevent
+/// unwanted coalescing, a real split-boundaries step) for no verifiable gain. This type's
+/// invariant is therefore scoped down to "the pre-effect staging itself never fails post-effect"
+/// (already true, since a `RangeMap<usize, Transient>` insert/remove is exactly as fallible --
+/// i.e. aborts the process on allocator OOM, never returns an error -- as every other
+/// `BTreeMap`-backed structure in this module (`pending_initializations`, `reserved`) in this
+/// global-allocator-aborts-on-OOM environment), not "the final commit into `vmas` is also
+/// staged."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transient {
+    /// A platform install callback (fresh `allocate_pages`/`allocate_shared_pages`, or a `Replace`
+    /// overwrite) is in flight for this fragment; `publish` is the [`VmArea`] it will carry once
+    /// installed.
+    Installing { publish: VmArea },
+    /// A platform teardown callback (`deallocate_pages`) is in flight for this fragment; `restore`
+    /// is the [`VmArea`] it carried immediately before the teardown was requested.
+    Retiring { restore: VmArea },
+}
+
+/// One change of [`Vmem::vmas`], as recorded by [`TrackedVmas`] and replayed into the
+/// [`VmaMirror`].
+#[derive(Clone, Copy, Debug)]
+pub(super) enum VmaOp {
+    /// `RangeMap::insert(range, value)`.
+    Insert(usize, usize, VmArea),
+    /// `RangeMap::remove(range)`.
+    Remove(usize, usize),
+}
+
+/// [`Vmem::vmas`], with every mutation logged: each `insert`/`remove` since the last
+/// [`Vmem::drain_vma_ops`], in order. Read access is the plain [`RangeMap`] (through `Deref`);
+/// there is deliberately no `DerefMut`, so `insert`/`remove` below are the only ways to change it
+/// and no change can escape the log. `PageManager` replays the log into its [`VmaMirror`] before
+/// it releases its mapping lock (hvf-t1g-remainder-multisecond-service-guest-memory-access-
+/// convoy): the mirror is what a guest-memory access checks, so an access never waits for a
+/// mapping mutation's platform effect. The replay is exactly the section's own operations,
+/// applied in the same order to a map that was identical before the section -- `RangeMap`'s
+/// insert and remove are deterministic, so the mirror ends identical -- at a cost proportional to
+/// the change: no re-read of the table, no sorting, and (the log keeps its capacity) no
+/// allocation in steady state (T1h fix-up: the first version merged and re-read "dirty ranges"
+/// per section).
+struct TrackedVmas {
+    map: RangeMap<usize, VmArea>,
+    ops: Vec<VmaOp>,
+}
+
+impl TrackedVmas {
+    fn new() -> Self {
+        Self {
+            map: RangeMap::new(),
+            ops: Vec::new(),
+        }
+    }
+
+    // Logged only once the table change itself returned: a change that panics (an empty range)
+    // is neither applied nor replayed, so the replay the section's unwinding still runs cannot
+    // panic a second time.
+    fn insert(&mut self, range: Range<usize>, value: VmArea) {
+        let (start, end) = (range.start, range.end);
+        self.map.insert(range, value);
+        self.ops.push(VmaOp::Insert(start, end, value));
+    }
+
+    fn remove(&mut self, range: Range<usize>) {
+        let (start, end) = (range.start, range.end);
+        self.map.remove(range);
+        self.ops.push(VmaOp::Remove(start, end));
+    }
+}
+
+impl core::ops::Deref for TrackedVmas {
+    type Target = RangeMap<usize, VmArea>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+/// The memory permissions of `range` over a mapping table: those of the single entry covering all
+/// of `range`, `None` when no one entry does (a hole, or pieces with different properties).
+fn table_memory_permissions(
+    vmas: &RangeMap<usize, VmArea>,
+    range: Range<usize>,
+) -> Option<MemoryRegionPermissions> {
+    let (range_start, range_end) = (range.start, range.end);
+    let (mapped, vma) = vmas.overlapping(range).next()?;
+    if mapped.start > range_start || mapped.end < range_end {
+        // partial overlap implies that the given range contains unmapped pages or
+        // consists of memory pages with different permissions.
+        return None;
+    }
+    Some(vma.flags().into())
+}
+
+/// The flags of the mapping-table entry containing `address`.
+fn table_flags_at(vmas: &RangeMap<usize, VmArea>, address: usize) -> Option<VmFlags> {
+    vmas.get_key_value(&address).map(|(_, vma)| vma.flags())
+}
+
+/// The shared-backing futex identity and byte offset of `address` in a mapping table.
+fn table_shared_futex_key_at(
+    vmas: &RangeMap<usize, VmArea>,
+    address: usize,
+) -> Option<(usize, usize)> {
+    let (_, vma) = vmas.get_key_value(&address)?;
+    let shared = vma.shared_futex?;
+    let SharedFutexPosition::Origin(origin) = shared.position else {
+        return None;
+    };
+    Some((shared.identity, address.wrapping_sub(origin)))
+}
+
+/// A copy of [`Vmem`]'s mapping table (every entry, same ranges, same values, so the same
+/// coalesced form) that `PageManager` keeps behind its own short-held lock and brings up to date
+/// at the end of every exclusive section of its mapping lock, by replaying the section's own
+/// table operations ([`Vmem::replay_vma_ops`]). Answers the point-in-time questions a
+/// guest-memory access or a futex key needs without that lock, i.e. without waiting behind a
+/// mapping mutation's platform effect; it shows each mutation's result from the moment the
+/// mutating section ends -- before that section's lock is released, so before the mutating
+/// syscall can return.
+pub(super) struct VmaMirror {
+    map: RangeMap<usize, VmArea>,
+}
+
+impl VmaMirror {
+    pub(super) fn new() -> Self {
+        Self {
+            map: RangeMap::new(),
+        }
+    }
+
+    /// Applies one logged table operation, exactly as [`TrackedVmas`] applied it.
+    fn apply(&mut self, op: VmaOp) {
+        match op {
+            VmaOp::Insert(start, end, vma) => self.map.insert(start..end, vma),
+            VmaOp::Remove(start, end) => self.map.remove(start..end),
+        }
+    }
+
+    /// Every entry, in address order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
+        self.map.iter()
+    }
+
+    /// The permissions of `page_range`: those of the single entry covering all of it, `None`
+    /// when no one entry does (a hole, or pieces with different properties).
+    pub(super) fn get_memory_permissions<const ALIGN: usize>(
+        &self,
+        page_range: PageRange<ALIGN>,
+    ) -> Option<MemoryRegionPermissions> {
+        table_memory_permissions(&self.map, page_range.into())
+    }
+
+    /// The flags of the mapping containing `address`.
+    pub(super) fn flags_at(&self, address: usize) -> Option<VmFlags> {
+        table_flags_at(&self.map, address)
+    }
+
+    /// The shared-backing futex identity and byte offset for `address`.
+    pub(super) fn shared_futex_key_at(&self, address: usize) -> Option<(usize, usize)> {
+        table_shared_futex_key_at(&self.map, address)
+    }
+}
+
 /// Virtual Memory Manager
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](PageManagementProvider).
@@ -392,25 +587,46 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     /// Current program break address.
     pub(super) brk: usize,
     /// Virtual memory areas.
-    vmas: RangeMap<usize, VmArea>,
+    vmas: TrackedVmas,
     /// Temporary ownership of mappings whose caller callback has not returned.
     pending_initializations: RangeMap<usize, InitializationId>,
     /// Next callback identity. Zero is never issued and identities are never reused.
     next_initialization_id: usize,
     /// Address ranges a caller has claimed as logically owned without (or no longer) having a
-    /// live mapping here -- disjoint, start -> end. A flexible (non-`MAP_FIXED`) placement search
-    /// treats these exactly like a live `vmas` entry: occupied, never handed out. `MAP_FIXED`
-    /// requests are unaffected (see `get_unmmaped_area`'s `fixed_addr` branch), matching the
-    /// narrow problem this exists for: a shared, single flat address space faking multiple guest
-    /// processes by taking turns (`litebox_shim_linux`'s `SharedAddressSpace`) can have one member
-    /// "parked" -- its memory copied out, its addresses momentarily absent from `vmas` -- while
-    /// another member of the same family keeps running and, on `execve`, tears down and rebuilds
-    /// its own (shared) `vmas` entries. Nothing stopped the fresh image's flexible placement from
-    /// landing on exactly the addresses the parked member still remembers and will later try to
-    /// restore into, corrupting or safely-but-fatally colliding with whatever is there by then.
-    /// The park/restore machinery reserves a member's saved ranges here for exactly as long as it
-    /// is parked, so a fresh placement is steered elsewhere instead.
-    reserved: BTreeMap<usize, usize>,
+    /// live mapping here -- disjoint per owner, start -> end. A flexible (non-`MAP_FIXED`)
+    /// placement search treats an owner's own entries here exactly like a live `vmas` entry:
+    /// occupied, never handed out *to that same owner*. `MAP_FIXED` requests are unaffected (see
+    /// `get_unmmaped_area`'s `fixed_addr` branch), matching the narrow problem this exists for: a
+    /// shared, single flat address space faking multiple guest processes by taking turns
+    /// (`litebox_shim_linux`'s `SharedAddressSpace`) can have one member "parked" -- its memory
+    /// copied out, its addresses momentarily absent from `vmas` -- while another member of the
+    /// SAME family keeps running and, on `execve`, tears down and rebuilds its own (shared)
+    /// `vmas` entries. Nothing stopped the fresh image's flexible placement from landing on
+    /// exactly the addresses the parked member still remembers and will later try to restore
+    /// into, corrupting or safely-but-fatally colliding with whatever is there by then. The
+    /// park/restore machinery reserves a member's saved ranges here for exactly as long as it is
+    /// parked, so a fresh placement *by the same family* is steered elsewhere instead.
+    ///
+    /// Keyed outermost by [`VmViewId`] -- the same "current memory view" identity a
+    /// `SharedAddressSpace`'s own members already share (`Task::current_mem_view`), and that
+    /// every other family-aware check in this codebase (`GuestVaDomain::custody_at_via_lineage`,
+    /// the W^X ledger, the growsdown fault-classification fix) already uses to distinguish one
+    /// family's own memory from another's. This is a real fix, not a relabeling: prior to it,
+    /// this was one flat, owner-blind `BTreeMap<usize, usize>`, so ANY live reservation (made by
+    /// ANY family, for its own entirely unrelated park/hand-off reasons) steered EVERY OTHER
+    /// family's own flexible placement search away too -- confirmed live
+    /// (`vfork-park-reserved-range-steers-unrelated-familys-flexible-mmap-confirmed`): an
+    /// `OBSERVER` process, with zero relationship to a `vfork`-ing `V` beyond a common
+    /// grandparent, had its own genuinely-free hinted `mmap` steered off its hint purely because
+    /// `V`'s own vfork-parked reservation happened to numerically overlap it. On real Linux this
+    /// is categorically impossible (separate address spaces), and it cannot happen here either
+    /// now: [`Self::reserved_overlaps`] only ever consults the *querying* owner's own sub-map.
+    reserved: HashMap<VmViewId, BTreeMap<usize, usize>>,
+    /// Pre-effect-staged fragment bookkeeping (see [`Transient`]). Always empty except during the
+    /// brief window between staging a mutation's fragments and either committing or rolling them
+    /// back -- entered and cleared within the same `remove_mapping`/`insert_mapping` call, never
+    /// observed by anything else since the caller holds this whole struct's own lock throughout.
+    transient: RangeMap<usize, Transient>,
 }
 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
@@ -419,12 +635,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
     pub(super) fn new(platform: &'static Platform) -> Self {
         let mut vmem = Self {
-            vmas: RangeMap::new(),
+            vmas: TrackedVmas::new(),
             pending_initializations: RangeMap::new(),
             next_initialization_id: 1,
             brk: 0,
             platform,
-            reserved: BTreeMap::new(),
+            reserved: HashMap::new(),
+            transient: RangeMap::new(),
         };
         for each in platform.reserved_pages() {
             assert!(
@@ -450,6 +667,28 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         self.vmas.iter()
     }
 
+    /// Whether the mapping table changed since the last [`Self::replay_vma_ops`].
+    pub(super) fn has_vma_ops(&self) -> bool {
+        !self.vmas.ops.is_empty()
+    }
+
+    /// Replays every mapping-table operation logged since the last call into `mirror`, in order,
+    /// and empties the log (keeping a bounded capacity, so a steady state allocates nothing).
+    /// Returns how many operations it replayed. See [`TrackedVmas`].
+    pub(super) fn replay_vma_ops(&mut self, mirror: &mut VmaMirror) -> usize {
+        /// Log capacity kept between sections; one exceptional section (an `execve` of a large
+        /// image) does not pin its peak forever.
+        const KEPT_CAPACITY: usize = 64;
+        let replayed = self.vmas.ops.len();
+        for op in self.vmas.ops.drain(..) {
+            mirror.apply(op);
+        }
+        if self.vmas.ops.capacity() > KEPT_CAPACITY {
+            self.vmas.ops.shrink_to(KEPT_CAPACITY);
+        }
+        replayed
+    }
+
     /// Reserves a callback identity before publishing the mapping it will own.
     /// Consumed identities are deliberately not reused, including when allocation fails.
     pub(super) fn reserve_initialization_id(&mut self) -> Result<InitializationId, MappingError> {
@@ -461,6 +700,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     }
 
     /// Marks a newly-published mapping as owned by one initialization callback.
+    ///
+    /// Pure logical bookkeeping (`self.vmas`/`self.pending_initializations` mutation only): no
+    /// platform effect call of its own, so there is no pre-effect/post-effect distinction here
+    /// for [`Transient`] to protect -- a panic here aborts the process exactly like any other
+    /// `BTreeMap` growth in this environment.
     pub(super) fn track_initialization(
         &mut self,
         range: PageRange<ALIGN>,
@@ -500,6 +744,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         self.pending_initializations.overlaps(range)
     }
 
+    /// Pure logical bookkeeping (`self.vmas` mutation only): no platform effect call of its
+    /// own, so there is no pre-effect/post-effect distinction here for [`Transient`] to protect.
     fn clear_initialization_markers(&mut self, range: Range<usize>) {
         let pieces: Vec<(Range<usize>, VmArea)> = self
             .vmas
@@ -551,8 +797,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .collect();
         let mut first_error = None;
         for piece in pieces {
-            match unsafe { self.platform.deallocate_pages(piece.clone()) } {
+            // PREPARE: a panic inside `deallocate_pages` then leaves a forensic
+            // `Transient::Retiring` record rather than silent, unrecorded loss. Cleared again
+            // below once the platform call returns, on both the commit and the rollback path
+            // (mirrors `Self::remove_mapping`'s own pattern). No entry is staged if this piece
+            // has no corresponding `vmas` entry (nothing to restore either way).
+            let restore = self.vmas.get_key_value(&piece.start).map(|(_, v)| *v);
+            if let Some(restore) = restore {
+                self.transient
+                    .insert(piece.clone(), Transient::Retiring { restore });
+            }
+            // EFFECT
+            let effect_result = unsafe { self.platform.deallocate_pages(piece.clone()) };
+            self.transient.remove(piece.clone());
+            match effect_result {
                 Ok(()) => {
+                    // COMMIT
                     self.vmas.remove(piece.clone());
                     self.pending_initializations.remove(piece);
                 }
@@ -567,26 +827,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
     }
 
+    /// Pure logical bookkeeping (`self.pending_initializations` mutation only): no platform
+    /// effect call of its own, so there is no pre-effect/post-effect distinction here for
+    /// [`Transient`] to protect.
     fn invalidate_initializations(&mut self, range: Range<usize>) {
         self.pending_initializations.remove(range.clone());
         self.clear_initialization_markers(range);
-    }
-
-    /// Returns the flags for the mapping containing `address`.
-    pub(super) fn flags_at(&self, address: usize) -> Option<VmFlags> {
-        self.vmas
-            .get_key_value(&address)
-            .map(|(_, vma)| vma.flags())
-    }
-
-    /// Returns a shared-backing futex identity and byte offset for `address`.
-    pub(super) fn shared_futex_key_at(&self, address: usize) -> Option<(usize, usize)> {
-        let (_, vma) = self.vmas.get_key_value(&address)?;
-        let shared = vma.shared_futex?;
-        let SharedFutexPosition::Origin(origin) = shared.position else {
-            return None;
-        };
-        Some((shared.identity, address.wrapping_sub(origin)))
     }
 
     fn assign_shared_futex_identity(&mut self, vma: &mut VmArea, origin: usize) {
@@ -622,6 +868,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// Any existing tracked mappings that overlap `range` are silently removed from tracking
     /// (without calling the platform deallocator) before inserting. Use [`Self::overlapping`] to
     /// check for overlap before running this if needed.
+    ///
+    /// No platform effect call of its own (`self.vmas` bookkeeping only, over an already
+    /// materialized region): no pre-effect/post-effect distinction here for [`Transient`] to
+    /// protect.
     pub(super) fn register_existing_mapping_overwrite(
         &mut self,
         range: PageRange<ALIGN>,
@@ -664,41 +914,64 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             "removing mapping"
         );
         let range = Range::from(range);
-        let deferred_pieces: alloc::vec::Vec<Range<usize>> = self
+        // PREPARE: collected once and reused below for both the deferred/non-deferred split
+        // logic and the pre-effect staging -- no need to re-query `vmas` a second time.
+        let pieces: alloc::vec::Vec<(Range<usize>, VmArea)> = self
             .overlapping(range.clone())
-            .filter(|(_, vma)| vma.flags.contains(VmFlags::VM_DEFERRED))
-            .map(|(r, _)| r.clone())
+            .map(|(r, vma)| (r.clone(), *vma))
             .collect();
-        if deferred_pieces.is_empty() {
-            unsafe {
-                self.platform
-                    .deallocate_pages(range.clone())
-                    .map_err(VmemUnmapError::UnmapError)?;
+        let deferred_pieces_present = pieces
+            .iter()
+            .any(|(_, vma)| vma.flags.contains(VmFlags::VM_DEFERRED));
+        // Every fragment that will actually receive a real platform teardown call (deferred
+        // fragments never reach the platform, so nothing is staged for them) is recorded here
+        // before that call runs: a panic inside `deallocate_pages` then leaves a forensic
+        // `Transient::Retiring` record rather than silent, unrecorded loss. Cleared again below
+        // once the platform call returns, on both the commit and the rollback path.
+        let mut effect_pieces: alloc::vec::Vec<Range<usize>> = alloc::vec::Vec::new();
+        for (r, vma) in &pieces {
+            if vma.flags.contains(VmFlags::VM_DEFERRED) {
+                continue;
             }
+            let piece = r.start.max(range.start)..r.end.min(range.end);
+            if piece.is_empty() {
+                continue;
+            }
+            self.transient
+                .insert(piece.clone(), Transient::Retiring { restore: *vma });
+            effect_pieces.push(piece);
+        }
+
+        // EFFECT
+        let effect_result: Result<(), crate::platform::page_mgmt::DeallocationError> = if !deferred_pieces_present {
+            unsafe { self.platform.deallocate_pages(range.clone()) }
         } else {
             // Deferred (VM_DEFERRED) pieces have no platform state to tear
             // down; deallocating the whole range would ask the platform to
             // unmap pages it never mapped. Deallocate only the pieces that
             // were actually materialized.
-            let pieces: alloc::vec::Vec<(Range<usize>, VmArea)> = self
-                .overlapping(range.clone())
-                .map(|(r, vma)| (r.clone(), *vma))
-                .collect();
-            for (r, vma) in pieces {
-                if vma.flags.contains(VmFlags::VM_DEFERRED) {
-                    continue;
-                }
-                let piece = r.start.max(range.start)..r.end.min(range.end);
-                if piece.is_empty() {
-                    continue;
-                }
-                unsafe {
-                    self.platform
-                        .deallocate_pages(piece)
-                        .map_err(VmemUnmapError::UnmapError)?;
+            let mut first_error = None;
+            for piece in &effect_pieces {
+                if let Err(error) = unsafe { self.platform.deallocate_pages(piece.clone()) } {
+                    first_error = Some(error);
+                    break;
                 }
             }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        };
+
+        // The platform call has returned either way: nothing is in flight any more, so every
+        // staged fragment is cleared regardless of outcome (on failure this is the ROLLBACK --
+        // `vmas` itself is untouched below, so there is nothing left to restore).
+        for piece in &effect_pieces {
+            self.transient.remove(piece.clone());
         }
+        effect_result.map_err(VmemUnmapError::UnmapError)?;
+
+        // COMMIT
         self.vmas.remove(range.clone());
         self.invalidate_initializations(range);
         Ok(())
@@ -707,15 +980,35 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// Reset pages without removing its mapping (similar to Linux `madvise` with
     /// `MADV_DONTNEED` or `MADV_FREE`).
     ///
-    /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
-    /// returns `Err(VmemResetError::FileBacked)`.
+    /// Per-VMA Linux semantics (see the `madvise-dontneed-file-backed-reset` PRD row):
+    /// - Private anonymous: dropped and refaulted zero-filled (the `insert_mapping`
+    ///   `Replace` path below) -- for both advice values alike.
+    /// - `VM_SHARED` (file-backed or anonymous -- memfd, `.pak`, shm): left completely
+    ///   untouched, for both advice values. Linux's own contract is that the next access
+    ///   observes the shared object's *current* bytes either way (`MADV_DONTNEED` merely
+    ///   zaps the PTE; neither advice value ever discards a real shared object's content),
+    ///   and `Vmem` has no lesser-effort "zap PTE, keep the same backing" primitive to
+    ///   offer instead of a full deallocate/reallocate -- which would risk fabricating a
+    ///   fresh backing under the reused `shared_futex` identity rather than provably
+    ///   reconnecting to the live one. A no-op is strictly safe and observably correct.
+    /// - Private file-backed: returns `Err(VmemResetError::FileBacked)` for both advice
+    ///   values. Real Linux instead discards dirty COW'd content and refaults the file's
+    ///   own original bytes on the next access -- but `VmArea` retains no durable reference
+    ///   back to the source file/offset once the initial `mmap` populates a mapping (every
+    ///   real file-content population site -- `do_mmap_file_memcpy`'s eager copy and
+    ///   `try_cow_mmap_file`'s COW-over-`static_data` fast path alike -- lives in
+    ///   `litebox_shim_linux/src/syscalls/mm.rs`, permanently read-only under this
+    ///   project's standing constraints; see
+    ///   `mremap-private-file-grow-content-population-shim-boundary-remainder` for the
+    ///   identical architectural wall hit independently by `mremap`'s own grow path, and
+    ///   `madvise-dontneed-file-backed-content-replay` for this row's own tracked
+    ///   remainder). Silently substituting zero-fill instead would be objectively wrong
+    ///   content -- strictly worse than a typed, loudly-returned error -- so this refuses
+    ///   instead, exactly as the `anonymous_only` case below already did before this
+    ///   function supported any file-backed arm at all.
     ///
-    /// The current implementation effectively re-inserts the mapping with the same
-    /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
-    ///
-    /// # Panics
-    ///
-    /// File-backed mapping is not supported yet.
+    /// Delegation-covered, not a separate `Transient` staging site: every actual platform
+    /// effect here runs through [`Self::insert_mapping`]'s own `Replace` call, already staged.
     ///
     /// # Safety
     ///
@@ -726,6 +1019,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         range: PageRange<ALIGN>,
         anonymous_only: bool,
     ) -> Result<(), VmemResetError> {
+        let _ = anonymous_only;
         let range: Range<usize> = range.into();
         // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
         // while still resetting all of the existing vmas in the range.
@@ -735,11 +1029,17 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
         for (r, vma) in overlapping_ranges {
+            if vma.flags.contains(VmFlags::VM_SHARED) {
+                // MAP_SHARED file-backed and shared anonymous alike: see the doc comment
+                // above. Neither advice value ever touches a shared VMA's backing.
+                continue;
+            }
             if vma.is_file_backed() {
-                if anonymous_only {
-                    return Err(VmemResetError::FileBacked);
-                }
-                unimplemented!("resetting file-backed mappings is not supported yet");
+                // Private file-backed: see the doc comment above. Loudly refuse instead of
+                // panicking or corrupting content with zero-fill; identical for both
+                // DONTNEED and FREE, since neither can correctly refault real file bytes
+                // yet.
+                return Err(VmemResetError::FileBacked);
             }
             if vma.flags.contains(VmFlags::VM_DEFERRED) {
                 // A deferred reservation has no contents to invalidate: it is
@@ -751,7 +1051,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let end = r.end.min(range.end);
             let new_range = PageRange::new(start, end).unwrap();
             unsafe { self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Replace) }
-                .expect("failed to reset pages");
+                .map_err(VmemResetError::Platform)?;
         }
         if unmapped_error {
             Err(VmemResetError::AlreadyUnallocated)
@@ -842,6 +1142,30 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 }
             }
         };
+        // PREPARE (fixed-address branches only -- `Hint` placement's final address is chosen *by*
+        // the platform call itself, so no exact key is known yet to stage against): record the
+        // not-yet-materialized target before the platform call runs. Whatever this range's
+        // previous `VmArea` was (the `Replace` case) stays directly readable from `self.vmas`
+        // itself throughout -- `vmas` is not touched until the commit step below -- so nothing
+        // needs to be separately duplicated here. A panic inside `allocate_pages`/
+        // `allocate_shared_pages` leaves this forensic `Transient::Installing` record rather than
+        // silent, unrecorded loss; cleared again once the platform call returns, on both the
+        // commit and the rollback path.
+        //
+        // KNOWN, DISCLOSED CARVE-OUT (`Hint` only): `PageManagementProvider::allocate_pages`
+        // itself performs the placement search and returns the chosen address; there is no
+        // pre-effect target key available to stage against without splitting the trait's
+        // placement search from its own commit step, a larger cross-trait change not attempted
+        // here. A panic inside `allocate_pages` while resolving a `Hint` therefore leaves no
+        // `Transient` record at all -- an accepted, narrow gap, distinct from every other branch
+        // of this function.
+        let staged_fixed_range = if matches!(fixed_address_behavior, FixedAddressBehavior::Hint) {
+            None
+        } else {
+            self.transient
+                .insert(start..end, Transient::Installing { publish: vma });
+            Some(start..end)
+        };
         if vma.flags.contains(VmFlags::VM_SHARED) && vma.shared_futex.is_none() {
             vma.shared_futex = Some(SharedFutexMapping {
                 identity: SharedFutexBacking::new().identity,
@@ -871,7 +1195,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let permissions = MemoryRegionPermissions::from_bits(permissions).unwrap();
         let suggested_range = Range::from(suggested_range);
         let suggested_len = suggested_range.len();
-        let ret = if let Some((identity, offset)) = shared_allocation {
+        // EFFECT
+        let effect_result = if let Some((identity, offset)) = shared_allocation {
             self.platform.allocate_shared_pages(
                 identity,
                 offset,
@@ -893,7 +1218,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         .map_err(|err| match err {
             AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
             other => other,
-        })?;
+        });
+        // The platform call has returned either way: nothing is in flight any more, so the staged
+        // fragment is cleared regardless of outcome (on failure this is the ROLLBACK -- `vmas`
+        // itself is untouched below, so there is nothing left to restore).
+        if let Some(staged) = staged_fixed_range {
+            self.transient.remove(staged);
+        }
+        let ret = effect_result?;
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_len;
         self.assign_shared_futex_identity(&mut vma, new_start);
@@ -934,12 +1266,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// When using [`CreatePagesFlags::FIXED_ADDR`] without [`CreatePagesFlags::NOREPLACE`], the
     /// caller must ensure any overlapping mappings are not used by any other code, as they will be
     /// unmapped.
+    /// `steer_owner` scopes [`Self::reserved`] steering for the flexible-placement search to this
+    /// one owner's own reservations (see [`Self::reserved_overlaps`]) -- pass the calling guest
+    /// task's own [`VmViewId`] (from `Platform::current_guest_access`) so an unrelated family's
+    /// vfork-parked reservation can never steer this placement, or `None` from a host-internal
+    /// caller with no such context (preserves this search's original, fully owner-blind
+    /// steering, i.e. no behavior change for such a caller).
     pub(super) unsafe fn create_mapping(
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         vma: VmArea,
         flags: CreatePagesFlags,
+        steer_owner: Option<VmViewId>,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let total_length = (length
             + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
@@ -953,6 +1292,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 suggested_address,
                 total_length,
                 flags.contains(CreatePagesFlags::FIXED_ADDR),
+                steer_owner,
             )
             .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
@@ -984,6 +1324,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// (due to enlarging).
     ///
     /// See <https://elixir.bootlin.com/linux/v5.19.17/source/mm/mremap.c#L886> for reference.
+    ///
+    /// Delegation-covered, not a separate `Transient` staging site: both the shrink and grow
+    /// paths run their actual platform effect entirely through [`Self::remove_mapping`] /
+    /// [`Self::insert_mapping`], already staged.
     ///
     /// # Safety
     ///
@@ -1099,15 +1443,21 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .get_key_value(&old_range.start)
             .expect("VMEM: range not found");
         assert!(cur_range.contains(&(old_range.end - 1)));
+        // Copied out to an owned value immediately: everything below needs `self.transient`
+        // (a different field) mutated while still consulting the old mapping's contents, which
+        // a live borrow through `self.vmas.get_key_value` would otherwise conflict with.
+        let vma = *vma;
         if self.has_pending_initialization(&Range::from(old_range)) {
             return Err(VmemMoveError::OutOfMemory);
         }
 
-        if vma.is_file_backed() && !vma.flags.contains(VmFlags::VM_SHARED) {
-            unimplemented!("private file-backed mapping move is not supported yet");
-        }
+        // `steer_owner: None` -- out of this fix's scope (the confirmed bug and its live
+        // reproduction are both about a fresh `mmap`'s placement, not `mremap`'s), so this
+        // unconditionally keeps the exact pre-fix, fully owner-blind steering: every live
+        // reservation from every family still steers an `mremap`'s own placement search, same as
+        // before this change.
         let new_addr = self
-            .get_unmmaped_area(suggested_new_address, new_size, false)
+            .get_unmmaped_area(suggested_new_address, new_size, false, None)
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let shared_remap = vma.shared_futex.map(|shared| {
@@ -1116,7 +1466,55 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             };
             (shared.identity, old_range.start.wrapping_sub(origin))
         });
-        let new_addr = unsafe {
+        // `new_addr` is a real pre-known target (unlike `Hint` placement in `insert_mapping`,
+        // which the platform call itself picks): `get_unmmaped_area` already reserved it above,
+        // so the fully-computed post-move `VmArea` (including its shared-futex origin, rebased
+        // onto this already-known `new_addr`) can be staged before the platform call runs.
+        let mut moved_vma = vma;
+        let new_start = new_range.start;
+        let new_end = new_range.end;
+        if let Some(shared) = &mut moved_vma.shared_futex {
+            let SharedFutexPosition::Origin(origin) = &mut shared.position else {
+                unreachable!("installed shared futex mappings always have an origin")
+            };
+            let old_offset = old_range.start.wrapping_sub(*origin);
+            *origin = new_start.wrapping_sub(old_offset);
+        }
+        // A private file-backed mapping only reaches this function (rather than returning
+        // early from `resize_mapping`) when it is also growing -- `PageManager::remap_pages`
+        // only calls `move_mappings` after `resize_mapping` reports `RangeOccupied`, and
+        // `resize_mapping` itself resolves a same-size request (`new_end == range.end`)
+        // before any occupancy check runs, so `new_size` exceeds `old_range.len()` on every
+        // real caller. The relocated head (`new_start .. new_start + old_len`) is filled by
+        // the EFFECT call below with the *exact current bytes* of the old range (a byte-level
+        // copy either via this platform's own override or the default `RawConstPointer`-based
+        // trait body -- see both `remap_pages` doc comments), so whatever a COW fault already
+        // diverged stays diverged and an untouched alias's pristine file bytes move across
+        // unchanged: that portion genuinely keeps its file identity and stays tagged
+        // `is_file_backed`. Any grown tail beyond that (`new_start + old_len .. new_end`) is
+        // fresh platform-allocated space the EFFECT call never writes real file content into
+        // -- this manager has no file/fd access below the shim syscall boundary to read
+        // further file bytes (see `resize_mapping`'s identical, already-shipped tail split
+        // above for the in-place-growth twin of this same gap) -- so it is tagged anonymous
+        // for the same reason `resize_mapping`'s tail is: `reset_pages`/`set_wipe_on_fork`
+        // must see it as anonymous, and, lacking real file content, it genuinely is.
+        let old_len = old_range.len();
+        let grown_tail = (moved_vma.is_file_backed()
+            && !moved_vma.flags.contains(VmFlags::VM_SHARED)
+            && new_size.as_usize() > old_len)
+            .then(|| VmArea::new(moved_vma.flags, false, None));
+        // PREPARE: a panic inside `remap_pages`/`remap_shared_pages` then leaves a forensic
+        // `Transient::Retiring` at the old range and `Transient::Installing` at the new one,
+        // rather than silent, unrecorded loss. Cleared again below once the platform call
+        // returns, on both the commit and the rollback path.
+        self.transient
+            .insert(Range::from(old_range), Transient::Retiring { restore: vma });
+        self.transient.insert(
+            new_start..new_end,
+            Transient::Installing { publish: moved_vma },
+        );
+        // EFFECT
+        let effect_result = unsafe {
             if let Some((identity, offset)) = shared_remap {
                 self.platform.remap_shared_pages(
                     identity,
@@ -1129,27 +1527,38 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 self.platform
                     .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
             }
-        }
-        .map_err(VmemMoveError::RemapError)?;
+        };
+        // The platform call has returned either way: nothing is in flight any more, so both
+        // staged fragments are cleared regardless of outcome (on failure this is the ROLLBACK --
+        // `vmas` itself is untouched below, so there is nothing left to restore).
+        self.transient.remove(Range::from(old_range));
+        self.transient.remove(new_start..new_end);
+        let new_addr = effect_result.map_err(VmemMoveError::RemapError)?;
 
-        let mut moved_vma = *vma;
-        let new_start = new_addr.as_usize();
-        let new_end = new_start + new_size.as_usize();
-        if let Some(shared) = &mut moved_vma.shared_futex {
-            let SharedFutexPosition::Origin(origin) = &mut shared.position else {
-                unreachable!("installed shared futex mappings always have an origin")
-            };
-            let old_offset = old_range.start.wrapping_sub(*origin);
-            *origin = new_start.wrapping_sub(old_offset);
-        }
+        // COMMIT
         let installed = new_start..new_end;
-        self.vmas.insert(installed.clone(), moved_vma);
+        match grown_tail {
+            Some(tail_vma) => {
+                let split = new_start + old_len;
+                self.vmas.insert(new_start..split, moved_vma);
+                self.vmas.insert(split..new_end, tail_vma);
+            }
+            None => {
+                self.vmas.insert(installed.clone(), moved_vma);
+            }
+        }
         self.vmas.remove(old_range.into());
         self.invalidate_initializations(installed);
         self.invalidate_initializations(old_range.into());
         Ok(new_addr)
     }
 
+    /// Commits a flag change into `self.vmas` for one already-decided fragment (splitting the
+    /// original entry at its edges if needed). Called from [`Self::protect_mapping`] (post its
+    /// own real platform effect, already staged there) and from [`Self::set_wipe_on_fork`] /
+    /// [`Self::set_dont_fork`], neither of which calls any platform effect of their own for a
+    /// flag-only change -- `self.vmas` mutation only, so there is no pre-effect/post-effect
+    /// distinction here for [`Transient`] to protect in those two callers.
     fn record_protected_piece(
         &mut self,
         original: Range<usize>,
@@ -1241,9 +1650,72 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .collect()
     }
 
+    /// Sets (`MADV_DONTFORK`) or clears (`MADV_DOFORK`) [`VmFlags::VM_DONTCOPY`] on every
+    /// mapping overlapping `range`, splitting mappings at the range's edges exactly as
+    /// [`Self::set_wipe_on_fork`] does.
+    ///
+    /// Unlike [`Self::set_wipe_on_fork`], this is legal on any mapping (file-backed, shared,
+    /// or private) -- real Linux's `MADV_DONTFORK` carries no such restriction. A hole in the
+    /// range is still `ENOMEM`, and every mapping is validated before any is changed.
+    pub(super) fn set_dont_fork(
+        &mut self,
+        range: PageRange<ALIGN>,
+        enable: bool,
+    ) -> Result<(), VmemDontForkError> {
+        let range = range.start..range.end;
+        let pieces: Vec<(Range<usize>, Range<usize>, VmArea)> = self
+            .vmas
+            .overlapping(range.clone())
+            .map(|(mapped, vma)| {
+                (
+                    mapped.clone(),
+                    mapped.start.max(range.start)..mapped.end.min(range.end),
+                    *vma,
+                )
+            })
+            .collect();
+        let mut covered = range.start;
+        let mut holes = false;
+        for (_, intersection, _) in &pieces {
+            if intersection.start != covered {
+                holes = true;
+            }
+            covered = intersection.end;
+        }
+        if covered != range.end {
+            holes = true;
+        }
+        for (original, intersection, vma) in pieces {
+            if vma.flags.contains(VmFlags::VM_DONTCOPY) == enable {
+                continue;
+            }
+            let mut flags = vma.flags;
+            flags.set(VmFlags::VM_DONTCOPY, enable);
+            self.record_protected_piece(original, intersection, vma, flags);
+        }
+        if holes {
+            return Err(VmemDontForkError::Unmapped(range));
+        }
+        Ok(())
+    }
+
+    /// Every mapping carrying [`VmFlags::VM_DONTCOPY`], with its flags, in address order.
+    pub(super) fn dont_fork_ranges(&self) -> Vec<(Range<usize>, VmFlags)> {
+        self.vmas
+            .iter()
+            .filter(|(_, vma)| vma.flags.contains(VmFlags::VM_DONTCOPY))
+            .map(|(r, vma)| (r.clone(), vma.flags))
+            .collect()
+    }
+
     /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of a range in the virtual address space.
     ///
     /// See <https://elixir.bootlin.com/linux/v5.19.17/source/mm/mprotect.c#L617> for reference.
+    ///
+    /// Linux-exact partial-application ordering: this walks the range in address order and
+    /// applies the change to every mapping it has already walked before it returns an error. A
+    /// gap or `VM_MAY`-incompatible mapping at the very start of `range` is refused before any
+    /// mutation; one discovered further in still leaves every mapping walked before it changed.
     ///
     /// # Safety
     ///
@@ -1269,53 +1741,103 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 )
             })
             .collect();
+        // Walk in address order, stopping at the first gap or `VM_MAY`-incompatible mapping.
+        // Everything walked before that point is a real, contiguous, compatible prefix that gets
+        // applied below; the offending fragment and anything after it never does.
         let mut covered = range.start;
-        for (_, intersection, vma) in &mappings_to_change {
+        let mut applicable: Vec<(Range<usize>, Range<usize>, VmArea)> = Vec::new();
+        let mut pending_error: Option<VmemProtectError> = None;
+        for (original, intersection, vma) in mappings_to_change {
             if intersection.start != covered {
-                return Err(VmemProtectError::InvalidRange(range));
+                pending_error = Some(VmemProtectError::InvalidRange(range.clone()));
+                break;
             }
-            covered = intersection.end;
             if (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits() != 0 {
-                return Err(VmemProtectError::NoAccess {
+                pending_error = Some(VmemProtectError::NoAccess {
                     old: vma.flags,
                     new: flags,
                 });
+                break;
             }
+            covered = intersection.end;
+            applicable.push((original, intersection, vma));
         }
-        if covered != range.end {
-            return Err(VmemProtectError::InvalidRange(range));
+        if pending_error.is_none() && covered != range.end {
+            pending_error = Some(VmemProtectError::InvalidRange(range.clone()));
         }
-        if mappings_to_change
+
+        if applicable
             .iter()
             .all(|(_, _, vma)| vma.flags & VmFlags::VM_ACCESS_FLAGS == flags)
         {
-            return Ok(());
+            return match pending_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            };
         }
 
-        let any_deferred = mappings_to_change
+        let any_deferred = applicable
             .iter()
             .any(|(_, _, vma)| vma.flags.contains(VmFlags::VM_DEFERRED));
 
         if self.platform.has_transactional_permission_updates() && !any_deferred {
             // This provider explicitly guarantees that an ordinary error means
             // no page changed; HVF uses process-abort containment after any
-            // lower publication. One call therefore closes the multi-VMA
-            // partial-progress boundary without assuming the same of native
-            // providers with reservation or backing boundaries.
-            unsafe { self.platform.update_permissions(range.clone(), permissions) }
-                .map_err(VmemProtectError::ProtectError)?;
-            for (original, intersection, vma) in mappings_to_change {
-                if vma.flags & VmFlags::VM_ACCESS_FLAGS != flags {
-                    let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-                    self.record_protected_piece(original, intersection, vma, new_flags);
+            // lower publication. One call over exactly the applicable prefix
+            // (never the offending fragment or anything after it) closes the
+            // multi-VMA partial-progress boundary without assuming the same of
+            // native providers with reservation or backing boundaries.
+            if let (Some((_, first, _)), Some((_, last, _))) =
+                (applicable.first(), applicable.last())
+            {
+                let applied_range = first.start..last.end;
+                // PREPARE: one `Transient::Installing` per fragment that will actually change,
+                // matching the single batched call below -- a panic inside `update_permissions`
+                // then leaves a forensic record per fragment rather than silent, unrecorded loss.
+                let mut staged: Vec<Range<usize>> = Vec::new();
+                for (_, intersection, vma) in &applicable {
+                    if vma.flags & VmFlags::VM_ACCESS_FLAGS != flags {
+                        let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
+                        let publish = VmArea {
+                            flags: new_flags,
+                            is_file_backed: vma.is_file_backed,
+                            shared_futex: vma.shared_futex,
+                            initialization: vma.initialization,
+                        };
+                        self.transient
+                            .insert(intersection.clone(), Transient::Installing { publish });
+                        staged.push(intersection.clone());
+                    }
+                }
+                // EFFECT
+                let effect_result =
+                    unsafe { self.platform.update_permissions(applied_range, permissions) };
+                // The platform call has returned either way: nothing is in flight any more, so
+                // every staged fragment is cleared regardless of outcome (on failure this is the
+                // ROLLBACK -- `vmas` itself is untouched below, so there is nothing left to
+                // restore).
+                for staged_range in staged {
+                    self.transient.remove(staged_range);
+                }
+                effect_result.map_err(VmemProtectError::ProtectError)?;
+                // COMMIT
+                for (original, intersection, vma) in applicable {
+                    if vma.flags & VmFlags::VM_ACCESS_FLAGS != flags {
+                        let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
+                        self.record_protected_piece(original, intersection, vma, new_flags);
+                    }
                 }
             }
-            return Ok(());
+            return match pending_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            };
         }
 
-        // Native providers retain their individual mapping boundaries. All
-        // coverage and VM_MAY checks above complete before the first mutation,
-        // so no deterministic validation failure can follow earlier progress.
+        // Native providers retain their individual mapping boundaries. Only the
+        // already-validated `applicable` prefix (contiguous and `VM_MAY`-compatible, address
+        // order) is ever mutated; a gap or incompatible mapping past it surfaces as
+        // `pending_error` below, once every fragment before it has been applied.
         //
         // A deferred (VM_DEFERRED) piece has no platform state yet: it is
         // *materialized* here -- freshly allocated with the requested access --
@@ -1323,7 +1845,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // allocation is made non-executable first and then updated, because
         // platforms are entitled to refuse born-executable allocations (the
         // HVF memory manager does: `HvfMemoryError::InitialExecute`).
-        for (original, intersection, vma) in mappings_to_change {
+        for (original, intersection, vma) in applicable {
             if vma.flags & VmFlags::VM_ACCESS_FLAGS == flags {
                 continue;
             }
@@ -1335,34 +1857,133 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 } else {
                     permissions
                 };
-                self.platform
-                    .allocate_pages(
-                        intersection.clone(),
-                        allocate_perms,
-                        false,
-                        false,
-                        crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
-                    )
-                    .map_err(VmemProtectError::DeferredAllocate)?;
-                if wants_exec {
-                    unsafe { self.platform.update_permissions(intersection.clone(), permissions) }
-                        .map_err(VmemProtectError::ProtectError)?;
-                }
                 let new_flags =
                     (vma.flags & !VmFlags::VM_ACCESS_FLAGS & !VmFlags::VM_DEFERRED) | flags;
+                let publish = VmArea {
+                    flags: new_flags,
+                    is_file_backed: vma.is_file_backed,
+                    shared_futex: vma.shared_futex,
+                    initialization: vma.initialization,
+                };
+                // PREPARE: staged before the deferred `allocate_pages` call (and the `EXECUTE`
+                // follow-up `update_permissions`, when needed) so a panic in either leaves a
+                // forensic record rather than silent, unrecorded loss.
+                self.transient
+                    .insert(intersection.clone(), Transient::Installing { publish });
+                // EFFECT
+                let effect_result: Result<(), VmemProtectError> = match self.platform.allocate_pages(
+                    intersection.clone(),
+                    allocate_perms,
+                    false,
+                    false,
+                    crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
+                ) {
+                    Ok(_) if wants_exec => unsafe {
+                        self.platform
+                            .update_permissions(intersection.clone(), permissions)
+                    }
+                    .map_err(VmemProtectError::ProtectError),
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(VmemProtectError::DeferredAllocate(error)),
+                };
+                self.transient.remove(intersection.clone());
+                effect_result?;
+                // COMMIT
                 self.record_protected_piece(original, intersection, vma, new_flags);
                 continue;
             }
-            unsafe {
+            let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
+            let publish = VmArea {
+                flags: new_flags,
+                is_file_backed: vma.is_file_backed,
+                shared_futex: vma.shared_futex,
+                initialization: vma.initialization,
+            };
+            // PREPARE
+            self.transient
+                .insert(intersection.clone(), Transient::Installing { publish });
+            // EFFECT
+            let effect_result = unsafe {
                 self.platform
                     .update_permissions(intersection.clone(), permissions)
-            }
-            .map_err(VmemProtectError::ProtectError)?;
-            let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
+            };
+            // The platform call has returned either way: nothing is in flight any more, so the
+            // staged fragment is cleared regardless of outcome (on failure this is the ROLLBACK
+            // -- `vmas` itself is untouched below, so there is nothing left to restore).
+            self.transient.remove(intersection.clone());
+            effect_result.map_err(VmemProtectError::ProtectError)?;
+            // COMMIT
             self.record_protected_piece(original, intersection, vma, new_flags);
         }
 
+        match pending_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::protect_mapping`]'s admission half alone: `range` must be fully mapped and every
+    /// mapping there must allow `permissions` under its `VM_MAY*` flags. No effect.
+    pub(super) fn check_permissions(
+        &self,
+        range: PageRange<ALIGN>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), VmemProtectError> {
+        let flags =
+            VmFlags::from_bits(u32::from(permissions.bits())).unwrap() & VmFlags::VM_ACCESS_FLAGS;
+        let range = range.start..range.end;
+        let mut covered = range.start;
+        for (mapped, vma) in self.vmas.overlapping(range.clone()) {
+            if mapped.start.max(range.start) != covered {
+                return Err(VmemProtectError::InvalidRange(range));
+            }
+            if (!(vma.flags.bits() >> 4) & flags.bits()) & VmFlags::VM_ACCESS_FLAGS.bits() != 0 {
+                return Err(VmemProtectError::NoAccess {
+                    old: vma.flags,
+                    new: flags,
+                });
+            }
+            covered = mapped.end.min(range.end);
+        }
+        if covered != range.end {
+            return Err(VmemProtectError::InvalidRange(range));
+        }
         Ok(())
+    }
+
+    /// [`Self::protect_mapping`]'s bookkeeping half alone, for a change whose platform effect was
+    /// already applied in the caller's own per-view address space: records `permissions` as
+    /// `range`'s access flags (a reservation becoming accessible is no longer `VM_DEFERRED`),
+    /// touching no platform state. `range` must have passed [`Self::check_permissions`].
+    pub(super) fn record_permissions(
+        &mut self,
+        range: PageRange<ALIGN>,
+        permissions: MemoryRegionPermissions,
+    ) {
+        let flags =
+            VmFlags::from_bits(u32::from(permissions.bits())).unwrap() & VmFlags::VM_ACCESS_FLAGS;
+        let range = range.start..range.end;
+        let pieces: Vec<(Range<usize>, Range<usize>, VmArea)> = self
+            .vmas
+            .overlapping(range.clone())
+            .map(|(mapped, vma)| {
+                (
+                    mapped.clone(),
+                    mapped.start.max(range.start)..mapped.end.min(range.end),
+                    *vma,
+                )
+            })
+            .collect();
+        for (original, intersection, vma) in pieces {
+            let new_flags = if flags.is_empty() {
+                vma.flags & !VmFlags::VM_ACCESS_FLAGS
+            } else {
+                (vma.flags & !VmFlags::VM_ACCESS_FLAGS & !VmFlags::VM_DEFERRED) | flags
+            };
+            if new_flags != vma.flags {
+                self.record_protected_piece(original, intersection, vma, new_flags);
+            }
+        }
     }
 
     /// Create a mapping with the given flags.
@@ -1385,6 +2006,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
+    ///
+    /// `steer_owner`: see [`Self::create_mapping`]'s own doc comment -- forwarded verbatim.
     pub(super) unsafe fn create_pages(
         &mut self,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
@@ -1392,6 +2015,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         flags: CreatePagesFlags,
         perms: MemoryRegionPermissions,
         shared_futex_backing: Option<(SharedFutexBacking, usize)>,
+        steer_owner: Option<VmViewId>,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
@@ -1431,32 +2055,31 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     shared_futex_backing,
                 ),
                 flags,
+                steer_owner,
             )
         }
         .map_err(MappingError::MapError)
     }
 
-    /// Get the memory permissions of a given address range.
+    /// Visibility seam for [`super::domain::GuestVaDomain::place`]'s search callback: an
+    /// identical-signature, identical-body thin wrapper around [`Self::get_unmmaped_area`],
+    /// published one module level up (`pub(super)`, i.e. visible within `mm`) so
+    /// `PageManager::create_pages` (in `mod.rs`) can drive `Vmem`'s own real placement search
+    /// from behind the domain's placement query without making `get_unmmaped_area` itself
+    /// non-private. Zero behavior change from calling `get_unmmaped_area` directly.
     ///
-    /// `page_range` specifies the range of pages to check the memory permissions.
-    /// This function returns `MemoryRegionPermissions` only if the range is valid.
-    pub(super) fn get_memory_permissions(
+    /// Read-only search (`&self`), like [`Self::get_unmmaped_area`]: not a mutation site.
+    ///
+    /// `steer_owner`: see [`Self::create_mapping`]'s own doc comment -- forwarded verbatim to
+    /// [`Self::get_unmmaped_area`]/[`Self::reserved_overlaps`].
+    pub(super) fn find_unmapped_area(
         &self,
-        page_range: PageRange<ALIGN>,
-    ) -> Option<MemoryRegionPermissions> {
-        let (range_start, range_end) = (page_range.start, page_range.end);
-        let range: core::ops::Range<usize> = page_range.into();
-        if let Some(iter) = self.overlapping(range).next() {
-            if iter.0.start > range_start || iter.0.end < range_end {
-                // partial overlap implies that the given range contains unmapped pages or
-                // consists of memory pages with different permissions.
-                return None;
-            }
-            let vmflags = iter.1.flags();
-            Some(vmflags.into())
-        } else {
-            None
-        }
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        fixed_addr: bool,
+        steer_owner: Option<VmViewId>,
+    ) -> Option<usize> {
+        self.get_unmmaped_area(suggested_address, length, fixed_addr, steer_owner)
     }
 
     /*================================Internal Functions================================ */
@@ -1466,11 +2089,20 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// similar to how `mmap` works.
     ///
     /// Returns `None` if no area found. Otherwise, returns the start address of a page-aligned area.
+    ///
+    /// Read-only search (`&self`): not a mutation site at all, so there is nothing here for
+    /// [`Transient`] to protect.
+    ///
+    /// `steer_owner`: see [`Self::create_mapping`]'s own doc comment -- passed straight through
+    /// to every [`Self::reserved_overlaps`] call this search makes (including inside
+    /// [`Self::top_down_search`]), so the whole search steers around exactly one consistent
+    /// owner's own reservations.
     fn get_unmmaped_area(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         fixed_addr: bool,
+        steer_owner: Option<VmViewId>,
     ) -> Option<usize> {
         let size = length.as_usize();
         if size > Platform::TASK_ADDR_MAX {
@@ -1499,7 +2131,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 && !self
                     .vmas
                     .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
-                && !self.reserved_overlaps(&(suggested_address.0..(suggested_address.0 + size)))
+                && !self.reserved_overlaps(
+                    &(suggested_address.0..(suggested_address.0 + size)),
+                    steer_owner,
+                )
             {
                 return Some(suggested_address.0);
             }
@@ -1529,17 +2164,26 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         if let Some(suggested_address) = suggested_address
             && suggested_address.0 < unconstrained_high_limit
             && let Some(found) =
-                self.top_down_search(low_limit, suggested_address.0, size)
+                self.top_down_search(low_limit, suggested_address.0, size, steer_owner)
         {
             return Some(found);
         }
-        self.top_down_search(low_limit, unconstrained_high_limit, size)
+        self.top_down_search(low_limit, unconstrained_high_limit, size, steer_owner)
     }
 
     /// The unhinted top-down search `get_unmmaped_area` falls back to: the highest gap of at
     /// least `size` bytes whose start is in `[low_limit, high_limit]`. Shared by the
     /// unconstrained search and, with a smaller `high_limit`, the hint-biased search above.
-    fn top_down_search(&self, low_limit: usize, high_limit: usize, size: usize) -> Option<usize> {
+    ///
+    /// `steer_owner`: see [`Self::create_mapping`]'s own doc comment -- forwarded to every
+    /// [`Self::reserved_overlaps`] call below.
+    fn top_down_search(
+        &self,
+        low_limit: usize,
+        high_limit: usize,
+        size: usize,
+        steer_owner: Option<VmViewId>,
+    ) -> Option<usize> {
         // An inverted range is empty by this function's own contract (`start
         // in [low_limit, high_limit]`) and must fail cleanly. This guards a
         // real caller mistake, not a hypothetical one: `get_unmmaped_area`'s
@@ -1600,7 +2244,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // high_limit` proxy.
         if last_end <= high_limit
             && !self.vmas.overlaps(&(high_limit..high_limit + size))
-            && !self.reserved_overlaps(&(high_limit..high_limit + size))
+            && !self.reserved_overlaps(&(high_limit..high_limit + size), steer_owner)
         {
             return Some(high_limit);
         }
@@ -1624,7 +2268,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 continue;
             }
             if !self.vmas.overlaps(&(start..start + size))
-                && !self.reserved_overlaps(&(start..start + size))
+                && !self.reserved_overlaps(&(start..start + size), steer_owner)
             {
                 return Some(start);
             }
@@ -1633,61 +2277,93 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         None
     }
 
-    /// Whether any part of `range` is covered by an externally reserved range
-    /// (see [`Self::reserved`]).
-    fn reserved_overlaps(&self, range: &Range<usize>) -> bool {
-        self.reserved
-            .range(..range.end)
-            .next_back()
-            .is_some_and(|(_, &end)| range.start < end)
+    /// Whether any part of `range` is covered by a reservation (see [`Self::reserved`]) belonging
+    /// to `steer_owner` -- or, if `steer_owner` is `None` (a host-internal caller with no current
+    /// guest-view context; see [`Self::create_mapping`]'s own doc comment), by a reservation
+    /// belonging to ANY owner, exactly matching this method's original owner-blind behavior for
+    /// such a caller.
+    ///
+    /// `Some(owner)` deliberately consults ONLY `owner`'s own sub-map: this is the actual fix for
+    /// `vfork-park-reserved-range-steers-unrelated-familys-flexible-mmap-confirmed`
+    /// (`Self::reserved`'s own doc comment has the full story) -- an unrelated owner's live
+    /// reservation must steer nobody's placement search but that owner's own.
+    fn reserved_overlaps(&self, range: &Range<usize>, steer_owner: Option<VmViewId>) -> bool {
+        fn map_overlaps(map: &BTreeMap<usize, usize>, range: &Range<usize>) -> bool {
+            map.range(..range.end)
+                .next_back()
+                .is_some_and(|(_, &end)| range.start < end)
+        }
+        match steer_owner {
+            Some(owner) => self.reserved.get(&owner).is_some_and(|map| map_overlaps(map, range)),
+            None => self.reserved.values().any(|map| map_overlaps(map, range)),
+        }
     }
 
-    /// Marks `range` as reserved: a flexible placement search will steer around it even though it
-    /// has no live `vmas` entry. Overlapping/adjacent existing reservations are merged. See
+    /// Marks `range` as reserved on `owner`'s own behalf: a flexible placement search steered by
+    /// that same `owner` (see [`Self::reserved_overlaps`]) steers around it even though it has no
+    /// live `vmas` entry; a search steered by (or on behalf of) any other owner is unaffected.
+    /// Overlapping/adjacent existing reservations *of the same owner* are merged. See
     /// [`Self::reserved`].
-    pub(super) fn reserve_external(&mut self, range: Range<usize>) {
+    ///
+    /// Pure logical bookkeeping (`self.reserved` mutation only): no platform effect call of its
+    /// own, so there is no pre-effect/post-effect distinction here for [`Transient`] to protect.
+    pub(super) fn reserve_external(&mut self, range: Range<usize>, owner: VmViewId) {
         if range.start >= range.end {
             return;
         }
+        let map = self.reserved.entry(owner).or_default();
         let mut start = range.start;
         let mut end = range.end;
-        let overlapping: Vec<(usize, usize)> = self
-            .reserved
+        let overlapping: Vec<(usize, usize)> = map
             .range(..=end)
             .rev()
             .take_while(|&(_, &e)| e >= start)
             .map(|(&s, &e)| (s, e))
             .collect();
         for (s, e) in overlapping {
-            self.reserved.remove(&s);
+            map.remove(&s);
             start = start.min(s);
             end = end.max(e);
         }
-        self.reserved.insert(start, end);
+        map.insert(start, end);
     }
 
-    /// Releases a reservation made by [`Self::reserve_external`]. `range` need not exactly match
-    /// what was reserved (a partial release shrinks/splits the covering reservation); releasing
-    /// where nothing is reserved is a no-op.
-    pub(super) fn release_external(&mut self, range: Range<usize>) {
+    /// Releases a reservation made by [`Self::reserve_external`] under the same `owner`. `range`
+    /// need not exactly match what was reserved (a partial release shrinks/splits the covering
+    /// reservation); releasing where `owner` has nothing reserved (including an `owner` that has
+    /// never reserved anything at all) is a no-op -- in particular, this can never shrink or split
+    /// a *different* owner's own reservation, even one that numerically overlaps `range`.
+    ///
+    /// Pure logical bookkeeping (`self.reserved` mutation only): no platform effect call of its
+    /// own, so there is no pre-effect/post-effect distinction here for [`Transient`] to protect.
+    pub(super) fn release_external(&mut self, range: Range<usize>, owner: VmViewId) {
         if range.start >= range.end {
             return;
         }
-        let overlapping: Vec<(usize, usize)> = self
-            .reserved
+        let Some(map) = self.reserved.get_mut(&owner) else {
+            return;
+        };
+        let overlapping: Vec<(usize, usize)> = map
             .range(..range.end)
             .rev()
             .take_while(|&(_, &e)| e > range.start)
             .map(|(&s, &e)| (s, e))
             .collect();
         for (s, e) in overlapping {
-            self.reserved.remove(&s);
+            map.remove(&s);
             if s < range.start {
-                self.reserved.insert(s, range.start);
+                map.insert(s, range.start);
             }
             if range.end < e {
-                self.reserved.insert(range.end, e);
+                map.insert(range.end, e);
             }
+        }
+        // Never leave a stale, permanently-empty sub-map behind: `owner` (a `VmViewId`) is never
+        // reused (see the type's own doc comment), so a long-running instance with many
+        // short-lived families (an interactive shell forking/exec-ing repeatedly, e.g.) would
+        // otherwise accumulate one empty `BTreeMap` per family that ever existed, forever.
+        if map.is_empty() {
+            self.reserved.remove(&owner);
         }
     }
 }
@@ -1710,6 +2386,8 @@ pub enum VmemResetError {
     AlreadyUnallocated,
     #[error("reset file-backed mapping")]
     FileBacked,
+    #[error("failed to re-create the reset mapping: {0}")]
+    Platform(crate::platform::page_mgmt::AllocationError),
 }
 
 /// Error for [`Vmem::set_wipe_on_fork`] (`madvise(MADV_WIPEONFORK|MADV_KEEPONFORK)`).
@@ -1721,6 +2399,15 @@ pub enum VmemWipeOnForkError {
     Unmapped(Range<usize>),
     #[error("the mapping at {0:?} is file-backed or shared, so it cannot be wiped on fork")]
     NotPrivateAnonymous(Range<usize>),
+}
+
+/// Error for [`Vmem::set_dont_fork`] (`madvise(MADV_DONTFORK|MADV_DOFORK)`).
+#[derive(Error, Debug)]
+pub enum VmemDontForkError {
+    #[error("arg is not aligned")]
+    UnAligned,
+    #[error("the range {0:?} contains unmapped pages")]
+    Unmapped(Range<usize>),
 }
 
 /// Error for [`Vmem::resize_mapping`]

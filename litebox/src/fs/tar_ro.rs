@@ -247,6 +247,24 @@ impl super::backend::Backend for TarRo {
         Ok(len)
     }
 
+    /// The file's payload inside the archive, when the archive itself is borrowed static
+    /// memory (a runner that leaks its tar bytes for the process lifetime): the platform's
+    /// copy-on-write file mapping keys on this slice's address and length. An owned archive
+    /// has no `'static` bytes to hand out and keeps the copying path.
+    fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
+        let h = h.get_typed::<Self>();
+        if h.is_symlink {
+            return None;
+        }
+        match &self.tar_index.tar_data {
+            alloc::borrow::Cow::Borrowed(tar) => {
+                let tar: &'static [u8] = tar;
+                Some(&tar[self.tar_index.files[h.idx].data_range.clone()])
+            }
+            alloc::borrow::Cow::Owned(_) => None,
+        }
+    }
+
     fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
     }

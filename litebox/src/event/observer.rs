@@ -131,6 +131,17 @@ impl<E, F: EventsFilter<E>, Platform: RawSyncPrimitivesProvider> Subject<E, F, P
         }
     }
 
+    /// Whether at least one live observer is registered. Prunes entries whose observers were
+    /// dropped without being unregistered first, so a stale registration never reads as live.
+    pub fn has_observers(&self) -> bool {
+        if self.nums.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let mut observers = self.observers.lock();
+        self.prune_dead_observers(&mut observers);
+        !observers.is_empty()
+    }
+
     /// Notify all observers of the given events.
     pub fn notify_observers(&self, events: E) {
         if self.nums.load(Ordering::Relaxed) == 0 {

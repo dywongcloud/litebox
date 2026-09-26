@@ -1765,6 +1765,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
     }
 
+    pub(super) fn recv_timeout(&self) -> Option<Duration> {
+        self.options.lock().recv_timeout
+    }
+
+    pub(super) fn send_timeout(&self) -> Option<Duration> {
+        self.options.lock().send_timeout
+    }
+
     pub(super) fn new(
         sock_type: SockType,
         flags: SockFlags,
@@ -2078,6 +2086,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         optname: SocketOptionName,
         optval: UserPtrMut<u8>,
         len: u32,
+        translate_pid: impl Fn(i32) -> i32,
     ) -> Result<usize, Errno> {
         match global.getsockopt_common(optname, optval, len, |sopt| match sopt {
             SocketOption::RCVTIMEO => SocketOptionValue::Timeout(self.options.lock().recv_timeout),
@@ -2117,11 +2126,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {
-                        let ucred = stream.get_peer_cred().unwrap_or(Ucred {
+                        let mut ucred = stream.get_peer_cred().unwrap_or(Ucred {
                             pid: 0,
                             uid: u32::MAX,
                             gid: u32::MAX,
                         });
+                        // Translate the peer's real (root-view) pid into the CALLING task's own
+                        // pid-namespace view -- a no-op unless the caller is inside one (see
+                        // `Task::translate_pid_for_current_ns`), matching real Linux's own
+                        // per-namespace `SO_PEERCRED` translation.
+                        ucred.pid = translate_pid(ucred.pid.cast_signed()).cast_unsigned();
                         return super::write_to_user::<_, Platform>(ucred, optval, len);
                     }
                     UnixSocketInner::Datagram(_) => {

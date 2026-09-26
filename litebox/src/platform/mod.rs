@@ -25,6 +25,21 @@ pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
 pub use stdin_pump::StdinPump;
 
+/// Whether a platform instance mediates every guest syscall through a single, exhaustive
+/// dispatch point that a seccomp filter engine could hook once and see all guest syscalls
+/// through.
+///
+/// `Incomplete` is the default for every platform: no filter engine exists yet, and claiming
+/// `Complete` is only meaningful for a platform that has verified single-choke-point dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeccompMediationCapability {
+    /// This platform instance has not verified (or does not have) complete syscall mediation.
+    Incomplete,
+    /// This platform instance mediates every guest syscall through one exhaustive dispatch
+    /// point.
+    Complete,
+}
+
 /// A provider of a platform upon which LiteBox can execute.
 ///
 /// Ideally, a [`Provider`] is zero-sized, and only exists to provide access to functionality
@@ -33,6 +48,15 @@ pub use stdin_pump::StdinPump;
 pub trait Provider:
     RawMutexProvider + IPInterfaceProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
 {
+    /// Reports whether this platform instance mediates every guest syscall through a single,
+    /// exhaustive dispatch point.
+    ///
+    /// Defaults to [`SeccompMediationCapability::Incomplete`]. A platform instance overrides
+    /// this only once it has verified such a choke point exists and is live for the current
+    /// instance.
+    fn seccomp_mediation_capability(&self) -> SeccompMediationCapability {
+        SeccompMediationCapability::Incomplete
+    }
 }
 
 /// Thread management provider.
@@ -310,6 +334,14 @@ pub trait TimeProvider {
     fn now(&self) -> Self::Instant;
     /// Returns the current system time.
     fn current_time(&self) -> Self::SystemTime;
+    /// Tells the platform the instant a shim counts its guest-visible monotonic clock
+    /// (`CLOCK_MONOTONIC`) from, so a platform that answers clock queries inside the guest
+    /// itself -- a vDSO -- serves `now() - epoch` with the very same epoch and arithmetic as
+    /// the shim's own syscall path, and a guest mixing the two never sees its clock step.
+    /// A no-op by default: a platform with no guest-side clock has nothing to mirror.
+    fn publish_monotonic_epoch(&self, epoch: Self::Instant) {
+        let _ = epoch;
+    }
     /// Returns the total CPU time (user + system) consumed so far by the thread calling this
     /// method, corresponding to `CLOCK_THREAD_CPUTIME_ID` on Linux.
     ///

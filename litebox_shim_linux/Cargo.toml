@@ -19,6 +19,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false }
 object = { version = "0.36.7", default-features = false, features = ["elf", "read_core"] }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
+triomphe = { version = "=0.1.16", default-features = false }
 
 [features]
 alarm_fallback = []

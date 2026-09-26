@@ -389,7 +389,10 @@ fn serve_updates(
 
 /// The `(y, height)` runs of adjacent [`BAND_ROWS`]-row bands whose pixels differ between
 /// `sent` and `current` (both `rows * stride` bytes).
-fn dirty_bands(sent: &[u8], current: &[u8], stride: usize, rows: u16) -> Vec<(u16, u16)> {
+///
+/// `pub(crate)`: also used by [`crate::web`]'s browser-viewer pusher, which needs the exact same
+/// incremental-update banding this RFB server already does (see that module's own doc comment).
+pub(crate) fn dirty_bands(sent: &[u8], current: &[u8], stride: usize, rows: u16) -> Vec<(u16, u16)> {
     let mut runs: Vec<(u16, u16)> = Vec::new();
     let mut y = 0u16;
     while y < rows {

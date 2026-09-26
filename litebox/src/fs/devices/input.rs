@@ -479,6 +479,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
         }
     }
 
+    /// Whether a guest consumer currently holds a poll interest in the keyboard device
+    /// (`event0`) -- an evdev keyboard reader such as Xorg's input driver, whose epoll interest
+    /// stays registered for as long as it owns the device. The runner keys its tty fallback off
+    /// this: typed keys belong on the guest's stdin only while no evdev reader has the keyboard,
+    /// the way a VT stops delivering characters once X has taken it over.
+    pub fn keyboard_has_readers(&self) -> bool {
+        self.inner.devices[DeviceKind::Keyboard.index()]
+            .pollee
+            .has_observers()
+    }
+
     /// The `mousedev` magic knock upgrading to ImPS/2 (`set rate 200, 100, 80`).
     const IMPS_SEQ: [u8; 6] = [0xf3, 200, 0xf3, 100, 0xf3, 80];
     /// The knock upgrading to Explorer PS/2 (`set rate 200, 200, 80`).

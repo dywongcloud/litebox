@@ -31,42 +31,208 @@ ws.onclose = () => { status.textContent = "disconnected — reload to reconnect"
 ws.onerror = () => { status.textContent = "connection error"; };
 
 ws.onmessage = (ev) => {
+  const receivedMs = performance.now();
+  // [u16 width][u16 height][u16 rect count] then, per rect, [u16 y][u16 height][RGBA bytes] --
+  // only the full-width bands that actually changed (see web.rs's own doc comment); painting
+  // each at its own y leaves the rest of the canvas exactly as it already was.
   const data = new Uint8Array(ev.data);
   const w = (data[0] << 8) | data[1];
   const h = (data[2] << 8) | data[3];
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-  const frame = new ImageData(new Uint8ClampedArray(ev.data, 4), w, h);
-  ctx.putImageData(frame, 0, 0);
+  const rectCount = (data[4] << 8) | data[5];
+  let offset = 6;
+  for (let i = 0; i < rectCount; i++) {
+    const y = (data[offset] << 8) | data[offset + 1];
+    const bandHeight = (data[offset + 2] << 8) | data[offset + 3];
+    offset += 4;
+    const byteLength = w * bandHeight * 4;
+    const band = new ImageData(new Uint8ClampedArray(ev.data, offset, byteLength), w, bandHeight);
+    ctx.putImageData(band, 0, y);
+    offset += byteLength;
+  }
+  // Latency-trace trailer (see web.rs): a server running with LITEBOX_LATENCY_TRACE set follows
+  // the last band with the frame's u64 sequence number, and nothing else ever follows the bands
+  // -- so exactly 8 bytes left here means "traced frame, report once it is on screen"; an
+  // untraced server leaves 0 and this page then sends nothing beyond its input messages.
+  if (offset + 8 === data.byteLength) {
+    const seq = data.slice(offset, offset + 8);
+    requestAnimationFrame(() => sendDisplayed(seq, receivedMs));
+  }
 };
 
 function send(bytes) { if (ws.readyState === WebSocket.OPEN) ws.send(new Uint8Array(bytes)); }
 
-// --- keyboard: X11 keysyms, matching what an RFB client would send -----------------------
-const SPECIAL_KEYS = {
-  "Enter": 0xff0d, "Backspace": 0xff08, "Tab": 0xff09, "Escape": 0xff1b,
-  "ArrowLeft": 0xff51, "ArrowUp": 0xff52, "ArrowRight": 0xff53, "ArrowDown": 0xff54,
-  "Home": 0xff50, "End": 0xff57, "PageUp": 0xff55, "PageDown": 0xff56,
-  "Insert": 0xff63, "Delete": 0xffff,
-  "F1": 0xffbe, "F2": 0xffbf, "F3": 0xffc0, "F4": 0xffc1, "F5": 0xffc2,
-  "F6": 0xffc3, "F7": 0xffc4, "F8": 0xffc5, "F9": 0xffc6, "F10": 0xffc7,
-  "Shift": 0xffe1, "Control": 0xffe3, "Alt": 0xffe9, "Meta": 0xffe7,
-};
-function keysymOf(e) {
-  if (e.key in SPECIAL_KEYS) return SPECIAL_KEYS[e.key];
-  if (e.key.length === 1) {
-    const cp = e.key.codePointAt(0);
-    if (cp >= 0x20 && cp <= 0xff) return cp;  // Latin-1 keysyms are the characters themselves
-  }
-  return null;
+// The display acknowledgement for a traced frame: [3u8][u64 frame seq BE][f64 performance.now()
+// ms BE, taken in the animation-frame callback after the frame's putImageData calls][f64
+// performance.now() ms BE, taken at onmessage entry]. That callback runs before its animation
+// frame is composited, so the pixels reach the screen up to one display refresh after the first
+// timestamp, never before it.
+function sendDisplayed(seq, receivedMs) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const report = new DataView(new ArrayBuffer(25));
+  report.setUint8(0, 3);
+  new Uint8Array(report.buffer, 1, 8).set(seq);
+  report.setFloat64(9, performance.now());
+  report.setFloat64(17, receivedMs);
+  ws.send(report.buffer);
 }
-function sendKey(e, down) {
-  const sym = keysymOf(e);
-  if (sym === null) return;
-  e.preventDefault();
+
+// --- keyboard: X11 keysyms of PHYSICAL keys -----------------------------------------
+//
+// The guest's own X keymap is the only place Shift/CapsLock/NumLock may be applied, so
+// every key goes on the wire as the BASE (unshifted) keysym of its physical key, and the
+// modifier and lock keys go on the wire as their own explicit press/release -- exactly the
+// contract litebox_rfb/src/keymap.rs documents.
+//
+// `e.code` is the physical key position: it does not change with modifier state and does
+// not change with the host's keyboard layout. `e.key` changes with both -- with CapsLock
+// or Shift latched the browser reports "A", not "a" -- so deriving the keysym from `e.key`
+// applies the shift once in the browser and again in the guest's keymap. That double
+// application, together with a keyup lost whenever focus leaves this canvas mid-gesture
+// (Shift+click a link, then navigate), is what left the guest typing upper-case and
+// disagreeing with the host's real CapsLock.
+const PHYSICAL_KEYSYM = {
+  KeyA: 0x61, KeyB: 0x62, KeyC: 0x63, KeyD: 0x64, KeyE: 0x65, KeyF: 0x66, KeyG: 0x67,
+  KeyH: 0x68, KeyI: 0x69, KeyJ: 0x6a, KeyK: 0x6b, KeyL: 0x6c, KeyM: 0x6d, KeyN: 0x6e,
+  KeyO: 0x6f, KeyP: 0x70, KeyQ: 0x71, KeyR: 0x72, KeyS: 0x73, KeyT: 0x74, KeyU: 0x75,
+  KeyV: 0x76, KeyW: 0x77, KeyX: 0x78, KeyY: 0x79, KeyZ: 0x7a,
+  Digit0: 0x30, Digit1: 0x31, Digit2: 0x32, Digit3: 0x33, Digit4: 0x34, Digit5: 0x35,
+  Digit6: 0x36, Digit7: 0x37, Digit8: 0x38, Digit9: 0x39,
+  Space: 0x20, Minus: 0x2d, Equal: 0x3d, BracketLeft: 0x5b, BracketRight: 0x5d,
+  Backslash: 0x5c, Semicolon: 0x3b, Quote: 0x27, Comma: 0x2c, Period: 0x2e,
+  Slash: 0x2f, Backquote: 0x60,
+  Enter: 0xff0d, Backspace: 0xff08, Tab: 0xff09, Escape: 0xff1b,
+  ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
+  Home: 0xff50, End: 0xff57, PageUp: 0xff55, PageDown: 0xff56,
+  Insert: 0xff63, Delete: 0xffff,
+  F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2, F6: 0xffc3,
+  F7: 0xffc4, F8: 0xffc5, F9: 0xffc6, F10: 0xffc7, F11: 0xffc8, F12: 0xffc9,
+  ShiftLeft: 0xffe1, ShiftRight: 0xffe2,
+  ControlLeft: 0xffe3, ControlRight: 0xffe4,
+  AltLeft: 0xffe9, AltRight: 0xffea,
+  MetaLeft: 0xffeb, MetaRight: 0xffec,
+  // Lock keys: a press toggles the guest's lock and is immediately released -- a lock is
+  // never held down.
+  CapsLock: 0xffe5, NumLock: 0xff7f, ScrollLock: 0xff14,
+};
+const LOCK_NAMES = ["CapsLock", "NumLock", "ScrollLock"];
+const LOCK_KEYS = { CapsLock: true, NumLock: true, ScrollLock: true };
+
+// --- the one held-key / lock model ----------------------------------------------------
+// Every way a modifier can leak through -- blur, visibilitychange, pagehide, the pointer
+// leaving, the socket closing -- funnels through releaseAllHeld(), so no future event
+// type can be forgotten one at a time and leave a modifier stuck down again.
+const held = new Set();                                    // e.code currently down
+const lockState = { CapsLock: false, NumLock: false, ScrollLock: false };  // told to guest
+let hostLocks = null;                                      // last seen host lock state
+// Permanent guard counters: cheap, and they name the two ways this used to break.
+const inputGuard = {
+  strayKeyup: 0,
+  modifiersReleasedOnFocusLoss: 0,
+  repeatsSuppressed: 0,
+  lockResyncs: 0,
+};
+window.liteboxInputGuard = inputGuard;
+window.liteboxHeldKeys = held;
+
+function sendKeysym(sym, down) {
   send([1, down ? 1 : 0, (sym >>> 24) & 0xff, (sym >>> 16) & 0xff, (sym >>> 8) & 0xff, sym & 0xff]);
 }
-canvas.addEventListener("keydown", (e) => sendKey(e, true));
-canvas.addEventListener("keyup", (e) => sendKey(e, false));
+function sendLockToggle(name) {
+  const sym = PHYSICAL_KEYSYM[name];
+  sendKeysym(sym, true);
+  sendKeysym(sym, false);
+  lockState[name] = !lockState[name];
+}
+function releaseAllHeld(why) {
+  if (held.size === 0) return;
+  const stuck = [...held];
+  let modifiers = 0;
+  for (const code of stuck) {
+    if (PHYSICAL_KEYSYM[code] >= 0xffe0) modifiers += 1;
+    sendKeysym(PHYSICAL_KEYSYM[code], false);
+    held.delete(code);
+  }
+  if (modifiers !== 0) {
+    inputGuard.modifiersReleasedOnFocusLoss += modifiers;
+    console.warn("litebox: " + why + " while " + modifiers + " modifier(s) were still down (" +
+      stuck.join(", ") + "); released them");
+  }
+}
+function observeHostLocks(e) {
+  if (typeof e.getModifierState !== "function") return;
+  hostLocks = {
+    CapsLock: e.getModifierState("CapsLock"),
+    NumLock: e.getModifierState("NumLock"),
+    ScrollLock: e.getModifierState("ScrollLock"),
+  };
+}
+// Bring the guest's locks back in line with the host's real ones. This is what stops the
+// guest's case from drifting away from the host's actual CapsLock.
+function resyncLocks(why) {
+  if (hostLocks === null) return;
+  for (const name of LOCK_NAMES) {
+    if (hostLocks[name] === lockState[name]) continue;
+    inputGuard.lockResyncs += 1;
+    console.warn("litebox: " + why + ": host " + name + "=" + hostLocks[name] +
+      " but the guest was told " + lockState[name] + "; toggling");
+    sendLockToggle(name);
+  }
+}
+function onKey(e, down) {
+  const code = e.code;
+  const sym = PHYSICAL_KEYSYM[code];
+  if (sym === undefined) return;   // physical key the guest has no mapping for: leave it alone
+  e.preventDefault();
+  observeHostLocks(e);
+  if (code in LOCK_KEYS) {
+    // The keyup of a lock must not toggle it a second time, and a held lock key must not
+    // auto-repeat into a strobe of toggles.
+    if (!down) return;
+    if (e.repeat) { inputGuard.repeatsSuppressed += 1; return; }
+    sendLockToggle(code);
+    hostLocks[code] = lockState[code];   // the host's own state flipped with this press
+    return;
+  }
+  resyncLocks("keystroke");
+  if (down) {
+    if (held.has(code)) {
+      // Autorepeat: the browser re-emits keydown with no keyup between. Re-sending would
+      // duplicate the character -- the guest's tty path has no dedup of its own.
+      if (e.repeat) inputGuard.repeatsSuppressed += 1;
+      return;
+    }
+    held.add(code);
+    sendKeysym(sym, true);
+  } else {
+    if (!held.has(code)) {
+      inputGuard.strayKeyup += 1;
+      console.warn("litebox: keyup for " + code + " that was never reported down; ignoring");
+      return;
+    }
+    held.delete(code);
+    sendKeysym(sym, false);
+  }
+}
+canvas.addEventListener("keydown", (e) => onKey(e, true));
+canvas.addEventListener("keyup", (e) => onKey(e, false));
+// Every focus-loss path calls the same function.
+for (const name of ["blur", "focusout", "pagehide"]) {
+  window.addEventListener(name, () => releaseAllHeld(name));
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") releaseAllHeld("visibilitychange:hidden");
+});
+// Pointer leaving the canvas, but only with no button down: a Shift+drag that exits the
+// letterboxed canvas must keep its modifier (pointer capture keeps the gesture alive).
+canvas.addEventListener("pointerleave", (e) => {
+  if (e.buttons === 0) releaseAllHeld("pointerleave");
+});
+// Focus gain is when the host's lock state is most likely to have moved on while we were
+// not listening (the user pressed CapsLock with another window focused).
+window.addEventListener("focus", () => resyncLocks("window focus"));
+canvas.addEventListener("focus", () => resyncLocks("canvas focus"));
+canvas.addEventListener("pointerdown", (e) => { observeHostLocks(e); resyncLocks("pointerdown"); });
 
 // --- pointer: RFB-style button mask ------------------------------------------------------
 // DOM `buttons`: bit0 left, bit1 RIGHT, bit2 MIDDLE. RFB mask: bit0 left, bit1 MIDDLE,
@@ -89,9 +255,17 @@ function onMouse(e) {
   e.preventDefault();
   canvas.focus();
 }
-canvas.addEventListener("mousemove", onMouse);
-canvas.addEventListener("mousedown", onMouse);
-canvas.addEventListener("mouseup", onMouse);
+// Pointer capture (not plain mouse events) so a drag that leaves the canvas's own bounds --
+// trivial to do, since the canvas is letterboxed/centered with margin around it -- still
+// delivers its eventual pointerup HERE rather than to whatever element is now under the
+// cursor. Without this, a release outside the canvas is silently lost from the canvas's own
+// perspective: the guest never learns the button was let go and the window manager is left
+// permanently believing a drag is still in progress (observed live: a stuck xfwm4 move-cursor
+// and an unresponsive desktop after exactly this kind of drag-release-outside-canvas).
+canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); onMouse(e); });
+canvas.addEventListener("pointermove", onMouse);
+canvas.addEventListener("pointerup", onMouse);
+canvas.addEventListener("pointercancel", onMouse);
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 canvas.addEventListener("wheel", (e) => {
   const [x, y] = fbCoords(e);

@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
+use crate::utils::ids::VmViewId;
 
 /// Bytes per pixel for the one pixel format litebox's `/dev/fb0` ever reports: XRGB8888 (bits
 /// 31:24 unused/transparency-ignored, 23:16 red, 15:8 green, 7:0 blue -- matches Qt's
@@ -142,15 +143,34 @@ struct FramebufferState {
     /// `xres * (2 * yres) * BYTES_PER_PIXEL` bytes, row-major, top-left first, `line_length`
     /// stride between rows -- exactly what every fbdev consumer's `mmap` expects to find.
     pixels: Vec<u8>,
-    /// A guest `mmap` of `/dev/fb0`, when one is live: `(guest_address, byte_length)`. On
-    /// litebox's userland platforms the guest and the runner share one host address space, so
-    /// while this is set it IS the pixel store -- every accessor (fd `read`/`write`, the RFB
-    /// snapshot) goes through the mapping instead of `pixels`, giving the mmap-write ->
-    /// remote-viewer coherence real fbdev applications (`links2 -g`, netsurf-fbdev, Xorg
-    /// fbdev) depend on. The shim registers it at `mmap` time (pre-filled from `pixels`) and
-    /// MUST clear it (under this state's lock) before any overlapping guest `munmap` actually
-    /// unmaps, or a concurrent RFB snapshot would read through a dangling pointer.
-    mapping: Option<(usize, usize)>,
+    /// A guest `mmap` of `/dev/fb0`, when one is live. On litebox's userland platforms the guest
+    /// and the runner share one host address space, so while this is set it IS the pixel store
+    /// for `read_at`/`write_at` -- every fd accessor goes through the mapping instead of
+    /// `pixels`, giving the mmap-write -> remote-viewer coherence real fbdev applications
+    /// (`links2 -g`, netsurf-fbdev, Xorg fbdev) depend on. The shim registers it at `mmap` time
+    /// (pre-filled from `pixels`) and MUST clear it (under this state's lock) before any
+    /// overlapping guest `munmap` actually unmaps, or a concurrent RFB snapshot would read
+    /// through a dangling pointer.
+    mapping: Option<GuestMapping>,
+}
+
+/// A registered guest `mmap` of the framebuffer, carrying enough custody identity for
+/// [`Framebuffer::read_visible_into`] to decide whether the mapping is still safe to dereference.
+///
+/// Stores the owning view's identity together with a `'static` handle straight to the
+/// process-global [`crate::mm::domain::GuestVaDomain`] (a concrete, non-generic type) captured at
+/// registration time via `Platform::current_guest_access`'s `PageManager` handle -- so checking
+/// it back later (from a different, runner-side thread that has no `Platform`-typed confinement
+/// context of its own) needs no `Platform` instance and no extra generic parameter on
+/// `FramebufferState` itself.
+#[derive(Clone, Copy)]
+struct GuestMapping {
+    addr: usize,
+    len: usize,
+    /// `None` when no confinement context was ever recorded for this registration -- treated the
+    /// same as an untrusted view by [`Framebuffer::read_visible_into`], never as an implicit
+    /// "trust it".
+    owner: Option<(VmViewId, &'static crate::mm::domain::GuestVaDomain)>,
 }
 
 impl FramebufferState {
@@ -172,7 +192,7 @@ impl FramebufferState {
             // deregistered under this state's lock before the guest unmaps it. Concurrent guest
             // writes to the same pages are benign data races at the pixel level (tearing), the
             // same property a real shared-framebuffer mapping has.
-            Some((addr, len)) => unsafe {
+            Some(GuestMapping { addr, len, .. }) => unsafe {
                 core::slice::from_raw_parts_mut(addr as *mut u8, len.min(self.pixels.len()))
             },
             None => &mut self.pixels,
@@ -383,19 +403,6 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Framebuffer<Platform> {
         n
     }
 
-    /// Read the currently *visible* page (post-pan) into `dst`, for a runner-side presenter/RFB
-    /// server -- distinct from the fbdev `read`/`write` path, which serves the raw byte-offset
-    /// contract over the full two-page store.
-    pub fn read_visible_into(&self, dst: &mut Vec<u8>) {
-        let mut state = self.inner.lock();
-        let range = state.visible_range();
-        let pixels = state.pixel_bytes_mut();
-        let end = range.end.min(pixels.len());
-        let start = range.start.min(end);
-        dst.clear();
-        dst.extend_from_slice(&pixels[start..end]);
-    }
-
     /// Current geometry, for a runner-side reader that needs `xres`/`yres`/stride but not the
     /// full ioctl-struct shape.
     pub fn geometry(&self) -> FramebufferGeometry {
@@ -409,6 +416,100 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Framebuffer<Platform> {
 
     pub(super) fn smem_len(&self) -> u32 {
         self.inner.lock().smem_len()
+    }
+
+    /// The live guest mapping, if one is registered: `(guest_address, byte_length)`. Lets the
+    /// shim's bulk-release paths (execve) test whether a range about to be freed carries the
+    /// registration without holding this lock across the release.
+    #[must_use]
+    pub fn guest_mapping(&self) -> Option<(usize, usize)> {
+        self.inner.lock().mapping.map(|m| (m.addr, m.len))
+    }
+}
+
+/// The three entry points that decide whether a registered guest mapping is still safe to
+/// dereference need `Platform::current_guest_access`/`Platform::guest_va_domain` (wave 7's
+/// view-confinement channel), so they carry the extra `PageManagementProvider` bound; every
+/// other method above stays usable by platforms (Windows, SNP) that never call these three.
+/// `PAGE_SIZE` is `litebox_shim_linux`'s own fixed instantiation of `ALIGN` -- the only concrete
+/// value this bound is ever monomorphized against in practice (see this impl's own module docs
+/// for why a free `const ALIGN: usize` parameter here would otherwise be ambiguous against
+/// `MacOsUserland`'s blanket `impl<const ALIGN: usize> PageManagementProvider<ALIGN>`).
+impl<Platform> Framebuffer<Platform>
+where
+    Platform: RawSyncPrimitivesProvider
+        + crate::platform::PageManagementProvider<{ crate::mm::linux::PAGE_SIZE }>
+        + 'static,
+{
+    /// Read the currently *visible* page (post-pan) into `dst`, for a runner-side presenter/RFB
+    /// server -- distinct from the fbdev `read`/`write` path, which serves the raw byte-offset
+    /// contract over the full two-page store.
+    ///
+    /// If a guest mapping is registered, its bytes are trusted only while the view that
+    /// registered it (see [`GuestMapping::owner_view`]) is still confirmed
+    /// [`crate::mm::domain::ViewOverlay::Active`] in the process-global
+    /// [`crate::mm::domain::GuestVaDomain`] -- e.g. not `Poisoned` by a
+    /// [`crate::mm::session::MemoryEffectSession`] dropped mid-effect. Otherwise (no mapping, no
+    /// recorded owner, or the view is no longer `Active`) this reads the last-known-good bytes
+    /// out of the owned `pixels` shadow instead of dereferencing a mapping whose owning view may
+    /// no longer be trustworthy.
+    pub fn read_visible_into(&self, dst: &mut Vec<u8>) {
+        // SnapshotAccess: a torn-generation guard around the mapping-trusting copy below, on top
+        // of the existing overlay==Active check. The overlay check alone only confirms the owning
+        // view is not currently poisoned/quarantined/retired -- it says nothing about whether the
+        // exact bytes this copy is about to read stay backed by the SAME custody generation for
+        // the copy's whole duration. A retire-then-reinstall race (the mapping's owner unmaps and
+        // a fresh mapping lands at the same guest address, all between this function's overlay
+        // check and its byte copy) could otherwise mix bytes from two different backing
+        // generations into one torn buffer. Snapshotting `custody_fragments` immediately before
+        // and immediately after the copy, and only trusting the copy when the two snapshots are
+        // byte-identical, closes that window; this never holds the domain's own lock across the
+        // copy (each `custody_fragments` call takes and releases it independently), matching "never
+        // held across a RawMutex::block".
+        const MAX_SNAPSHOT_ATTEMPTS: u32 = 4;
+        let mut state = self.inner.lock();
+        let range = state.visible_range();
+        for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
+            let Some(mapping) = state.mapping else {
+                break;
+            };
+            let Some((view, domain)) = mapping.owner else {
+                break;
+            };
+            let active = domain
+                .query_view(view)
+                .is_some_and(|snapshot| snapshot.overlay == crate::mm::domain::ViewOverlay::Active);
+            if !active {
+                break;
+            }
+            let end = range.end.min(mapping.len);
+            let start = range.start.min(end);
+            let guest_range = mapping.addr + start..mapping.addr + end;
+            let before = domain.custody_fragments(view, guest_range.clone());
+            dst.clear();
+            {
+                let pixels = state.pixel_bytes_mut();
+                let pend = end.min(pixels.len());
+                let pstart = start.min(pend);
+                dst.extend_from_slice(&pixels[pstart..pend]);
+            }
+            let after = domain.custody_fragments(view, guest_range);
+            if before == after {
+                return;
+            }
+            litebox_util_log::debug!(
+                view:? = view, addr:? = mapping.addr, start:? = start, end:? = end;
+                "read_visible_into: custody generation changed mid-copy, retrying"
+            );
+        }
+        // Fallback: no live, trustworthy mapping (never registered, no recorded owner, no longer
+        // `Active`, or every snapshot retry above still raced) -- the last-known-good `pixels`
+        // shadow instead of dereferencing a mapping whose owning view may no longer be
+        // trustworthy, or may be tearing under our own copy.
+        dst.clear();
+        let end = range.end.min(state.pixels.len());
+        let start = range.start.min(end);
+        dst.extend_from_slice(&state.pixels[start..end]);
     }
 
     /// Register a live guest `mmap` of the framebuffer at `guest_addr`..`guest_addr + len`.
@@ -427,15 +528,12 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Framebuffer<Platform> {
         // SAFETY: caller contract -- `guest_addr` covers `len` writable bytes.
         let dst = unsafe { core::slice::from_raw_parts_mut(guest_addr as *mut u8, n) };
         dst.copy_from_slice(&state.pixels[..n]);
-        state.mapping = Some((guest_addr, len));
-    }
-
-    /// The live guest mapping, if one is registered: `(guest_address, byte_length)`. Lets the
-    /// shim's bulk-release paths (execve) test whether a range about to be freed carries the
-    /// registration without holding this lock across the release.
-    #[must_use]
-    pub fn guest_mapping(&self) -> Option<(usize, usize)> {
-        self.inner.lock().mapping
+        let owner = Platform::current_guest_access().map(|(view, _task, pm)| (view, pm.guest_va_domain()));
+        state.mapping = Some(GuestMapping {
+            addr: guest_addr,
+            len,
+            owner,
+        });
     }
 
     /// Deregister the guest mapping if `[start, start + len)` overlaps it, copying the mapped
@@ -447,13 +545,35 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Framebuffer<Platform> {
     /// being the pixel store, which is safe (writes there just stop propagating).
     pub fn clear_guest_mapping_overlapping(&self, start: usize, len: usize) {
         let mut state = self.inner.lock();
-        let Some((addr, map_len)) = state.mapping else {
+        let Some(GuestMapping { addr, len: map_len, owner }) = state.mapping else {
             return;
         };
         let map_end = addr.saturating_add(map_len);
         let end = start.saturating_add(len);
         if end <= addr || start >= map_end {
             return;
+        }
+        // Per-view address spaces are numbered independently, so the SAME numeric guest-VA
+        // range this mapping was registered at can also appear, purely by coincidence, in a
+        // completely unrelated view's own `owned_ranges`/`private` bookkeeping (confirmed live:
+        // the registration recorded a real `owner` view and was found cleared well before that
+        // view's own process had exited or unmapped anything of its own -- an unrelated view's
+        // ordinary exit-time release was the actual cause). Every caller here
+        // (`sys_munmap`/`sys_mremap`/a fixed-address `sys_mmap` replace in mm.rs, and the two
+        // exit-time bulk-release paths in process.rs) is running inside that CALLING task's own
+        // guest-memory-access context, so comparing it against the view that actually registered
+        // this mapping distinguishes "the owner is really unmapping/exiting its own framebuffer
+        // mapping" (clear it) from "an unrelated view's own memory just happens to overlap this
+        // address numerically" (leave the live registration alone). No owner was ever recorded
+        // (`owner: None`) falls back to the original unconditional clear -- there is no identity
+        // to verify against, and erring toward clearing (degrading to the last-known-good
+        // snapshot) is the same safe default `read_visible_into` already applies whenever it
+        // cannot trust a recorded owner.
+        if let Some((owner_view, _)) = owner {
+            let caller_view = Platform::current_guest_access().map(|(view, _, _)| view);
+            if caller_view != Some(owner_view) {
+                return;
+            }
         }
         let n = map_len.min(state.pixels.len());
         // SAFETY: the mapping is still registered, so per `set_guest_mapping`'s contract the

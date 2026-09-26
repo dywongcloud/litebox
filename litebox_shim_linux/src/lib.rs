@@ -55,6 +55,7 @@ pub mod vsock_transport;
 mod wait;
 
 use crate::syscalls::file::get_file_descriptor_flags;
+use crate::syscalls::process::EntryDisposition;
 
 pub type DefaultFS<Platform> = LinuxFS<Platform>;
 
@@ -79,7 +80,8 @@ impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 /// This exists so that the (many) `impl` blocks throughout the shim can be written
 /// as `impl<Platform: ShimPlatform, ..>` rather than repeating a large `where` clause.
 pub trait ShimPlatform:
-    litebox::platform::RawPointerProvider
+    litebox::platform::Provider
+    + litebox::platform::RawPointerProvider
     + litebox::platform::TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
     + litebox::mm::linux::VmemPageFaultHandler
@@ -98,7 +100,8 @@ pub trait ShimPlatform:
 }
 
 impl<T> ShimPlatform for T where
-    T: litebox::platform::RawPointerProvider
+    T: litebox::platform::Provider
+        + litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
         + litebox::mm::linux::VmemPageFaultHandler
@@ -324,28 +327,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
-        if info.kernel_mode
-            && let Some((fault_address, error_code)) = page_fault_info(info)
-        {
-            if unsafe {
-                self.task
-                    .global
-                    .pm
-                    .handle_page_fault(fault_address, error_code)
-            }
-            .is_ok()
-            {
-                return ContinueOperation::Resume;
-            } else {
-                return ContinueOperation::Terminate;
-            }
-        }
         // Best-effort symbolization of a genuine guest fault: name the guest
         // ELF image (and image-relative offset) containing the fault PC and
         // the return address, in the `path+0xoffset` form `llvm-symbolizer`
         // resolves directly against the guest's own binaries. Debug level so
         // it is inert unless logging is enabled -- guests also take faults on
-        // purpose (e.g. OpenSSL's SIGILL CPU-feature probes).
+        // purpose (e.g. OpenSSL's SIGILL CPU-feature probes). Logged
+        // unconditionally, ahead of the page-fault fast path below: a
+        // kernel_mode data/instruction abort that `PageManager::handle_page_fault`
+        // ends up refusing is exactly the case this diagnostic is most needed
+        // for, and the early `return` below used to skip it entirely.
         {
             let symbolize = |addr: usize| match self.task.symbolize_guest_address(addr) {
                 Some((path, offset)) => alloc::format!("{path}+{offset:#x}"),
@@ -370,6 +361,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     sp:% = alloc::format!("{:#x}", ctx.sp), regs:% = regs;
                     "guest fault registers"
                 );
+                // Best-effort, bounded multi-frame backtrace (see
+                // `litebox::shim::FrameBacktrace`'s own doc comment): empty
+                // unless the reporting platform backend populated one
+                // (currently the macOS HVF backend only), in which case this
+                // can name the real caller even when `x30` above is
+                // degenerate (see `chromium-fd-ownership-lr-degenerate-
+                // disassembly-proof`). A no-op allocation-wise when empty.
+                let frames = info.backtrace.as_slice();
+                if !frames.is_empty() {
+                    let mut chain = alloc::string::String::new();
+                    for (i, &addr) in frames.iter().enumerate() {
+                        use core::fmt::Write as _;
+                        let addr = usize::try_from(addr).unwrap_or(usize::MAX);
+                        let _ = write!(chain, "#{i} {} ", symbolize(addr));
+                    }
+                    litebox_util_log::debug!(
+                        frames:% = frames.len(), chain:% = chain;
+                        "guest fault backtrace"
+                    );
+                }
             }
             #[cfg(target_arch = "x86_64")]
             litebox_util_log::debug!(
@@ -378,11 +389,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 "guest fault location"
             );
         }
+        if info.kernel_mode
+            && let Some((fault_address, error_code)) = page_fault_info(info)
+        {
+            // Routed through `enter_shim` (matching every other guest-fault-shaped entry point)
+            // rather than dispatched inline: a refusal here is guest-controlled (a full stack, or
+            // a poisoned/quarantined/retired view), not a host bug, so it must actually deliver a
+            // real `SIGSEGV` into the guest's own handler (or its default disposition) via
+            // `prepare_to_run_guest`'s existing `process_signals` call, exactly like Linux's own
+            // `expand_stack`-failure behavior -- never a silent host-side `Terminate` with no
+            // signal at all.
+            return self.enter_shim(false, ctx, |task, _ctx| {
+                if let Err(err) = unsafe { task.global.pm.handle_page_fault(fault_address, error_code) } {
+                    task.deliver_page_fault_segv(fault_address, err);
+                }
+            });
+        }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         self.enter_shim(false, ctx, |_, _| {})
+    }
+
+    fn memory_service(
+        &self,
+        req: litebox::shim::WxFlipRequest,
+    ) -> litebox::shim::WxFlipOutcome {
+        self.task.global.pm.commit_wx_flip(req)
+    }
+
+    fn cow_custody_ancestor(
+        &self,
+        view: litebox::utils::ids::VmViewId,
+        page: usize,
+    ) -> Option<litebox::utils::ids::VmViewId> {
+        match self
+            .task
+            .global
+            .platform
+            .guest_va_domain()
+            .custody_at_via_lineage(view, page)
+        {
+            litebox::mm::domain::Custody::Present { view: ancestor, .. }
+            | litebox::mm::domain::Custody::Retiring { view: ancestor, .. } => Some(ancestor),
+            _ => None,
+        }
+    }
+
+    fn cow_custody_publish_divergence(
+        &self,
+        view: litebox::utils::ids::VmViewId,
+        range: core::ops::Range<usize>,
+    ) {
+        let domain = self.task.global.platform.guest_va_domain();
+        if domain.family_has_live_descendant_of(view) {
+            return;
+        }
+        let _ = domain.confirm_present_or_reconcile(view, range);
+    }
+
+    fn fork_family_has_live_descendant(&self, view: litebox::utils::ids::VmViewId) -> bool {
+        self.task
+            .global
+            .platform
+            .guest_va_domain()
+            .family_has_live_descendant_of(view)
     }
 }
 
@@ -393,6 +465,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         ctx: &mut litebox_common_linux::PtRegs,
         f: impl FnOnce(&Task<Platform, FS>, &mut litebox_common_linux::PtRegs),
     ) -> ContinueOperation {
+        self.task.refresh_guest_memory_access_context();
         if !is_init {
             self.task.enter_from_guest();
         }
@@ -494,7 +567,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
-            next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             proc_handle: self.proc_handle.take(),
             framebuffer: self.framebuffer.take(),
             input_registry: self.input_registry.take(),
@@ -507,8 +579,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             termios: litebox::sync::Mutex::new(litebox_common_linux::Termios::default_cooked()),
             stdio_foreground_pgid: core::sync::atomic::AtomicI32::new(0),
             processes: syscalls::process::ProcessTable::new(),
+            #[cfg(target_arch = "aarch64")]
+            ptrace_registry: syscalls::process::PtraceRegistry::new(),
             brk_lock: litebox::sync::Mutex::new(()),
         });
+        // A platform that serves `clock_gettime` inside the guest (a vDSO) must count
+        // `CLOCK_MONOTONIC` from the same instant `gettime_as_duration` does.
+        global.platform.publish_monotonic_epoch(global.boot_time);
         LinuxShim(global)
     }
 }
@@ -536,6 +613,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     #[must_use]
     pub fn input_registry(&self) -> Option<litebox::fs::devices::InputRegistry<Platform>> {
         self.0.input_registry.clone()
+    }
+
+    /// A cheap handle to this shim's `/proc` backend, if [`LinuxShimBuilder::default_fs`]
+    /// mounted one -- for a runner-side publisher (diagnostics-counter-readout-surface) to call
+    /// [`litebox::fs::proc::Proc::set_counters`] on, so `/proc/litebox/counters` renders real
+    /// content without the guest needing host access.
+    #[must_use]
+    pub fn proc_handle(&self) -> Option<litebox::fs::proc::Proc<Platform>> {
+        self.0.proc_handle.clone()
+    }
+
+    /// desktop-peak-task-count-witness's own JSON fragment -- see
+    /// `syscalls::process::task_diagnostics_json`. Mostly process-wide statics, not anything on
+    /// `self`, but takes `&self` for the same reason every other diagnostics accessor here does:
+    /// only a caller holding a live shim handle should be reading these. Also threads through
+    /// `self.0.processes` (wx-service-latency-vma-counts-per-process-remainder +
+    /// desktop-peak-task-count-witness-per-uid-charge), the one part of this fragment that needs
+    /// a live table walk rather than a plain static.
+    #[must_use]
+    pub fn task_diagnostics_json(&self) -> alloc::string::String {
+        syscalls::process::task_diagnostics_json(&self.0.processes)
     }
 
     /// Loads the program at `path` as the shim's initial task, returning the
@@ -570,9 +668,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
 
         // Keep the pid/tid allocator clear of the initial task's own pid, so that no `fork`ed
         // child can ever collide with it.
-        self.0
-            .next_thread_id
-            .fetch_max(pid.saturating_add(1), core::sync::atomic::Ordering::Relaxed);
+        self.0.processes.reserve_tid_exact(pid);
         self.0
             .stdio_foreground_pgid
             .store(pid, core::sync::atomic::Ordering::Release);
@@ -585,7 +681,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
                 ppid,
-                tid: pid,
+                tid: Cell::new(pid),
                 credentials: RefCell::new(
                     syscalls::process::Credentials::new(uid, euid, gid, egid).into(),
                 ),
@@ -594,9 +690,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 guest_sp: Cell::new(0),
+                task_id: litebox::utils::ids::TaskInstanceId::next()
+                    .expect("task identity space exhausted"),
+                user_ns: RefCell::new(None),
+                pid_ns: RefCell::new(None),
+                net_ns: RefCell::new(None),
+                syscall_restart: wait::SyscallRestartState::default(),
             },
         };
+        // Published to this (the very first, parentless) task's own `ThreadRemote` mirror
+        // immediately -- see `ThreadRemote::credentials`'s own doc comment -- so it is never
+        // observable at its constructor default (`uid`/`gid` 0) instead of its real identity.
+        entrypoints
+            .task
+            .thread_remote()
+            .set_credentials(entrypoints.task.credentials.borrow().clone());
 
+        entrypoints.task.refresh_guest_memory_access_context();
         let (path, argv) = entrypoints
             .task
             .resolve_shebang(alloc::string::String::from(path), argv)
@@ -944,6 +1054,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EFAULT)?;
                     read_total += size;
                 }
+                // A later chunk's own error is not this whole read's failure to report once an
+                // earlier chunk already delivered real bytes: POSIX `read(2)` itself promises
+                // exactly this partial-success shape (e.g. a signal interrupting a read after it
+                // already transferred data returns the count transferred, not an error), and this
+                // wrapper already honors the identical principle for the `Ok(0)`/EOF case just
+                // above -- an error on a later chunk deserves the same "stop and hand back what
+                // was already read" treatment, not silent discarding of bytes already copied into
+                // the guest's own buffer. Live-found necessary for `/proc/<pid>/mem`: unlike an
+                // ordinary file, a short read there is `/proc/<pid>/mem`'s own DEFINITIVE answer
+                // for this position (it hit the end of what is mapped, not "come back for more"),
+                // so the continuation chunk this loop naturally issues right after a short read
+                // lands exactly on that boundary and fails there by design -- discarding the
+                // already-read prefix on that expected failure would be wrong, not merely
+                // suboptimal, for any reader (real Crashpad included) depending on Linux's own
+                // `pread64` short-read contract.
+                Err(_) if read_total > 0 => break,
                 Err(e) => return Err(e),
             }
         }
@@ -1001,6 +1127,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 Err(e) => {
                     return if written_total > 0 {
+                        // The bytes already written are the answer; a later chunk's
+                        // interrupted wait must not restart (and so repeat) the whole write.
+                        self.cancel_syscall_restart();
                         Ok(written_total)
                     } else {
                         Err(e)
@@ -1012,12 +1141,62 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(written_total)
     }
 
+    /// Publishes this task's own `GuestVaDomain` view and page manager as the calling OS
+    /// thread's current guest-memory-access context (see
+    /// [`litebox::platform::PageManagementProvider::current_guest_access`]), so that every
+    /// `UserPtr`/`UserPtrMut` access this thread performs on this task's behalf -- from here
+    /// until whichever task next calls this on the same thread -- is confined to this task's own
+    /// admitted, correctly-permissioned memory.
+    ///
+    /// Called from [`LinuxShimEntrypoints::enter_shim`] (covering every subsequent
+    /// init/syscall/exception/interrupt entry) and from [`LinuxShim::load_program`] (covering the
+    /// one-time ELF-image write that happens before the guest ever runs, hence before any
+    /// `enter_shim` call). Idempotent and cheap, so calling it defensively on every entry is fine.
+    pub(crate) fn refresh_guest_memory_access_context(&self) {
+        let view = self.current_mem_view();
+        // SAFETY: `self.global` is this shim's single process-global state, allocated once in
+        // `LinuxShimBuilder`/`LinuxShim::load_program` and never dropped for the life of the
+        // guest process -- treating its `pm` field's reference as `'static` here matches the same
+        // standing assumption `PageManagementProvider::guest_va_domain`/`effect_gate` already
+        // rely on for their own process-global, "leaked" state.
+        let pm: &'static PageManager<Platform, PAGE_SIZE> = unsafe {
+            core::mem::transmute::<&PageManager<Platform, PAGE_SIZE>, _>(&self.global.pm)
+        };
+        Platform::set_current_guest_access(Some((view, self.task_id, pm)));
+        Platform::set_current_guest_stack_rlimit(Some(
+            self.process()
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::STACK),
+        ));
+    }
+
     /// Handle Linux syscalls and dispatch them to LiteBox implementations.
+    ///
+    /// The seccomp raw-entry check ([`Task::seccomp_check_entry`], `chromium-linux-seccomp-bpf`)
+    /// runs as the very first operation here, before `do_syscall`'s own `SyscallRequest::try_from_raw`,
+    /// any pointer read, ptrace, or logging/handler effect -- exactly the row's own enforcement-point
+    /// requirement. The overwhelmingly common case (no filter installed) costs one relaxed atomic
+    /// load and falls straight through to the unchanged `do_syscall` path below.
     ///
     /// # Panics
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        match self.seccomp_check_entry(ctx) {
+            EntryDisposition::Proceed(_permit) => {}
+            EntryDisposition::ReturnRaw(return_value) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    ctx.rax = return_value;
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    ctx.regs[0] = return_value;
+                }
+                return;
+            }
+            EntryDisposition::Handled => return,
+        }
         let result = self.do_syscall(ctx);
         // The request-side twin of this line lives in `do_syscall` (the
         // `req=` trace). Logging the result too is what turns the trace into
@@ -1025,7 +1204,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // syscalls (libuv's `uv_loop_init` cleanup was the motivating case)
         // is undiagnosable from requests alone, because the failing call and
         // the cleanup that follows it look identical without return values.
-        litebox_util_log::trace!(pid:? = self.pid, tid:? = self.tid, ret:? = result; "sysret");
+        litebox_util_log::trace!(pid:? = self.pid, tid:? = self.tid.get(), ret:? = result; "sysret");
+        // A blocking wait that classified its interruption (see `wait::SyscallRestart`) is
+        // rewound to its `svc` here instead of returning a value; `process_signals`, on this same
+        // way back to the guest, reverts that to `EINTR` if the handler it runs forbids the
+        // restart. A restart re-enters the full architectural entry -- `seccomp_check_entry`
+        // above included -- as if the syscall had never been issued.
+        if self.prepare_syscall_restart(ctx) {
+            return;
+        }
         let return_value = match result {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
@@ -1058,6 +1245,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // it identically on both architectures.
         #[cfg(target_arch = "aarch64")]
         let syscall_number = (ctx.syscallno as isize).reinterpret_as_unsigned();
+        // `restart_syscall(2)` is only ever issued by a guest this shim pointed at it (see
+        // `Task::settle_syscall_restart`); with nothing armed it is Linux's
+        // `do_no_restart_syscall`.
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = if syscall_number == ::syscalls::Sysno::restart_syscall as usize {
+            match self.enter_restart_syscall() {
+                Some(restarted) => restarted,
+                None => return Err(Errno::EINTR),
+            }
+        } else {
+            syscall_number
+        };
         // The decoder reports what it could not decode through the callback; keep
         // that message out of band so the one line logged below can carry the
         // syscall number, its name, the decoder's own description of the
@@ -1093,7 +1292,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // what showed that busybox's blocking `wait` is a `sigsuspend` loop, and that the shim
         // was answering `sigsuspend` with an unimplemented-syscall error that release builds did
         // not even log (`log_unsupported_fmt` is `debug_assertions`-only).
-        litebox_util_log::trace!(pid:? = self.pid, tid:? = self.tid, req:? = request; "syscall");
+        litebox_util_log::trace!(pid:? = self.pid, tid:? = self.tid.get(), req:? = request; "syscall");
 
         match request {
             SyscallRequest::Exit { status } => {
@@ -1139,15 +1338,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     })
                     .and_then(|cur_loc| {
                         self.pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
-                            .inspect(|read_total| {
-                                // Update the file offset to reflect the read we just did.
+                            .and_then(|read_total| {
+                                // Update the file offset to reflect the read we just did. This
+                                // is a real fallible operation, not an established invariant --
+                                // it used to be assumed infallible here ("previous lseek and
+                                // pread succeeded, so this lseek should too"), which was live-
+                                // reproduced false for e.g. `/proc/self/cmdline` (a position-
+                                // based file whose reported `file_status().size` does not track
+                                // its real, computed length -- see resolver.rs's `seek`) and
+                                // panicked the whole host process on the resulting `EINVAL`.
+                                // Surface a real failure here as this read's own error instead.
                                 self.sys_lseek(
                                     fd,
                                     (cur_loc + read_total).reinterpret_as_signed(),
                                     litebox::fs::SeekWhence::RelativeToBeginning,
                                 )
-                                // Given that previous lseek and pread succeeded, this lseek should also succeed.
-                                .expect("lseek failed");
+                                .map(|_| read_total)
                             })
                     })
                 }
@@ -1155,7 +1361,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Write { fd, buf, count } => {
                 self.write_with_user_buf(fd, buf, count, None)
             }
-            SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
+            SyscallRequest::Close { fd } => {
+                // Temporary close(2)/fd-lifecycle audit trail
+                // (`chromium-fd-ownership-violation-close-audit-trail`): see
+                // `syscalls::file::fd_audit_log_close_entry`'s doc comment. `ctx` is only live and
+                // meaningful right here, at the real syscall-entry point -- not inside `sys_close`
+                // itself, which is also called from ~45 internal/synthetic sites with no guest
+                // register context, including the read-only `syscalls/mm.rs`.
+                syscalls::file::fd_audit_log_close_entry(self.pid, self.tid.get(), fd, ctx);
+                syscall!(sys_close(fd))
+            }
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
                 syscalls::file::try_into_whence(whence.trunc())
@@ -1224,29 +1439,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 fd,
                 offset,
             } => {
+                let session = self.open_memory_effect_session()?;
                 // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
                 // `Task::touches_another_process`'s doc comment. Only `MAP_FIXED` is destructive
                 // to whatever is already there; an ordinary hinted/hint-free mapping always goes
                 // through the placement allocator, which cannot land on another process's live
                 // memory (`Vmem::reserve_external` already covers the one gap that existed there).
-                if flags.contains(litebox_common_linux::MapFlags::MAP_FIXED)
+                let result = if flags.contains(litebox_common_linux::MapFlags::MAP_FIXED)
                     && self.touches_another_process(addr, length)
                 {
                     Err(Errno::ENOMEM)
                 } else {
                     self.sys_mmap(addr, length, prot, flags, fd, offset)
                         .map(|ptr| ptr.as_usize())
-                }
+                };
+                session.close();
+                result
             }
             SyscallRequest::Mprotect { addr, length, prot } => {
+                let session = self.open_memory_effect_session()?;
                 // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
                 // `Task::touches_another_process`'s doc comment. Mirrors real Linux's own
                 // `mprotect` response to a range that is not entirely this process's own mapping.
-                if self.touches_another_process(addr.as_usize(), length) {
+                let result = if self.touches_another_process(addr.as_usize(), length) {
                     Err(Errno::ENOMEM)
                 } else {
                     syscall!(sys_mprotect(addr, length, prot))
-                }
+                };
+                session.close();
+                result
             }
             SyscallRequest::Mremap {
                 old_addr,
@@ -1255,6 +1476,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 flags,
                 new_addr,
             } => {
+                let session = self.open_memory_effect_session()?;
                 // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
                 // `Task::touches_another_process`'s doc comment. This was the last
                 // unguarded hole, and the one that actually reproduced live: a
@@ -1275,27 +1497,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let foreign_old = self.touches_another_process(old_addr.as_usize(), old_size);
                 let foreign_new = flags.contains(litebox_common_linux::MRemapFlags::MREMAP_FIXED)
                     && self.touches_another_process(new_addr, new_size);
-                if foreign_old || foreign_new {
+                let result = if foreign_old || foreign_new {
                     Err(Errno::ENOMEM)
                 } else {
                     self.sys_mremap(old_addr, old_size, new_size, flags, new_addr)
                         .map(|ptr| ptr.as_usize())
-                }
+                };
+                session.close();
+                result
             }
             SyscallRequest::Munmap { addr, length } => {
+                let session = self.open_memory_effect_session()?;
                 // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
                 // `Task::touches_another_process`'s doc comment. Real Linux's own `munmap` is a
                 // silent no-op over a range this process never had mapped; treating a range that
                 // turns out to be a stranger's memory the same way is the closest honest match --
                 // no case exists where correctly unmapping this process's own memory requires
                 // touching another process's.
-                if self.touches_another_process(addr.as_usize(), length) {
+                let result = if self.touches_another_process(addr.as_usize(), length) {
                     Ok(0)
                 } else {
                     syscall!(sys_munmap(addr, length))
-                }
+                };
+                session.close();
+                result
             }
-            SyscallRequest::Brk { addr } => self.sys_brk(addr),
+            SyscallRequest::Brk { addr } => {
+                let session = self.open_memory_effect_session()?;
+                let result = self.sys_brk(addr);
+                session.close();
+                result
+            }
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),
             SyscallRequest::Preadv {
@@ -1326,23 +1558,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 addr,
                 length,
                 behavior,
-            } => syscall!(sys_madvise(addr, length, behavior)),
+            } => {
+                let session = self.open_memory_effect_session()?;
+                // GUARD (litebox-ordinary-syscall-cross-process-clobber): see
+                // `Task::touches_another_process`'s doc comment. `madvise` on a range this
+                // process doesn't own is naturally a no-op/ENOMEM, just like `munmap`.
+                let result = if self.touches_another_process(addr.as_usize(), length) {
+                    Err(Errno::ENOMEM)
+                } else {
+                    syscall!(sys_madvise(addr, length, behavior))
+                };
+                session.close();
+                result
+            }
             SyscallRequest::Dup {
                 oldfd,
                 newfd,
                 flags,
-            } => syscall!(sys_dup(oldfd, newfd, flags)),
+            } => self
+                .sys_dup(oldfd, newfd, flags)
+                .inspect(|&fd| {
+                    syscalls::file::fd_audit_log_open_entry(self.pid, self.tid.get(), fd, "dup", ctx);
+                })
+                .to_syscall_result(),
             SyscallRequest::Socket {
                 domain,
                 type_and_flags,
                 protocol,
-            } => syscall!(sys_socket(domain, type_and_flags, protocol)),
+            } => self
+                .sys_socket(domain, type_and_flags, protocol)
+                .inspect(|&fd| {
+                    syscalls::file::fd_audit_log_open_entry(self.pid, self.tid.get(), fd, "socket", ctx);
+                })
+                .to_syscall_result(),
             SyscallRequest::Socketpair {
                 domain,
                 type_and_flags,
                 protocol,
                 sockvec,
-            } => syscall!(sys_socketpair(domain, type_and_flags, protocol, sockvec)),
+            } => self
+                .sys_socketpair(domain, type_and_flags, protocol, sockvec)
+                .inspect(|()| {
+                    // Diagnostic-only best-effort read-back: `sys_socketpair` already wrote both
+                    // fds into guest memory at `sockvec` above; re-read them purely to log, same
+                    // as every other `fd_audit_log_open_entry` call site. `None` (e.g. the guest
+                    // unmapped the page between that write and this read) is silently skipped --
+                    // this can never affect what already flowed back to the guest.
+                    if let Some(fd0) = sockvec.read_at_offset::<Platform>(0) {
+                        syscalls::file::fd_audit_log_open_entry(self.pid, self.tid.get(), fd0, "socketpair", ctx);
+                    }
+                    if let Some(fd1) = sockvec.read_at_offset::<Platform>(1) {
+                        syscalls::file::fd_audit_log_open_entry(self.pid, self.tid.get(), fd1, "socketpair", ctx);
+                    }
+                })
+                .to_syscall_result(),
             SyscallRequest::Connect {
                 sockfd,
                 sockaddr,
@@ -1419,7 +1688,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 addrlen,
             } => syscall!(sys_getpeername(sockfd, addr, addrlen)),
             SyscallRequest::Uname { buf } => syscall!(sys_uname(buf)),
-            SyscallRequest::Fcntl { fd, arg } => syscall!(sys_fcntl(fd, arg)),
+            SyscallRequest::Fcntl { fd, arg } => {
+                // Only `F_DUPFD`/`F_DUPFD_CLOEXEC` allocate a brand-new fd (the return value of
+                // every other `fcntl` command is a flags/lock word, not a fd number, so it would
+                // be actively misleading to log it as one).
+                let is_dupfd = matches!(&arg, litebox_common_linux::FcntlArg::DUPFD { .. });
+                self.sys_fcntl(fd, arg)
+                    .inspect(|&result| {
+                        if is_dupfd {
+                            syscalls::file::fd_audit_log_open_entry(
+                                self.pid,
+                                self.tid.get(),
+                                result,
+                                "fcntl_dupfd",
+                                ctx,
+                            );
+                        }
+                    })
+                    .to_syscall_result()
+            }
             SyscallRequest::Flock { fd, operation } => syscall!(sys_flock(fd, operation)),
             SyscallRequest::Getcwd { buf, size: count } => {
                 let mut kernel_buf = vec![0u8; count.min(MAX_KERNEL_BUF_SIZE)];
@@ -1572,7 +1859,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
-                    syscall!(sys_openat(dirfd, path, flags, mode))
+                    self.sys_openat(dirfd, path, flags, mode)
+                        .inspect(|&fd| {
+                            syscalls::file::fd_audit_log_open_entry(
+                                self.pid,
+                                self.tid.get(),
+                                fd,
+                                "openat",
+                                ctx,
+                            );
+                        })
+                        .to_syscall_result()
                 }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
             SyscallRequest::Fallocate {
@@ -1606,7 +1903,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::MemfdCreate { name, flags } => name
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |name| {
-                    syscall!(sys_memfd_create(&name, flags))
+                    self.sys_memfd_create(&name, flags)
+                        .inspect(|&fd| {
+                            syscalls::file::fd_audit_log_open_entry(
+                                self.pid,
+                                self.tid.get(),
+                                fd,
+                                "memfd_create",
+                                ctx,
+                            );
+                        })
+                        .to_syscall_result()
                 }),
             SyscallRequest::Mknodat {
                 dirfd,
@@ -1790,9 +2097,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_statfs(path, buf))),
             SyscallRequest::Fstatfs { fd, buf } => syscall!(sys_fstatfs(fd, buf)),
-            SyscallRequest::Eventfd2 { initval, flags } => {
-                syscall!(sys_eventfd2(initval, flags))
-            }
+            SyscallRequest::Eventfd2 { initval, flags } => self
+                .sys_eventfd2(initval, flags)
+                .inspect(|&fd| {
+                    syscalls::file::fd_audit_log_open_entry(
+                        self.pid,
+                        self.tid.get(),
+                        fd,
+                        "eventfd2",
+                        ctx,
+                    );
+                })
+                .to_syscall_result(),
             SyscallRequest::InotifyInit1 { flags } => syscall!(sys_inotify_init1(flags)),
             SyscallRequest::InotifyAddWatch { fd, pathname, mask } => pathname
                 .to_cstring::<Platform>()
@@ -1802,6 +2118,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::InotifyRmWatch { fd, wd } => syscall!(sys_inotify_rm_watch(fd, wd)),
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
+                    syscalls::file::fd_audit_log_open_entry(
+                        self.pid,
+                        self.tid.get(),
+                        read_fd,
+                        "pipe2r",
+                        ctx,
+                    );
+                    syscalls::file::fd_audit_log_open_entry(
+                        self.pid,
+                        self.tid.get(),
+                        write_fd,
+                        "pipe2w",
+                        ctx,
+                    );
                     pipefd
                         .write_at_offset::<Platform>(0, read_fd)
                         .ok_or(Errno::EFAULT)?;
@@ -1879,6 +2209,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => self
                 .sys_wait4(pid, wstatus, options, rusage)
                 .map(|pid| pid.reinterpret_as_unsigned() as usize),
+            SyscallRequest::Waitid {
+                idtype,
+                id,
+                infop,
+                options,
+                rusage: _,
+            } => self.sys_waitid(idtype, id, infop, options),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
@@ -2163,9 +2500,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     net: litebox::sync::Mutex<Platform, Network<Platform>>,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
-    /// Next thread ID to assign.
-    // TODO: better management of thread IDs
-    next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Unix98 pseudoterminal namespace shared by every guest task.
@@ -2179,10 +2513,13 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// [`Self::guest_images`].
     loaded_images: litebox::sync::Mutex<Platform, alloc::vec::Vec<LoadedImage>>,
     /// Stable shared-page identities keyed by filesystem device/inode, so aliases opened through
-    /// different file descriptions still converge on one backing object.
+    /// different file descriptions still converge on one backing object. Each entry also counts
+    /// how many distinct open file descriptions have resolved it (see
+    /// `syscalls::file::SharedFileBackingEntry`), so the last one to close can release the
+    /// platform's pin -- see `Task::do_close`'s `ConsumedFd::Fs` arm.
     shared_file_backings: litebox::sync::Mutex<
         Platform,
-        alloc::collections::BTreeMap<(usize, usize), litebox::mm::linux::SharedFutexBacking>,
+        alloc::collections::BTreeMap<(usize, usize), syscalls::file::SharedFileBackingEntry>,
     >,
     /// Handle to the `/proc` backend mounted by [`LinuxShimBuilder::default_fs`], if any --
     /// `None` when the shim was built with a filesystem that doesn't mount one.
@@ -2210,6 +2547,10 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// Parent/child relationships and exit statuses for every guest process, so that `fork`ed
     /// children can be reaped by `wait4`.
     processes: syscalls::process::ProcessTable<Platform>,
+    /// Process-global record of every live `ptrace` attach, keyed by the tracer's own
+    /// `TaskInstanceId` -- see `syscalls::process::PtraceRegistry`'s own doc comment.
+    #[cfg(target_arch = "aarch64")]
+    ptrace_registry: syscalls::process::PtraceRegistry<Platform>,
     /// Serializes the swap-operate-restore sequence that gives each guest process its own program
     /// break on top of the single break [`litebox::mm::PageManager`] tracks. See
     /// `Task::sys_brk`.
@@ -2224,8 +2565,11 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     pid: i32,
     /// Parent Process ID
     ppid: i32,
-    /// Thread ID
-    tid: i32,
+    /// Thread ID. A `Cell` (not a plain `i32` like `pid`) because a nonleader thread's `execve`
+    /// rekeys it in place to the thread-group leader's `pid` -- see
+    /// `syscalls::process::Task::sys_execve`'s nonleader-executor rekey -- while every other
+    /// identity on this `Task` (`pid`, `task_id`) stays fixed for its whole lifetime.
+    tid: Cell<i32>,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials. `setuid`/`setgid`
     /// replace the `Arc` rather than mutate through it, so a thread that
@@ -2247,6 +2591,35 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     /// just at a syscall that was handed a `PtRegs`; see
     /// `syscalls::process::Task::save_address_space` for what it is used for.
     guest_sp: Cell<usize>,
+    /// This task's own identity in the memory-mutation-transaction registry (see
+    /// `litebox::mm::domain::GuestVaDomain`), minted once per task instance and never reused --
+    /// distinct from `tid`, which the kernel may recycle.
+    task_id: litebox::utils::ids::TaskInstanceId,
+    /// The `CLONE_NEWUSER` user namespace this task is a member of, if any task in its lineage
+    /// has ever `unshare`d/`clone`d one into existence (see `syscalls::process::UserNamespace`).
+    /// `RefCell` because `unshare` replaces it on the calling task alone; inherited (the `Arc`
+    /// cloned, not the value) by every new thread/process that does not itself request a fresh
+    /// one, matching real Linux's namespace-membership inheritance.
+    user_ns: RefCell<Option<Arc<syscalls::process::UserNamespace>>>,
+    /// The `CLONE_NEWPID` pid namespace this task is a member of, if any task in its lineage has
+    /// ever `clone`d one into existence (see `syscalls::process::PidNamespace`). `None` means the
+    /// root/global namespace -- every process's exact behavior before this field existed, and
+    /// still exactly its behavior after, since every read of this field treats `None` as "use the
+    /// flat global pid space unchanged". `RefCell` for the same reason as `user_ns`: replaced
+    /// wholesale on the task that creates a nested one, inherited (the `Arc` cloned) by every
+    /// other new thread/process.
+    pid_ns: RefCell<Option<Arc<syscalls::process::PidNamespace<Platform>>>>,
+    /// The `CLONE_NEWNET` network namespace this task is a member of, if any task in its lineage
+    /// has ever `unshare`d/`clone`d one into existence (see `syscalls::process::NetNamespace`).
+    /// `None` means this task's networking is completely unnamespaced -- every task's exact
+    /// behavior before this field existed, and still every task's behavior outside one of these
+    /// namespaces. `RefCell` for the same reason as `user_ns`/`pid_ns`: replaced wholesale on the
+    /// task that creates a nested one, inherited (the `Arc` cloned) by every other new
+    /// thread/process.
+    net_ns: RefCell<Option<Arc<syscalls::process::NetNamespace>>>,
+    /// Restart bookkeeping for a blocking wait whose interruption the guest must not see as
+    /// `EINTR`; see [`wait::SyscallRestart`].
+    syscall_restart: wait::SyscallRestartState<Platform::Instant>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
@@ -2266,9 +2639,7 @@ mod test_utils {
             self: Arc<Self>,
             fs: alloc::sync::Arc<FS>,
         ) -> Task<Platform, FS> {
-            let pid = self
-                .next_thread_id
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let pid = self.processes.alloc_tid().expect("tid space exhausted in test");
             let files = Arc::new(syscalls::file::FilesState::new(fs));
             files.initialize_stdio_in_shared_descriptors_table(&self);
             Task {
@@ -2276,7 +2647,7 @@ mod test_utils {
                 thread: syscalls::process::ThreadState::new_process(pid, 0),
                 pid,
                 ppid: 0,
-                tid: pid,
+                tid: Cell::new(pid),
                 credentials: RefCell::new(Arc::new(syscalls::process::Credentials::new(
                     0, 0, 0, 0,
                 ))),
@@ -2285,6 +2656,12 @@ mod test_utils {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 guest_sp: Cell::new(0),
+                task_id: litebox::utils::ids::TaskInstanceId::next()
+                    .expect("task identity space exhausted"),
+                user_ns: RefCell::new(None),
+                pid_ns: RefCell::new(None),
+                net_ns: RefCell::new(None),
+                syscall_restart: wait::SyscallRestartState::default(),
                 global: self,
             }
         }
@@ -2295,21 +2672,28 @@ mod test_utils {
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
             let tid = self
                 .global
-                .next_thread_id
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                .processes
+                .alloc_tid()
+                .expect("tid space exhausted in test");
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
                 thread: self.thread.new_thread(tid)?,
                 pid: self.pid,
                 ppid: self.ppid,
-                tid,
+                tid: Cell::new(tid),
                 credentials: RefCell::new(self.credentials.borrow().clone()),
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
                 guest_sp: Cell::new(0),
+                task_id: litebox::utils::ids::TaskInstanceId::next()
+                    .expect("task identity space exhausted"),
+                user_ns: RefCell::new(self.user_ns.borrow().clone()),
+                pid_ns: RefCell::new(self.pid_ns.borrow().clone()),
+                net_ns: RefCell::new(self.net_ns.borrow().clone()),
+                syscall_restart: wait::SyscallRestartState::default(),
             };
             Some(task)
         }

@@ -85,6 +85,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        frame_sigmask: litebox_common_linux::signal::SigSet,
     ) -> Result<(), DeliverFault> {
         if !action.flags.contains(SaFlags::RESTORER) {
             return Err(DeliverFault);
@@ -122,12 +123,12 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                     ss: ctx.ss.trunc(),
                     err: last_exception.error_code.into(),
                     trapno: last_exception.exception.0.into(),
-                    oldmask: self.blocked.get().as_u64(),
+                    oldmask: frame_sigmask.as_u64(),
                     cr2: last_exception.cr2 as u64,
                     fpstate: 0, // TODO
                     reserved1: [0; 8],
                 },
-                sigmask: self.blocked.get(),
+                sigmask: frame_sigmask,
             },
             siginfo: siginfo.clone(),
         };

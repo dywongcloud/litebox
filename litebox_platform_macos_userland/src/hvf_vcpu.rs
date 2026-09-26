@@ -30,14 +30,14 @@
 use core::fmt;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::hvf::{
-    HvfArchitecturalState, HvfEl1State, HvfError, HvfPstateContext, HvfVcpu, HvfVcpuCancellation,
-    HvfVcpuExit, process_hvf_vm,
+    HvfArchitecturalState, HvfEl1State, HvfError, HvfFpInstall, HvfGuestFp, HvfPstateContext,
+    HvfVcpu, HvfVcpuCancellation, HvfVcpuExit, process_hvf_vm,
 };
 use crate::hvf_memory::{HvfMemoryError, HvfVcpuRunAttachment};
 
@@ -439,6 +439,12 @@ pub enum HvfVcpuLaneError {
         current_thread: usize,
         process: usize,
     },
+    /// FXR: a guest run claimed a resident SIMD/FP file this lane does not hold for it and
+    /// carried no host copy either, so no correct SIMD/FP state exists to run with.
+    FpResidency {
+        lane_generation: u64,
+        claimed_seq: Option<u64>,
+    },
 }
 
 impl fmt::Display for HvfVcpuLaneError {
@@ -518,6 +524,13 @@ impl fmt::Display for HvfVcpuLaneError {
             } => write!(
                 f,
                 "HVF vCPU cleanup retained {current_thread} owner-thread and {process} process-wide quarantined vCPUs; the owner lane stays alive as cleanup custodian"
+            ),
+            Self::FpResidency {
+                lane_generation,
+                claimed_seq,
+            } => write!(
+                f,
+                "HVF lane {lane_generation} does not hold the guest thread's resident SIMD/FP registers (claimed residency {claimed_seq:?}) and the run carried no host copy"
             ),
         }
     }
@@ -652,6 +665,323 @@ pub struct HvfVcpuRunResult {
     pub state: HvfVcpuExitState,
     pub run_epoch: u64,
     pub execution_time: u64,
+    /// Wall nanoseconds the owner thread spent inside `hv_vcpu_run` for this result (summed
+    /// over reruns): the subtrahend of `diagnostics_counters`' exit-to-reentry handoff cost.
+    pub run_wall_ns: u64,
+    /// Wall nanoseconds of the owner thread's whole `execute_attached` service for this result
+    /// (synchronization trip, state marshalling, the run, settle/finish); `0` for a result that
+    /// never went through an owner thread (a diagnostic's direct construction).
+    pub owner_ns: u64,
+    /// Operation-gate mutex acquisitions the owner thread made for this result.
+    pub owner_gate_locks: u64,
+    /// Host ticks from the guest stamping the command to the owner starting it.
+    pub owner_wake_ticks: u64,
+    /// Host tick at which the owner finished `execute_attached`.
+    pub owner_end_ticks: u64,
+    /// Host tick at which the owner sent the reply; `0` when no owner thread was involved.
+    pub replied_at_ticks: u64,
+    /// FXR: where the thread's SIMD/FP file is after this run.
+    pub fp: HvfExitFp,
+}
+
+/// FXR: where a guest thread's SIMD/FP file (Q0-Q31, FPCR, FPSR) is after a run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HvfExitFp {
+    /// The result's architectural state carries it.
+    Materialized,
+    /// It stayed resident in the lane's vCPU under this identity; the result state's
+    /// Q/FPCR/FPSR are zero and must never be read. The lane hands it back to the thread's
+    /// [`HvfGuestRegisterCell`] before anything overwrites it, or on request.
+    Resident { lane_generation: u64, seq: u64 },
+}
+
+/// FXR: how a guest thread's run treats its SIMD/FP file (see
+/// [`HvfVcpuLaneHandle::run_guest_reserved`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvfGuestFpClaim {
+    /// The residency sequence of the SIMD file the thread believes this lane holds for it.
+    pub resident_seq: Option<u64>,
+    /// The run state's Q/FPCR/FPSR are the thread's current SIMD file.
+    pub host_valid: bool,
+}
+
+/// FXR: a SIMD/FP file a lane handed back to its thread, or `fp: None` when the vCPU holding it
+/// was already gone (the thread must fail loudly rather than run on with invented values).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvfFpDeposit {
+    pub lane_generation: u64,
+    pub seq: u64,
+    pub(crate) fp: Option<HvfGuestFp>,
+    /// The lane still holds the same values resident (a requested materialization).
+    pub still_resident: bool,
+}
+
+/// FXR: one guest thread's SIMD/FP custody cell for the resident-register cache -- its identity
+/// (pointer identity of the `Arc`) and the mailbox a lane hands the thread's SIMD file back
+/// through when that file was left resident in the lane's vCPU (exit reads skip it) and the lane
+/// must give it up: another thread's run, a synchronization trip, the lane closing, or the thread
+/// asking for it.
+pub struct HvfGuestRegisterCell {
+    mailbox: Mutex<Vec<HvfFpDeposit>>,
+    deposited: Condvar,
+    /// Deposits pushed so far, so the owning thread can skip the mailbox lock while none arrived.
+    deposits: AtomicU64,
+}
+
+impl fmt::Debug for HvfGuestRegisterCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGuestRegisterCell")
+            .field("deposits", &self.deposits.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl HvfGuestRegisterCell {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            mailbox: Mutex::new(Vec::new()),
+            deposited: Condvar::new(),
+            deposits: AtomicU64::new(0),
+        })
+    }
+
+    fn deposit(&self, deposit: HvfFpDeposit) {
+        let mut mailbox = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mailbox.push(deposit);
+        self.deposits.fetch_add(1, Ordering::Release);
+        drop(mailbox);
+        self.deposited.notify_all();
+    }
+
+    /// Deposits pushed so far.
+    pub fn deposit_count(&self) -> u64 {
+        self.deposits.load(Ordering::Acquire)
+    }
+
+    fn take_locked(
+        mailbox: &mut Vec<HvfFpDeposit>,
+        lane_generation: u64,
+        seq: u64,
+    ) -> (Option<HvfFpDeposit>, usize) {
+        let position = mailbox
+            .iter()
+            .rposition(|deposit| deposit.lane_generation == lane_generation && deposit.seq == seq);
+        let taken = position.map(|position| mailbox.swap_remove(position));
+        let stale = mailbox.len();
+        mailbox.clear();
+        (taken, stale)
+    }
+
+    /// Removes the deposit for residency `(lane_generation, seq)` if one arrived, discarding every
+    /// other (stale) deposit; returns it and the number discarded. A thread has exactly one
+    /// residency at a time, so a deposit for any other identity is out of date.
+    pub fn take(&self, lane_generation: u64, seq: u64) -> (Option<HvfFpDeposit>, usize) {
+        let mut mailbox = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::take_locked(&mut mailbox, lane_generation, seq)
+    }
+
+    /// Discards every deposit (the thread's SIMD file is authoritative on the host).
+    pub fn discard_all(&self) -> usize {
+        let mut mailbox = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let discarded = mailbox.len();
+        mailbox.clear();
+        discarded
+    }
+
+    /// [`Self::take`], waiting until `deadline` for the deposit to arrive.
+    pub fn wait_take(
+        &self,
+        lane_generation: u64,
+        seq: u64,
+        deadline: Instant,
+    ) -> (Option<HvfFpDeposit>, usize) {
+        let mut mailbox = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut discarded = 0;
+        loop {
+            let (taken, stale) = Self::take_locked(&mut mailbox, lane_generation, seq);
+            discarded += stale;
+            if taken.is_some() {
+                return (taken, discarded);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return (None, discarded);
+            }
+            mailbox = self
+                .deposited
+                .wait_timeout(mailbox, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// FXR, owner-thread-local: the guest thread whose SIMD/FP file this lane's vCPU holds resident
+/// (left unread by that thread's last exit read).
+struct LaneFpHolder {
+    cell: Arc<HvfGuestRegisterCell>,
+    seq: u64,
+    /// The thread already holds a host copy (a requested materialization handed it one while the
+    /// file stayed resident): giving the file up needs no read.
+    saved: bool,
+}
+
+/// FXR, owner-thread-local residency bookkeeping of one lane.
+struct LaneResidency {
+    lane_generation: u64,
+    holder: Option<LaneFpHolder>,
+    next_seq: u64,
+}
+
+impl LaneResidency {
+    const fn new(lane_generation: u64) -> Self {
+        Self {
+            lane_generation,
+            holder: None,
+            next_seq: 1,
+        }
+    }
+
+    fn deposit(&self, holder: &LaneFpHolder, fp: Option<HvfGuestFp>, still_resident: bool) {
+        holder.cell.deposit(HvfFpDeposit {
+            lane_generation: self.lane_generation,
+            seq: holder.seq,
+            fp,
+            still_resident,
+        });
+    }
+
+    /// Gives the resident SIMD file up: hands it back to its thread (reading it out of the vCPU
+    /// unless the thread already has a copy) and forgets the holder, after which the vCPU's SIMD
+    /// file may be overwritten. `reason` is the `RESIDENT_DEPOSITS_*` counter to credit. A failed
+    /// read deposits a loss marker (the thread fails at its next SIMD use) and returns the error.
+    fn surrender(&mut self, vcpu: &mut HvfVcpu, reason: usize) -> Result<(), HvfVcpuLaneError> {
+        let Some(holder) = self.holder.take() else {
+            // Unsaved SIMD state with no holder is an orphan: only a run that failed after
+            // entering the guest leaves one, and that run's thread received the failure. Nobody
+            // can ever claim it.
+            vcpu.discard_unsaved_fp();
+            return Ok(());
+        };
+        if holder.saved {
+            // Review fix-up (FXR-c1): `saved` is set only by [`Self::materialize`], right after a
+            // successful `read_guest_fp()` that already cleared this flag, so this is a no-op
+            // today. Clearing it here anyway makes the invariant local: whatever the vCPU still
+            // holds after a `saved` holder is by definition already in the thread's copy, so no
+            // later `HvfFpInstall::Install` may be refused for it. Without it the proof that
+            // [`HvfError::ResidentFpUnsaved`] is unreachable here needs a non-local argument about
+            // how `saved` is set and cleared.
+            vcpu.discard_unsaved_fp();
+            return Ok(());
+        }
+        match vcpu.read_guest_fp() {
+            Ok(fp) => {
+                self.deposit(&holder, Some(fp), false);
+                crate::diagnostics_counters::record_resident(reason, 1);
+                Ok(())
+            }
+            Err(error) => {
+                self.deposit(&holder, None, false);
+                crate::diagnostics_counters::record_resident(
+                    crate::diagnostics_counters::RESIDENT_FP_LOST,
+                    1,
+                );
+                Err(error.into())
+            }
+        }
+    }
+
+    /// The lane is going away: hand the resident SIMD file back while the vCPU can still be read,
+    /// or record its loss.
+    fn surrender_at_close(&mut self, mut vcpu: Option<&mut HvfVcpu>) {
+        let Some(holder) = self.holder.as_ref() else {
+            return;
+        };
+        if holder.saved {
+            // Same local invariant as [`Self::surrender`]: a `saved` holder's file is already in
+            // the thread's copy, so the vCPU holds nothing that must not be overwritten.
+            if let Some(vcpu) = vcpu.as_deref_mut() {
+                vcpu.discard_unsaved_fp();
+            }
+            self.holder = None;
+            return;
+        }
+        match vcpu {
+            Some(vcpu) if vcpu.is_live() => {
+                let _ = self.surrender(vcpu, crate::diagnostics_counters::RESIDENT_DEPOSITS_CLOSE);
+            }
+            _ => {
+                if let Some(holder) = self.holder.take() {
+                    self.deposit(&holder, None, false);
+                    crate::diagnostics_counters::record_resident(
+                        crate::diagnostics_counters::RESIDENT_FP_LOST,
+                        1,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `MaterializeFp`: hands a copy of the resident SIMD file `(cell, seq)` to its thread while it
+    /// stays resident. Not held (already handed back, or never here): nothing to do -- the
+    /// deposit that gave it up is already in the thread's mailbox.
+    fn materialize(
+        &mut self,
+        vcpu: &mut HvfVcpu,
+        cell: &Arc<HvfGuestRegisterCell>,
+        seq: u64,
+    ) -> Result<(), HvfVcpuLaneError> {
+        let Some(holder) = self.holder.as_mut() else {
+            return Ok(());
+        };
+        if !Arc::ptr_eq(&holder.cell, cell) || holder.seq != seq {
+            return Ok(());
+        }
+        match vcpu.read_guest_fp() {
+            Ok(fp) => {
+                holder.saved = true;
+                holder.cell.deposit(HvfFpDeposit {
+                    lane_generation: self.lane_generation,
+                    seq,
+                    fp: Some(fp),
+                    still_resident: true,
+                });
+                crate::diagnostics_counters::record_resident(
+                    crate::diagnostics_counters::RESIDENT_DEPOSITS_MATERIALIZE,
+                    1,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(holder) = self.holder.take() {
+                    self.deposit(&holder, None, false);
+                }
+                crate::diagnostics_counters::record_resident(
+                    crate::diagnostics_counters::RESIDENT_FP_LOST,
+                    1,
+                );
+                Err(error.into())
+            }
+        }
+    }
+}
+
+/// FXR: the guest-thread part of an `Execute` command (absent for full-mode runs).
+struct HvfGuestRun {
+    cell: Arc<HvfGuestRegisterCell>,
+    claim: HvfGuestFpClaim,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1531,9 +1861,16 @@ impl RunControl {
             let attempt =
                 Self::next_cancellation_attempt(&mut state, lane_generation, cancellation, target)?;
             self.issue_cancellation(&mut state, &attempt, cancellation)?;
+            // hvf-exit-overhead-instrumentation: a real `hv_vcpus_exit` against a running lane.
+            crate::diagnostics_counters::record_kick_issued();
             Ok(attempt)
         } else {
-            Self::latch_cancellation(&mut state, lane_generation, cancellation, target)
+            let attempt =
+                Self::latch_cancellation(&mut state, lane_generation, cancellation, target)?;
+            // hvf-exit-overhead-instrumentation: latched -- the imminent run returns `Canceled`
+            // without entering the guest (see `execute_once`).
+            crate::diagnostics_counters::record_kick_latched();
+            Ok(attempt)
         }
     }
 
@@ -2625,7 +2962,45 @@ impl HvfVcpuLaneHandle {
         state: &HvfArchitecturalState,
     ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
         let reservation = self.reserve_run()?;
-        self.execute(ExecutionKind::Start, reservation, attachment, state, None)
+        self.execute(ExecutionKind::Start, reservation, attachment, state, None, None)
+    }
+
+    /// FXR resident-register run of one guest thread (the backend's per-exit path): like
+    /// [`Self::run_with_deadline_reserved`], but the owner installs only the registers its
+    /// resident cache does not already hold, keeps the thread's SIMD/FP file resident when
+    /// `claim` names the file this lane holds for `cell`, reads back only the 39 exit registers,
+    /// and leaves the SIMD file resident (the result reports [`HvfExitFp::Resident`]).
+    pub fn run_guest_reserved(
+        &self,
+        reservation: HvfVcpuRunReservation,
+        attachment: HvfVcpuRunAttachment,
+        state: &HvfArchitecturalState,
+        cell: Arc<HvfGuestRegisterCell>,
+        claim: HvfGuestFpClaim,
+        vtimer_deadline: u64,
+    ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
+        self.execute(
+            ExecutionKind::Start,
+            reservation,
+            attachment,
+            state,
+            Some(HvfGuestRun { cell, claim }),
+            Some(vtimer_deadline),
+        )
+    }
+
+    /// FXR: asks this lane to hand a copy of the resident SIMD/FP file `(cell, seq)` back to its
+    /// thread (deposited into `cell`; the caller waits there, not for a reply).
+    pub fn request_fp_materialization(
+        &self,
+        cell: &Arc<HvfGuestRegisterCell>,
+        seq: u64,
+    ) -> Result<(), HvfVcpuLaneError> {
+        self.admit(Command::MaterializeFp {
+            cell: Arc::clone(cell),
+            seq,
+        })
+        .map_err(|(_, error)| error)
     }
 
     /// [`Self::run`] with the virtual timer armed to `vtimer_deadline` (a
@@ -2653,6 +3028,7 @@ impl HvfVcpuLaneHandle {
             reservation,
             attachment,
             state,
+            None,
             Some(vtimer_deadline),
         )
     }
@@ -2663,7 +3039,7 @@ impl HvfVcpuLaneHandle {
         state: &HvfArchitecturalState,
     ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
         let reservation = self.reserve_run()?;
-        self.execute(ExecutionKind::Resume, reservation, attachment, state, None)
+        self.execute(ExecutionKind::Resume, reservation, attachment, state, None, None)
     }
 
     /// Brings this lane's vCPU onto the attachment's current root and
@@ -2710,20 +3086,26 @@ impl HvfVcpuLaneHandle {
         reservation: HvfVcpuRunReservation,
         attachment: HvfVcpuRunAttachment,
         state: &HvfArchitecturalState,
+        guest: Option<HvfGuestRun>,
         vtimer_deadline: Option<u64>,
     ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
         if !reservation.belongs_to(self) {
             return Err(HvfVcpuLaneError::RegistryAccounting);
         }
         let deadline = operation_deadline()?;
+        let submit_start = crate::diagnostics_counters::ticks();
         attachment.submit(self.generation)?;
+        let submit_end = crate::diagnostics_counters::ticks();
         let (reply, response) = mpsc::sync_channel(1);
+        let stamped = crate::diagnostics_counters::ticks();
         let command = Command::Execute {
             kind,
             reservation,
             attachment,
             state: *state,
+            guest,
             vtimer_deadline,
+            stamped_at: stamped,
             reply,
         };
         if let Err((command, primary)) = self.admit(command) {
@@ -2742,13 +3124,26 @@ impl HvfVcpuLaneHandle {
                 _ => HvfVcpuLaneError::RegistryAccounting,
             });
         }
-        match receive_until(response, deadline) {
+        let outcome = match receive_until(response, deadline) {
             Err(error @ (HvfVcpuLaneError::OperationTimeout | HvfVcpuLaneError::LaneClosed)) => {
                 self.abandon_after_wait_failure();
-                Err(error)
+                return Err(error);
             }
             result => result?,
+        };
+        if let Ok(run) = &outcome
+            && run.replied_at_ticks != 0
+        {
+            let resumed = crate::diagnostics_counters::ticks();
+            crate::diagnostics_counters::record_channel([
+                submit_end.wrapping_sub(submit_start),
+                stamped.wrapping_sub(submit_end),
+                run.owner_wake_ticks,
+                run.replied_at_ticks.wrapping_sub(run.owner_end_ticks),
+                resumed.wrapping_sub(run.replied_at_ticks),
+            ]);
         }
+        outcome
     }
 
     pub fn set_pending_interrupt(&self, fiq: bool, pending: bool) -> Result<(), HvfVcpuLaneError> {
@@ -2967,8 +3362,19 @@ enum Command {
         reservation: HvfVcpuRunReservation,
         attachment: HvfVcpuRunAttachment,
         state: HvfArchitecturalState,
+        /// FXR: `Some` for a resident-register guest-thread run, `None` for a full-mode run
+        /// (full install, full read).
+        guest: Option<HvfGuestRun>,
         vtimer_deadline: Option<u64>,
+        stamped_at: u64,
         reply: Reply<HvfVcpuRunResult>,
+    },
+    /// FXR: hand a copy of the resident SIMD/FP file `(cell, seq)` back to its thread's cell.
+    /// No reply: the requester waits on its cell, which every path that gives the file up
+    /// (this command, an eviction, a synchronization trip, the lane closing) deposits into.
+    MaterializeFp {
+        cell: Arc<HvfGuestRegisterCell>,
+        seq: u64,
     },
     /// Synchronize this lane onto the attachment's root/generations (monitor
     /// TLBI trip plus acknowledgement) without running guest code.
@@ -3022,6 +3428,9 @@ impl Command {
             Self::SetVtimer { reply, .. } | Self::ReadVtimer { reply } => {
                 reply_result(reply, Err(error));
             }
+            // The requester waits on its cell; the owner's close path hands the file back (or
+            // records its loss) whether or not this request ever ran.
+            Self::MaterializeFp { .. } => {}
         }
     }
 }
@@ -3088,6 +3497,7 @@ fn owner_thread(context: OwnerThreadContext) {
         completed,
     } = context;
     let mut vcpu = None;
+    let mut residency = LaneResidency::new(lane_generation);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let setup = (|| {
             command_queue.register_owner()?;
@@ -3118,6 +3528,7 @@ fn owner_thread(context: OwnerThreadContext) {
             &control,
             &command_queue,
             &mut vcpu,
+            &mut residency,
         )
     }));
     if outcome.is_err() || lifecycle.load(Ordering::Acquire) == LANE_LIVE {
@@ -3129,6 +3540,10 @@ fn owner_thread(context: OwnerThreadContext) {
     for command in command_queue.close_and_drain() {
         command.reject(HvfVcpuLaneError::LaneClosed);
     }
+
+    // FXR: a guest thread's SIMD/FP file still resident here goes back to it before the vCPU is
+    // destroyed (or is recorded lost when the vCPU is already gone, or after an owner panic).
+    residency.surrender_at_close(if outcome.is_ok() { vcpu.as_mut() } else { None });
 
     let mut cleanup_attempts = 0usize;
     let mut cleanup_error: Option<HvfVcpuLaneError> = None;
@@ -3249,6 +3664,7 @@ fn owner_loop(
     control: &RunControl,
     command_queue: &CommandQueue,
     vcpu: &mut Option<HvfVcpu>,
+    residency: &mut LaneResidency,
 ) -> Result<(), HvfVcpuLaneError> {
     loop {
         if lifecycle.load(Ordering::Acquire) != LANE_LIVE {
@@ -3301,9 +3717,13 @@ fn owner_loop(
                 reservation,
                 attachment,
                 state,
+                guest,
                 vtimer_deadline,
+                stamped_at,
                 reply,
             } => {
+                let owner_wake_ticks =
+                    crate::diagnostics_counters::ticks().wrapping_sub(stamped_at);
                 let mut result = execute_attached(
                     raw,
                     control,
@@ -3312,12 +3732,20 @@ fn owner_loop(
                     reservation,
                     attachment,
                     &state,
+                    guest,
+                    residency,
                     vtimer_deadline,
                 );
                 let untrusted = result
                     .as_ref()
                     .is_err_and(HvfVcpuLaneError::terminalizes_execution_vcpu)
                     || control.is_untrusted();
+                // FXR: a run whose lane leaves service right after it (retired as untrusted,
+                // quarantined by the SDK, or shut down) must not strand the thread's SIMD file in
+                // the dying vCPU: read it into the result now, while the vCPU still answers.
+                if untrusted || !raw.is_live() || control.is_terminal() {
+                    materialize_result_fp(raw, residency, &mut result);
+                }
                 if untrusted {
                     // The architectural state can no longer be trusted: retire
                     // the vCPU now, on its owner thread, unless the SDK already
@@ -3342,9 +3770,37 @@ fn owner_loop(
                     // still trustworthy and is destroyed normally by cleanup.
                     raise_lane_lifecycle(lifecycle, LANE_ABANDONED);
                 }
+                if let Ok(run) = result.as_mut() {
+                    run.owner_wake_ticks = owner_wake_ticks;
+                    run.replied_at_ticks = crate::diagnostics_counters::ticks();
+                }
                 reply_result(reply, result);
             }
+            Command::MaterializeFp { cell, seq } => {
+                if let Err(error) = residency.materialize(raw, &cell, seq) {
+                    litebox_util_log::error!(error:% = error;
+                        "HVF lane could not read a guest thread's resident SIMD/FP registers back");
+                }
+                if !raw.is_live() {
+                    vcpu.take();
+                    raise_lane_lifecycle(lifecycle, LANE_ABANDONED);
+                    return Ok(());
+                }
+            }
             Command::Synchronize { attachment, reply } => {
+                // FXR: the trip installs an all-zero scratch state; the resident SIMD file goes
+                // back to its thread first.
+                if let Err(error) = residency.surrender(
+                    raw,
+                    crate::diagnostics_counters::RESIDENT_DEPOSITS_SYNC,
+                ) {
+                    reply_result(reply, Err(finish_attachment_with_error(attachment, error)));
+                    if !raw.is_live() {
+                        vcpu.take();
+                    }
+                    raise_lane_lifecycle(lifecycle, LANE_ABANDONED);
+                    continue;
+                }
                 let mut result = synchronize_attached(raw, control, lane_generation, attachment);
                 let untrusted = result
                     .as_ref()
@@ -3435,6 +3891,116 @@ fn reply_result<T>(reply: Reply<T>, result: Result<T, HvfVcpuLaneError>) {
 // Execution on the owner thread.
 // ---------------------------------------------------------------------------
 
+/// FXR: the SIMD/FP half of a run's install, decided by [`reconcile_fp`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunFp {
+    /// Full-mode run: full 74-register install, full read, no residency.
+    Full,
+    /// Guest run: keep the SIMD file resident / install it from the run state.
+    Guest(HvfFpInstall),
+}
+
+/// FXR: settles who owns the vCPU's SIMD file before a run. A full-mode run, or a guest run of a
+/// different thread, first hands the resident file back to its thread (owner change); a guest run
+/// of the holding thread keeps it when its claim names exactly this residency, and otherwise
+/// (its host copy superseded the resident one) installs its host copy -- which it must carry.
+fn reconcile_fp(
+    vcpu: &mut HvfVcpu,
+    residency: &mut LaneResidency,
+    guest: Option<&HvfGuestRun>,
+) -> Result<RunFp, HvfVcpuLaneError> {
+    use crate::diagnostics_counters::{
+        RESIDENT_DEPOSITS_EVICT, RESIDENT_FP_CLAIM_FALLBACK, RESIDENT_FP_FROM_HOST,
+        RESIDENT_FP_KEPT, record_resident,
+    };
+    let Some(guest) = guest else {
+        residency.surrender(vcpu, RESIDENT_DEPOSITS_EVICT)?;
+        return Ok(RunFp::Full);
+    };
+    let same_thread = residency
+        .holder
+        .as_ref()
+        .is_some_and(|holder| Arc::ptr_eq(&holder.cell, &guest.cell));
+    if same_thread {
+        let holds_claim = residency
+            .holder
+            .as_ref()
+            .is_some_and(|holder| Some(holder.seq) == guest.claim.resident_seq);
+        if holds_claim {
+            record_resident(RESIDENT_FP_KEPT, 1);
+            return Ok(RunFp::Guest(HvfFpInstall::Keep));
+        }
+        // The thread's own resident file, superseded by the host copy it now runs with (a
+        // sigreturn / ptrace / clone-setup `set_fp_state`): dead, nobody wants it back.
+        residency.holder = None;
+        vcpu.discard_unsaved_fp();
+    } else {
+        residency.surrender(vcpu, RESIDENT_DEPOSITS_EVICT)?;
+    }
+    if !guest.claim.host_valid {
+        return Err(HvfVcpuLaneError::FpResidency {
+            lane_generation: residency.lane_generation,
+            claimed_seq: guest.claim.resident_seq,
+        });
+    }
+    record_resident(
+        if guest.claim.resident_seq.is_some() {
+            RESIDENT_FP_CLAIM_FALLBACK
+        } else {
+            RESIDENT_FP_FROM_HOST
+        },
+        1,
+    );
+    Ok(RunFp::Guest(HvfFpInstall::Install))
+}
+
+/// FXR: before a lane leaves service after an `Ok` guest run, reads the thread's still-resident
+/// SIMD file into the result (so nothing is stranded in a dying vCPU); an unreadable file turns
+/// the result into the error.
+fn materialize_result_fp(
+    vcpu: &mut HvfVcpu,
+    residency: &mut LaneResidency,
+    result: &mut Result<HvfVcpuRunResult, HvfVcpuLaneError>,
+) {
+    let Ok(run) = result.as_mut() else {
+        return;
+    };
+    let HvfExitFp::Resident { seq, .. } = run.fp else {
+        return;
+    };
+    if !residency.holder.as_ref().is_some_and(|holder| holder.seq == seq) {
+        return;
+    }
+    residency.holder = None;
+    let fp = if vcpu.is_live() {
+        vcpu.read_guest_fp().map_err(HvfVcpuLaneError::from)
+    } else {
+        Err(HvfVcpuLaneError::Hvf(HvfError::VcpuNotLive))
+    };
+    match fp {
+        Ok(fp) => {
+            let state = match &mut run.state {
+                HvfVcpuExitState::DirectGuest(state) | HvfVcpuExitState::LowerElMonitor(state) => {
+                    state
+                }
+            };
+            fp.write_into(state);
+            run.fp = HvfExitFp::Materialized;
+            crate::diagnostics_counters::record_resident(
+                crate::diagnostics_counters::RESIDENT_RESULTS_MATERIALIZED,
+                1,
+            );
+        }
+        Err(error) => {
+            crate::diagnostics_counters::record_resident(
+                crate::diagnostics_counters::RESIDENT_FP_LOST,
+                1,
+            );
+            *result = Err(error);
+        }
+    }
+}
+
 fn execute_attached(
     vcpu: &mut HvfVcpu,
     control: &RunControl,
@@ -3443,11 +4009,36 @@ fn execute_attached(
     mut reservation: HvfVcpuRunReservation,
     attachment: HvfVcpuRunAttachment,
     state: &HvfArchitecturalState,
+    guest: Option<HvfGuestRun>,
+    residency: &mut LaneResidency,
     vtimer_deadline: Option<u64>,
 ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
+    use crate::diagnostics_counters::{
+        OWNER_ARM_VTIMER, OWNER_ATTACHMENT_FINISH, OWNER_BEGIN_RUNNING, OWNER_SETTLE, OWNER_SYNC,
+    };
+    // Owner-side service span for `HvfVcpuRunResult::owner_ns` (see its doc comment).
+    let mut trace = crate::diagnostics_counters::OwnerTrace::start();
+    let gate_locks_before = crate::diagnostics_counters::gate_locks_this_thread();
     let run_epoch = reservation.run_epoch();
     let result = (|| {
+        let mut desired = *state;
+        let mut run_fp = reconcile_fp(vcpu, residency, guest.as_ref())?;
         if attachment.requires_synchronization() {
+            crate::diagnostics_counters::record_sync_trip();
+            // FXR: the trip installs an all-zero scratch state over the whole register file.
+            // Keep the running thread's own resident SIMD file across it by reading it out
+            // now and installing it again with the run (every other holder was already
+            // handed back by `reconcile_fp`).
+            if run_fp == RunFp::Guest(HvfFpInstall::Keep) {
+                let fp = vcpu.read_guest_fp()?;
+                fp.write_into(&mut desired);
+                residency.holder = None;
+                run_fp = RunFp::Guest(HvfFpInstall::Install);
+                crate::diagnostics_counters::record_resident(
+                    crate::diagnostics_counters::RESIDENT_DEPOSITS_SYNC,
+                    1,
+                );
+            }
             attachment.begin_synchronizing(lane_generation)?;
             let proof = synchronize_once(
                 vcpu,
@@ -3457,21 +4048,49 @@ fn execute_attached(
                 attachment.synchronization_request(),
             )?;
             attachment.acknowledge_owner_synchronization(proof)?;
+            trace.spans.mark(OWNER_SYNC);
         }
         attachment.begin_running(lane_generation)?;
-        if let Some(cval) = vtimer_deadline {
+        trace.spans.mark(OWNER_BEGIN_RUNNING);
+        // A guest run arms its time slice inside its resident install (one entry point, one
+        // admission); a full-mode run keeps the separate arm.
+        if run_fp == RunFp::Full
+            && let Some(cval) = vtimer_deadline
+        {
             vcpu.arm_vtimer(cval)?;
         }
-        match kind {
-            ExecutionKind::Start => run_once(
+        trace.spans.mark(OWNER_ARM_VTIMER);
+        match (kind, run_fp) {
+            (ExecutionKind::Start, RunFp::Full) => run_once(
                 vcpu,
                 control,
                 lane_generation,
                 run_epoch,
-                state,
+                &desired,
                 HvfPstateContext::UserEl0t,
+                &mut trace,
             ),
-            ExecutionKind::Resume => resume_once(vcpu, control, lane_generation, run_epoch, state),
+            (ExecutionKind::Start, RunFp::Guest(fp)) => {
+                let Some(guest) = guest.as_ref() else {
+                    return Err(HvfVcpuLaneError::RegistryAccounting);
+                };
+                run_guest_once(
+                    vcpu,
+                    control,
+                    lane_generation,
+                    run_epoch,
+                    &desired,
+                    fp,
+                    vtimer_deadline,
+                    guest,
+                    residency,
+                    &mut trace,
+                )
+            }
+            (ExecutionKind::Resume, RunFp::Full) => {
+                resume_once(vcpu, control, lane_generation, run_epoch, &desired, &mut trace)
+            }
+            (ExecutionKind::Resume, RunFp::Guest(_)) => Err(HvfVcpuLaneError::RegistryAccounting),
         }
     })();
     let untrusted = result
@@ -3479,11 +4098,20 @@ fn execute_attached(
         .is_err_and(HvfVcpuLaneError::terminalizes_execution_vcpu)
         || control.is_untrusted();
     let mut cleanup_error = reservation.settle(untrusted).err();
+    trace.spans.mark(OWNER_SETTLE);
     if let Err(error) = attachment.finish().map_err(HvfVcpuLaneError::from) {
         append_lane_error(&mut cleanup_error, error);
     }
+    trace.spans.mark(OWNER_ATTACHMENT_FINISH);
     match (result, cleanup_error) {
-        (Ok(result), None) => Ok(result),
+        (Ok(mut result), None) => {
+            result.owner_ns = trace.total_ns();
+            result.owner_gate_locks = crate::diagnostics_counters::gate_locks_this_thread()
+                .wrapping_sub(gate_locks_before);
+            result.owner_end_ticks = trace.spans.last();
+            crate::diagnostics_counters::record_owner_run(&trace);
+            Ok(result)
+        }
         (Err(primary), None) => Err(primary),
         (Err(primary), Some(cleanup)) => Err(primary.with_cleanup(cleanup)),
         (Ok(_), Some(cleanup)) => Err(cleanup),
@@ -3524,21 +4152,55 @@ fn execute_once(
     control: &RunControl,
     lane_generation: u64,
     run_epoch: u64,
-) -> Result<(HvfVcpuExit, u64, u64), HvfVcpuLaneError> {
+    trace: &mut crate::diagnostics_counters::OwnerTrace,
+) -> Result<(HvfVcpuExit, u64, u64, u64), HvfVcpuLaneError> {
+    use crate::diagnostics_counters::{
+        OWNER_EXECUTION_TIME, OWNER_RUN_CONTROL_BEGIN, OWNER_RUN_CONTROL_FINISH,
+        OWNER_RUN_WRAPPER, RUN_CLASS_AFTER_FULL_SET, RUN_CLASS_NO_SET,
+    };
+    // Wall time inside `hv_vcpu_run`, summed over reruns: `HvfVcpuRunResult::run_wall_ns`.
+    let mut run_wall_ns = 0u64;
     loop {
         control.begin_run(run_epoch)?;
         match control.begin_running(run_epoch) {
             Ok(()) => {}
             Err(HvfVcpuLaneError::LatchedCancellation) => {
-                return Ok((HvfVcpuExit::Canceled, vcpu.execution_time()?, run_epoch));
+                crate::diagnostics_counters::record_canceled(
+                    crate::diagnostics_counters::CanceledKind::Latched,
+                );
+                trace.latched = true;
+                trace.spans.mark(OWNER_RUN_CONTROL_BEGIN);
+                let execution_time = vcpu.execution_time()?;
+                trace.spans.mark(OWNER_EXECUTION_TIME);
+                return Ok((HvfVcpuExit::Canceled, execution_time, run_epoch, run_wall_ns));
             }
             Err(error) => return Err(error),
         }
+        trace.spans.mark(OWNER_RUN_CONTROL_BEGIN);
         let run = vcpu.run();
+        let wrapper_ticks = trace.spans.mark(OWNER_RUN_WRAPPER);
+        run_wall_ns =
+            run_wall_ns.saturating_add(crate::diagnostics_counters::ticks_to_ns(wrapper_ticks));
+        if run.is_ok() {
+            let (raw_ticks, installs_before) = vcpu.last_run_profile();
+            crate::diagnostics_counters::record_run_split(
+                if installs_before == 0 {
+                    RUN_CLASS_NO_SET
+                } else {
+                    RUN_CLASS_AFTER_FULL_SET
+                },
+                raw_ticks,
+                wrapper_ticks,
+            );
+        }
         let disposition = control.finish_run(run_epoch, &run);
+        trace.spans.mark(OWNER_RUN_CONTROL_FINISH);
         let exit = match (run, disposition) {
             (Ok(exit), Ok(RunDisposition::Deliver)) => exit,
-            (Ok(_), Ok(RunDisposition::Rerun)) => continue,
+            (Ok(_), Ok(RunDisposition::Rerun)) => {
+                trace.reruns += 1;
+                continue;
+            }
             (Err(primary), Ok(_)) => return Err(primary.into()),
             (Ok(_), Err(error)) => return Err(error),
             (Err(primary), Err(cleanup)) => {
@@ -3546,7 +4208,9 @@ fn execute_once(
             }
         };
         hold_vcpu_run_completion_barrier(lane_generation, run_epoch);
-        return Ok((exit, vcpu.execution_time()?, run_epoch));
+        let execution_time = vcpu.execution_time()?;
+        trace.spans.mark(OWNER_EXECUTION_TIME);
+        return Ok((exit, execution_time, run_epoch, run_wall_ns));
     }
 }
 
@@ -3557,35 +4221,113 @@ fn run_once(
     run_epoch: u64,
     state: &HvfArchitecturalState,
     context: HvfPstateContext,
+    trace: &mut crate::diagnostics_counters::OwnerTrace,
 ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
+    use crate::diagnostics_counters::{OWNER_CLASSIFY, OWNER_GET_STATE, OWNER_SET_STATE};
     vcpu.set_architectural_state(state, context)?;
-    let (exit, execution_time, run_epoch) =
-        execute_once(vcpu, control, lane_generation, run_epoch)?;
+    crate::diagnostics_counters::record_set_state(trace.spans.mark(OWNER_SET_STATE));
+    let (exit, execution_time, run_epoch, run_wall_ns) =
+        execute_once(vcpu, control, lane_generation, run_epoch, trace)?;
     if matches!(exit, HvfVcpuExit::Unknown | HvfVcpuExit::Malformed { .. }) {
         return Err(HvfVcpuLaneError::RejectedExit(exit));
     }
     let raw_state = vcpu.architectural_state_unclassified()?;
-    let state = match raw_state.cpsr_context() {
-        Ok(HvfPstateContext::UserEl0t) => HvfVcpuExitState::DirectGuest(raw_state),
-        Ok(HvfPstateContext::MonitorEl1h)
-            if raw_state
-                .require_spsr_el1(HvfPstateContext::UserEl0t)
-                .is_ok() =>
-        {
-            HvfVcpuExitState::LowerElMonitor(raw_state)
-        }
-        _ => {
-            return Err(HvfVcpuLaneError::InvalidExecutionState {
-                exit,
-                state: (&raw_state).into(),
-            });
-        }
-    };
+    crate::diagnostics_counters::record_get_state(trace.spans.mark(OWNER_GET_STATE));
+    let state = classify_exit_state(exit, raw_state)?;
+    trace.spans.mark(OWNER_CLASSIFY);
     Ok(HvfVcpuRunResult {
         exit,
         state,
         run_epoch,
         execution_time,
+        run_wall_ns,
+        owner_ns: 0,
+        owner_gate_locks: 0,
+        owner_wake_ticks: 0,
+        owner_end_ticks: 0,
+        replied_at_ticks: 0,
+        fp: HvfExitFp::Materialized,
+    })
+}
+
+fn classify_exit_state(
+    exit: HvfVcpuExit,
+    raw_state: HvfArchitecturalState,
+) -> Result<HvfVcpuExitState, HvfVcpuLaneError> {
+    match raw_state.cpsr_context() {
+        Ok(HvfPstateContext::UserEl0t) => Ok(HvfVcpuExitState::DirectGuest(raw_state)),
+        Ok(HvfPstateContext::MonitorEl1h)
+            if raw_state
+                .require_spsr_el1(HvfPstateContext::UserEl0t)
+                .is_ok() =>
+        {
+            Ok(HvfVcpuExitState::LowerElMonitor(raw_state))
+        }
+        _ => Err(HvfVcpuLaneError::InvalidExecutionState {
+            exit,
+            state: (&raw_state).into(),
+        }),
+    }
+}
+
+/// FXR resident-register run of one guest thread: installs only what the vCPU's resident cache
+/// does not already hold (`fp` decides the SIMD file), runs, reads back the 39 exit registers,
+/// and leaves the SIMD file resident under a fresh identity recorded as this lane's holder.
+fn run_guest_once(
+    vcpu: &mut HvfVcpu,
+    control: &RunControl,
+    lane_generation: u64,
+    run_epoch: u64,
+    state: &HvfArchitecturalState,
+    fp: HvfFpInstall,
+    vtimer_deadline: Option<u64>,
+    guest: &HvfGuestRun,
+    residency: &mut LaneResidency,
+    trace: &mut crate::diagnostics_counters::OwnerTrace,
+) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
+    use crate::diagnostics_counters::{OWNER_CLASSIFY, OWNER_GET_STATE, OWNER_SET_STATE};
+    vcpu.install_guest_state(state, HvfPstateContext::UserEl0t, fp, vtimer_deadline)?;
+    crate::diagnostics_counters::record_set_state(trace.spans.mark(OWNER_SET_STATE));
+    let (exit, execution_time, run_epoch, run_wall_ns) =
+        execute_once(vcpu, control, lane_generation, run_epoch, trace)?;
+    if matches!(exit, HvfVcpuExit::Unknown | HvfVcpuExit::Malformed { .. }) {
+        return Err(HvfVcpuLaneError::RejectedExit(exit));
+    }
+    let raw_state = vcpu.read_guest_exit_state()?;
+    crate::diagnostics_counters::record_get_state(trace.spans.mark(OWNER_GET_STATE));
+    let state = classify_exit_state(exit, raw_state)?;
+    let seq = residency.next_seq;
+    residency.next_seq = residency.next_seq.wrapping_add(1).max(1);
+    match residency.holder.as_mut() {
+        // The same thread again (the common case): keep the cell reference already held.
+        Some(holder) if Arc::ptr_eq(&holder.cell, &guest.cell) => {
+            holder.seq = seq;
+            holder.saved = false;
+        }
+        _ => {
+            residency.holder = Some(LaneFpHolder {
+                cell: Arc::clone(&guest.cell),
+                seq,
+                saved: false,
+            });
+        }
+    }
+    trace.spans.mark(OWNER_CLASSIFY);
+    Ok(HvfVcpuRunResult {
+        exit,
+        state,
+        run_epoch,
+        execution_time,
+        run_wall_ns,
+        owner_ns: 0,
+        owner_gate_locks: 0,
+        owner_wake_ticks: 0,
+        owner_end_ticks: 0,
+        replied_at_ticks: 0,
+        fp: HvfExitFp::Resident {
+            lane_generation,
+            seq,
+        },
     })
 }
 
@@ -3595,6 +4337,7 @@ fn resume_once(
     lane_generation: u64,
     run_epoch: u64,
     state: &HvfArchitecturalState,
+    trace: &mut crate::diagnostics_counters::OwnerTrace,
 ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
     if state.pc != process_hvf_vm()?.monitor().resume_offset() as u64
         || state.esr_el1 != 0x5600_0000
@@ -3614,6 +4357,7 @@ fn resume_once(
         run_epoch,
         state,
         HvfPstateContext::MonitorEl1h,
+        trace,
     )
 }
 
@@ -3715,11 +4459,27 @@ fn synchronize_once(
             suppress_internal_interrupts(vcpu)?;
             let synchronization_epoch = control.begin_synchronizing(run_epoch)?;
             hold_vcpu_synchronization_barrier();
+            let wrapper_start = crate::diagnostics_counters::ticks();
             let run = vcpu.run();
+            if run.is_ok() {
+                let wrapper_ticks = crate::diagnostics_counters::ticks().wrapping_sub(wrapper_start);
+                crate::diagnostics_counters::record_run_split(
+                    crate::diagnostics_counters::RUN_CLASS_SYNC_TRIP,
+                    vcpu.last_run_profile().0,
+                    wrapper_ticks,
+                );
+            }
             let disposition = control.finish_synchronizing(synchronization_epoch, &run);
             let exit = match (run, disposition) {
                 (Ok(exit), Ok(SynchronizationDisposition::Completed)) => exit,
-                (Ok(_), Ok(SynchronizationDisposition::Rerun)) => continue,
+                (Ok(_), Ok(SynchronizationDisposition::Rerun)) => {
+                    // FXR: the trip only ever runs the scratch state installed above (the caller
+                    // handed every guest thread's resident SIMD file back first), so what the
+                    // interrupted attempt left in the SIMD file is scratch too: nothing to save
+                    // before the next attempt's full install.
+                    vcpu.discard_unsaved_fp();
+                    continue;
+                }
                 (Ok(_), Ok(SynchronizationDisposition::Canceled(_))) => {
                     return Err(HvfVcpuLaneError::LaneClosed);
                 }

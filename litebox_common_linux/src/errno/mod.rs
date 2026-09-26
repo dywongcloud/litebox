@@ -225,6 +225,8 @@ impl From<litebox::fs::errors::WriteError> for Errno {
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::fs::errors::WriteError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::WriteError::PermissionDenied => Errno::EPERM,
+            litebox::fs::errors::WriteError::InvalidArgument => Errno::EINVAL,
             litebox::fs::errors::WriteError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
@@ -367,6 +369,7 @@ impl From<litebox::mm::linux::VmemResetError> for Errno {
             litebox::mm::linux::VmemResetError::UnAligned => Errno::EINVAL,
             litebox::mm::linux::VmemResetError::AlreadyUnallocated => Errno::ENOMEM,
             litebox::mm::linux::VmemResetError::FileBacked => Errno::EINVAL,
+            litebox::mm::linux::VmemResetError::Platform(_) => Errno::ENOMEM,
         }
     }
 }

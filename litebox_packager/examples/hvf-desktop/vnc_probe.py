@@ -7,8 +7,15 @@ just enough of RFB 3.3-3.8 (server-chosen version, no-auth or VNC-auth-less
 setups only -- litebox's --vnc server requires no password) to:
 
   1. Request an incremental FramebufferUpdate over one fixed pixel region
-     and return a hash of that region's pixel bytes.
-  2. Optionally send a synthetic PointerEvent (button click or move) first.
+     and return a hash of that region's pixel bytes (`hash`), or write the
+     region out as a PNG (`png --out FILE`) so a human or an image-reading
+     tool can look at what the guest actually painted.
+  2. Optionally send synthetic input first: PointerEvents (`--move X Y`,
+     `--click X Y`, `--drag X1 Y1 X2 Y2 [STEPS]`, `--wheel-up X Y [TICKS]`,
+     `--wheel-down X Y [TICKS]`) and KeyEvents (`--key KEYSYM ...`,
+     `--chord MOD [MOD...] KEY`, `--ctrl KEY`, `--key-hold KEYSYM SECS`,
+     `--type TEXT`), in a fixed order, so one invocation can drive a small
+     interaction and then capture its result.
 
 Exit code 0 with a hash line on stdout means the round trip completed within
 the timeout. Exit code 1 means the RFB session itself failed or timed out --
@@ -17,9 +24,36 @@ own VNC server thread answering FramebufferUpdateRequest is independent of
 whatever guest-side X11 client is stuck.
 
 Usage:
-    vnc_probe.py hash HOST PORT X Y W H [--click X Y] [--timeout SECS]
+    vnc_probe.py hash HOST PORT X Y W H [input options] [--timeout SECS]
+    vnc_probe.py png  HOST PORT X Y W H --out FILE [input options] [--timeout SECS]
 
-Prints one line "HASH <hex>" on success.
+Input options (applied before the capture, in this fixed order):
+    --move X Y                 pointer motion, no buttons
+    --click X Y                left button press+release at X Y
+    --drag X1 Y1 X2 Y2 [STEPS] press at X1,Y1, move through STEPS
+                                interpolated points (default 10) to X2,Y2
+                                with the button held, then release
+    --wheel-up X Y [TICKS]     scroll wheel up TICKS times (default 3) at X Y
+    --wheel-down X Y [TICKS]   scroll wheel down TICKS times (default 3) at X Y
+    --chord MOD [MOD...] KEY   hold each MOD keysym, tap KEY, release MODs
+                                in reverse order (e.g. --chord Control_L
+                                Shift_L t, or --chord Alt_L Tab)
+    --ctrl KEY                 convenience alias for --chord Control_L KEY
+    --key KEYSYM [...]         X11 keysyms, each pressed then released in
+                                turn; a keysym may be given as a name from
+                                the small table below, a single character,
+                                or hex (0xff0d)
+    --key-hold KEYSYM SECS     press KEYSYM, hold for SECS, then release --
+                                for held-key acceptance scenarios distinct
+                                from a quick tap
+    --type TEXT                each printable ASCII character of TEXT as a
+                                key tap
+    --hold SECS                down/up hold duration used by --key, --chord,
+                                --ctrl and --type taps (default 0.03)
+    --settle SECS               wait after the last input before capturing
+                                (default 1.0)
+
+`hash` prints one line "HASH <hex>" on success; `png` prints "PNG <file> WxH".
 """
 
 import argparse
@@ -93,6 +127,124 @@ def send_pointer_event(sock: socket.socket, x: int, y: int, button_mask: int) ->
     sock.sendall(struct.pack(">BBHH", 5, button_mask, x, y))
 
 
+# RFC 6143 button-mask bits: bit 3 = button 4 (wheel up), bit 4 = button 5 (wheel down).
+WHEEL_UP_BIT = 1 << 3
+WHEEL_DOWN_BIT = 1 << 4
+
+
+def send_wheel_event(sock: socket.socket, x: int, y: int, button_bit: int, ticks: int) -> None:
+    send_pointer_event(sock, x, y, button_mask=0)  # move there first
+    time.sleep(0.05)
+    for _ in range(ticks):
+        send_pointer_event(sock, x, y, button_mask=button_bit)
+        time.sleep(0.03)
+        send_pointer_event(sock, x, y, button_mask=0)
+        time.sleep(0.03)
+
+
+def drag(
+    sock: socket.socket, x1: int, y1: int, x2: int, y2: int, steps: int, button_mask: int = 1
+) -> None:
+    send_pointer_event(sock, x1, y1, button_mask=0)
+    time.sleep(0.05)
+    send_pointer_event(sock, x1, y1, button_mask=button_mask)
+    time.sleep(0.05)
+    for i in range(1, steps + 1):
+        t = i / steps
+        send_pointer_event(sock, round(x1 + (x2 - x1) * t), round(y1 + (y2 - y1) * t), button_mask=button_mask)
+        time.sleep(0.02)
+    send_pointer_event(sock, x2, y2, button_mask=button_mask)
+    time.sleep(0.05)
+    send_pointer_event(sock, x2, y2, button_mask=0)
+
+
+KEYSYM_NAMES = {
+    "Return": 0xFF0D, "Enter": 0xFF0D, "Tab": 0xFF09, "Escape": 0xFF1B, "BackSpace": 0xFF08,
+    "Delete": 0xFFFF, "Home": 0xFF50, "End": 0xFF57, "Left": 0xFF51, "Up": 0xFF52,
+    "Right": 0xFF53, "Down": 0xFF54, "Page_Up": 0xFF55, "Page_Down": 0xFF56,
+    "F1": 0xFFBE, "F5": 0xFFC2, "F11": 0xFFC8, "F12": 0xFFC9, "space": 0x20,
+    "Shift_L": 0xFFE1, "Control_L": 0xFFE3, "Alt_L": 0xFFE9, "Super_L": 0xFFEB,
+}
+
+
+def parse_keysym(token: str) -> int:
+    if token in KEYSYM_NAMES:
+        return KEYSYM_NAMES[token]
+    if token.lower().startswith("0x"):
+        return int(token, 16)
+    if len(token) == 1:
+        return ord(token)
+    raise ValueError(f"unknown keysym {token!r}")
+
+
+def send_key_event(sock: socket.socket, keysym: int, down: bool) -> None:
+    # message-type(1)=4, down-flag(1), padding(2), keysym(4)
+    sock.sendall(struct.pack(">BBxxI", 4, 1 if down else 0, keysym))
+
+
+def send_key_hold(sock: socket.socket, keysym: int, secs: float) -> None:
+    send_key_event(sock, keysym, True)
+    time.sleep(secs)
+    send_key_event(sock, keysym, False)
+
+
+def tap_keys(sock: socket.socket, keysyms: list[int], hold: float = 0.03) -> None:
+    for keysym in keysyms:
+        send_key_event(sock, keysym, True)
+        time.sleep(hold)
+        send_key_event(sock, keysym, False)
+        time.sleep(hold)
+
+
+def chord(sock: socket.socket, modifiers: list[int], keysym: int, hold: float = 0.03) -> None:
+    """Hold `modifiers`, tap `keysym`, release the modifiers (e.g. Control_L + l)."""
+    for m in modifiers:
+        send_key_event(sock, m, True)
+    time.sleep(hold)
+    send_key_event(sock, keysym, True)
+    time.sleep(hold)
+    send_key_event(sock, keysym, False)
+    for m in reversed(modifiers):
+        send_key_event(sock, m, False)
+    time.sleep(hold)
+
+
+def write_png(path: str, pixels: bytes, w: int, h: int, bytes_per_pixel: int) -> None:
+    """Raw RFB pixels (litebox sends 32 bpp BGRX little-endian) to an RGB PNG, stdlib only."""
+    import zlib
+
+    rows = bytearray()
+    for y in range(h):
+        rows.append(0)  # filter type: none
+        row = pixels[y * w * bytes_per_pixel : (y + 1) * w * bytes_per_pixel]
+        if bytes_per_pixel == 4:
+            for x in range(w):
+                b, g, r = row[x * 4], row[x * 4 + 1], row[x * 4 + 2]
+                rows += bytes((r, g, b))
+        elif bytes_per_pixel == 2:
+            for x in range(w):
+                v = row[x * 2] | (row[x * 2 + 1] << 8)
+                rows += bytes((((v >> 11) & 0x1F) << 3, ((v >> 5) & 0x3F) << 2, (v & 0x1F) << 3))
+        else:
+            for x in range(w):
+                rows += bytes((row[x], row[x], row[x]))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(rows), 6))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
 def request_framebuffer_region(
     sock: socket.socket,
     x: int,
@@ -150,16 +302,30 @@ def request_framebuffer_region(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["hash"])
+    parser.add_argument("mode", choices=["hash", "png"])
     parser.add_argument("host")
     parser.add_argument("port", type=int)
     parser.add_argument("x", type=int)
     parser.add_argument("y", type=int)
     parser.add_argument("w", type=int)
     parser.add_argument("h", type=int)
+    parser.add_argument("--move", nargs=2, type=int, metavar=("X", "Y"), default=None)
     parser.add_argument("--click", nargs=2, type=int, metavar=("X", "Y"), default=None)
+    parser.add_argument("--drag", nargs="+", type=int, metavar="X1 Y1 X2 Y2 [STEPS]", default=None)
+    parser.add_argument("--wheel-up", nargs="+", type=int, metavar="X Y [TICKS]", default=None)
+    parser.add_argument("--wheel-down", nargs="+", type=int, metavar="X Y [TICKS]", default=None)
+    parser.add_argument("--chord", nargs="+", metavar="MOD [MOD...] KEY", default=None)
+    parser.add_argument("--key", nargs="+", metavar="KEYSYM", default=None)
+    parser.add_argument("--ctrl", metavar="KEY", default=None, help="Control_L chord with KEY")
+    parser.add_argument("--key-hold", nargs=2, metavar=("KEYSYM", "SECS"), default=None)
+    parser.add_argument("--type", dest="type_text", metavar="TEXT", default=None)
+    parser.add_argument("--hold", type=float, default=0.03, help="down/up hold duration for key taps/chords")
+    parser.add_argument("--settle", type=float, default=1.0)
+    parser.add_argument("--out", default=None, help="png mode: output file")
     parser.add_argument("--timeout", type=float, default=4.0)
     args = parser.parse_args()
+    if args.mode == "png" and not args.out:
+        parser.error("png mode requires --out FILE")
 
     try:
         with socket.create_connection((args.host, args.port), timeout=args.timeout) as sock:
@@ -177,6 +343,11 @@ def main() -> int:
                     f"region {args.x},{args.y} {args.w}x{args.h} exceeds "
                     f"framebuffer {framebuffer_width}x{framebuffer_height}"
                 )
+            sent_input = False
+            if args.move is not None:
+                mx, my = args.move
+                send_pointer_event(sock, mx, my, button_mask=0)
+                sent_input = True
             if args.click is not None:
                 cx, cy = args.click
                 if not (0 <= cx < framebuffer_width and 0 <= cy < framebuffer_height):
@@ -184,9 +355,84 @@ def main() -> int:
                         f"click {cx},{cy} exceeds framebuffer "
                         f"{framebuffer_width}x{framebuffer_height}"
                     )
+                send_pointer_event(sock, cx, cy, button_mask=0)  # move there first
+                time.sleep(0.05)
                 send_pointer_event(sock, cx, cy, button_mask=1)  # press
                 time.sleep(0.05)
                 send_pointer_event(sock, cx, cy, button_mask=0)  # release
+                sent_input = True
+            if args.drag is not None:
+                if len(args.drag) not in (4, 5):
+                    parser.error("--drag takes X1 Y1 X2 Y2 [STEPS]")
+                dx1, dy1, dx2, dy2 = args.drag[:4]
+                steps = args.drag[4] if len(args.drag) == 5 else 10
+                for dx, dy in ((dx1, dy1), (dx2, dy2)):
+                    if not (0 <= dx < framebuffer_width and 0 <= dy < framebuffer_height):
+                        raise ValueError(
+                            f"drag point {dx},{dy} exceeds framebuffer "
+                            f"{framebuffer_width}x{framebuffer_height}"
+                        )
+                drag(sock, dx1, dy1, dx2, dy2, steps)
+                sent_input = True
+            if args.wheel_up is not None:
+                if len(args.wheel_up) not in (2, 3):
+                    parser.error("--wheel-up takes X Y [TICKS]")
+                wx, wy = args.wheel_up[0], args.wheel_up[1]
+                ticks = args.wheel_up[2] if len(args.wheel_up) == 3 else 3
+                if not (0 <= wx < framebuffer_width and 0 <= wy < framebuffer_height):
+                    raise ValueError(
+                        f"wheel-up {wx},{wy} exceeds framebuffer "
+                        f"{framebuffer_width}x{framebuffer_height}"
+                    )
+                send_wheel_event(sock, wx, wy, WHEEL_UP_BIT, ticks)
+                sent_input = True
+            if args.wheel_down is not None:
+                if len(args.wheel_down) not in (2, 3):
+                    parser.error("--wheel-down takes X Y [TICKS]")
+                wx, wy = args.wheel_down[0], args.wheel_down[1]
+                ticks = args.wheel_down[2] if len(args.wheel_down) == 3 else 3
+                if not (0 <= wx < framebuffer_width and 0 <= wy < framebuffer_height):
+                    raise ValueError(
+                        f"wheel-down {wx},{wy} exceeds framebuffer "
+                        f"{framebuffer_width}x{framebuffer_height}"
+                    )
+                send_wheel_event(sock, wx, wy, WHEEL_DOWN_BIT, ticks)
+                sent_input = True
+            if args.chord is not None:
+                if len(args.chord) < 2:
+                    parser.error("--chord takes MOD [MOD...] KEY")
+                *mod_tokens, key_token = args.chord
+                chord(sock, [parse_keysym(m) for m in mod_tokens], parse_keysym(key_token), hold=args.hold)
+                sent_input = True
+            if args.ctrl is not None:
+                chord(sock, [KEYSYM_NAMES["Control_L"]], parse_keysym(args.ctrl), hold=args.hold)
+                sent_input = True
+            if args.key is not None:
+                tap_keys(sock, [parse_keysym(k) for k in args.key], hold=args.hold)
+                sent_input = True
+            if args.key_hold is not None:
+                keysym_token, secs_token = args.key_hold
+                send_key_hold(sock, parse_keysym(keysym_token), float(secs_token))
+                sent_input = True
+            if args.type_text is not None:
+                shifted = {
+                    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+                    "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+                    "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\",
+                    ":": ";", '"': "'", "<": ",", ">": ".", "?": "/",
+                }
+                for ch in args.type_text:
+                    if not (0x20 <= ord(ch) < 0x7F):
+                        raise ValueError(f"--type only takes printable ASCII, got {ch!r}")
+                    if ch.isupper():
+                        chord(sock, [KEYSYM_NAMES["Shift_L"]], ord(ch.lower()), hold=args.hold)
+                    elif ch in shifted:
+                        chord(sock, [KEYSYM_NAMES["Shift_L"]], ord(shifted[ch]), hold=args.hold)
+                    else:
+                        tap_keys(sock, [ord(ch)], hold=args.hold)
+                sent_input = True
+            if sent_input:
+                time.sleep(args.settle)
             pixels = request_framebuffer_region(
                 sock,
                 args.x,
@@ -200,6 +446,10 @@ def main() -> int:
         print(f"ERROR {exc}", file=sys.stderr)
         return 1
 
+    if args.mode == "png":
+        write_png(args.out, pixels, args.w, args.h, bytes_per_pixel)
+        print(f"PNG {args.out} {args.w}x{args.h}")
+        return 0
     print(f"HASH {hashlib.sha256(pixels).hexdigest()}")
     return 0
 

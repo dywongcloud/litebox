@@ -319,6 +319,11 @@ pub const SI_TKILL: i32 = -6;
 pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
 
+/// `SEGV_MAPERR`: address not mapped to any object.
+pub const SEGV_MAPERR: i32 = 1;
+/// `SEGV_ACCERR`: invalid permissions for the mapped object.
+pub const SEGV_ACCERR: i32 = 2;
+
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
@@ -379,6 +384,18 @@ impl SiginfoData {
         pad[0] = pid.cast_unsigned();
         pad[1] = uid;
         pad[2] = status.cast_unsigned();
+        Self { pad }
+    }
+
+    /// Builds the `_sigsys` arm of the `siginfo_t` union (`si_call_addr`, `si_syscall`,
+    /// `si_arch`) a `seccomp` `SECCOMP_RET_TRAP` forced `SIGSYS` carries. The sibling `Siginfo`
+    /// field `errno` (not part of this union arm) carries the filter's own low-16-bit data
+    /// payload, matching real Linux's `seccomp_send_sigsys(this_syscall, data)`.
+    pub fn new_sigsys(call_addr: usize, syscall_nr: i32, arch: u32) -> Self {
+        let mut pad = [0u32; 28];
+        pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&call_addr.to_ne_bytes());
+        pad[2] = syscall_nr.cast_unsigned();
+        pad[3] = arch;
         Self { pad }
     }
 }
