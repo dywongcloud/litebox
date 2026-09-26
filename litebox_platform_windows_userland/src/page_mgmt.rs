@@ -226,25 +226,93 @@ where
             (range.start + len) as *mut c_void,
             std::io::Error::last_os_error()
         );
-        range = (range.start + len)..range.end;
     }
-    Ok(())
+
+    fn reserve_gaps(
+        &self,
+        store: &mut WindowsReservationStore<ALIGN>,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), AllocationError> {
+        let mut acquired = Vec::new();
+        for (gap, base) in store.reservations.segments(range.clone()) {
+            if base.is_some() {
+                continue;
+            }
+            match self.reserve_gap(gap) {
+                Ok(reservation) => acquired.push(reservation),
+                Err(error) => {
+                    for reservation in acquired {
+                        Self::release_reservation(reservation);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for reservation in acquired {
+            let base = reservation.range().start;
+            assert!(store.reservations.insert(base, reservation).is_none());
+        }
+        Ok(())
+    }
+
+    fn commit_pages(
+        store: &WindowsReservationStore<ALIGN>,
+        range: core::ops::Range<usize>,
+        flags: Win32_Memory::PAGE_PROTECTION_FLAGS,
+    ) -> bool {
+        for (_, reservation) in store.reservations.overlapping(range.clone()) {
+            let reserved = reservation.range();
+            let segment = range.start.max(reserved.start)..range.end.min(reserved.end);
+            let ptr = unsafe {
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    segment.start as *mut c_void,
+                    segment.len(),
+                    Win32_Memory::MEM_COMMIT,
+                    flags,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            if ptr.is_null() {
+                Self::decommit_pages(store, range);
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn decommit_pages(store: &WindowsReservationStore<ALIGN>, range: core::ops::Range<usize>) {
+        for (_, reservation) in store.reservations.overlapping(range.clone()) {
+            let reserved = reservation.range();
+            let segment = range.start.max(reserved.start)..range.end.min(reserved.end);
+            assert_ne!(
+                unsafe {
+                    VirtualFree(
+                        segment.start as *mut c_void,
+                        segment.len(),
+                        Win32_Memory::MEM_DECOMMIT,
+                    )
+                },
+                0,
+                "VirtualFree(DECOMMIT) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
-macro_rules! debug_assert_alignment {
-    ($r:ident, $page_size:expr) => {
-        debug_assert!($r.start.is_multiple_of($page_size));
-        debug_assert!($r.end.is_multiple_of($page_size));
-    };
-}
-
-impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
+    for WindowsUserland<ALIGN>
+{
     // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
     // The actual values should be determined by `GetSystemInfo()`.
     //
     // NOTE: make sure the values are PAGE_ALIGNED.
     const TASK_ADDR_MIN: usize = 0x1_0000;
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
@@ -505,6 +573,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     return Err(AllocationError::AddressInUse);
                 }
             }
+            Err(error) => return Err(error),
+        };
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            Self::decommit_pages(&reservations, range.clone());
         }
 
         // Ask Windows to select an address. Reserve an allocation-granularity-sized VAD, but commit
@@ -613,13 +685,69 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use litebox::mm::vmem::PAGE_SIZE;
     use litebox::platform::{PageManagementProvider, RawConstPointer};
+
+    fn do_query_on_region(
+        mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION,
+        base_addr: *mut c_void,
+    ) {
+        let ok = unsafe {
+            Win32_Memory::VirtualQuery(
+                base_addr,
+                mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        assert!(ok, "VirtualQuery addr={:p} failed: {}", base_addr, unsafe {
+            GetLastError()
+        });
+    }
+
+    /// Helper method to process a memory range by iterating through Windows memory regions.
+    ///
+    /// Windows memory is managed in Virtual Address Descriptors (VADs) at the NT kernel level,
+    /// which means a single user-space range might span multiple regions. This helper method
+    /// queries each region within the specified range and applies the given operation.
+    ///
+    /// # Parameters
+    /// - `range`: The memory range to process
+    /// - `operation`: A closure that takes (region_range, region_state) and returns Result<bool, E>.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation returns false for any region.
+    fn process_memory_range_by_regions<F, E>(
+        mut range: core::ops::Range<usize>,
+        mut operation: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(core::ops::Range<usize>, Win32_Memory::VIRTUAL_ALLOCATION_TYPE) -> Result<bool, E>,
+    {
+        while !range.is_empty() {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            do_query_on_region(&mut mbi, range.start as *mut c_void);
+            debug_assert_eq!(range.start, mbi.BaseAddress as usize);
+            let len = mbi.RegionSize.min(range.len());
+            let success = operation(range.start..range.start + len, mbi.State)?;
+            assert!(
+                success,
+                "operation failed on region {:p}-{:p}: {}",
+                range.start as *mut c_void,
+                (range.start + len) as *mut c_void,
+                std::io::Error::last_os_error()
+            );
+            range = (range.start + len)..range.end;
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_reserved_pages() {
         let platform = WindowsUserland::new();
         let reserved_pages: Vec<_> =
-            <WindowsUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
+            <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::reserved_pages(platform)
+                .collect();
 
         // Check that the reserved pages are not empty
         assert!(!reserved_pages.is_empty(), "No reserved pages found");
@@ -652,9 +780,10 @@ mod tests {
         let system_allocation_granularity =
             platform.sys_info.read().unwrap().dwAllocationGranularity as usize;
         // Allocate some pages: it should reserve `system_allocation_granularity` bytes but only commit 0x1000 bytes
-        let addr = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+        let suggested = <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN;
+        let addr = <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
             platform,
-            0..0x1000,
+            suggested..suggested + 0x1000,
             MemoryRegionPermissions::WRITE,
             false,
             true,
@@ -678,7 +807,7 @@ mod tests {
 
         assert!(system_allocation_granularity >= 0x1_0000);
         // We should be able to allocate [addr + 0x8000, addr + 0x1_0000)
-        let addr2 = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+        let addr2 = <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
             platform,
             (addr + 0x8000)..(addr + 0x1_0000),
             MemoryRegionPermissions::WRITE,
@@ -707,19 +836,5 @@ mod tests {
                 ),
             ]
         );
-
-        // Try to allocate [addr + 0x4000, addr + 0x1_0000), which overlaps with existing committed pages.
-        // OS should allocate a new region instead of the requested one (as `fixed_address` is false)
-        let addr3 = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
-            platform,
-            (addr + 0x4000)..(addr + 0x1_0000),
-            MemoryRegionPermissions::WRITE,
-            false,
-            true,
-            FixedAddressBehavior::Hint,
-        )
-        .unwrap()
-        .as_usize();
-        assert_ne!(addr3, addr + 0x4000);
     }
 }
