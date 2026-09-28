@@ -412,6 +412,41 @@ pub fn package_extracted_image(
     let mut added_tar_paths: BTreeSet<String> =
         tar_entries.iter().map(|e| e.tar_path.clone()).collect();
 
+    // --- Empty directories ---
+    //
+    // A file's parent directories are implied by its tar path, but a
+    // directory with no files beneath it (a `WORKDIR`, a `/data` volume mount
+    // point, the log directory a server refuses to start without) would
+    // otherwise vanish from the box. Emit those as explicit directory entries
+    // (a `tar_path` ending in `/`).
+    {
+        let mut populated: BTreeSet<String> = BTreeSet::new();
+        for entry in &tar_entries {
+            let mut path = entry.tar_path.as_str();
+            while let Some(idx) = path.rfind('/') {
+                path = &path[..idx];
+                if !populated.insert(path.to_string()) {
+                    break;
+                }
+            }
+        }
+        let mut empty_dirs = Vec::new();
+        collect_empty_dirs(&extracted.rootfs_path, "", &populated, &mut empty_dirs)?;
+        if options.verbose {
+            eprintln!("  Adding {} empty directories", empty_dirs.len());
+        }
+        for dir in empty_dirs {
+            let tar_path = format!("{dir}/");
+            if added_tar_paths.insert(tar_path.clone()) {
+                tar_entries.push(TarEntry {
+                    tar_path,
+                    data: Vec::new(),
+                    mode: 0o755,
+                });
+            }
+        }
+    }
+
     // --- Store config.json and generate config_and_run.sh from image config ---
 
     // Always store the raw OCI config JSON for future use.
@@ -845,8 +880,48 @@ pub fn rewrite_elf_for(
 // Tar archive construction
 // ---------------------------------------------------------------------------
 
+/// Collect the rootfs-relative paths of directories under `root/rel` that have
+/// no file anywhere beneath them (`populated` holds every directory that
+/// does). Only the leaves are reported: their parents are implied.
+fn collect_empty_dirs(
+    root: &Path,
+    rel: &str,
+    populated: &BTreeSet<String>,
+    out: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let dir = if rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
+        if populated.contains(&child) {
+            collect_empty_dirs(root, &child, populated, out)?;
+        } else {
+            let before = out.len();
+            collect_empty_dirs(root, &child, populated, out)?;
+            if out.len() == before {
+                out.push(child);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A file destined for the output tar: rootfs-relative path, contents, and
-/// Unix permission bits.
+/// Unix permission bits. A `tar_path` ending in `/` is an (empty) directory.
 pub struct TarEntry {
     pub tar_path: String,
     pub data: Vec<u8>,
@@ -873,7 +948,11 @@ pub fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
         header.set_mode(entry.mode & 0o777);
         header.set_uid(1000);
         header.set_gid(1000);
-        header.set_entry_type(tar::EntryType::Regular);
+        header.set_entry_type(if entry.tar_path.ends_with('/') {
+            tar::EntryType::Directory
+        } else {
+            tar::EntryType::Regular
+        });
         header.set_cksum();
         builder
             .append_data(&mut header, &entry.tar_path, entry.data.as_slice())

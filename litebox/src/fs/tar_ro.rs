@@ -469,6 +469,42 @@ impl TarIndex {
             }
         }
 
+        // `tar_no_std` yields only regular files, so directory entries (empty
+        // directories such as a `WORKDIR`, a volume mount point, or a log
+        // directory a server insists on) are found by scanning the headers
+        // directly. A file's parent directories are implied by its path; a
+        // directory with no files under it can only be declared explicitly.
+        let explicit_dirs = scan_directory_entries(tar_data.as_ref());
+        for (path, owner) in &explicit_dirs {
+            let mut parent = String::new();
+            let mut parent_dir_idx = 0;
+            for component in path.split('/').filter(|component| !component.is_empty()) {
+                if !parent.is_empty() {
+                    parent.push('/');
+                }
+                parent.push_str(component);
+                if let Some(&IndexedChild::File(_)) = dirs[parent_dir_idx].children.get(component)
+                {
+                    // A regular file already owns this name; the file wins.
+                    break;
+                }
+                let child_dir_idx = *dirs_by_path.entry(parent.clone()).or_insert_with(|| {
+                    dirs.push(IndexedDir {
+                        owner: Some(*owner),
+                        node_info: inode_allocator.next(),
+                        children: HashMap::new(),
+                    });
+                    dirs.len() - 1
+                });
+                dirs[parent_dir_idx]
+                    .children
+                    .entry(component.into())
+                    .or_insert(IndexedChild::Dir(child_dir_idx));
+                dirs[parent_dir_idx].owner.get_or_insert(*owner);
+                parent_dir_idx = child_dir_idx;
+            }
+        }
+
         Self {
             tar_data,
             files,
@@ -480,6 +516,70 @@ impl TarIndex {
         let range = self.files[file_idx].data_range.clone();
         &self.tar_data[range]
     }
+}
+
+/// Find the directory entries of a tar archive, as `(path, owner)`.
+///
+/// `tar_no_std` skips directory entries, so this walks the 512-byte headers
+/// itself, advancing exactly as that crate does (only regular files carry a
+/// payload). It stops quietly at the end of the archive or at a header it
+/// cannot parse.
+fn scan_directory_entries(tar: &[u8]) -> Vec<(String, UserInfo)> {
+    const BLOCK: usize = 512;
+    let mut dirs = Vec::new();
+    let mut pos = 0usize;
+    while let Some(hdr) = tar.get(pos..pos + BLOCK) {
+        if hdr.iter().all(|&b| b == 0) {
+            break;
+        }
+        let text = |range: Range<usize>| -> Option<&str> {
+            let field = &hdr[range];
+            let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+            core::str::from_utf8(&field[..end]).ok()
+        };
+        let octal = |range: Range<usize>| -> Option<u64> {
+            u64::from_str_radix(text(range)?.trim(), 8).ok()
+        };
+        let Some(size) = octal(124..136) else {
+            break;
+        };
+        let typeflag = hdr[156];
+        if typeflag == b'5' {
+            let (Some(name), Some(prefix)) = (text(0..100), text(345..500)) else {
+                break;
+            };
+            let is_ustar = hdr[257..262] == *b"ustar";
+            let full = if is_ustar && !prefix.is_empty() {
+                alloc::format!("{prefix}/{name}")
+            } else {
+                String::from(name)
+            };
+            let path = normalize_tar_filename(&full).trim_end_matches('/');
+            if !path.is_empty() && path != "." {
+                let owner = match (octal(108..116), octal(116..124)) {
+                    (Some(user), Some(group)) => UserInfo {
+                        user: u16::try_from(user).unwrap_or(DEFAULT_DIRECTORY_OWNER.user),
+                        group: u16::try_from(group).unwrap_or(DEFAULT_DIRECTORY_OWNER.group),
+                    },
+                    _ => DEFAULT_DIRECTORY_OWNER,
+                };
+                dirs.push((String::from(path), owner));
+            }
+        }
+        let has_payload = matches!(typeflag, b'0' | 0);
+        let Some(payload) = (if has_payload {
+            usize::try_from(size).ok().map(|s| s.div_ceil(BLOCK) * BLOCK)
+        } else {
+            Some(0)
+        }) else {
+            break;
+        };
+        let Some(next) = pos.checked_add(BLOCK).and_then(|n| n.checked_add(payload)) else {
+            break;
+        };
+        pos = next;
+    }
+    dirs
 }
 
 /// Strip the `./` prefix from tar filenames if present.

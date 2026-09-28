@@ -851,8 +851,22 @@ fn extract_tar<R: Read>(
         // entries. The ancestor check prevents stale symlinks from being
         // resolved during scan_rootfs and incorrectly pulling in lower-layer
         // content.
+        //
+        // A *directory* entry merges with what lower layers put under that
+        // path -- only whiteouts delete content -- so it must not prune the
+        // symlinks beneath it. Alpine's base layer defines `/bin/sh` and every
+        // other busybox applet as a symlink, and any later layer that re-lists
+        // `bin/` as a directory entry (e.g. one that installs a package) would
+        // otherwise silently delete them all, leaving an image with no shell.
+        let is_dir_entry = entry_type == tar::EntryType::Directory;
         symlinks.retain(|s| {
-            s.rel_path != path && !s.rel_path.starts_with(&path) && !path.starts_with(&s.rel_path)
+            if s.rel_path == path {
+                return false;
+            }
+            if s.rel_path.starts_with(&path) {
+                return is_dir_entry;
+            }
+            !path.starts_with(&s.rel_path)
         });
         entry
             .unpack(&target)
