@@ -146,6 +146,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem.with_root_privileges(|fs| {
             use litebox::fs::FileSystem as _;
+            // Same as the Linux runner: the non-root guest must be able to
+            // create ancestors of lower-layer-only directories in this layer.
+            fs.chmod(
+                "/",
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            )
+            .unwrap();
             fs.mkdir(
                 "/tmp",
                 litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,

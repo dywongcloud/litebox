@@ -815,99 +815,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `fork`.
     ///
-    /// Fork creates a new process (child) that is an independent copy of the calling process.
-    /// The child process has a distinct PID, separate memory space, and independent file descriptor table.
+    /// A box is a single address space: `clone()` requires `CLONE_THREAD` for every task (see
+    /// `do_clone`), so there is no way to create a second, independent process. `fork` therefore
+    /// fails with `ENOSYS`, which every libc reports as an ordinary "cannot fork" error that
+    /// shells and runtimes already handle (`sh: can't fork`, `subprocess` raising `OSError`).
     ///
-    /// POSIX semantics:
-    /// - Returns child PID to parent, 0 to child
-    /// - Child inherits: memory image, FD table, signal handlers (reset to default),
-    ///   resource limits, credentials, working directory
-    /// - Child gets: new PID, new session/process group if CLONE_NEWPID set
-    /// - Parent gets: child PID in return value
-    /// - Both parent and child are independently schedulable
-    ///
-    /// Current implementation status: PLANNED for full implementation.
-    /// Requires coordinated changes to:
-    /// 1. Memory model - copy parent address space (COW or full copy)
-    /// 2. PID allocation - separate namespace for process IDs vs thread IDs
-    /// 3. Process tracking - parent-child relationships for wait() syscalls
-    /// 4. Scheduler - support concurrent execution of parent and child
-    /// 5. Signal handlers - reset to SIG_DFL in child per POSIX
-    /// 6. File descriptors - copy table with independent offsets
-    ///
-    /// Until full implementation, returning ENOSYS. To implement:
-    /// - Add PID allocator to GlobalState (separate from next_thread_id)
-    /// - Add parent-child process tracking (children list in Process)
-    /// - Implement memory copy strategy (full copy or COW)
-    /// - Create sys_fork() handler that allocates new PID and spawns child
-    /// - Implement wait4/waitpid for process reaping
-    /// - Reset signal handlers in child (signal handler reset table needed)
-    /// - Test: simple fork, fork+exec, fork with FD inheritance, concurrent parent/child
+    /// It must not be emulated by starting a thread that returns 0: the "child" would share the
+    /// parent's memory and stack, so both would run the same code on the same frames, corrupting
+    /// state and crashing (or, worse, silently running commands with empty output).
+    #[expect(clippy::unused_self, reason = "matches the syscall handler signature")]
     pub(crate) fn sys_fork(
         &self,
-        ctx: &litebox_common_linux::PtRegs,
+        _ctx: &litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
-        // Allocate a new PID for the child process.
-        let child_pid = self.global.next_pid.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-        // Create a new thread state for the child. The child process's first thread
-        // has TID equal to its PID (matching Linux convention for single-threaded processes).
-        let child_thread = self.thread.new_thread(child_pid).ok_or(Errno::EBUSY)?;
-
-        // Set up the child's initial state to continue from the fork syscall.
-        // The child will return 0 from fork(), while the parent continues with child_pid.
-        child_thread.init_state.set(ThreadInitState::NewThread {
-            stack: None,  // Use default stack for fork child
-            tls: None,    // Inherit TLS from parent
-            set_child_tid: None,
-        });
-
-        // Prepare the child's execution context: same as parent but with return value = 0.
-        // The child process resumes at the syscall return point but gets 0 as fork() result.
-        let mut child_ctx = ctx.clone();
-        #[cfg(target_arch = "x86_64")]
-        {
-            child_ctx.rax = 0;  // fork() returns 0 in child process
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            child_ctx.regs[0] = 0;  // fork() returns 0 in child process
-        }
-
-        // Spawn the child process as a new task.
-        let r = unsafe {
-            self.global.platform.spawn_thread(
-                &child_ctx,
-                Box::new(NewThreadArgs {
-                    task: crate::Task {
-                        global: self.global.clone(),
-                        wait_state: crate::wait::WaitState::new(self.global.platform),
-                        thread: child_thread,
-                        // New process has its own PID; parent PID is this task's PID
-                        pid: child_pid,
-                        tid: child_pid,
-                        ppid: self.pid,
-                        // Copy credentials from parent
-                        credentials: RefCell::new(self.credentials.borrow().clone()),
-                        comm: self.comm.clone(),
-                        // Copy filesystem state from parent
-                        fs: self.fs.clone(),
-                        // Copy file descriptor table from parent (FDs initially shared)
-                        files: self.files.clone(),
-                        // Clone signals for new process (TODO: reset handlers to SIG_DFL per POSIX)
-                        signals: self.signals.clone_for_new_task(),
-                    },
-                }),
-            )
-        };
-
-        if let Err(err) = r {
-            litebox_util_log::error!(err:% = err; "failed to spawn fork child process");
-            return Err(Errno::ENOMEM);
-        }
-
-        // Return child PID to parent.
-        Ok(usize::try_from(child_pid).unwrap())
+        Err(Errno::ENOSYS)
     }
 }
 

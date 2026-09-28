@@ -184,13 +184,13 @@ fn test_fcntl() {
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
 
-    // Eventfd requires broker control in this shim configuration.
-    assert_eq!(
+    // Without a broker, eventfd falls back to an in-process counter.
+    assert!(
         task.sys_eventfd2(
             0,
             EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
-        ),
-        Err(Errno::EIO)
+        )
+        .is_ok()
     );
 
     // Test fcntl with DUPFD

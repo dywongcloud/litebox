@@ -382,6 +382,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
         in_mem.with_root_privileges(|fs| {
             let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+            // The guest runs as a non-root uid, and creating a file under a
+            // directory that exists only in the read-only lower (tar) layer
+            // first re-creates that directory's ancestors in this upper layer
+            // *as the guest*. That needs write access to the upper root, which
+            // is otherwise root-owned.
+            fs.chmod("/", mode).expect("Failed to chmod the upper root");
             if let Err(err) = fs.mkdir("/tmp", mode) {
                 match err {
                     litebox::fs::errors::MkdirError::AlreadyExists => {

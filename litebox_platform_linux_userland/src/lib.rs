@@ -2166,9 +2166,13 @@ fn register_exception_handlers() {
                 libc::sigaddset(&raw mut sa.sa_mask, interrupt_signal);
                 let mut old_sa = core::mem::zeroed();
                 sigaction(sig, Some(&sa), &mut old_sa);
-                assert_eq!(
-                    old_sa.sa_sigaction,
-                    libc::SIG_DFL,
+                // SIG_IGN is inherited from the parent, not installed by anyone
+                // in this process: non-interactive shells start `&` background
+                // jobs with SIGINT ignored, as do nohup-style supervisors, and
+                // such a runner must still start. Only a real handler means
+                // another component owns the signal.
+                assert!(
+                    old_sa.sa_sigaction == libc::SIG_DFL || old_sa.sa_sigaction == libc::SIG_IGN,
                     "signal {sig} handler already installed",
                 );
             }

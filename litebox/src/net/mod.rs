@@ -50,6 +50,19 @@ const MAX_PACKET_COUNT: usize = 32;
 /// TCP connection timeout.
 const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(75);
 
+/// The smoltcp listen address for a bind to `ip`: the unspecified address
+/// (`0.0.0.0`) means "any local address", which smoltcp spells `None`. Passing
+/// `Some(0.0.0.0)` instead makes the socket match only packets addressed to
+/// literally `0.0.0.0`, so a server that binds the wildcard (nearly every
+/// off-the-shelf server image does) would refuse every real connection.
+fn listen_addr(ip: &Ipv4Addr) -> Option<smoltcp::wire::IpAddress> {
+    if ip.is_unspecified() {
+        None
+    } else {
+        Some(smoltcp::wire::IpAddress::Ipv4(*ip))
+    }
+}
+
 /// The `Network` provides access to all networking related functionality provided by LiteBox.
 ///
 /// A LiteBox `Network` is parametric in the platform it runs on.
@@ -1248,7 +1261,7 @@ where
                 }
                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
                     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                        addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                        addr: listen_addr(addr.ip()),
                         port: new_port,
                     },
                     backlog: None,
@@ -1261,7 +1274,7 @@ where
                     .allocate_local_port(addr.port())
                     .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
                 let local_endpoint = smoltcp::wire::IpListenEndpoint {
-                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                    addr: listen_addr(addr.ip()),
                     port: lp.port(),
                 };
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
@@ -1333,10 +1346,7 @@ where
                         unimplemented!()
                     }
                     handle.server_socket = Some(TcpServerSpecific {
-                        ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                            addr: Some(smoltcp::wire::IpAddress::v4(0, 0, 0, 0)),
-                            port,
-                        },
+                        ip_listen_endpoint: smoltcp::wire::IpListenEndpoint { addr: None, port },
                         backlog: None,
                         socket_set_handles: vec![],
                     });
@@ -1347,10 +1357,12 @@ where
                 if server_socket.ip_listen_endpoint.port == 0 {
                     return Err(ListenError::InvalidAddress);
                 }
-                if server_socket.backlog.is_some() || !server_socket.socket_set_handles.is_empty() {
-                    // Need to change the amount of backlog; growing will just work, but truncating
-                    // might need some effort to pick which ones to keep/drop
-                    unimplemented!()
+                if server_socket.backlog.is_some() {
+                    // A repeat `listen` on a listening socket only adjusts the backlog (nginx
+                    // does this: once when it opens the socket, again when it configures it).
+                    // Growing adds listeners below; shrinking keeps the ones already queued,
+                    // and `refill_to_backlog` simply stops adding more until they drain.
+                    server_socket.backlog = Some(backlog);
                 } else {
                     server_socket.backlog = Some(backlog);
                     server_socket.socket_set_handles = Vec::with_capacity(backlog.into());

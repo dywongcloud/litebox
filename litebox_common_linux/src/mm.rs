@@ -260,8 +260,24 @@ pub fn sys_madvise<
     match advice {
         crate::MadviseBehavior::Normal
         | crate::MadviseBehavior::DontFork
-        | crate::MadviseBehavior::DoFork => {
+        | crate::MadviseBehavior::DoFork
+        | crate::MadviseBehavior::KeepOnFork => {
             // No-op for now, as we don't support fork yet.
+            Ok(())
+        }
+        crate::MadviseBehavior::Random
+        | crate::MadviseBehavior::Sequential
+        | crate::MadviseBehavior::WillNeed
+        | crate::MadviseBehavior::Mergeable
+        | crate::MadviseBehavior::Unmergeable
+        | crate::MadviseBehavior::HugePage
+        | crate::MadviseBehavior::NoHugePage
+        | crate::MadviseBehavior::DontDump
+        | crate::MadviseBehavior::DoDump
+        | crate::MadviseBehavior::Cold
+        | crate::MadviseBehavior::Pageout => {
+            // Purely advisory: Linux itself may ignore these, and runtimes
+            // (Go issues NoHugePage at startup) treat success as the norm.
             Ok(())
         }
         crate::MadviseBehavior::DontNeed => {
@@ -276,6 +292,8 @@ pub fn sys_madvise<
         crate::MadviseBehavior::Free => {
             unsafe { pm.reset_pages(addr, aligned_len, true) }.map_err(Errno::from)
         }
-        _ => unimplemented!("Unsupported madvise behavior {:?}", advice),
+        // Remove/WipeOnFork/Populate*/DontNeedLocked/HWPoison/SoftOffline: a guest
+        // must not be able to panic the runner, so report "unsupported advice".
+        _ => Err(Errno::EINVAL),
     }
 }

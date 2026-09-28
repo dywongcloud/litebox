@@ -563,7 +563,16 @@ impl<
                     let dirname = path.rsplit_once('/').unwrap().0;
                     if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
                         // We must migrate the directories above, and then re-trigger the open
-                        self.mkdir_migrating_ancestor_dirs(&path).unwrap();
+                        if let Err(e) = self.mkdir_migrating_ancestor_dirs(&path) {
+                            // A guest-reachable failure (e.g. no write permission in the
+                            // upper layer) must surface as an errno, never a panic.
+                            return Err(match e {
+                                MkdirError::NoWritePerms => OpenError::NoWritePerms,
+                                MkdirError::ReadOnlyFileSystem => OpenError::ReadOnlyFileSystem,
+                                MkdirError::PathError(e) => OpenError::PathError(e),
+                                MkdirError::AlreadyExists | MkdirError::Io => OpenError::Io,
+                            });
+                        }
                         return self.open(path, flags, mode);
                     }
                     // Otherwise, handle-able by a lower level, fallthrough

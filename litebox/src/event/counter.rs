@@ -21,7 +21,7 @@ use crate::{
         wait::WaitContext,
     },
     platform::TimeProvider,
-    sync::RawSyncPrimitivesProvider,
+    sync::{Mutex, RawSyncPrimitivesProvider},
 };
 
 /// Errors returned by local-core event counters.
@@ -42,39 +42,64 @@ pub enum EventCounterError {
     Unavailable,
 }
 
+/// Where an [`EventCounter`]'s count lives.
+enum Backend<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    /// Owned by the broker, which may be shared with other runners.
+    Broker {
+        broker: Arc<dyn BrokerControl>,
+        handle: ObjectHandle,
+        pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+    },
+    /// No broker is attached (a single standalone runner, e.g. `boxer run`):
+    /// the count is held in-process, guarded by a lock. Nothing else can
+    /// observe the object, so no cross-process coordination is needed --
+    /// the same situation, and the same fallback, as pipes without a broker.
+    Local(Mutex<Platform, u64>),
+}
+
 /// A local-core event counter object.
 pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    broker: Arc<dyn BrokerControl>,
-    handle: ObjectHandle,
-    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+    backend: Backend<Platform>,
     pollee: Arc<Pollee<Platform>>,
 }
+
+/// Largest value an eventfd counter may hold (`u64::MAX - 1`).
+const LOCAL_COUNT_MAX: u64 = u64::MAX - 1;
 
 impl<Platform> EventCounter<Platform>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
-    /// Creates a local-core event counter.
+    /// Creates a local-core event counter, brokered if the runner has a
+    /// broker and held in-process otherwise.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
     pub fn new(litebox: &LiteBox<Platform>, initial_count: u64) -> Result<Self, EventCounterError> {
+        let pollee = Arc::new(Pollee::new());
         let Some(broker) = litebox.broker_control() else {
-            return Err(EventCounterError::Unavailable);
+            if initial_count > LOCAL_COUNT_MAX {
+                return Err(EventCounterError::InvalidInput);
+            }
+            return Ok(Self {
+                backend: Backend::Local(Mutex::new(initial_count)),
+                pollee,
+            });
         };
         let handle = broker
             .create_event_with_count(initial_count)
             .map_err(BrokerObjectError::from)
             .map_err(EventCounterError::from)?;
         let pollable_registry = litebox.broker_pollable_registry();
-        let pollee = Arc::new(Pollee::new());
         pollable_registry.register_pollable(handle, &pollee);
         Ok(Self {
-            broker,
-            handle,
-            pollable_registry,
+            backend: Backend::Broker {
+                broker,
+                handle,
+                pollable_registry,
+            },
             pollee,
         })
     }
@@ -86,12 +111,28 @@ where
         nonblock: bool,
         mode: EventCounterReadMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
-        self.pollee.wait(cx, nonblock, Events::IN, || {
-            let response = self.consume(mode)?;
-            if response.readiness.contains(ReadinessFlags::WRITE) {
-                self.pollee.notify_observers(Events::OUT);
+        self.pollee.wait(cx, nonblock, Events::IN, || match &self.backend {
+            Backend::Broker { .. } => {
+                let response = self.consume(mode)?;
+                if response.readiness.contains(ReadinessFlags::WRITE) {
+                    self.pollee.notify_observers(Events::OUT);
+                }
+                Ok(response.value)
             }
-            Ok(response.value)
+            Backend::Local(count) => {
+                let mut count = count.lock();
+                if *count == 0 {
+                    return Err(TryOpError::TryAgain);
+                }
+                let value = match mode {
+                    EventCounterReadMode::One => 1,
+                    EventCounterReadMode::All => *count,
+                };
+                *count -= value;
+                drop(count);
+                self.pollee.notify_observers(Events::OUT);
+                Ok(value)
+            }
         })
     }
 
@@ -105,12 +146,27 @@ where
         if value == u64::MAX {
             return Err(TryOpError::Other(EventCounterError::InvalidInput));
         }
-        self.pollee.wait(cx, nonblock, Events::OUT, || {
-            let readiness = self.add(value)?;
-            if value != 0 && readiness.contains(ReadinessFlags::READ) {
-                self.pollee.notify_observers(Events::IN);
+        self.pollee.wait(cx, nonblock, Events::OUT, || match &self.backend {
+            Backend::Broker { .. } => {
+                let readiness = self.add(value)?;
+                if value != 0 && readiness.contains(ReadinessFlags::READ) {
+                    self.pollee.notify_observers(Events::IN);
+                }
+                Ok(core::mem::size_of::<u64>())
             }
-            Ok(core::mem::size_of::<u64>())
+            Backend::Local(count) => {
+                let mut count = count.lock();
+                if *count > LOCAL_COUNT_MAX - value {
+                    // Would overflow: eventfd blocks (or EAGAINs) until a read drains it.
+                    return Err(TryOpError::TryAgain);
+                }
+                *count += value;
+                drop(count);
+                if value != 0 {
+                    self.pollee.notify_observers(Events::IN);
+                }
+                Ok(core::mem::size_of::<u64>())
+            }
         })
     }
 
@@ -118,14 +174,20 @@ where
         &self,
         mode: EventCounterReadMode,
     ) -> Result<ConsumeEventResponse, BrokerObjectError> {
-        self.broker
-            .consume_event(self.handle, mode)
+        let Backend::Broker { broker, handle, .. } = &self.backend else {
+            unreachable!("consume is only called for broker-backed counters")
+        };
+        broker
+            .consume_event(*handle, mode)
             .map_err(|error| self.broker_request_error(error))
     }
 
     fn add(&self, value: u64) -> Result<ReadinessFlags, BrokerObjectError> {
-        self.broker
-            .add_event(self.handle, value)
+        let Backend::Broker { broker, handle, .. } = &self.backend else {
+            unreachable!("add is only called for broker-backed counters")
+        };
+        broker
+            .add_event(*handle, value)
             .map_err(|error| self.broker_request_error(error))
     }
 
@@ -143,8 +205,15 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        if let Backend::Broker {
+            broker,
+            handle,
+            pollable_registry,
+        } = &self.backend
+        {
+            pollable_registry.unregister_pollable(*handle);
+            let _ = broker.close_object(*handle);
+        }
     }
 }
 
@@ -157,9 +226,22 @@ where
     }
 
     fn check_io_events(&self) -> Events {
-        let readiness = match self
-            .broker
-            .check_readiness(self.handle)
+        let (broker, handle) = match &self.backend {
+            Backend::Broker { broker, handle, .. } => (broker, *handle),
+            Backend::Local(count) => {
+                let count = *count.lock();
+                let mut events = Events::empty();
+                if count > 0 {
+                    events |= Events::IN;
+                }
+                if count < LOCAL_COUNT_MAX {
+                    events |= Events::OUT;
+                }
+                return events;
+            }
+        };
+        let readiness = match broker
+            .check_readiness(handle)
             .map_err(|error| self.broker_request_error(error))
         {
             Ok(readiness) => readiness,
