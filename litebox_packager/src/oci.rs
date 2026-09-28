@@ -238,8 +238,16 @@ pub fn pull_and_extract_for_platform(
         Ok::<_, anyhow::Error>(image_data)
     })?;
 
-    let layers: Vec<LayerData> = image_data
-        .layers
+    // `oci_client::Client::pull` downloads layers concurrently and returns them
+    // in completion order, not manifest order. Applying them in that order made
+    // the rootfs nondeterministic: a small upper layer (one that edits
+    // /etc/passwd, say) can finish before the large base layer it modifies, and
+    // the base is then extracted over it. Restore manifest order by digest.
+    let ordered_layers = match &image_data.manifest {
+        Some(manifest) => order_layers_by_manifest(&manifest.layers, image_data.layers)?,
+        None => image_data.layers,
+    };
+    let layers: Vec<LayerData> = ordered_layers
         .into_iter()
         .map(|layer| LayerData {
             data: layer.data.to_vec(),
@@ -262,6 +270,34 @@ pub fn pull_and_extract_for_platform(
     )?;
 
     extract_image_layers(&layers, config_json, verbose)
+}
+
+/// Put pulled `layers` into the order the manifest lists them (bottom first),
+/// matching each by its sha256 digest. Fails if a listed layer was not pulled,
+/// which also catches a corrupted or substituted blob.
+fn order_layers_by_manifest(
+    descriptors: &[oci_client::manifest::OciDescriptor],
+    layers: Vec<oci_client::client::ImageLayer>,
+) -> anyhow::Result<Vec<oci_client::client::ImageLayer>> {
+    let mut remaining: Vec<Option<(String, oci_client::client::ImageLayer)>> = layers
+        .into_iter()
+        .map(|layer| Some((layer.sha256_digest(), layer)))
+        .collect();
+    let mut ordered = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let slot = remaining
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|(digest, _)| *digest == descriptor.digest))
+            .with_context(|| {
+                format!(
+                    "pulled layers do not include manifest layer {} (digest mismatch)",
+                    descriptor.digest
+                )
+            })?;
+        let (_, layer) = slot.take().expect("slot was just matched as Some");
+        ordered.push(layer);
+    }
+    Ok(ordered)
 }
 
 /// Resolve the credentials to authenticate a pull with.

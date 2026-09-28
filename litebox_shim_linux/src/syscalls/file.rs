@@ -241,6 +241,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         mode: Mode,
     ) -> Result<TypedFd<FS>, Errno> {
         let mode = mode & !self.get_umask();
+        // `/proc/self/fd/<n>` for the stdio descriptors is a link to the stdio devices (the same
+        // resolution `stat` does); many images log to it (`ErrorLog /proc/self/fd/2`).
+        let normalized_path = path.normalized()?;
+        let path = self
+            .do_readlink(normalized_path.as_str())
+            .unwrap_or(normalized_path);
         self.files
             .borrow()
             .fs
@@ -1466,7 +1472,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 0 => return Ok("/dev/stdin".to_string()),
                 1 => return Ok("/dev/stdout".to_string()),
                 2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
+                // Other descriptors have no path to name; never a guest-reachable panic.
+                _ => return Err(Errno::ENOENT),
             }
         }
 

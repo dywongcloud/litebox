@@ -365,17 +365,24 @@ Rules of thumb that fall out of that list:
   `listen [::]:80;`). Go servers fall back to IPv4 on their own.
 - **Guest runs as uid 1000**, not root, whatever the image's `USER` says, so a
   server that needs to write somewhere root-owned must be pointed elsewhere.
+- **Layer order matters and used to be wrong.** `boxer build -i` applied
+  layers in download-completion order rather than manifest order, so a small
+  upper layer that edited a base file (`/etc/passwd`) could be overwritten by
+  the large base layer extracted after it: nondeterministically, per build.
+  Layers are now applied in manifest order and verified by digest. Boxes built
+  before that fix can have stale files from lower layers; rebuild them.
 - **Docker Hub rate limits.** Every `boxer build -i docker.io/...` pulls the
   manifest anonymously, and Docker Hub allows only a small number of those per
   6 hours per IP. Iterating on builds can exhaust it
   (`TOOMANYREQUESTS`); build once and keep the `.box.wasm`. `ghcr.io` and
   `mcr.microsoft.com` are alternatives.
 
-Not yet working: `httpd:alpine` starts but stops at `bad user name www-data`.
-The box's `/etc/group` has `www-data` while `/etc/passwd` does not, although
-the image's build adds both; this points at how one layer's `/etc/passwd` is
-merged and has not been root-caused (inspecting the layers needs a registry
-pull, which was rate limited at the time).
+Not yet working: `httpd:alpine` (Apache). With `--entrypoint httpd -- -X -c
+'ServerName localhost'` it parses its stock config, opens its logs
+(`/proc/self/fd/N`), and binds port 80, then stops because it writes its PID
+file by creating a temp file and `rename()`-ing it: `AH10231 ... (38)Function
+not implemented`. `rename`/`link`/`symlink` have no filesystem support at all
+yet (see below), so Apache stays out until that lands.
 
 ## Known costs and limits
 

@@ -76,6 +76,7 @@ pub struct Proc<Platform: RawSyncPrimitivesProvider + 'static> {
 struct ProcInner<Platform: RawSyncPrimitivesProvider + 'static> {
     root_inode: NodeInfo,
     pid_dir_inode: NodeInfo,
+    fd_dir_inode: NodeInfo,
     meminfo_inode: NodeInfo,
     mounts_inode: NodeInfo,
     stat_inode: NodeInfo,
@@ -100,6 +101,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Proc<Platform> {
             inner: Arc::new(ProcInner {
                 root_inode: allocator.next(),
                 pid_dir_inode: allocator.next(),
+                fd_dir_inode: allocator.next(),
                 meminfo_inode: allocator.next(),
                 mounts_inode: allocator.next(),
                 stat_inode: allocator.next(),
@@ -246,8 +248,12 @@ fn render_status(task: &ProcTaskInfo) -> Vec<u8> {
 pub enum ProcDir {
     /// `/proc` itself.
     Root,
-    /// `/proc/<pid>`, the single guest task's directory.
+    /// `/proc/<pid>`, the single guest task's directory (also reachable as `/proc/self`).
     PidDir,
+    /// `/proc/<pid>/fd`. It lists nothing: the shim resolves `/proc/self/fd/<n>` itself (to the
+    /// stdio devices) before a path reaches this filesystem, but real programs (Apache checks
+    /// that a log's directory exists before opening `/proc/self/fd/2`) need the directory to.
+    FdDir,
 }
 
 /// Which synthetic file a file handle refers to.
@@ -273,6 +279,7 @@ impl ProcFile {
         let table = match dir {
             ProcDir::Root => Self::ROOT_FILES,
             ProcDir::PidDir => Self::PID_DIR_FILES,
+            ProcDir::FdDir => &[],
         };
         table.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
     }
@@ -317,9 +324,10 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
             let component = components[index];
             match current {
                 ProcDir::Root => {
-                    if component
-                        .parse::<i32>()
-                        .is_ok_and(|pid| pid == self.task_pid())
+                    if component == "self"
+                        || component
+                            .parse::<i32>()
+                            .is_ok_and(|pid| pid == self.task_pid())
                     {
                         walked.push(WalkedComponent {
                             permissions: PermissionCheck::ByResolver(PermissionInfo {
@@ -340,13 +348,26 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
                     }
                 }
                 ProcDir::PidDir => {
-                    if ProcFile::in_dir(ProcDir::PidDir, component).is_some() {
+                    if component == "fd" {
+                        walked.push(WalkedComponent {
+                            permissions: PermissionCheck::ByResolver(PermissionInfo {
+                                mode: READONLY_DIR_MODE,
+                                owner: self.task_owner(),
+                            }),
+                        });
+                        current = ProcDir::FdDir;
+                        index += 1;
+                    } else if ProcFile::in_dir(ProcDir::PidDir, component).is_some() {
                         return Ok(WalkOutcome {
                             components: walked,
                             last: WalkingDirHandle::from_typed::<Self>(current),
                             stop_reason: WalkStopReason::StoppedAtNonDirectory,
                         });
+                    } else {
+                        return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
                     }
+                }
+                ProcDir::FdDir => {
                     return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
                 }
             }
@@ -389,7 +410,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
         }
         let owner = match dir {
             ProcDir::Root => UserInfo::ROOT,
-            ProcDir::PidDir => self.task_owner(),
+            ProcDir::PidDir | ProcDir::FdDir => self.task_owner(),
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(file),
@@ -419,14 +440,23 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
                 });
                 Ok(entries)
             }
-            ProcDir::PidDir => Ok(ProcFile::PID_DIR_FILES
-                .iter()
-                .map(|(name, _)| DirEntry {
-                    name: String::from(*name),
-                    file_type: FileType::RegularFile,
-                    ino_info: None,
-                })
-                .collect()),
+            ProcDir::PidDir => {
+                let mut entries: Vec<DirEntry> = ProcFile::PID_DIR_FILES
+                    .iter()
+                    .map(|(name, _)| DirEntry {
+                        name: String::from(*name),
+                        file_type: FileType::RegularFile,
+                        ino_info: None,
+                    })
+                    .collect();
+                entries.push(DirEntry {
+                    name: String::from("fd"),
+                    file_type: FileType::Directory,
+                    ino_info: Some(self.inner.fd_dir_inode.clone()),
+                });
+                Ok(entries)
+            }
+            ProcDir::FdDir => Ok(Vec::new()),
         }
     }
 
@@ -484,6 +514,7 @@ impl<Platform: RawSyncPrimitivesProvider + 'static> Backend for Proc<Platform> {
             // `busybox ps` gets a process's uid/gid by `stat`-ing `/proc/<pid>` itself
             // (`PSSCAN_UIDGID`), not by parsing `/proc/<pid>/status` -- this owner is load-bearing.
             ProcDir::PidDir => (self.inner.pid_dir_inode.clone(), self.task_owner()),
+            ProcDir::FdDir => (self.inner.fd_dir_inode.clone(), self.task_owner()),
         };
         Ok(FileStatus {
             file_type: FileType::Directory,
