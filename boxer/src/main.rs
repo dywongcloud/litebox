@@ -88,6 +88,13 @@ enum Cli {
         /// can inject a peer's address without rebuilding the box.
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Replace the image's ENTRYPOINT (docker's `--entrypoint`): the image
+        /// CMD is dropped and any trailing arguments follow this program.
+        /// Useful for bypassing an entrypoint script that needs `fork`, which
+        /// LiteBox does not support. A bare name is looked up on the image's
+        /// PATH.
+        #[arg(long = "entrypoint", value_name = "PROGRAM")]
+        entrypoint: Option<String>,
         /// Arguments overriding the image CMD.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -190,11 +197,13 @@ fn main() -> anyhow::Result<()> {
             publish_all,
             verbose,
             env,
+            entrypoint,
             args,
         } => run::run(
             &box_path,
             &args,
             &env,
+            entrypoint.as_deref(),
             &run::NetOptions {
                 tun_device: net,
                 net_host_ip,

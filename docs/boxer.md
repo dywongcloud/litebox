@@ -37,6 +37,9 @@ boxer run app.box.wasm /bin/echo hi   # override CMD
 # Serve: publish every EXPOSEd port, or map one explicitly
 boxer run -P app.box.wasm
 boxer run -p 8080:80 app.box.wasm
+
+# Replace the image ENTRYPOINT (docker's --entrypoint); args follow after `--`
+boxer run --entrypoint nginx -p 8080:80 nginx.box.wasm -- -g 'daemon off; master_process off;'
 ```
 
 ## Ports
@@ -328,6 +331,51 @@ persist back out of the sandbox -- a builder needs real writes. Consequences:
   tar), including nested indexes, with the same layer pipeline. An archive
   whose config declares a different architecture than `--platform` is
   refused rather than mislabeled.
+
+## Verified images
+
+Unmodified images pulled straight from a registry, built with
+`boxer build -i <ref>` and served with `boxer run -p HOST:GUEST`, on x86_64
+Linux. "Result" is what a real client got back over the published port.
+
+| Image | Run | Result |
+|---|---|---|
+| `hashicorp/http-echo` (static Go) | `-e ECHO_TEXT=hi` | HTTP 200, body `hi` |
+| `traefik/whoami` (static Go 1.26) | default | HTTP 200 |
+| `joseluisq/static-web-server:2` (static Rust, tokio) | `-e SERVER_HOST=0.0.0.0` | HTTP 404 (no site files, server is up) |
+| `python:3-alpine` (musl) | `python3 -m http.server 8000 --bind 0.0.0.0` | HTTP 200 (~10 s cold start) |
+| `python:3-slim` (glibc, dynamic) | same | HTTP 200 |
+| `nginx:alpine` | `--entrypoint nginx -- -g 'daemon off; master_process off;'` | HTTP 200 |
+| `nginx:stable` (Debian, glibc) | same | HTTP 200 |
+| `redis:alpine` | `--entrypoint redis-server -- --save "" --appendonly no` | `PING` -> `+PONG` |
+
+Rules of thumb that fall out of that list:
+
+- **No `fork`.** A box is one address space (see "Composition"), so `fork`
+  fails with `ENOSYS`. Anything that forks must be configured not to: nginx
+  needs `master_process off`, Apache needs `-X`, and a shell entrypoint script
+  that uses `$(...)`, pipes, or external commands stops with
+  `can't fork: Function not implemented`. Most official images start through
+  such a script (`docker-entrypoint.sh`), so use `--entrypoint` to launch the
+  server binary directly.
+- **IPv4 only.** Sockets are `AF_INET`; a server that binds the IPv6 wildcard
+  (`[::]`, the default of `python -m http.server` and static-web-server) fails
+  with `Address family not supported by protocol`. Bind `0.0.0.0` explicitly
+  (`--bind 0.0.0.0`, `SERVER_HOST=0.0.0.0`, `listen 80;` rather than
+  `listen [::]:80;`). Go servers fall back to IPv4 on their own.
+- **Guest runs as uid 1000**, not root, whatever the image's `USER` says, so a
+  server that needs to write somewhere root-owned must be pointed elsewhere.
+- **Docker Hub rate limits.** Every `boxer build -i docker.io/...` pulls the
+  manifest anonymously, and Docker Hub allows only a small number of those per
+  6 hours per IP. Iterating on builds can exhaust it
+  (`TOOMANYREQUESTS`); build once and keep the `.box.wasm`. `ghcr.io` and
+  `mcr.microsoft.com` are alternatives.
+
+Not yet working: `httpd:alpine` starts but stops at `bad user name www-data`.
+The box's `/etc/group` has `www-data` while `/etc/passwd` does not, although
+the image's build adds both; this points at how one layer's `/etc/passwd` is
+merged and has not been root-caused (inspecting the layers needs a registry
+pull, which was rate limited at the time).
 
 ## Known costs and limits
 

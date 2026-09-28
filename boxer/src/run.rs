@@ -93,10 +93,22 @@ pub fn run(
     box_path: &Path,
     extra_args: &[String],
     extra_env: &[String],
+    entrypoint: Option<&str>,
     net: &NetOptions,
 ) -> anyhow::Result<()> {
     let parsed = parse_box_file(box_path)?;
-    let meta = &parsed.meta;
+    // `--entrypoint` replaces the image's ENTRYPOINT and drops its CMD.
+    let overridden_meta;
+    let meta = match entrypoint {
+        Some(program) => {
+            let mut meta = parsed.meta.clone();
+            meta.entrypoint = Some(vec![program.to_string()]);
+            meta.cmd = None;
+            overridden_meta = meta;
+            &overridden_meta
+        }
+        None => &parsed.meta,
+    };
 
     let host_arch = if cfg!(target_arch = "aarch64") {
         "arm64"
@@ -238,7 +250,10 @@ pub fn run(
         );
     }
 
-    let (program, program_args): (String, Vec<String>) = if has_shell && has_config_script {
+    let (program, program_args): (String, Vec<String>) = if has_shell
+        && has_config_script
+        && entrypoint.is_none()
+    {
         // The config script exports ENV, cds to WORKDIR, and execs either the
         // caller's command or the image default.
         (
@@ -252,7 +267,13 @@ pub fn run(
         // relative ENTRYPOINT/CMD (`["./server"]`) resolve against it, the same
         // way a real exec resolves a relative path against the caller's cwd.
         let mut argv = argv;
-        (argv.remove(0), argv)
+        let mut program = argv.remove(0);
+        if !program.contains('/')
+            && let Some(resolved) = resolve_in_path(&program, &meta.env, &entry_names)
+        {
+            program = resolved;
+        }
+        (program, argv)
     };
 
     run_native(
@@ -275,6 +296,23 @@ pub fn run(
             host_ip,
         },
     )
+}
+
+/// Resolve a bare command name against the image's `PATH` (docker's exec
+/// semantics), returning the absolute path of the first directory that holds
+/// it. `entry_names` are the rootfs tar's entries (no leading `/`).
+fn resolve_in_path(command: &str, env: &[String], entry_names: &[String]) -> Option<String> {
+    let path = env
+        .iter()
+        .find_map(|entry| entry.strip_prefix("PATH="))
+        .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    path.split(':').filter(|dir| dir.starts_with('/')).find_map(|dir| {
+        let candidate = format!("{}/{command}", dir.trim_start_matches('/').trim_end_matches('/'));
+        entry_names
+            .iter()
+            .any(|name| *name == candidate)
+            .then(|| format!("/{candidate}"))
+    })
 }
 
 /// Merge `overrides` (`KEY=VALUE`, as given to `-e`) onto `base` (the
