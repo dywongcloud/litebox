@@ -198,9 +198,13 @@ scaled up. Verified in headless Chromium against the real `x11-server` +
 - **View only:** the bridge discards pointer/key events, so there is no input.
 - **Password:** the browser client only speaks security type "None", so don't
   set `VNC_PASSWORD` on the bridge when using it.
-- The proxy binds to loopback and rejects WebSocket connections whose
-  `Origin` isn't itself, so other websites open in your browser can't reach
-  the session through it. Flags: `--vnc HOST:PORT`, `--listen HOST:PORT`.
+- The proxy binds to loopback, only answers loopback `Host` names (DNS
+  rebinding) and rejects WebSocket connections whose `Origin` isn't itself, so
+  other websites open in your browser can't reach the session through it.
+  There is no login of its own. Flags: `--vnc HOST:PORT`, `--listen HOST:PORT`.
+- The bridge serves one client at a time; close the browser tab (or
+  Reconnect) before opening another viewer. A client that stalls during the
+  handshake is dropped after 5 s.
 
 ## macOS Screen Sharing / `open vnc://` needs a password
 
@@ -214,10 +218,10 @@ support classic VNC password auth (security type 2), off by default: set
 ```
 
 then `open vnc://127.0.0.1:5901` and enter that password (VNC only uses the
-first 8 characters). With it set, `rfb_client_witness.py` and the browser
+first 8 bytes, so use an ASCII password). With it set, `rfb_client_witness.py` and the browser
 client no longer work, since they only speak "None". The DES challenge
 response (`src/rfbauth.rs`, no dependencies) was cross-checked against
-OpenSSL on Linux; Apple's viewer itself has not been tried.
+OpenSSL on Linux; Apple's viewer itself has not been tried. Failed attempts are delayed 1 s.
 
 ## Graphics demo
 

@@ -130,9 +130,9 @@ fn des_encrypt_block(keys: &[u64; 16], block: [u8; 8]) -> [u8; 8] {
 /// The response a client must send for `challenge` under `password`: DES-ECB
 /// of both 8-byte halves, keyed by the password truncated or zero-padded to 8
 /// bytes with each key byte's bits reversed (VNC's long-standing quirk).
-pub fn expected_response(password: &str, challenge: &[u8; 16]) -> [u8; 16] {
+pub fn expected_response(password: &[u8], challenge: &[u8; 16]) -> [u8; 16] {
     let mut key = [0u8; 8];
-    for (slot, byte) in key.iter_mut().zip(password.bytes()) {
+    for (slot, byte) in key.iter_mut().zip(password) {
         *slot = byte.reverse_bits();
     }
     let keys = subkeys(key);
@@ -161,7 +161,16 @@ fn random_challenge() -> [u8; 16] {
     out
 }
 
-fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
+/// Fill `buf`, retrying on `WouldBlock`/`Interrupted`. Under litebox's guest
+/// TCP stack a nominally blocking socket returns spurious EAGAIN immediately,
+/// so that must be retried; but on a native host an expired `SO_RCVTIMEO` also
+/// surfaces as EAGAIN, so retrying forever would let one stalled client wedge
+/// this single-threaded server. Resolve both: retry, but give up with
+/// `TimedOut` once the socket's configured read timeout has elapsed with no
+/// progress (no deadline if none is configured or it can't be read).
+pub fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
+    let limit = stream.read_timeout().ok().flatten();
+    let mut last_progress = std::time::Instant::now();
     let mut filled = 0;
     while filled < buf.len() {
         match stream.read(&mut buf[filled..]) {
@@ -171,11 +180,20 @@ fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
                     "connection closed mid-read",
                 ));
             }
-            Ok(n) => filled += n,
+            Ok(n) => {
+                filled += n;
+                last_progress = std::time::Instant::now();
+            }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::Interrupted =>
             {
+                if limit.is_some_and(|l| last_progress.elapsed() >= l) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "client stalled",
+                    ));
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => return Err(e),
@@ -184,16 +202,25 @@ fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Read `VNC_PASSWORD`; empty counts as unset.
-pub fn password_from_env() -> Option<String> {
-    std::env::var("VNC_PASSWORD").ok().filter(|p| !p.is_empty())
+/// Read `VNC_PASSWORD` as raw bytes; empty counts as unset. Uses `var_os` so
+/// a non-UTF-8 value still enables authentication instead of silently
+/// falling back to "None".
+pub fn password_from_env() -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStringExt;
+    std::env::var_os("VNC_PASSWORD")
+        .map(OsStringExt::into_vec)
+        .filter(|p| !p.is_empty())
 }
+
+/// How long a client gets to answer the challenge: long enough for a person to
+/// type a password into a viewer's dialog.
+const AUTH_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// RFB 3.8 security handshake, called right after the version exchange:
 /// offers type 2 if `password` is set, else type 1, and sends the
 /// SecurityResult. A wrong response gets SecurityResult=1 plus a reason and
-/// an `Err`.
-pub fn negotiate_security(stream: &mut TcpStream, password: Option<&str>) -> std::io::Result<()> {
+/// an `Err`, after a 1s delay to slow online guessing.
+pub fn negotiate_security(stream: &mut TcpStream, password: Option<&[u8]>) -> std::io::Result<()> {
     let offered: u8 = if password.is_some() { 2 } else { 1 };
     stream.write_all(&[1, offered])?;
     let mut chosen = [0u8; 1];
@@ -207,9 +234,14 @@ pub fn negotiate_security(stream: &mut TcpStream, password: Option<&str>) -> std
     if let Some(password) = password {
         let challenge = random_challenge();
         stream.write_all(&challenge)?;
+        let previous_timeout = stream.read_timeout().ok().flatten();
+        stream.set_read_timeout(Some(AUTH_RESPONSE_TIMEOUT))?;
         let mut response = [0u8; 16];
-        read_exact(stream, &mut response)?;
+        let read = read_exact(stream, &mut response);
+        stream.set_read_timeout(previous_timeout)?;
+        read?;
         if response != expected_response(password, &challenge) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
             stream.write_all(&1u32.to_be_bytes())?;
             let reason = b"authentication failed";
             stream.write_all(&(reason.len() as u32).to_be_bytes())?;

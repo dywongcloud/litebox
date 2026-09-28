@@ -7,29 +7,13 @@ mod graphics;
 mod rfbauth;
 
 use graphics::{Color, Graphics, SoftRasterizer};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
-use std::thread;
 use std::time::Duration;
 
 fn read_exact(stream: &mut std::net::TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    let mut filled = 0;
-    while filled < len {
-        match stream.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                ));
-            }
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    rfbauth::read_exact(stream, &mut buf)?;
     Ok(buf)
 }
 

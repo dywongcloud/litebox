@@ -16,7 +16,7 @@ mod x11proto;
 #[path = "../rfbauth.rs"]
 mod rfbauth;
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
@@ -35,30 +35,11 @@ fn parse_display(display: &str) -> (String, u16) {
     (host.to_string(), num.parse().expect("bad display number"))
 }
 
-/// Read exactly `len` bytes, retrying on `WouldBlock`/`Interrupted` -- a
-/// real EAGAIN was observed here under litebox's guest TCP stack even on a
-/// nominally-blocking socket, so this must not treat it as fatal.
+/// Read exactly `len` bytes, tolerating litebox's spurious EAGAIN but still
+/// honouring the socket's read timeout (see `rfbauth::read_exact`).
 fn read_exact(stream: &mut TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    let mut filled = 0;
-    while filled < len {
-        match stream.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed mid-read",
-                ));
-            }
-            Ok(n) => filled += n,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    rfbauth::read_exact(stream, &mut buf)?;
     Ok(buf)
 }
 
