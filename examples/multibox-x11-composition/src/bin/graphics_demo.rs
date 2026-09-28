@@ -3,6 +3,8 @@
 
 #[path = "../graphics.rs"]
 mod graphics;
+#[path = "../rfbauth.rs"]
+mod rfbauth;
 
 use graphics::{Color, Graphics, SoftRasterizer};
 use std::io::{Read, Write};
@@ -48,12 +50,7 @@ fn write_pixel_format(out: &mut Vec<u8>) {
 fn handshake(stream: &mut std::net::TcpStream, width: u16, height: u16) -> std::io::Result<()> {
     stream.write_all(b"RFB 003.008\n")?;
     let _client_version = read_exact(stream, 12)?;
-    stream.write_all(&[1u8, 1u8])?;
-    let chosen = read_exact(stream, 1)?;
-    if chosen[0] != 1 {
-        return Err(std::io::Error::other("client did not choose None security"));
-    }
-    stream.write_all(&0u32.to_be_bytes())?;
+    rfbauth::negotiate_security(stream, rfbauth::password_from_env().as_deref())?;
     let _client_init = read_exact(stream, 1)?;
 
     let mut init = Vec::new();

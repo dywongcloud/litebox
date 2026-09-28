@@ -13,6 +13,9 @@
 #[allow(dead_code)]
 mod x11proto;
 
+#[path = "../rfbauth.rs"]
+mod rfbauth;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
@@ -93,14 +96,9 @@ fn handshake(stream: &mut TcpStream, width: u16, height: u16) -> std::io::Result
     stream.write_all(b"RFB 003.008\n")?;
     let _client_version = read_exact(stream, 12)?;
 
-    // Security: offer only "None" (type 1).
-    stream.write_all(&[1u8, 1u8])?;
-    let chosen = read_exact(stream, 1)?;
-    if chosen[0] != 1 {
-        return Err(std::io::Error::other("client did not choose None security"));
-    }
-    // RFB 3.8 requires a SecurityResult even for None.
-    stream.write_all(&0u32.to_be_bytes())?;
+    // Security: "None" by default, VNC password auth when VNC_PASSWORD is set
+    // (Apple's Screen Sharing client refuses "None"). Sends SecurityResult.
+    rfbauth::negotiate_security(stream, rfbauth::password_from_env().as_deref())?;
 
     let _client_init = read_exact(stream, 1)?; // shared-flag
 

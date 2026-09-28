@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>litebox VNC</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light dark; --bg: #f4f4f5; --fg: #18181b; --muted: #71717a; --line: #d4d4d8; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #18181b; --fg: #f4f4f5; --muted: #a1a1aa; --line: #3f3f46; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  #status { color: var(--muted); margin-bottom: 12px; }
+  #status.error { color: #dc2626; }
+  canvas { display: block; border: 1px solid var(--line); image-rendering: pixelated; background: #000; max-width: 100%; }
+  button { margin-top: 12px; font: inherit; padding: 4px 12px; }
+</style>
+</head>
+<body>
+<h1>litebox VNC (browser client)</h1>
+<div id="status">connecting...</div>
+<canvas id="screen" width="1" height="1"></canvas>
+<button id="reconnect" hidden>Reconnect</button>
+<script>
+"use strict";
+const statusEl = document.getElementById("status");
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const reconnectBtn = document.getElementById("reconnect");
+
+// Exposed for debugging: window.vnc.pixel(x, y) -> [r, g, b].
+window.vnc = { connected: false, frames: 0, width: 0, height: 0, error: null,
+  pixel(x, y) { return Array.from(ctx.getImageData(x, y, 1, 1).data.slice(0, 3)); } };
+
+function setStatus(text, isError) {
+  statusEl.textContent = text;
+  statusEl.className = isError ? "error" : "";
+}
+
+function connect() {
+  reconnectBtn.hidden = true;
+  window.vnc.connected = false;
+  window.vnc.error = null;
+  setStatus("connecting...");
+  const ws = new WebSocket(`ws://${location.host}/websockify`);
+  ws.binaryType = "arraybuffer";
+
+  let chunks = [], have = 0, waiter = null, closed = false;
+  ws.onmessage = (e) => {
+    const c = new Uint8Array(e.data);
+    chunks.push(c); have += c.length;
+    if (waiter) waiter();
+  };
+  ws.onclose = () => { closed = true; if (waiter) waiter(); };
+
+  function take(n) {
+    const out = new Uint8Array(n);
+    let off = 0;
+    while (off < n) {
+      const c = chunks[0], need = n - off;
+      if (c.length <= need) { out.set(c, off); off += c.length; chunks.shift(); }
+      else { out.set(c.subarray(0, need), off); chunks[0] = c.subarray(need); off = n; }
+    }
+    have -= n;
+    return out;
+  }
+  function read(n) {
+    return new Promise((resolve, reject) => {
+      const attempt = () => {
+        if (have >= n) { waiter = null; resolve(take(n)); }
+        else if (closed) { waiter = null; reject(new Error("connection closed")); }
+        else waiter = attempt;
+      };
+      attempt();
+    });
+  }
+  const send = (bytes) => ws.send(bytes);
+  const text = (u8) => new TextDecoder().decode(u8);
+
+  (async () => {
+    await new Promise((res, rej) => { ws.onopen = res; ws.addEventListener("error", () => rej(new Error("WebSocket error"))); });
+
+    const version = text(await read(12));
+    if (!version.startsWith("RFB 003.")) throw new Error("not an RFB server: " + JSON.stringify(version));
+    send(new TextEncoder().encode("RFB 003.008\n"));
+
+    const nTypes = (await read(1))[0];
+    if (nTypes === 0) {
+      const len = new DataView((await read(4)).buffer).getUint32(0);
+      throw new Error("server refused: " + text(await read(len)));
+    }
+    const types = Array.from(await read(nTypes));
+    if (!types.includes(1)) {
+      throw new Error("server requires authentication (security types " + types.join(",") +
+        "); this client only supports \"None\" -- start the bridge without VNC_PASSWORD");
+    }
+    send(Uint8Array.of(1));
+    const secResult = new DataView((await read(4)).buffer).getUint32(0);
+    if (secResult !== 0) throw new Error("security handshake failed");
+    send(Uint8Array.of(1)); // ClientInit: shared
+
+    const init = await read(24);
+    const dv = new DataView(init.buffer);
+    const width = dv.getUint16(0), height = dv.getUint16(2);
+    const pf = {
+      bpp: init[4], bigEndian: init[6] !== 0, trueColor: init[7] !== 0,
+      rMax: dv.getUint16(8), gMax: dv.getUint16(10), bMax: dv.getUint16(12),
+      rShift: init[14], gShift: init[15], bShift: init[16],
+    };
+    const name = text(await read(dv.getUint32(20)));
+    if (!pf.trueColor || ![16, 32].includes(pf.bpp)) throw new Error("unsupported pixel format (bpp=" + pf.bpp + ")");
+    canvas.width = width; canvas.height = height;
+    const scale = Math.max(1, Math.floor(640 / width));
+    canvas.style.width = (width * scale) + "px";
+    canvas.style.height = (height * scale) + "px";
+    Object.assign(window.vnc, { connected: true, width, height });
+    setStatus(`connected: ${name} (${width}x${height})`);
+
+    // SetEncodings: Raw only.
+    const enc = new DataView(new ArrayBuffer(8));
+    enc.setUint8(0, 2); enc.setUint16(2, 1); enc.setInt32(4, 0);
+    send(enc.buffer);
+
+    const bytesPP = pf.bpp / 8;
+    const img = ctx.createImageData(width, height);
+    const request = () => {
+      const r = new DataView(new ArrayBuffer(10));
+      r.setUint8(0, 3); r.setUint8(1, 0); // non-incremental: always answered
+      r.setUint16(6, width); r.setUint16(8, height);
+      send(r.buffer);
+    };
+    request();
+
+    let frameTimes = [];
+    while (true) {
+      const type = (await read(1))[0];
+      if (type === 0) { // FramebufferUpdate
+        const head = await read(3);
+        const nRects = (head[1] << 8) | head[2];
+        for (let i = 0; i < nRects; i++) {
+          const h = await read(12);
+          const hv = new DataView(h.buffer);
+          const rx = hv.getUint16(0), ry = hv.getUint16(2), rw = hv.getUint16(4), rh = hv.getUint16(6);
+          const encoding = hv.getInt32(8);
+          if (encoding !== 0) throw new Error("unsupported encoding " + encoding);
+          if (rx + rw > width || ry + rh > height) throw new Error("rectangle outside framebuffer");
+          const data = await read(rw * rh * bytesPP);
+          const pv = new DataView(data.buffer);
+          for (let y = 0; y < rh; y++) {
+            for (let x = 0; x < rw; x++) {
+              const v = bytesPP === 4 ? pv.getUint32((y * rw + x) * 4, !pf.bigEndian)
+                                       : pv.getUint16((y * rw + x) * 2, !pf.bigEndian);
+              const o = ((ry + y) * width + rx + x) * 4;
+              img.data[o] = ((v >>> pf.rShift) & pf.rMax) * 255 / pf.rMax;
+              img.data[o + 1] = ((v >>> pf.gShift) & pf.gMax) * 255 / pf.gMax;
+              img.data[o + 2] = ((v >>> pf.bShift) & pf.bMax) * 255 / pf.bMax;
+              img.data[o + 3] = 255;
+            }
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+        window.vnc.frames++;
+        const now = performance.now();
+        frameTimes.push(now);
+        frameTimes = frameTimes.filter((t) => now - t < 2000);
+        setStatus(`connected: ${name} (${width}x${height}), ${(frameTimes.length / 2).toFixed(1)} fps, frame ${window.vnc.frames}`);
+        setTimeout(request, 100);
+      } else if (type === 1) { // SetColourMapEntries (unused for true colour)
+        const h = new DataView((await read(5)).buffer);
+        await read(h.getUint16(3) * 6);
+      } else if (type === 2) { // Bell
+      } else if (type === 3) { // ServerCutText
+        await read(3);
+        await read(new DataView((await read(4)).buffer).getUint32(0));
+      } else {
+        throw new Error("unknown server message type " + type);
+      }
+    }
+  })().catch((err) => {
+    window.vnc.connected = false;
+    window.vnc.error = String(err.message || err);
+    setStatus((closed ? "disconnected: " : "error: ") + window.vnc.error, true);
+    reconnectBtn.hidden = false;
+    try { ws.close(); } catch (_) {}
+  });
+}
+
+reconnectBtn.onclick = connect;
+connect();
+</script>
+</body>
+</html>

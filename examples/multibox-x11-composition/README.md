@@ -175,6 +175,50 @@ pointer item (its third correction). It did not reproduce across 18
 back-to-back attempts while investigating it; if you hit it, just run
 `boxer compose` again.
 
+## Viewing it in a web browser
+
+`browser_vnc.py` + `browser_vnc.html` are a dependency-free browser client:
+a small canvas RFB client plus a WebSocket-to-TCP proxy, on the host (not in
+a box). With `boxer compose` running:
+
+```sh
+python3 examples/multibox-x11-composition/browser_vnc.py     # proxies 127.0.0.1:5901
+open http://127.0.0.1:6080/                                  # or any browser
+```
+
+You should see the same 160x120 olive-green rectangle with a black margin,
+scaled up. Verified in headless Chromium against the real `x11-server` +
+`x11-app` + `vnc-bridge` binaries (center pixel read back from the canvas is
+`0x11,0xcc,0x66`); not yet run against a live `boxer compose` on a Mac.
+
+- **It is slow:** one full-frame update takes ~9 s, because
+  `x11proto::write_all_retrying` (see "A real network caveat" below) writes
+  256 bytes per 15 ms on each of two hops. Expect a refresh every ~10 s, not
+  a smooth video. That is the demo's existing limit, not the browser client.
+- **View only:** the bridge discards pointer/key events, so there is no input.
+- **Password:** the browser client only speaks security type "None", so don't
+  set `VNC_PASSWORD` on the bridge when using it.
+- The proxy binds to loopback and rejects WebSocket connections whose
+  `Origin` isn't itself, so other websites open in your browser can't reach
+  the session through it. Flags: `--vnc HOST:PORT`, `--listen HOST:PORT`.
+
+## macOS Screen Sharing / `open vnc://` needs a password
+
+Apple's built-in viewer refuses a VNC server that offers no authentication
+("Unable to communicate with ..."). The bridge and graphics demo therefore
+support classic VNC password auth (security type 2), off by default: set
+`VNC_PASSWORD` in the instance's `env` in `compose.json`, e.g.
+
+```json
+"env": { "DISPLAY": "${x11server.guest_ip}:0", "BIND_IP": "${vncbridge.guest_ip}", "VNC_PASSWORD": "litebox" }
+```
+
+then `open vnc://127.0.0.1:5901` and enter that password (VNC only uses the
+first 8 characters). With it set, `rfb_client_witness.py` and the browser
+client no longer work, since they only speak "None". The DES challenge
+response (`src/rfbauth.rs`, no dependencies) was cross-checked against
+OpenSSL on Linux; Apple's viewer itself has not been tried.
+
 ## Graphics demo
 
 The graphics library (`src/graphics.rs`) provides a simple software-rasterizer
