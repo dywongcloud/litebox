@@ -62,22 +62,74 @@ impl Drop for SpanGuard {
 /// Internal macro for log backend implementation.
 ///
 /// This macro dispatches log events to the `log` crate, properly using log's `kv`
-/// feature to pass structured key-value pairs. The match converts from our
-/// [`Level`](crate::Level) enum to [`log::Level`].
+/// feature to pass structured key-value pairs. Key-value pairs are first
+/// normalized by [`__log_kv!`](crate::__log_kv) so that capture modes `log`
+/// has no native support for (currently `:x` for hexadecimal) are rewritten
+/// in terms of ones it does.
 ///
 /// Not intended for direct use; called by the public logging macros.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __log_impl {
-    ($level:expr, $($key:tt $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {{
-        $crate::__private::log::log!(
-            $crate::Level::to_log_level($level),
-            $($key $(:$cap)? $(= $value)?),+;
-            $msg
-        )
-    }};
+    ($level:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+ ; $msg:literal) => {
+        $crate::__log_kv!([$level] [$msg] [] [$($key $(:$cap)? $(= $value)?),+])
+    };
     ($level:expr, $msg:literal) => {
         $crate::__private::log::log!($crate::Level::to_log_level($level), $msg)
+    };
+}
+
+/// Internal tt-muncher that normalizes key-value pairs for the log backend.
+///
+/// Processes fields one at a time, rewriting capture modes that `log` lacks
+/// native support for:
+///
+/// - `key:x [= value]` becomes `key:% = Hex(value)`, rendering the value as
+///   `0x`-prefixed lowercase hexadecimal.
+///
+/// All other fields are passed through to `log` untouched. Each processed
+/// field is accumulated as a `[...]`-bracketed group so the final arm can
+/// join the groups with commas.
+///
+/// Arguments: `[level] [msg] [accumulated_fields] [remaining_input]`
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __log_kv {
+    // Field: key:x = value (0x-prefixed lowercase hex, via Display)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :x = $value:expr $(, $($rest:tt)*)?]) => {
+        $crate::__log_kv!(
+            [$level] [$msg]
+            [$($acc)* [$key:% = $crate::__private::Hex(&$value)]]
+            [$($($rest)*)?]
+        )
+    };
+    // Field: key:x (shorthand) -> delegates to key:x = key
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :x $(, $($rest:tt)*)?]) => {
+        $crate::__log_kv!([$level] [$msg] [$($acc)*] [$key :x = $key $(, $($rest)*)?])
+    };
+    // Field: key:cap = value (capture mode natively supported by log)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :$cap:tt = $value:expr $(, $($rest:tt)*)?]) => {
+        $crate::__log_kv!([$level] [$msg] [$($acc)* [$key:$cap = $value]] [$($($rest)*)?])
+    };
+    // Field: key = value (no capture mode)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident = $value:expr $(, $($rest:tt)*)?]) => {
+        $crate::__log_kv!([$level] [$msg] [$($acc)* [$key = $value]] [$($($rest)*)?])
+    };
+    // Field: key:cap (shorthand with capture mode natively supported by log)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident :$cap:tt $(, $($rest:tt)*)?]) => {
+        $crate::__log_kv!([$level] [$msg] [$($acc)* [$key:$cap]] [$($($rest)*)?])
+    };
+    // Field: key (bare identifier)
+    ([$level:expr] [$msg:literal] [$($acc:tt)*] [$key:ident $(, $($rest:tt)*)?]) => {
+        $crate::__log_kv!([$level] [$msg] [$($acc)* [$key]] [$($($rest)*)?])
+    };
+    // All fields processed: emit the log call, joining field groups with commas.
+    ([$level:expr] [$msg:literal] [$([$($kv:tt)*])+] []) => {
+        $crate::__private::log::log!(
+            $crate::Level::to_log_level($level),
+            $($($kv)*),+;
+            $msg
+        )
     };
 }
 
@@ -85,18 +137,20 @@ macro_rules! __log_impl {
 ///
 /// Creates a [`SpanGuard`] and emits a `[SPAN ENTER]` log message. The guard
 /// will emit `[SPAN EXIT]` when dropped. Key-value pairs are included in the
-/// entry message using log's `kv` syntax.
+/// entry message using log's `kv` syntax, normalized by
+/// [`__log_kv!`](crate::__log_kv) with the span name seeded as the first
+/// field.
 ///
 /// Not intended for direct use; called by the public span macros.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __span_impl {
-    ($level:expr, $name:expr, $($key:tt $(:$cap:tt)? $(= $value:expr)?),+) => {{
+    ($level:expr, $name:expr, $($key:ident $(:$cap:tt)? $(= $value:expr)?),+) => {{
         let __level = $level;
-        $crate::__private::log::log!(
-            $crate::Level::to_log_level(__level),
-            span = $name, $($key $(:$cap)? $(= $value)?),+;
-            "[SPAN ENTER]"
+        $crate::__log_kv!(
+            [__level] ["[SPAN ENTER]"]
+            [[span = $name]]
+            [$($key $(:$cap)? $(= $value)?),+]
         );
         $crate::SpanGuard { name: $name, level: __level, module_path: module_path!() }
     }};
