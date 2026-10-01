@@ -12,15 +12,170 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hashbrown::HashMap;
 use thiserror::Error;
 
+use crate::platform::DescriptorTableAccess;
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 use crate::utilities::anymap::AnyMap;
 
 #[cfg(test)]
 mod tests;
+
+/// NETFIX permanent guard: every walk of the whole process-global descriptor table names the
+/// site that asked for it, so a new walk is a new variant that shows up in the `fd` counters
+/// (`table_walks`) instead of silently becoming a per-poll cost again. The network worker used
+/// to walk the table twice per poll (>= 1000 polls/s), which pegged a core on a long-lived
+/// desktop because the table never shrinks; those two walks are gone, and their variants stay
+/// listed (at zero) so a reader of the counters sees that they are gone rather than unlisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkSite {
+    /// `fs::layered` rebinding every open description of a lower inode that migrated to the
+    /// upper layer: once per migration event, never per syscall.
+    LayeredRebind,
+    /// The retired `Network::close_pending_sockets` walk (per poll).
+    NetClosePendingSockets,
+    /// The retired `Network::drain_all_socket_channel_buffers` walk (per poll).
+    NetDrainAllSocketChannels,
+    /// A walk through [`Descriptors::iter`] / [`Descriptors::iter_mut`], which do not name a
+    /// site; any non-zero value here is a walk somebody added without declaring it.
+    Unattributed,
+}
+
+impl WalkSite {
+    const ALL: [WalkSite; 4] = [
+        WalkSite::LayeredRebind,
+        WalkSite::NetClosePendingSockets,
+        WalkSite::NetDrainAllSocketChannels,
+        WalkSite::Unattributed,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            WalkSite::LayeredRebind => 0,
+            WalkSite::NetClosePendingSockets => 1,
+            WalkSite::NetDrainAllSocketChannels => 2,
+            WalkSite::Unattributed => 3,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            WalkSite::LayeredRebind => "layered_rebind",
+            WalkSite::NetClosePendingSockets => "net_close_pending_sockets",
+            WalkSite::NetDrainAllSocketChannels => "net_drain_all_socket_channels",
+            WalkSite::Unattributed => "unattributed",
+        }
+    }
+}
+
+/// Release counters for the descriptor table (NETFIX section 5.1). Plain relaxed statics: the
+/// table is one per `LiteBox`, the slot counters are only changed under the table's write
+/// guard, and the walk/guard counters are lock-free reads for `-Z --counters`.
+mod counters {
+    use core::sync::atomic::AtomicU64;
+
+    /// Occupied slots right now (descriptors of every guest process plus host-owned ones).
+    pub(super) static ENTRIES_LIVE: AtomicU64 = AtomicU64::new(0);
+    /// Largest `ENTRIES_LIVE` ever observed.
+    pub(super) static ENTRIES_PEAK: AtomicU64 = AtomicU64::new(0);
+    /// `entries.len()`: slots ever allocated. The vector never shrinks, so this is the cost of
+    /// any whole-table walk.
+    pub(super) static TABLE_CAPACITY: AtomicU64 = AtomicU64::new(0);
+    /// Slots filled by `insert_handle` / `duplicate`.
+    pub(super) static INSERTS: AtomicU64 = AtomicU64::new(0);
+    /// Slots examined by the linear free-slot scan of those two (inventory row S1).
+    pub(super) static INSERT_SCAN_STEPS: AtomicU64 = AtomicU64::new(0);
+    /// Slots emptied (`remove`, a unique close, a drained queued close).
+    pub(super) static REMOVES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TABLE_WALKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    pub(super) static TABLE_WALK_ENTRIES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    /// The network worker took the table outside its one sanctioned scope. Must stay 0.
+    pub(super) static NET_WORKER_TABLE_TAKES: AtomicU64 = AtomicU64::new(0);
+    /// The network worker took the table inside the sanctioned queued-close drain.
+    pub(super) static NET_WORKER_TABLE_TAKES_SANCTIONED: AtomicU64 = AtomicU64::new(0);
+}
+
+fn note_slot_filled(scan_steps: usize, capacity: usize) {
+    let live = counters::ENTRIES_LIVE.fetch_add(1, Ordering::Relaxed) + 1;
+    counters::ENTRIES_PEAK.fetch_max(live, Ordering::Relaxed);
+    counters::INSERTS.fetch_add(1, Ordering::Relaxed);
+    counters::INSERT_SCAN_STEPS.fetch_add(scan_steps as u64, Ordering::Relaxed);
+    counters::TABLE_CAPACITY.store(capacity as u64, Ordering::Relaxed);
+}
+
+fn note_slot_emptied() {
+    counters::ENTRIES_LIVE.fetch_sub(1, Ordering::Relaxed);
+    counters::REMOVES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Called by [`crate::LiteBox::descriptor_table`] / `descriptor_table_mut` with the platform's
+/// classification of the calling thread (NETFIX section 5.3). The network worker must never take
+/// the global table: it is the lock every guest `open`/`close`/`socket`/`dup`/`fork` needs, and a
+/// worker that held it on every poll stalled all of them. The one sanctioned exception is the
+/// queued-close drain, which runs only when a removal is certain.
+pub(crate) fn note_table_access(access: DescriptorTableAccess) {
+    match access {
+        DescriptorTableAccess::Ordinary => {}
+        DescriptorTableAccess::NetworkWorker => {
+            counters::NET_WORKER_TABLE_TAKES.fetch_add(1, Ordering::Relaxed);
+            // Debug builds trap on the first violation; release builds keep the counter, which
+            // every `-Z --counters` snapshot carries.
+            #[cfg(debug_assertions)]
+            panic!("NETFIX guard: the network worker took the global descriptor table");
+        }
+        DescriptorTableAccess::NetworkWorkerSanctioned => {
+            counters::NET_WORKER_TABLE_TAKES_SANCTIONED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The `fd` block of the combined counters snapshot (`-Z --counters`, `/proc/litebox/counters`):
+/// a complete JSON object.
+#[must_use]
+pub fn counters_json() -> alloc::string::String {
+    use core::fmt::Write as _;
+    let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+    let mut out = alloc::string::String::new();
+    let _ = write!(
+        out,
+        "{{\"entries_live\":{},\"entries_peak\":{},\"table_capacity\":{},\"inserts\":{},\"insert_scan_steps\":{},\"removes\":{},\"net_worker_table_takes\":{},\"net_worker_table_takes_sanctioned\":{},\"table_walks\":{{",
+        load(&counters::ENTRIES_LIVE),
+        load(&counters::ENTRIES_PEAK),
+        load(&counters::TABLE_CAPACITY),
+        load(&counters::INSERTS),
+        load(&counters::INSERT_SCAN_STEPS),
+        load(&counters::REMOVES),
+        load(&counters::NET_WORKER_TABLE_TAKES),
+        load(&counters::NET_WORKER_TABLE_TAKES_SANCTIONED),
+    );
+    for (i, site) in WalkSite::ALL.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "\"{}\":{}",
+            site.name(),
+            load(&counters::TABLE_WALKS[site.index()])
+        );
+    }
+    out.push_str("},\"table_walk_entries\":{");
+    for (i, site) in WalkSite::ALL.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "\"{}\":{}",
+            site.name(),
+            load(&counters::TABLE_WALK_ENTRIES[site.index()])
+        );
+    }
+    out.push_str("}}");
+    out
+}
 
 /// Storage of file descriptors and their entries.
 pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
@@ -64,6 +219,18 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         handle: EntryHandle<Platform, Subsystem>,
     ) -> TypedFd<Subsystem> {
         let EntryHandle(entry, PhantomData) = handle;
+        let idx = self.free_slot();
+        let old = self.entries[idx].replace(IndividualEntry::new(entry));
+        assert!(old.is_none());
+        TypedFd {
+            _phantom: PhantomData,
+            x: OwnedFd::new(idx),
+        }
+    }
+
+    /// The lowest empty slot, appending one if every slot is occupied. Counted (inventory row
+    /// S1): the scan is linear in the table's capacity and runs under the table's write guard.
+    fn free_slot(&mut self) -> usize {
         let idx = self
             .entries
             .iter()
@@ -72,12 +239,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 self.entries.push(None);
                 self.entries.len() - 1
             });
-        let old = self.entries[idx].replace(IndividualEntry::new(entry));
-        assert!(old.is_none());
-        TypedFd {
-            _phantom: PhantomData,
-            x: OwnedFd::new(idx),
-        }
+        note_slot_filled(idx + 1, self.entries.len());
+        idx
     }
 
     /// Create a duplicate of the provided `fd`.
@@ -98,17 +261,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         &mut self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<TypedFd<Subsystem>> {
-        let idx = self
-            .entries
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.entries.push(None);
-                self.entries.len() - 1
-            });
-        let new_ind_entry = IndividualEntry::new(Arc::clone(
-            &self.entries[fd.x.as_usize()?].as_ref().unwrap().x,
-        ));
+        // Resolve the source before claiming a slot: a closed source used to leave a freshly
+        // appended `None` behind and (now) would count a fill that never happened.
+        let source = Arc::clone(&self.entries[fd.x.as_usize()?].as_ref().unwrap().x);
+        let idx = self.free_slot();
+        let new_ind_entry = IndividualEntry::new(source);
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
         Some(TypedFd {
@@ -130,6 +287,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let Some(old) = self.entries[fd.x.as_usize()?].take() else {
             unreachable!();
         };
+        note_slot_emptied();
         fd.x.mark_as_closed();
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
@@ -173,6 +331,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         if Arc::strong_count(&old.x) == 1 {
             // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
+                note_slot_emptied();
                 fd.x.mark_as_closed();
                 let entry = Arc::into_inner(old.x)
                     .map(RwLock::into_inner)
@@ -262,13 +421,33 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         entries
     }
 
+    /// Record one whole-table walk for `site` (NETFIX guard), together with the number of slots
+    /// it is about to visit.
+    fn note_walk(&self, site: WalkSite) {
+        counters::TABLE_WALKS[site.index()].fetch_add(1, Ordering::Relaxed);
+        counters::TABLE_WALK_ENTRIES[site.index()]
+            .fetch_add(self.entries.len() as u64, Ordering::Relaxed);
+    }
+
     /// An iterator of descriptors and entries for a subsystem
     ///
     /// Note: each of the entries take locks, thus should not be held on to for too long, in order
     /// to prevent dead-locks.
+    ///
+    /// Visits every slot of the process-global table: prefer [`Self::iter_at`], which names the
+    /// caller in the `fd.table_walks` counters; this one is counted as `unattributed`.
     pub(crate) fn iter<Subsystem: FdEnabledSubsystem>(
         &self,
     ) -> impl Iterator<Item = (InternalFd, impl core::ops::Deref<Target = Subsystem::Entry>)> {
+        self.iter_at::<Subsystem>(WalkSite::Unattributed)
+    }
+
+    /// [`Self::iter`], attributed to `site` in the `fd.table_walks` counters.
+    pub(crate) fn iter_at<Subsystem: FdEnabledSubsystem>(
+        &self,
+        site: WalkSite,
+    ) -> impl Iterator<Item = (InternalFd, impl core::ops::Deref<Target = Subsystem::Entry>)> {
+        self.note_walk(site);
         self.entries.iter().enumerate().filter_map(|(i, entry)| {
             entry.as_ref().and_then(|e| {
                 let entry = e.read();
@@ -290,6 +469,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ///
     /// Note: each of the entries take locks, thus should not be held on to for too long, in order
     /// to prevent dead-locks.
+    ///
+    /// Visits every slot of the process-global table and write-locks every matching entry; see
+    /// [`Self::iter_mut_at`].
     pub(crate) fn iter_mut<Subsystem: FdEnabledSubsystem>(
         &self,
     ) -> impl Iterator<
@@ -298,6 +480,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             impl core::ops::DerefMut<Target = Subsystem::Entry>,
         ),
     > {
+        self.iter_mut_at::<Subsystem>(WalkSite::Unattributed)
+    }
+
+    /// [`Self::iter_mut`], attributed to `site` in the `fd.table_walks` counters.
+    pub(crate) fn iter_mut_at<Subsystem: FdEnabledSubsystem>(
+        &self,
+        site: WalkSite,
+    ) -> impl Iterator<
+        Item = (
+            InternalFd,
+            impl core::ops::DerefMut<Target = Subsystem::Entry>,
+        ),
+    > {
+        self.note_walk(site);
         self.entries.iter().enumerate().filter_map(|(i, entry)| {
             entry.as_ref().and_then(|e| {
                 if !e.read().matches_subsystem::<Subsystem>() {
@@ -594,6 +790,16 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     #[must_use]
     pub fn identity(&self) -> EntryIdentity {
         EntryIdentity(self.0.as_ptr().addr())
+    }
+
+    /// The number of strong handles to the open file description right now: one per descriptor
+    /// slot that names it plus every in-flight [`EntryHandle`] (an `SCM_RIGHTS` message in
+    /// transit, a transient upgrade). It can only over-count the descriptors, never under-count,
+    /// so comparing it with a count of descriptors known to be closing is a conservative
+    /// "every alias is accounted for" test that never closes early.
+    #[must_use]
+    pub fn strong_count(&self) -> usize {
+        self.0.strong_count()
     }
 }
 

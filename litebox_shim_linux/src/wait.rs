@@ -27,6 +27,34 @@ impl<Platform: ShimPlatform> WaitState<Platform> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Times one of the blocking points a guest thread can pass through *after* it became
+    /// runnable and *before* it runs guest code again, and reports it to the platform's
+    /// runnable-not-running accounting whenever it actually cost something (see
+    /// [`litebox::platform::RunnableWaitKind`]).
+    ///
+    /// Every caller here brackets its own slow branch, so an ordinary guest re-entry -- no fork in
+    /// flight, no shared address space, untraced, no signal pending -- pays nothing at all: the
+    /// four sites below are each a single load in that case.
+    pub(crate) fn note_rbnr_wait(
+        &self,
+        kind: litebox::platform::RunnableWaitKind,
+        f: impl FnOnce(),
+    ) {
+        let started = self.global.platform.now();
+        f();
+        let ended = self.global.platform.now();
+        let Some(elapsed) = ended.checked_duration_since(&started) else {
+            return;
+        };
+        // Sub-microsecond waits are indistinguishable from the two clock reads themselves; only
+        // report what a reader could act on.
+        if elapsed >= core::time::Duration::from_micros(1) {
+            self.global
+                .platform
+                .note_rbnr_wait(kind, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        }
+    }
+
     /// Returns a wait context to use to perform interruptible waits.
     pub(crate) fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, Platform> {
         self.wait_state.0.context().with_check_for_interrupt(self)
@@ -64,6 +92,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
             #[cfg(feature = "alarm_fallback")]
             self.check_alarm_deadline();
+            // Step G: the signal-frame write into guest memory is the last thing between a woken
+            // thread and its guest code, and it takes the service-path locks, so it is its own
+            // runnable-not-running class (W6). It is timed *inside* `process_signals`, from the
+            // first signal actually dequeued to the end of the delivery -- gating it here on
+            // `has_pending_signals()` instead would add that call's process-inner mutex, remote
+            // drain, shared-pending lock and handler-table lock to every guest re-entry (measured:
+            // the guard's whole hot-path budget, for a class worth 58 ms over three runs).
             self.process_signals(ctx);
             // After delivery: a delivered handler has taken the saved mask into its frame (and
             // runs under the temporary one), so this only fires when nothing was delivered.

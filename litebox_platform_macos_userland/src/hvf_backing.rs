@@ -9,6 +9,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use crate::diagnostics_counters::RankedMutex;
 use std::time::{Duration, Instant};
 
 use crate::darwin::{KERN_SUCCESS, mach_task_self, mach_vm_deallocate, reserve_fixed};
@@ -645,15 +646,28 @@ fn new_resource_record(
     })
 }
 
-static HOST_RESOURCES: OnceLock<Mutex<HostResourceRegistry>> = OnceLock::new();
-static HOST_ADDRESS_ACQUISITION: OnceLock<Mutex<()>> = OnceLock::new();
+/// CLASS A: ranked ([`crate::diagnostics_counters::RANK_HOST_RESOURCES`]). Held across the
+/// `mach_vm_*` / `mmap` host calls of a slot's own lifetime, which is the "host call while
+/// holding a lock" shape the rank checker cannot see any other way.
+static HOST_RESOURCES: OnceLock<RankedMutex<HostResourceRegistry>> = OnceLock::new();
+/// CLASS A: ranked ([`crate::diagnostics_counters::RANK_HOST_ADDRESS_ACQ`]). The host-VA
+/// acquisition serializer: it is taken precisely so a `mach_vm_allocate` / `mmap` reservation
+/// cannot race another, so it is held across that host call by construction.
+static HOST_ADDRESS_ACQUISITION: OnceLock<RankedMutex<()>> = OnceLock::new();
 
-fn host_resources() -> &'static Mutex<HostResourceRegistry> {
-    HOST_RESOURCES.get_or_init(|| Mutex::new(HostResourceRegistry::new()))
+fn host_resources() -> &'static RankedMutex<HostResourceRegistry> {
+    HOST_RESOURCES.get_or_init(|| {
+        RankedMutex::new(
+            HostResourceRegistry::new(),
+            crate::diagnostics_counters::RANK_HOST_RESOURCES,
+        )
+    })
 }
 
-fn host_address_acquisition() -> &'static Mutex<()> {
-    HOST_ADDRESS_ACQUISITION.get_or_init(|| Mutex::new(()))
+fn host_address_acquisition() -> &'static RankedMutex<()> {
+    HOST_ADDRESS_ACQUISITION.get_or_init(|| {
+        RankedMutex::new((), crate::diagnostics_counters::RANK_HOST_ADDRESS_ACQ)
+    })
 }
 
 /// Registers one record; `pages` is the host page count its range will

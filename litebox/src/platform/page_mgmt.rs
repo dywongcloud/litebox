@@ -860,6 +860,21 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     #[expect(unused_variables, reason = "default body, non-underscored param name")]
     fn set_current_guest_stack_rlimit(rlimit_bytes: Option<usize>) {}
 
+    /// BCORE-4: whether the calling OS thread may take a dedicated guest-execution resource of
+    /// its own (on the macOS HVF backend, its own vCPU). The shim clears it for the window in
+    /// which a task's process still shares its parent's address space (the `vfork` hand-off),
+    /// because handing a shared space to a waiter requires quiescing every execution
+    /// participant of it. Default `true`; a platform with no such resource leaves it alone.
+    fn current_vcpu_bind_eligible() -> bool {
+        true
+    }
+
+    /// BCORE-4: sets [`Self::current_vcpu_bind_eligible`] for the calling OS thread. Intended
+    /// to be called alongside [`Self::set_current_guest_access`] on every shim entry. The
+    /// default is a no-op.
+    #[expect(unused_variables, reason = "default body, non-underscored param name")]
+    fn set_current_vcpu_bind_eligible(eligible: bool) {}
+
     /// Records that a guest page fault was resolved with no guest-visible signal -- stack
     /// growth, lazy materialization, COW-split, overlay-wait, or page-table repopulation, i.e.
     /// [`PageManager::handle_page_fault`](crate::mm::PageManager::handle_page_fault) returning

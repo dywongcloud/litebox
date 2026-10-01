@@ -29,7 +29,7 @@ use alloc::vec::Vec;
 
 use crate::event::polling::Pollee;
 use crate::event::{Events, observer::Observer};
-use crate::platform::TimeProvider;
+use crate::platform::{Instant as _, Provider, TimeProvider};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 use super::super::backend::{
@@ -152,13 +152,22 @@ impl QueuedEvent {
 /// injection must never block or grow without bound when no guest is reading).
 const QUEUE_CAP: usize = 1024;
 
-struct DeviceData {
+struct DeviceData<Platform: TimeProvider> {
     queue: VecDeque<QueuedEvent>,
     key_bitmap: [u8; KEY_BITMAP_BYTES],
+    /// When the oldest still-undrained event in `queue` was injected, on the platform's monotonic
+    /// clock; `None` when the queue is empty or every event in it has already been through a
+    /// drain. This is the inject end of the input-consume latency: the read that takes the last of
+    /// those events is the drain end (see [`InputRegistry::try_drain`]), and the difference is
+    /// exactly how long the input consumer took to pick the event up -- the one number the
+    /// desktop input-lag class (`hvf-desktop-input-consumer-lag-class-inventory`) could never
+    /// measure before. Reset on every drain, so a burst that a consumer reads in one go reports
+    /// one latency (its oldest event's), and a consumer that never reads reports nothing.
+    undrained_since: Option<Platform::Instant>,
 }
 
-struct DeviceState<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
-    data: Mutex<Platform, DeviceData>,
+struct DeviceState<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> {
+    data: Mutex<Platform, DeviceData<Platform>>,
     pollee: Pollee<Platform>,
 }
 
@@ -205,7 +214,7 @@ struct MiceCtl {
     last: Option<(i32, i32)>,
 }
 
-struct MiceDev<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
+struct MiceDev<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> {
     ctl: Mutex<Platform, MiceCtl>,
     pollee: Pollee<Platform>,
 }
@@ -213,32 +222,29 @@ struct MiceDev<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
 /// Bound on buffered mice packet bytes; oldest whole packets are dropped on overflow.
 const MICE_PACKET_CAP: usize = 4096;
 
-struct RegistryInner<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
+struct RegistryInner<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> {
     devices: [DeviceState<Platform>; 2],
     mice: MiceDev<Platform>,
 }
 
 /// A cheap-to-clone handle to the two virtual input devices' shared state: the runner side
 /// injects events through it, the shim side drains them and answers `EVIOC*` ioctls through it.
-pub struct InputRegistry<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
+/// The registry needs the platform instance for exactly one thing: the monotonic clock it stamps
+/// an injected event with and reads back when a guest drains it, so the inject-to-drain latency
+/// of every input event is measurable (see [`Self::try_drain`]).
+pub struct InputRegistry<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> {
+    platform: &'static Platform,
     inner: Arc<RegistryInner<Platform>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> Clone
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> Clone
     for InputRegistry<Platform>
 {
     fn clone(&self) -> Self {
         Self {
+            platform: self.platform,
             inner: Arc::clone(&self.inner),
         }
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> Default
-    for InputRegistry<Platform>
-{
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -257,17 +263,19 @@ pub enum EvdevIoctlReply {
     Invalid,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> InputRegistry<Platform> {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(platform: &'static Platform) -> Self {
         let device = || DeviceState {
             data: Mutex::new(DeviceData {
                 queue: VecDeque::new(),
                 key_bitmap: [0; KEY_BITMAP_BYTES],
+                undrained_since: None,
             }),
             pollee: Pollee::new(),
         };
         Self {
+            platform,
             inner: Arc::new(RegistryInner {
                 devices: [device(), device()],
                 mice: MiceDev {
@@ -291,6 +299,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
         let dev = &self.inner.devices[kind.index()];
         {
             let mut data = dev.data.lock();
+            // Step G: stamp the inject end only for an event that lands in an empty queue -- it
+            // is the one that has to wait for a consumer. A later event in the same queue shares
+            // the stamp, which is what makes a whole burst report one latency.
+            let stamped_at = if data.queue.is_empty() {
+                Some(self.platform.now())
+            } else {
+                None
+            };
             for &(r#type, code, value) in events {
                 if r#type == EV_KEY && usize::from(code) <= KEY_MAX {
                     let bit = usize::from(code);
@@ -322,6 +338,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
                 code: SYN_REPORT,
                 value: 0,
             });
+            if let Some(at) = stamped_at {
+                data.undrained_since = Some(at);
+            }
         }
         dev.pollee.notify_observers(Events::IN);
     }
@@ -410,6 +429,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputRegistry
             };
             event.serialize_into(&mut buf[written..written + INPUT_EVENT_SIZE]);
             written += INPUT_EVENT_SIZE;
+        }
+        // Step G: the drain end. One sample per drain that actually moved events: the time the
+        // oldest of them waited for a consumer. Published through the platform (which rate-limits
+        // its own warning for the ones over its threshold) because the histogram has to live
+        // wherever the rest of the runnable-not-running readout does.
+        if written != 0
+            && let Some(since) = data.undrained_since.take()
+            && let Some(elapsed) = self.platform.now().checked_duration_since(&since)
+        {
+            let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+            self.platform.note_input_consume_ns(ns);
         }
         if !data.queue.is_empty() {
             drop(data);
@@ -809,13 +839,13 @@ fn capability_bitmap(kind: DeviceKind, ev: u16) -> Vec<u8> {
 /// wait-context needed to block); the [`Backend::read`] here only serves the non-blocking
 /// leftovers path and reports "would block" as [`ReadError::Io`], which the interception layer
 /// prevents real consumers from ever seeing.
-pub struct InputDevices<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> {
+pub struct InputDevices<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> {
     registry: InputRegistry<Platform>,
     root_inode: NodeInfo,
     _alloc: InodeAllocator,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> InputDevices<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> InputDevices<Platform> {
     #[must_use]
     pub fn new(allocator: InodeAllocator, registry: InputRegistry<Platform>) -> Self {
         let root_inode = allocator.next();
@@ -863,12 +893,12 @@ pub struct InputFileHandle {
 #[derive(Debug, Clone, Copy)]
 pub struct InputDirHandle;
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static>
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static>
     super::super::backend::private::Sealed for InputDevices<Platform>
 {
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> BackendHandles
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> BackendHandles
     for InputDevices<Platform>
 {
     type WalkingDirHandle<'a> = InputDirHandle;
@@ -876,7 +906,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> BackendHandle
     type DirHandle = InputDirHandle;
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + 'static> Backend
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Provider + 'static> Backend
     for InputDevices<Platform>
 {
     fn root(&self) -> WalkingDirHandle<'_> {

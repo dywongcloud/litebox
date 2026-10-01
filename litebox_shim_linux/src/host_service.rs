@@ -79,15 +79,19 @@ struct StreamDropGuard<Platform: ShimPlatform, FS: ShimFS> {
 impl<Platform: ShimPlatform, FS: ShimFS> StreamOps for StreamDropGuard<Platform, FS> {
     fn close(&mut self, graceful: bool) {
         if let Some(sockfd) = self.sockfd.take() {
-            // NOT `CloseBehavior::Graceful`: that removes the descriptor entry -- and with it
-            // the channel proxy -- immediately, so any bytes still sitting in the TX ring are
-            // orphaned before the network worker can drain them to the wire (observed live as
-            // an HTTP response the guest never received). `GracefulIfNoPendingData` instead
-            // defers via `consider_closed` until the ring and send queue drain, which is the
-            // flush-then-FIN a byte-stream close means here; its `DataPending` "error" is that
-            // deferral, not a failure.
+            // `CloseBehavior::Graceful` is the flush-then-FIN a byte-stream close means here:
+            // `Network::close_handle` keeps a socket whose TX ring still holds bytes alive as a
+            // draining socket (the channel proxy with it) and sends the FIN only once the ring has
+            // drained into smoltcp, and smoltcp itself sends the FIN after its send queue.
+            //
+            // NETFIX leak L1: this used to be `GracefulIfNoPendingData`, chosen before that
+            // draining path existed (an HTTP response the guest never received). With bytes
+            // pending it answers `DataPending` and keeps the descriptor -- but `sockfd` is taken
+            // above and dropped here, so nothing ever retried: the descriptor slot, the socket
+            // handle and proxy, the smoltcp socket and the ephemeral port all leaked, once per
+            // proxied connection closed with a response still in flight.
             let behavior = if graceful {
-                litebox::net::CloseBehavior::GracefulIfNoPendingData
+                litebox::net::CloseBehavior::Graceful
             } else {
                 litebox::net::CloseBehavior::Immediate
             };

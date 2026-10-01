@@ -32,8 +32,10 @@ use core::cell::RefCell;
 use core::fmt;
 use core::ops::Range;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+use crate::diagnostics_counters::{RankedMutex, RankedRwLock};
 use std::time::{Duration, Instant};
 
 use litebox::mm::domain::GuestVaDomain;
@@ -48,7 +50,8 @@ use litebox::utils::ids::{FamilyId, VmViewId};
 use litebox_common_linux::PtRegs;
 
 use crate::hvf::{
-    HvfArchitecturalState, HvfEl1State, HvfError, HvfSimd128, HvfVcpuExit, process_hvf_vm,
+    HvfArchitecturalState, HvfEl1State, HvfError, HvfSimd128, HvfVcpuCancellation, HvfVcpuExit,
+    process_hvf_vm,
 };
 use crate::hvf_memory::{
     ANY_FILE_WINDOW_EVER, ANY_HOST_REDIRECT_EVER, FILE_COW_COUNTERS, FILE_ORIGINS, FileOrigin,
@@ -58,11 +61,14 @@ use crate::hvf_memory::{
     HvfVcpuParticipant, HvfVcpuRunAttachment, fallible_read_u64, file_cow_count,
     file_origin_adjust, next_file_origin_gva, process_hvf_memory,
 };
+use crate::diagnostics_counters::{
+    GR_COUNTERS, GrSite, gr_stale_skips_round,
+};
 use litebox::platform::page_mgmt::CowAllocationError;
 use crate::hvf_vcpu::{
-    HvfExitFp, HvfFpDeposit, HvfGuestFpClaim, HvfGuestRegisterCell, HvfVcpuExitState,
+    HvfBoundVcpu, HvfExitFp, HvfFpDeposit, HvfGuestFpClaim, HvfGuestRegisterCell, HvfVcpuExitState,
     HvfVcpuLane, HvfVcpuLaneCancellation, HvfVcpuLaneError, HvfVcpuLaneHandle, HvfVcpuRegistry,
-    HvfVcpuRunReservation, HvfVcpuRunResult,
+    HvfVcpuRunReservation, HvfVcpuRunResult, RunControl,
 };
 
 /// Best-effort, bounded AAPCS64 frame-pointer walk from the faulting
@@ -95,6 +101,16 @@ use crate::hvf_vcpu::{
 /// address (guards a cyclic/self-referential chain independent of the
 /// hard frame cap); `FrameBacktrace::MAX_FRAMES` bounds the loop
 /// regardless of whether any of those checks ever trip.
+/// Whether the one consumer of [`ExceptionInfo::backtrace`] can see it: the shim's debug-level
+/// guest-fault log (see `EnterShim::exception` in `litebox_shim_linux`). The field is documented
+/// as purely diagnostic and `EMPTY` is always valid, so the frame walk -- up to
+/// `FrameBacktrace::MAX_FRAMES` fallible guest reads per exception exit, on every exception exit,
+/// including the ones a guest takes on purpose -- is only paid when that log is enabled. Kept in
+/// sync with the shim's own gate by targeting the module that owns the log line.
+fn exception_backtrace_wanted() -> bool {
+    litebox_util_log::log_enabled!(target: "litebox_shim_linux", litebox_util_log::Level::Debug)
+}
+
 fn capture_frame_backtrace(fp0: usize) -> litebox::shim::FrameBacktrace {
     let mut frames = [0u64; litebox::shim::FrameBacktrace::MAX_FRAMES];
     let mut count = 0usize;
@@ -176,6 +192,16 @@ const STALE_VIEW_RERUN_LIMIT: u32 = 64;
 /// `HostFailure` already gets -- this bound is what turns that into a bounded number of free
 /// retries instead of an unconditional, indefinite one.
 const ALIAS_CONFLICT_RERUN_LIMIT: u32 = 64;
+
+/// GSIGSEGV2: per-thread "attempts on one fault" cells for the two stale-translation recovery
+/// arms, keyed by `(page, translation_generation, count)` -- see
+/// [`HvfBackend::fault_repeat_count`] for why the page alone is the wrong identity.
+thread_local! {
+    static WRITABLE_NOW_RESUMES: core::cell::Cell<(usize, u64, u32)> =
+        const { core::cell::Cell::new((usize::MAX, 0, 0)) };
+    static REPAIR_RESUMES: core::cell::Cell<(usize, u64, u32)> =
+        const { core::cell::Cell::new((usize::MAX, 0, 0)) };
+}
 
 /// Largest range `materialize_inherited_range` walks page by page (4 GiB of 16 KiB pages).
 const MATERIALIZE_PAGE_BOUND: usize = 1 << 18;
@@ -272,6 +298,10 @@ pub enum HvfBackendError {
     /// has not been verified) is exactly the open design question a future
     /// change must resolve before this can be implemented safely.
     ViewSpaceCreationUnsupported,
+    /// An in-repo HVF witness could not set up or could not observe the condition it exists
+    /// to prove. Carries a static message rather than a per-probe error type so every probe
+    /// reports the same way.
+    Witness(&'static str),
 }
 
 impl fmt::Display for HvfBackendError {
@@ -337,6 +367,7 @@ impl fmt::Display for HvfBackendError {
                 f,
                 "creating a new per-view HVF address space is not yet supported"
             ),
+            Self::Witness(message) => write!(f, "HVF witness failed: {message}"),
         }
     }
 }
@@ -387,6 +418,9 @@ struct HvfThreadContext {
     /// The lane `(index, generation)` this thread last ran on: the lane whose resident cache is
     /// closest to this thread's state, preferred by the pool.
     last_lane: Option<(usize, u64)>,
+    /// BCORE-4: this thread's own vCPU. `None` for a thread that runs on the lane pool, which
+    /// is every thread unless `LITEBOX_HVF_BOUND=1` and the bind trigger fired.
+    bound: Option<BoundThread>,
 }
 
 /// FXR: where a guest thread's authoritative SIMD/FP file is.
@@ -418,6 +452,7 @@ impl HvfThreadContext {
             cell: None,
             deposits_seen: 0,
             last_lane: None,
+            bound: None,
         }
     }
 
@@ -700,14 +735,17 @@ pub(crate) fn set_thread_tpidr_el0(value: usize) {
 /// running on (or is delivered before its next entry).
 pub(crate) struct HvfThreadSlot {
     pending: AtomicBool,
-    current: Mutex<Option<HvfVcpuLaneCancellation>>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_THREAD_SLOT`]) -- `kick()` holds it
+    /// across the cancellation's SDK call, and the run loop holds it across the lane's
+    /// `reserve_run`, so it is both a host-call and a lock-acquisition site.
+    current: RankedMutex<Option<HvfVcpuLaneCancellation>>,
 }
 
 impl HvfThreadSlot {
     pub(crate) const fn new() -> Self {
         Self {
             pending: AtomicBool::new(false),
-            current: Mutex::new(None),
+            current: RankedMutex::new(None, crate::diagnostics_counters::RANK_THREAD_SLOT),
         }
     }
 
@@ -743,7 +781,10 @@ impl HvfThreadSlot {
 // ---------------------------------------------------------------------------
 
 struct LaneGeneration {
-    lane: Mutex<Option<HvfVcpuLane>>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_LANE`]) -- the lane object is moved
+    /// out under this lock during lane replacement, and the replacement path waits on the
+    /// maintenance condvar (see `LANE_REPLACEMENT_POLL`) with nothing else held.
+    lane: RankedMutex<Option<HvfVcpuLane>>,
     handle: HvfVcpuLaneHandle,
     /// The view this lane's participant is currently registered against
     /// (`None` for [`HvfBackend::default_space`]), paired with the
@@ -755,13 +796,15 @@ struct LaneGeneration {
     /// The participant is `None` only for the transient instant inside
     /// [`HvfBackend::ensure_lane_attached_to_view`]'s own critical section
     /// where it has been moved out to pass by value into
-    /// `HvfAddressSpace::migrate_vcpu_participant` -- that method holds this
-    /// same lock for its entire duration, so no other reader can ever
-    /// observe `None` here. Every other reader treats `None` as a logic
-    /// error (a lane whose only participant registration was lost to a
-    /// migration failure, which the caller must treat as fatal to this lane
-    /// generation, not silently skipped).
-    participant: Mutex<(Option<VmViewId>, Option<HvfVcpuParticipant>)>,
+    /// `HvfAddressSpace::migrate_vcpu_participant`: that function is CALLED
+    /// with this lock held (see its own doc comment), so the `None` is
+    /// observable only to a thread that already holds it -- no other reader
+    /// can ever observe `None` here. Every other reader treats `None` as a
+    /// logic error (a lane whose only participant registration was lost to
+    /// a migration failure, which the caller must treat as fatal to this
+    /// lane generation, not silently skipped).
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_PARTICIPANT`]).
+    participant: RankedMutex<(Option<VmViewId>, Option<HvfVcpuParticipant>)>,
     /// hvf-lane-view-affinity: lock-free mirror of `participant.0` as a [`view_tag`] key, for
     /// the lane pool's handout choice ([`preferred_free_lane`]). Written only where
     /// `participant.0` is written (construction, and the migrate arm of
@@ -771,6 +814,25 @@ struct LaneGeneration {
     /// only cost one migration: `ensure_lane_attached_to_view` still decides from
     /// `participant.0` itself.
     view_tag: AtomicU64,
+    /// T1b (hvf-kick-only-lanes-in-mutated-space): lock-free mirror of `participant.1`'s
+    /// [`HvfVcpuParticipant::address_space`], keyed by address-space id the way `view_tag` is keyed
+    /// by view id. A mutation kicks only the lanes whose tag is the space it just mutated, so one
+    /// process's `Protect`/`Unmap` no longer cancels the runs of every other process's lanes
+    /// (today: one kick request per lane in the VM -- 11 per round).
+    ///
+    /// Written exactly where the participant itself is replaced and always under `participant`:
+    /// `create_lane_generation` (construction) and the migrate arm of
+    /// [`HvfBackend::ensure_lane_attached_to_view`]. Read with Acquire by `kick_lanes` with no lock
+    /// at all. Correctness (invariant 4): a lane can be *in flight* in a space `S` only after
+    /// `attach` + `submit` in `S`, and this tag's store is sequenced before that attach on the same
+    /// thread; `submit` publishes `in_flight` under `S`'s `cell.state`, which the mutating thread
+    /// acquires before it mints the retirement, so its Acquire load of this tag reads `S` (or a
+    /// later value, which requires the lane to have finished that run and migrated with a departing
+    /// acknowledgement). A lane of another space is not a participant `S`'s retirement requires and
+    /// holds no stale `S` translation (different root), so skipping it is safe -- and a tag that is
+    /// somehow stale costs only exit latency, never correctness: that lane still re-attaches at its
+    /// next exit, and a run on a stale root is rerun rather than delivered.
+    space_tag: AtomicU64,
 }
 
 /// The address space [`HvfBackend::space_for_view`] resolved for a given
@@ -802,13 +864,19 @@ enum LaneSlotState {
 }
 
 struct PooledLane {
-    state: Mutex<LaneSlotState>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_LANE_SLOT`]); taken by the pool
+    /// hand-out while [`HvfBackend::free`] is held and by lane replacement, never across a wait.
+    state: RankedMutex<LaneSlotState>,
 }
 
 struct LaneMaintenance {
-    requested: Mutex<bool>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_LANE_MAINTENANCE`]); waited on through
+    /// `wake` by the maintenance thread, so the park is a named `wait_while_holding` site.
+    requested: RankedMutex<bool>,
     wake: Condvar,
-    owner: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// CLASS A: same rank as `requested` (the two are never held at the same time except by
+    /// [`HvfBackend::lane_maintenance`]'s own hand-off, which takes them in this order).
+    owner: RankedMutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 struct SharedInitialization {
@@ -845,14 +913,23 @@ fn view_tag(view: Option<VmViewId>) -> u64 {
 
 /// hvf-lane-view-affinity: the free-list position [`HvfBackend::acquire_lane_inner`] serves to
 /// the one ticket it is serving, for a thread whose view has affinity key `view_tag`: a free lane
-/// whose participant is already registered in that view if there is one, else the least recently
-/// released lane (the deque's front, the pre-existing LRU choice); `None` only when no lane is
-/// free. Ticket fairness is untouched -- this only chooses WHICH idle lane the served ticket
-/// gets. The point: with several views interleaving, the LRU lane was most likely last run by
-/// another view, and handing it out made `ensure_lane_attached_to_view` migrate its participant
-/// (two exclusive VM operations, serialized behind every other process's mapping mutation) and
-/// the fresh participant then forced a synchronization monitor trip (a second `hv_vcpu_run`)
-/// before the real run -- on most syscalls of a multi-process desktop (52-55% of runs measured).
+/// whose participant is already registered in that view if there is one -- FXR first the lane this
+/// thread last ran on, else (T2c) the MOST recently released lane of this view -- and only when no
+/// lane of this view is free, the deque's front; `None` only when no lane is free. Ticket fairness
+/// is untouched -- this only chooses WHICH idle lane the served ticket gets. The point: with
+/// several views interleaving, a lane last run by another view made
+/// `ensure_lane_attached_to_view` migrate its participant (two exclusive VM operations, serialized
+/// behind every other process's mapping mutation) and the fresh participant then forced a
+/// synchronization monitor trip (a second `hv_vcpu_run`) before the real run -- on most syscalls
+/// of a multi-process desktop (52-55% of runs measured). Any lane of this own view avoids both.
+///
+/// Which lane of the view is chosen changed with T2c: it was the least recently released one (the
+/// deque's front, the pre-existing LRU choice) and is now the most recently released one (LIFO
+/// within the view, hence `rposition` over a deque whose two release sites both push to the back).
+/// LIFO pairs a thread with the lane whose owner thread is most likely still spinning for work
+/// (see `AdaptiveSpin` in hvf_vcpu.rs) instead of parked, which is worth more than the register
+/// cache warmth LRU was guessing at. Safety-neutral either way: both choices are a lane of the
+/// same view, so no participant migration is introduced.
 ///
 /// FXR: within the view, the lane this thread last ran on (`preferred`, `(index, generation)`)
 /// comes first when it is free: its resident-register cache already holds most of this thread's
@@ -871,8 +948,12 @@ fn preferred_free_lane(
     {
         return Some(position);
     }
+    // T2c: with no lane of its own free, the most recently released lane of this view comes
+    // first. Release pushes to the back, so this is LIFO within the view: the lane a thread just
+    // handed back is the one whose owner is most likely still spinning for work (see
+    // `AdaptiveSpin` in hvf_vcpu.rs), and reusing it also avoids a participant migration.
     free.iter()
-        .position(|lane| lane.view_tag == view_tag)
+        .rposition(|lane| lane.view_tag == view_tag)
         .or_else(|| (!free.is_empty()).then_some(0))
 }
 
@@ -1035,6 +1116,14 @@ pub struct HvfLifecycleResidualSnapshot {
     pub file_windows_live: usize,
     /// Live read-only file aliases onto origin pages across every space.
     pub file_alias_pages_live: usize,
+    /// BCORE-1: vCPUs a guest thread created and drives on its own host thread. Back to 0 once
+    /// every guest thread that took one has exited -- `unbind_current_thread` is the only
+    /// releaser, and it runs from the shim's thread-exit path and from `run_thread`'s return.
+    pub bound_vcpus: u32,
+    /// BCORE-1: bound vCPUs no thread can destroy any more (an owner unwound past its own
+    /// vCPU). Permanent and expected to be 0: a nonzero value means a vCPU leaked out of the
+    /// bound path and the VM's own cap is smaller from here on.
+    pub lost_vcpus: u32,
 }
 
 /// Decrements [`HvfExceptionCounters::in_flight`] on every return path out of
@@ -1075,7 +1164,12 @@ pub(crate) struct HvfBackend {
     /// [`Self::space_for_view`]. Bounded the same way `default_space` itself
     /// is: `create_mirrored_address_space` enforces
     /// `HvfMemoryLimits::max_address_spaces` (254) internally.
-    view_spaces: Mutex<HashMap<VmViewId, Arc<HvfAddressSpace>>>,
+    /// CLASS C: read-mostly (every guest exit resolves its view's space here), so a reader
+    /// lock: a `Mutex` made one address-space lookup at a time process-wide, measured 0.354
+    /// thread-seconds per wall-second of waiters at idle (`prepare_guest_access+192`).
+    /// Writes (create on first use, remove on release) stay exclusive.
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_VIEW_SPACES`]).
+    view_spaces: RankedRwLock<HashMap<VmViewId, Arc<HvfAddressSpace>>>,
     /// Views already permanently retired at the domain level (see
     /// [`Self::release_view_space`]) whose own [`Self::view_spaces`] entry has not yet been
     /// destroyed -- [`HvfAddressSpace::destroy`] refused at least once, or a live descendant still
@@ -1085,25 +1179,64 @@ pub(crate) struct HvfBackend {
     /// captured once, by the caller, before the view is unregistered from the domain -- see
     /// [`GuestVaDomain::family_of_view`]'s own doc comment for why a fresh per-retry lookup by
     /// [`VmViewId`] alone cannot work here.
-    pending_view_retirement: Mutex<Vec<(VmViewId, Option<FamilyId>)>>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_VIEW_RETIREMENT`]). Taken by
+    /// [`Self::release_view_space`]'s deferral arm and by the reap paths, i.e. around a space's
+    /// `destroy()`, which joins the VM operation gate -- so it is exactly the "held across the
+    /// FIFO" shape the rank exists to name.
+    pending_view_retirement: RankedMutex<Vec<(VmViewId, Option<FamilyId>)>>,
     registry: HvfVcpuRegistry,
     el1: HvfEl1State,
     lanes: Vec<PooledLane>,
-    free: Mutex<LanePool>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_LANE_POOL`]). A guest thread parks on
+    /// [`Self::available`] while holding it when no lane is free, which is the one condvar wait on
+    /// the per-syscall path; it is also taken by every mutation's shootdown.
+    free: RankedMutex<LanePool>,
     available: Condvar,
+    /// Step GF (b): guest threads parked inside [`Self::acquire_lane_inner`] right now, i.e.
+    /// genuinely waiting for a lane rather than running one. A thread holding a sticky lease
+    /// reads this (one relaxed load per run) and gives its lane back as soon as it is non-zero,
+    /// which is what keeps stickiness from starving a waiter: the pool's strict FIFO ticket
+    /// order is bypassed only while nobody is queued.
+    lane_waiters: AtomicUsize,
+    /// Step GF (b): bumped whenever something needs every retained lane back -- a mapping
+    /// shootdown (which can only synchronize a lane it can take out of the pool) or lane
+    /// maintenance. A sticky lease records the epoch it was taken at and is given back at the
+    /// holder's next loop top once this has moved.
+    lane_yield_epoch: AtomicU64,
+    /// Step GF (fix-up): one bit per lane index, set exactly while that lane's checkout is parked
+    /// in some thread's [`RETAINED_LANE`] and cleared the moment it is not. This is what lets a
+    /// shootdown tell the two reasons a lane can be checked out apart: "a thread is keeping it
+    /// between runs" (which the shootdown can only reach by asking that thread to give it back)
+    /// versus "a thread is mid-run on it" (which the shootdown simply has to wait out). Before
+    /// this existed, every unreachable lane bumped [`Self::lane_yield_epoch`], and a bump revokes
+    /// *every* retained lease process-wide -- so a shootdown storm switched stickiness off for
+    /// every thread, not just the ones holding a lane the shootdown needed.
+    retained_lanes: AtomicU64,
     lane_maintenance: LaneMaintenance,
-    participant_recovery: Mutex<()>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_PARTICIPANT_RECOVERY`]); it serializes
+    /// the lane-participant recovery sweep, which takes each lane's participant (ranked above it)
+    /// and the memory manager's locks while held.
+    participant_recovery: RankedMutex<()>,
     trampoline: Range<usize>,
     /// The vDSO image page followed by its clock data page; see [`crate::vdso`].
     vdso: Range<usize>,
     /// The clock data page's host-writable storage address and the values last published
     /// there; one mutex serializes the shim's epoch hand-over against the periodic realtime
     /// refresher (see [`Self::publish_vdso_clock`]).
-    vdso_clock: Mutex<VdsoClock>,
-    shared_initialization: Mutex<SharedInitialization>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_VDSO_CLOCK`]); it serializes the
+    /// shim's epoch hand-over against the periodic realtime refresher, both of which write the
+    /// clock page the guest reads without a lock, so it is held across that host write.
+    vdso_clock: RankedMutex<VdsoClock>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_SHARED_INIT`]); a second thread waits
+    /// on [`Self::shared_initialization_changed`] while holding it, so the park is a named
+    /// `wait_while_holding` site rather than an invisible one.
+    shared_initialization: RankedMutex<SharedInitialization>,
     shared_initialization_changed: Condvar,
     /// Running count of settled mutations, for the periodic debug counters.
     mutations: std::sync::atomic::AtomicU64,
+    /// BCORE-4: one entry per live bound vCPU, so a mutation's settle can kick them exactly
+    /// the way it kicks running lanes. Only ever non-empty with `LITEBOX_HVF_BOUND=1`.
+    bound_entries: Mutex<Vec<Arc<BoundEntry>>>,
     /// Lazy write-xor-execute emulation for a guest `mprotect(RWX)`; see
     /// [`WxToggle`]'s own doc comment.
     wx_toggle: WxToggle,
@@ -1117,6 +1250,202 @@ struct VdsoClock {
     /// `0` until [`HvfBackend::install_vdso`] has run.
     storage: usize,
     values: crate::vdso::ClockValues,
+}
+
+// -- step GF (b): lane stickiness -----------------------------------------
+//
+// Why this exists. The G inventory (step G, `.gm/syscall-bench/steps/G/inventory.md` §7 and the
+// 2026-09-29 re-measurement under `.gm/syscall-bench/steps/GF/`) credits 71-76 % of the
+// X-connected spaces' runnable-not-running time to `r2_view_attach` and 9-15 % to
+// `r1_lane_wait`, and both are the same thing: the pooled path hands the lane back to
+// [`HvfBackend::free`] at the end of every single run, so the next run of the same thread has to
+// take a ticket, wait its turn, and -- whenever the lane it gets is registered in a different
+// view -- migrate it (`HvfBackend::ensure_lane_attached_to_view`, two participant operations and
+// a fresh address-space attachment), measured at 10.4 ms mean per migration on the desktop.
+//
+// What it does. A thread whose run ended keeps the checkout in [`RETAINED_LANE`] instead, so the
+// next run reuses `slot.current`'s whole attachment: no pool round trip, no migration, no
+// re-attach. The invariant that makes that safe is single and applies to every case below:
+//
+// > **A thread may hold a lane only while it is making progress towards its next run.**
+//
+// Five things enforce it:
+//
+// * **a waiter** -- [`HvfBackend::lane_waiters`] is non-zero, so the pool's strict FIFO ticket
+//   order is bypassed only while nobody is queued;
+// * **a host wait** -- [`release_retained_lane`] runs before this thread blocks on any host
+//   primitive it can be parked on: the platform park ([`RawMutex::block_inner`], which every
+//   ulock wait -- interruptible guest wait, vfork park, shim lock -- goes through), the
+//   exclusive-VM-operation admission FIFO (`HvfVm::wait_for_operation_state`, the desktop's
+//   single largest blocked wait), and a contended [`crate::diagnostics_counters::RankedMutex`].
+//   A thread parked in one of these cannot give its lane back at a loop top, and the shim's
+//   dispatch -- which runs *while* the lease is retained -- blocks on them for milliseconds at a
+//   time, so covering them is not hygiene: it is the difference between holding a lane across a
+//   host I/O wait and not;
+// * **a shootdown or lane maintenance** -- [`HvfBackend::lane_yield_epoch`] moved. Note the one
+//   case this cannot cover: the shootdown's own caller is the mutating thread, which retains the
+//   lane it is now trying to acquire and has no loop top until the shootdown returns, so
+//   [`HvfBackend::shootdown`] releases its own lease up front instead of asking itself for it;
+// * **the retention bounds** -- [`LANE_STICKY_MAX_RUNS`] consecutive runs, or
+//   [`lane_sticky_max_hold`] of wall clock, whichever comes first. Both are real: the run count
+//   is carried from one retain to the next (it is incremented on the lease the thread is actually
+//   still holding, not on a throwaway copy), and the deadline is stamped when the lease is taken.
+//   They are the backstop for a thread that never blocks and never sees a waiter, including a
+//   thread blocked on a host primitive this list does not know about -- which bounds the hold but
+//   cannot release it mid-block, so the site list above is not optional;
+
+/// How many consecutive runs one retained lease may serve. Nothing but this stands between a
+/// guest thread that never blocks and the rest of the process's threads if
+/// [`HvfBackend::lane_waiters`] were ever wrong; at ~10 us per short syscall it bounds a
+/// waiter-free hold to well under a millisecond.
+///
+/// Step GF (fix-up): this cap was dead code on arrival -- `retain_lane` stored `0` on every call
+/// and `take_retained_lane` incremented a copy whose struct was dropped with the lease moved out
+/// of it, so no lease ever reached 64 runs and `lane_sticky.released_cap` was structurally 0.
+/// [`Self::take_retained_lane`] now returns the incremented count so the caller can carry it into
+/// the next [`retain_lane`].
+const LANE_STICKY_MAX_RUNS: u32 = 64;
+
+/// Default for [`lane_sticky_max_hold`]: one guest time slice.
+const LANE_STICKY_MAX_HOLD_US: u64 = 10_000;
+
+/// Step GF (fix-up): the wall-clock half of the retention bound -- a lease is given back at the
+/// holder's next loop top once this much wall time has passed since it was taken, whatever the
+/// run count says. Two things it buys that the run count cannot: it names the bound the PRD row
+/// actually words ("until it blocks or its 10 ms slice expires"), and it catches a lease held
+/// across one very long iteration (a multi-millisecond shim dispatch), which a run count of 64
+/// never would. Override with `LITEBOX_HVF_LANE_STICKY_US`.
+fn lane_sticky_max_hold() -> Duration {
+    static HOLD: OnceLock<Duration> = OnceLock::new();
+    *HOLD.get_or_init(|| {
+        let us = std::env::var("LITEBOX_HVF_LANE_STICKY_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(LANE_STICKY_MAX_HOLD_US);
+        Duration::from_micros(us)
+    })
+}
+
+/// A lane checkout a guest thread is keeping from one run to the next.
+struct RetainedLane {
+    lease: LaneLease<'static>,
+    /// Consecutive runs this lease has served so far.
+    runs: u32,
+    /// [`HvfBackend::lane_yield_epoch`] when the lease was taken.
+    epoch: u64,
+    /// Step GF (fix-up): wall-clock deadline stamped when the lease was taken, so a lease held
+    /// across one long iteration is not also held across the next.
+    deadline: Instant,
+}
+
+thread_local! {
+    /// Step GF (b): the calling guest thread's retained lane, if any. One per host thread, and a
+    /// host thread runs one guest thread at a time, so there is no keying to do.
+    static RETAINED_LANE: RefCell<Option<RetainedLane>> = const { RefCell::new(None) };
+}
+
+/// Step GF (b): asks every thread holding a retained lane to give it back at its next loop top.
+/// Called by a mapping shootdown that could not take a lane out of the pool (it must synchronize
+/// that lane, and a checked-out lane is invisible to it) and by lane maintenance.
+fn bump_lane_yield_epoch() {
+    if let Some(backend) = active() {
+        backend.lane_yield_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Step GF (b): hands the calling thread's retained lane back to the pool, if it has one.
+///
+/// The one entry point for every "this thread is about to stop iterating" case: before a platform
+/// wait ([`RawMutex::block_inner`]), before the exclusive-VM-operation admission wait
+/// (`HvfVm::wait_for_operation_state`), before a contended `RankedMutex`, and when the thread
+/// leaves [`HvfBackend::run_thread`] altogether. Safe to call from any thread at any time -- it is
+/// a no-op when nothing is retained, and a retained lane is never mid-attachment (the attachment is
+/// consumed by the run that just returned) so it is always immediately releasable.
+pub(crate) fn release_retained_lane(reason: usize) {
+    let Some(retained) = RETAINED_LANE.with(|cell| cell.borrow_mut().take()) else {
+        return;
+    };
+    // The lease's own backend, not `active()`: a lease is only ever retained on the backend it was
+    // taken from (`run_thread_loop` filters `active()` against `self` before retaining), so this
+    // is exact and cannot clear a bit on some other backend's mask.
+    retained.lease.backend.clear_retained_lane(retained.lease.index());
+    crate::diagnostics_counters::record_lane_sticky(reason);
+    drop(retained.lease);
+}
+
+/// Step GF (b): stores `lease` as this thread's retained lane, carrying the run count `runs`
+/// forward from the lease's previous retention (0 for a lease just taken from the pool).
+fn retain_lane(lease: LaneLease<'static>, runs: u32, epoch: u64, deadline: Instant) {
+    lease.backend.set_retained_lane(lease.index());
+    RETAINED_LANE.with(|cell| {
+        *cell.borrow_mut() = Some(RetainedLane {
+            lease,
+            runs,
+            epoch,
+            deadline,
+        });
+    });
+}
+
+impl HvfBackend {
+    /// Step GF (fix-up): records that lane `index` is now parked in some thread's
+    /// [`RETAINED_LANE`]. See [`Self::retained_lanes`].
+    fn set_retained_lane(&self, index: usize) {
+        if index < u64::BITS as usize {
+            self.retained_lanes.fetch_or(1 << index, Ordering::SeqCst);
+        }
+    }
+
+    /// Step GF (fix-up): the converse of [`Self::set_retained_lane`].
+    fn clear_retained_lane(&self, index: usize) {
+        if index < u64::BITS as usize {
+            self.retained_lanes.fetch_and(!(1 << index), Ordering::SeqCst);
+        }
+    }
+
+    /// Step GF (fix-up): whether lane `index` is currently parked in some thread's
+    /// [`RETAINED_LANE`] rather than merely checked out by a thread mid-run.
+    fn lane_is_retained(&self, index: usize) -> bool {
+        index < u64::BITS as usize && self.retained_lanes.load(Ordering::SeqCst) & (1 << index) != 0
+    }
+
+    /// Step GF (b): takes this thread's retained lane back for one more run, or `None` when the
+    /// thread has none or must not keep it (see the module comment for the release cases). The
+    /// returned [`RetainedLane::runs`] is already incremented, so the caller can carry it into the
+    /// next [`retain_lane`] -- that carry is what makes [`LANE_STICKY_MAX_RUNS`] reachable.
+    fn take_retained_lane(&self) -> Option<RetainedLane> {
+        if !crate::diagnostics_counters::lane_sticky_enabled() {
+            return None;
+        }
+        let mut retained = RETAINED_LANE.with(|cell| cell.borrow_mut().take())?;
+        use crate::diagnostics_counters::{
+            LANE_STICKY_RELEASED_CAP, LANE_STICKY_RELEASED_TIME, LANE_STICKY_RELEASED_WAITERS,
+            LANE_STICKY_RELEASED_YIELD,
+        };
+        let waiters = self.lane_waiters.load(Ordering::Relaxed) != 0;
+        let yielded = self.lane_yield_epoch.load(Ordering::Acquire) != retained.epoch;
+        let capped = retained.runs >= LANE_STICKY_MAX_RUNS;
+        let expired = Instant::now() >= retained.deadline;
+        let reason = if waiters {
+            Some(LANE_STICKY_RELEASED_WAITERS)
+        } else if yielded {
+            Some(LANE_STICKY_RELEASED_YIELD)
+        } else if capped {
+            Some(LANE_STICKY_RELEASED_CAP)
+        } else if expired {
+            Some(LANE_STICKY_RELEASED_TIME)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.clear_retained_lane(retained.lease.index());
+            crate::diagnostics_counters::record_lane_sticky(reason);
+            drop(retained.lease);
+            return None;
+        }
+        retained.runs = retained.runs.saturating_add(1);
+        Some(retained)
+    }
 }
 
 /// Affine custody of one index removed from [`LanePool::free`]. A checkout can
@@ -1136,6 +1465,20 @@ impl LaneLease<'_> {
 
     fn lane(&self) -> &LaneGeneration {
         &self.generation
+    }
+
+    /// Step GF (b): rebinds this checkout to a `&'static` backend so it can outlive the
+    /// `&self` borrow it was taken under and be kept in [`RETAINED_LANE`] from one run to the
+    /// next. The checkout is affine either way -- this moves it rather than dropping it, so the
+    /// lane is never returned to the pool here.
+    fn with_backend(self, backend: &'static HvfBackend) -> LaneLease<'static> {
+        let this = core::mem::ManuallyDrop::new(self);
+        LaneLease {
+            backend,
+            index: this.index,
+            generation: Arc::clone(&this.generation),
+            return_to_pool: this.return_to_pool,
+        }
     }
 
     fn retire(mut self) {
@@ -1260,20 +1603,12 @@ impl<'backend, 'slot> ActiveThreadLaneLease<'backend, 'slot> {
         self.reservation = Some(reservation);
     }
 
-    fn take_reservation(&mut self) -> HvfVcpuRunReservation {
-        self.reservation.take().unwrap_or_else(|| {
-            fatal(
-                "submitting a missing vCPU run reservation",
-                &HvfBackendError::LanePoolCorrupt {
-                    index: self.index(),
-                },
-            )
-        })
-    }
-}
-
-impl Drop for ActiveThreadLaneLease<'_, '_> {
-    fn drop(&mut self) {
+    /// Clears everything that makes THIS THREAD the lane's authority: the cancellation
+    /// capability installed in the thread's slot first, then any run reservation it has not
+    /// submitted -- deliberately in that order, so no new interrupt can acquire stale authority
+    /// while the reservation is being cancelled. [`Drop`] and [`Self::settle_keeping_lane`]
+    /// share it, so "end the run" means exactly one thing.
+    fn clear_authority(&mut self) {
         if let Some(expected) = self.cancellation.take() {
             let mut current = self
                 .slot
@@ -1294,11 +1629,41 @@ impl Drop for ActiveThreadLaneLease<'_, '_> {
             }
             *current = None;
         }
-
-        // Dropping an unsubmitted reservation settles its exact epoch. This is
-        // deliberately after clearing `slot.current`, so no new interrupt can
-        // acquire stale authority while the reservation is being canceled.
         drop(self.reservation.take());
+    }
+
+    /// Ends the run exactly as [`Drop`] does, but hands the checkout back to the caller instead
+    /// of returning the lane to the pool (step GF (b) lane stickiness). `None` means the lane
+    /// generation was no longer reusable, in which case [`LaneLease::retire`] has already run.
+    fn settle_keeping_lane(&mut self) -> Option<LaneLease<'backend>> {
+        self.clear_authority();
+        let lease = self.lease.take()?;
+        if lease.generation.handle.is_reusable() {
+            Some(lease)
+        } else {
+            crate::diagnostics_counters::record_lane_sticky(
+                crate::diagnostics_counters::LANE_STICKY_RELEASED_RETIRE,
+            );
+            lease.retire();
+            None
+        }
+    }
+
+    fn take_reservation(&mut self) -> HvfVcpuRunReservation {
+        self.reservation.take().unwrap_or_else(|| {
+            fatal(
+                "submitting a missing vCPU run reservation",
+                &HvfBackendError::LanePoolCorrupt {
+                    index: self.index(),
+                },
+            )
+        })
+    }
+}
+
+impl Drop for ActiveThreadLaneLease<'_, '_> {
+    fn drop(&mut self) {
+        self.clear_authority();
 
         let Some(lease) = self.lease.take() else {
             return;
@@ -1386,7 +1751,11 @@ impl fmt::Debug for HvfBackend {
 }
 
 static HVF_BACKEND: OnceLock<HvfBackend> = OnceLock::new();
-static HVF_BACKEND_INSTALL: Mutex<()> = Mutex::new(());
+// CLASS A: ranked ([`crate::diagnostics_counters::RANK_BACKEND_INSTALL`]) -- it serializes
+// backend installation, which creates the VM, every lane vCPU and the vDSO: host calls, and
+// never anything that can take this lock again, so it is the order's bottom.
+static HVF_BACKEND_INSTALL: RankedMutex<()> =
+    RankedMutex::new((), crate::diagnostics_counters::RANK_BACKEND_INSTALL);
 
 /// The installed backend, if the runner selected HVF execution.
 pub(crate) fn active() -> Option<&'static HvfBackend> {
@@ -1613,7 +1982,6 @@ pub fn hvf_vtimer_monitor_race_probe() -> Result<HvfVtimerMonitorRaceReport, Hvf
             exit: HvfVcpuExit::VtimerActivated,
             state: HvfVcpuExitState::LowerElMonitor(monitor_state),
             run_epoch: 0,
-            execution_time: 0,
             run_wall_ns: 0,
             owner_ns: 0,
             owner_gate_locks: 0,
@@ -1654,6 +2022,565 @@ pub fn hvf_vtimer_monitor_race_probe() -> Result<HvfVtimerMonitorRaceReport, Hvf
     })();
     drop(lease);
     outcome
+}
+
+/// BCORE-3: the bound-vCPU host-signal fast path, exercised for real.
+///
+/// The branch shipped but had never executed in any test: `setitimer` is `ENOSYS` in the shim,
+/// so no guest ever produced the `SIGALRM` that would make [`crate::host_signals_pending`]
+/// true, and `bound.host_signal_fastpath` was 0 in every run ever taken. This witness supplies
+/// the missing half from the host side, which is where the missing producer actually lives: a
+/// real bound vCPU (not a lane) runs a real spinning guest, so its exits really are
+/// `VtimerActivated`, and a real `pthread_kill(SIGALRM)` -- handled by the production handler
+/// (`crate::async_signal_handler`) and recorded in the same per-thread bitmap the production
+/// timer path writes -- makes that word nonzero between two of those exits.
+///
+/// Asserted, all at once:
+/// * the bound path engaged (`bound.runs` moved) and really took `VtimerActivated` exits;
+/// * at least one of them had NO host signal pending, so the control arm (`yield_now` +
+///   resume) is what ran then;
+/// * at least one had one pending, `bound.host_signal_fastpath` moved, and
+///   `EnterShim::interrupt` was genuinely called -- i.e. the shipped branch executed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HvfBoundHostSignalReport {
+    /// Bound-loop iterations this witness drove.
+    pub iterations: u32,
+    /// Iterations on which the thread had no bound vCPU (it fell through to the pool).
+    pub unbound_iterations: u32,
+    /// Bound runs taken (`bound.runs` delta).
+    pub bound_runs: u64,
+    /// `VtimerActivated` exits on the bound vCPU (`bound.vtimer_exits` delta).
+    pub vtimer_exits: u64,
+    /// Of those, the ones with no host signal pending yet: the control arm.
+    pub vtimer_exits_without_signal: u64,
+    /// `bound.host_signal_fastpath` delta -- the branch under test.
+    pub host_signal_fastpath: u64,
+    /// `EnterShim::interrupt` calls that branch actually made.
+    pub shim_interrupts: u64,
+    /// The host signal used to make `host_signals_pending()` true.
+    pub signal: i32,
+    /// Phase 1, measured: wall time between two consecutive `VtimerActivated` exits of the
+    /// spinning guest, in milliseconds -- i.e. how long a bound vCPU will run guest code that
+    /// never exits on its own before the slice preempts it. Zero when the guest took fewer
+    /// than two vtimer exits.
+    pub spin_slice_ms: u64,
+    /// Phase 2: the kick aimed at the reserved (not yet running) bound vCPU really was latched,
+    /// i.e. the debit below is real.
+    pub teardown_latched_kick: bool,
+    /// Phase 2: debits charged by that teardown-phase kick.
+    pub teardown_kicks_issued: u64,
+    /// Phase 2: of those, the ones `unbind`'s `terminalize` reported as abandoned instead of
+    /// dropping. Must be nonzero: reaching this counter at all is what the fix-up is for.
+    pub teardown_kicks_abandoned: u64,
+    /// Phase 2: stale debits that same `terminalize` reported as expired.
+    pub teardown_kicks_expired_terminal: u64,
+    /// `bound.live` after all three phases: every bound vCPU this witness created is gone.
+    pub bound_live_after: u64,
+    /// Phase 3: the `Drop` arm really was reached with a kick outstanding (bound, reserved,
+    /// and the kick latched rather than refused).
+    pub drop_armed: bool,
+    /// Phase 3a: the participant was deregistered before the drop, so the destructor was left
+    /// with exactly the vCPU and the ledger -- this arm isolates that half of the teardown.
+    pub drop_deregistered: bool,
+    /// Phase 3a: the `BoundThread` really left the thread-local, so `Drop for HvfBoundVcpu`
+    /// ran (no `unbind`, no `unbind_current_thread`).
+    pub drop_ran: bool,
+    /// Phase 3: debits charged by the kick that was outstanding at the drop.
+    pub drop_kicks_issued: u64,
+    /// Phase 3: of those, the ones `Drop`'s `terminalize` reported as abandoned.
+    pub drop_kicks_abandoned: u64,
+    /// Phase 3: stale debits that same `terminalize` reported as expired.
+    pub drop_kicks_expired_terminal: u64,
+    /// Phase 3: `bound.unbinds_drop` delta -- the destructor's own teardown counter.
+    pub drop_unbinds_drop: u64,
+    /// Phase 3: `bound.lost` delta. Must be 0: the destructor destroyed the vCPU.
+    pub drop_lost: u64,
+    /// Phase 3a: `bound_entries` rows left behind after the drop. Must be 0: a destroyed vCPU
+    /// must not stay in the list the mutation kick rounds and the eviction pick walk.
+    pub drop_entries_left: u64,
+    /// Phase 3b: the `BoundThread` fell with its participant STILL IN PLACE -- the shape an
+    /// unwinding owner thread produces, and the one phase 3a cannot see.
+    pub drop_undo_ran: bool,
+    /// Phase 3b: the stranded-record sweep ran on the space afterwards.
+    pub drop_undo_swept: bool,
+    /// Phase 3b: records that sweep had to REMOVE. Must be 0: `Drop` discharged the
+    /// participant, so a record that `begin_destroy` would refuse on was never left behind.
+    pub drop_undo_sweep_removed: u64,
+    /// Phase 4: a participant record was deliberately stranded -- the owner marked stopped and
+    /// the handle dropped without deregistration, which is the state no teardown of the vCPU
+    /// itself can repair.
+    pub sweep_armed: bool,
+    /// Phase 4: the sweep ran on the space.
+    pub sweep_ran: bool,
+    /// Phase 4: records the sweep removed. Must be >= 1: this is what makes an address space
+    /// destroyable again after any teardown that failed to deregister.
+    pub sweep_removed: u64,
+}
+
+/// A minimal, diagnostic-only [`EnterShim`] for [`hvf_bound_host_signal_probe`].
+///
+/// The guest is a bare `b .` spin, so its only exit is the vtimer and the only shim method the
+/// fast path can reach is `interrupt`. Any other one would mean this witness's own construction
+/// is wrong, so they end the loop instead of pretending to be a real shim.
+struct HvfBoundHostSignalShim {
+    interrupts: AtomicU64,
+}
+
+impl EnterShim for HvfBoundHostSignalShim {
+    type ExecutionContext = PtRegs;
+    fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+        ContinueOperation::Resume
+    }
+    fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+        ContinueOperation::Terminate
+    }
+    fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+        ContinueOperation::Terminate
+    }
+    fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+        self.interrupts.fetch_add(1, Ordering::Relaxed);
+        ContinueOperation::Resume
+    }
+}
+
+pub fn hvf_bound_host_signal_probe() -> Result<HvfBoundHostSignalReport, HvfBackendError> {
+    use crate::diagnostics_counters as dc;
+    const ITERATION_BOUND: u32 = 4_000;
+    /// Re-delivery period: far shorter than one time slice, so the vtimer exit that follows the
+    /// first delivery already sees a nonzero pending word.
+    const SIGNAL_PERIOD: Duration = Duration::from_millis(2);
+    const SIGNAL: libc::c_int = libc::SIGALRM;
+    let backend = active().ok_or(HvfBackendError::NotInstalled)?;
+    if !bound_enabled() {
+        return Err(HvfBackendError::Witness(
+            "LITEBOX_HVF_BOUND=1 is not set, so the bound-vCPU host-signal fast path never runs",
+        ));
+    }
+    // The production handler, for the signal the helper thread sends below.
+    crate::install_async_signal_handlers();
+    // A page holding `b .`: a guest that spins until the vtimer fires, so every exit is a
+    // `VtimerActivated` one. Mapped here, on the thread that installed the backend, with the
+    // same recipe `hvf_lane_starvation_probe` uses; only the bound run itself needs its own
+    // thread (it needs a `ThreadHandle` registration, and `run_with_handle` refuses to nest).
+    let spin_range = backend.trampoline.end..backend.trampoline.end + PAGE_SIZE;
+    let mapped = backend.default_space.map_range(
+        spin_range.clone(),
+        HvfGuestPermissions::READ | HvfGuestPermissions::WRITE,
+        false,
+        false,
+    )?;
+    let spin_mapping = OwnedGuestRange::new(backend, spin_range.clone());
+    backend.default_space.defer_retirement(mapped.retirement)?;
+    let spin_instruction: u32 = 0x1400_0000; // `b .`
+    // SAFETY: `spin_range` was just mapped read/write in the mirrored host view and nothing else
+    // references it yet.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            spin_instruction.to_le_bytes().as_ptr(),
+            spin_range.start as *mut u8,
+            4,
+        );
+    }
+    let executable = backend.default_space.protect_range(
+        spin_range.clone(),
+        HvfGuestPermissions::READ | HvfGuestPermissions::EXECUTE,
+    )?;
+    backend.default_space.defer_retirement(executable.retirement)?;
+    backend.default_space.pump_retirements()?;
+    let runs_before = dc::bound_stat_total(dc::BOUND_RUNS);
+    let vtimer_before = dc::bound_stat_total(dc::BOUND_VTIMER_EXITS);
+    let fastpath_before = dc::bound_stat_total(dc::BOUND_HOST_SIGNAL_FASTPATH);
+    let witness = std::thread::Builder::new()
+        .name("litebox-hvf-bound-host-signal".to_owned())
+        .spawn(move || -> Result<HvfBoundHostSignalReport, HvfBackendError> {
+            crate::ThreadHandle::run_with_handle(|| {
+                // SIGALRM has to be deliverable on THIS thread: `block_guest_signals` blocks it
+                // on threads that can never record one, and this thread is about to be able to.
+                //
+                // SAFETY: `sigemptyset`/`sigaddset` initialize `set` before `pthread_sigmask`
+                // reads it; unblocking a signal has no further precondition.
+                unsafe {
+                    let mut set: libc::sigset_t = core::mem::zeroed();
+                    libc::sigemptyset(&raw mut set);
+                    libc::sigaddset(&raw mut set, SIGNAL);
+                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, core::ptr::null_mut());
+                }
+                let shim = HvfBoundHostSignalShim {
+                    interrupts: AtomicU64::new(0),
+                };
+                let mut ctx = PtRegs::default();
+                ctx.pc = spin_range.start;
+                // EL0t with DAIF clear, so the vtimer interrupt is actually taken.
+                ctx.pstate = 0xa000_0000;
+                let slot = HvfThreadSlot::new();
+                let stop = Arc::new(AtomicBool::new(false));
+                // Held back until the control observation below has been made: the witness wants
+                // a vtimer exit with NO host signal pending first, to prove the two arms differ.
+                let go = Arc::new(AtomicBool::new(false));
+                let killer = {
+                    let stop = Arc::clone(&stop);
+                    let go = Arc::clone(&go);
+                    // `pthread_t` is an opaque pointer, carried as `usize` so it is `Send`. The
+                    // thread it names is this one, which outlives the sender (joined below).
+                    let target = unsafe { libc::pthread_self() } as usize;
+                    std::thread::Builder::new()
+                        .name("litebox-hvf-bound-host-signal-sender".to_owned())
+                        .spawn(move || {
+                            while !stop.load(Ordering::Relaxed) {
+                                if go.load(Ordering::Relaxed) {
+                                    // SAFETY: `target` is this witness thread's own `pthread_t`,
+                                    // still live (the sender is joined before this scope ends).
+                                    unsafe {
+                                        libc::pthread_kill(target as libc::pthread_t, SIGNAL)
+                                    };
+                                }
+                                std::thread::sleep(SIGNAL_PERIOD);
+                            }
+                        })
+                };
+                // Bind on the very first iteration: the trigger counts exits in a window, and
+                // this witness wants the bound path, not the pooled one.
+                let mut streak = (Instant::now(), BOUND_TRIGGER_EXITS - 1);
+                let mut iterations = 0u32;
+                let mut unbound_iterations = 0u32;
+                let mut vtimer_exits_without_signal = 0u64;
+                let mut first_slice_at: Option<Instant> = None;
+                let mut last_slice_at: Option<Instant> = None;
+                let mut slice_ends = 0u64;
+                let mut last_vtimer = vtimer_before;
+                let outcome = loop {
+                    if iterations >= ITERATION_BOUND {
+                        break Err(HvfBackendError::Witness(
+                            "the bound vCPU never took a vtimer exit with a host signal pending",
+                        ));
+                    }
+                    iterations += 1;
+                    match backend.bound_iteration(&shim, &mut ctx, &slot, None, &mut streak) {
+                        BoundOutcome::Ran(ContinueOperation::Terminate) => break Err(
+                            HvfBackendError::Witness("the bound run asked the loop to terminate"),
+                        ),
+                        BoundOutcome::Ran(_) => {
+                            let vtimer = dc::bound_stat_total(dc::BOUND_VTIMER_EXITS);
+                            let fastpath = dc::bound_stat_total(dc::BOUND_HOST_SIGNAL_FASTPATH);
+                            if vtimer != last_vtimer {
+                                last_vtimer = vtimer;
+                                // BCORE2-FX: the clock of the slice. Two consecutive vtimer
+                                // exits of a guest that never exits on its own (`b .`) are one
+                                // full slice apart, so the gap between them is the number the
+                                // bound path's preemption claim rests on -- measured, not
+                                // asserted from the code.
+                                if slice_ends == 0 {
+                                    first_slice_at = Some(Instant::now());
+                                } else {
+                                    last_slice_at = Some(Instant::now());
+                                }
+                                slice_ends += 1;
+                                if fastpath == fastpath_before {
+                                    vtimer_exits_without_signal += 1;
+                                    // One control observation is enough: from here the signal
+                                    // flows, so the next vtimer exit is the one under test.
+                                    go.store(true, Ordering::Release);
+                                }
+                            }
+                            if fastpath != fastpath_before {
+                                break Ok(());
+                            }
+                        }
+                        BoundOutcome::Unbound => unbound_iterations += 1,
+                    }
+                };
+                stop.store(true, Ordering::Release);
+                if let Ok(killer) = killer {
+                    let _ = killer.join();
+                }
+                // Give the vCPU back on the thread that owns it, through the same teardown the
+                // shim's thread-exit path uses (`unbind`, which terminalizes the kick ledger).
+                backend.unbind_current_thread(dc::BOUND_UNBINDS_EXIT);
+                // -- Phase 2: the teardown discharger -------------------------------------
+                //
+                // `unbind`/`Drop` terminalizing a bound vCPU's control is what makes
+                // `kicks_abandoned` / `kicks_expired_terminal` reachable at all (before that
+                // fix-up they were structurally 0: a vCPU destroyed while a kick was still
+                // outstanding dropped the debit in silence). Deterministic construction of
+                // exactly that state: reserve a run (the control is then `Reserved`), which is a
+                // phase a kick is *latched* against -- an SDK-free debit that only the run's own
+                // `consume_latched` or a `terminalize` can discharge -- kick it, and unbind
+                // without ever running it. The debit must surface as `kicks_abandoned`, and the
+                // latched attempt must be completed with `Terminalized` rather than left for a
+                // run that will never happen.
+                let issued_before = dc::bound_stat_total(dc::BOUND_KICKS_ISSUED);
+                let abandoned_before = dc::bound_stat_total(dc::BOUND_KICKS_ABANDONED);
+                let terminal_before = dc::bound_stat_total(dc::BOUND_KICKS_EXPIRED_TERMINAL);
+                let teardown_bound = backend.bind_current_thread(None);
+                let latched = if teardown_bound {
+                    HVF_THREAD.with(|context| {
+                        let context = context.borrow();
+                        let Some(bound) = context.bound.as_ref() else {
+                            return false;
+                        };
+                        // `Reserved` is what makes `request_kick` latch rather than refuse.
+                        let Ok(_epoch) = bound.vcpu.reserve_run() else {
+                            return false;
+                        };
+                        bound
+                            .entry
+                            .control
+                            .request_kick(
+                                bound.entry.generation,
+                                &bound.entry.cancellation,
+                                None,
+                            )
+                            .is_ok()
+                    })
+                } else {
+                    false
+                };
+                backend.unbind_current_thread(dc::BOUND_UNBINDS_EXIT);
+                let teardown_issued =
+                    dc::bound_stat_total(dc::BOUND_KICKS_ISSUED) - issued_before;
+                let teardown_abandoned =
+                    dc::bound_stat_total(dc::BOUND_KICKS_ABANDONED) - abandoned_before;
+                let teardown_expired_terminal =
+                    dc::bound_stat_total(dc::BOUND_KICKS_EXPIRED_TERMINAL) - terminal_before;
+                // -- Phase 3a: the `Drop` arm, ledger half --------------------------------
+                //
+                // `unbind` is the orderly teardown; `Drop for HvfBoundVcpu` is the containment
+                // of last resort for an owner thread that unwinds past its own vCPU (a panic, a
+                // TLS destructor). It has to discharge the ledger the same way, destroy the
+                // vCPU, give the registry slot back and take its `BoundEntry` out of the
+                // backend's list -- otherwise an unwound thread leaves a dead generation behind
+                // for every later mutation kick round to walk. Same deterministic state as
+                // phase 2 (reserve, so a kick latches), but here nothing calls `unbind`: the
+                // `BoundThread` leaves the thread-local and falls.
+                //
+                // This arm deregisters the participant by hand first (`drop_deregistered`), so
+                // it isolates the vCPU/ledger half. The half an unwinding owner cannot do for
+                // itself -- discharging the participant -- is phase 3b's.
+                let drop_issued_before = dc::bound_stat_total(dc::BOUND_KICKS_ISSUED);
+                let drop_abandoned_before = dc::bound_stat_total(dc::BOUND_KICKS_ABANDONED);
+                let drop_terminal_before = dc::bound_stat_total(dc::BOUND_KICKS_EXPIRED_TERMINAL);
+                let drops_before = dc::bound_stat_total(dc::BOUND_UNBINDS_DROP);
+                let lost_before = dc::bound_stat_total(dc::BOUND_LOST);
+                let drop_setup = if backend.bind_current_thread(None) {
+                    HVF_THREAD.with(|context| {
+                        let mut context = context.borrow_mut();
+                        let Some(bound) = context.bound.as_mut() else {
+                            return None;
+                        };
+                        // `Reserved` is what makes `request_kick` latch rather than refuse.
+                        let Ok(_epoch) = bound.vcpu.reserve_run() else {
+                            return None;
+                        };
+                        let latched = bound
+                            .entry
+                            .control
+                            .request_kick(bound.entry.generation, &bound.entry.cancellation, None)
+                            .is_ok();
+                        bound.vcpu.stop_owner();
+                        let deregistered = match bound.participant.take() {
+                            Some(mut participant) => bound
+                                .space
+                                .get(backend)
+                                .deregister_vcpu_participant(&mut participant)
+                                .is_ok(),
+                            None => false,
+                        };
+                        Some((latched, deregistered))
+                    })
+                } else {
+                    None
+                };
+                // The destructor runs here, at the end of this statement, when the taken
+                // `BoundThread` falls out of the temporary.
+                let drop_ran = HVF_THREAD
+                    .with(|context| context.borrow_mut().bound.take())
+                    .is_some();
+                let drop_armed = drop_setup.is_some_and(|(latched, _)| latched);
+                let drop_deregistered = drop_setup.is_some_and(|(_, deregistered)| deregistered);
+                let drop_kicks_issued =
+                    dc::bound_stat_total(dc::BOUND_KICKS_ISSUED) - drop_issued_before;
+                let drop_kicks_abandoned =
+                    dc::bound_stat_total(dc::BOUND_KICKS_ABANDONED) - drop_abandoned_before;
+                let drop_kicks_expired_terminal =
+                    dc::bound_stat_total(dc::BOUND_KICKS_EXPIRED_TERMINAL) - drop_terminal_before;
+                let drop_unbinds_drop =
+                    dc::bound_stat_total(dc::BOUND_UNBINDS_DROP) - drops_before;
+                let drop_lost = dc::bound_stat_total(dc::BOUND_LOST) - lost_before;
+                let drop_entries_left = backend
+                    .bound_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len() as u64;
+                // -- Phase 3b: the `Drop` arm as an unwind really leaves it ---------------
+                //
+                // The participant stays in place: the destructor is handed exactly what an
+                // unwinding owner thread hands it -- `vcpu` declared before `participant`, so
+                // the vCPU is destroyed first and only then would the handle's own destructor
+                // mark the capability `PARTICIPANT_ABANDONED`, leaving the RECORD in the
+                // address space. `begin_destroy` refuses with `AddressSpaceBusy` while that
+                // map is non-empty, so one unwound owner would strand the space for the life
+                // of the process. Run the same repair `begin_destroy` now performs, as an
+                // observation: it must find NOTHING to repair, which is the assertion that
+                // `Drop for BoundThread` really discharged the participant.
+                let _drop_undo_setup = if backend.bind_current_thread(None) {
+                    HVF_THREAD.with(|context| {
+                        let context = context.borrow();
+                        let Some(bound) = context.bound.as_ref() else {
+                            return false;
+                        };
+                        bound.vcpu.reserve_run().is_ok()
+                            && bound
+                                .entry
+                                .control
+                                .request_kick(
+                                    bound.entry.generation,
+                                    &bound.entry.cancellation,
+                                    None,
+                                )
+                                .is_ok()
+                    })
+                } else {
+                    false
+                };
+                let drop_undo_ran = HVF_THREAD
+                    .with(|context| context.borrow_mut().bound.take())
+                    .is_some();
+                let (drop_undo_swept, drop_undo_sweep_removed) =
+                    match backend.default_space.recover_stopped_vcpu_participants() {
+                        Ok(receipts) => (true, receipts.iter().filter(|r| r.removed).count() as u64),
+                        Err(_) => (false, u64::MAX),
+                    };
+                // -- Phase 4: the strand the sweep exists to repair ----------------------
+                //
+                // Deliberately strand a record the way a teardown that never deregistered
+                // would: mark the owner stopped, drop the handle WITHOUT deregistering it (its
+                // destructor only marks the capability abandoned), then unbind -- which by then
+                // has nothing left to discharge. This is the state no vCPU teardown can repair
+                // on its own, so the sweep has to: it must find and remove the record, which is
+                // what lets `begin_destroy` destroy the space again.
+                let mut sweep_armed = false;
+                if backend.bind_current_thread(None) {
+                    sweep_armed = HVF_THREAD.with(|context| {
+                        let mut context = context.borrow_mut();
+                        let Some(bound) = context.bound.as_mut() else {
+                            return false;
+                        };
+                        bound.vcpu.stop_owner();
+                        // Dropped here, underegistered: the capability becomes ABANDONED.
+                        bound.participant.take().is_some()
+                    });
+                    backend.unbind_current_thread(dc::BOUND_UNBINDS_EXIT);
+                }
+                let (sweep_ran, sweep_removed) =
+                    match backend.default_space.recover_stopped_vcpu_participants() {
+                        Ok(receipts) => (true, receipts.iter().filter(|r| r.removed).count() as u64),
+                        Err(_) => (false, 0),
+                    };
+                let report = HvfBoundHostSignalReport {
+                    iterations,
+                    unbound_iterations,
+                    bound_runs: dc::bound_stat_total(dc::BOUND_RUNS) - runs_before,
+                    vtimer_exits: dc::bound_stat_total(dc::BOUND_VTIMER_EXITS) - vtimer_before,
+                    vtimer_exits_without_signal,
+                    host_signal_fastpath: dc::bound_stat_total(dc::BOUND_HOST_SIGNAL_FASTPATH)
+                        - fastpath_before,
+                    shim_interrupts: shim.interrupts.load(Ordering::Relaxed),
+                    signal: SIGNAL,
+                    spin_slice_ms: match (first_slice_at, last_slice_at, slice_ends) {
+                        (Some(first), Some(last), ends) if ends >= 2 => u64::try_from(
+                            last.duration_since(first).as_millis() / u128::from((ends - 1).max(1)),
+                        )
+                        .unwrap_or(u64::MAX),
+                        _ => 0,
+                    },
+                    teardown_latched_kick: latched,
+                    teardown_kicks_issued: teardown_issued,
+                    teardown_kicks_abandoned: teardown_abandoned,
+                    teardown_kicks_expired_terminal: teardown_expired_terminal,
+                    bound_live_after: dc::bound_stat_total(dc::BOUND_LIVE),
+                    drop_armed,
+                    drop_deregistered,
+                    drop_ran,
+                    drop_kicks_issued,
+                    drop_kicks_abandoned,
+                    drop_kicks_expired_terminal,
+                    drop_unbinds_drop,
+                    drop_lost,
+                    drop_entries_left,
+                    drop_undo_ran,
+                    drop_undo_swept,
+                    drop_undo_sweep_removed,
+                    sweep_armed,
+                    sweep_ran,
+                    sweep_removed,
+                };
+                outcome.map(|()| report)
+            })
+        })
+        .map_err(|_| HvfBackendError::Witness("spawning the bound host-signal witness thread"))?;
+    let report = witness
+        .join()
+        .map_err(|_| HvfBackendError::Witness("the bound host-signal witness thread panicked"))??;
+    // The spin page stays mapped on purpose. This is a short-lived diagnostic process that
+    // exits immediately after the report, and asking `unmap_range` for a page at the very top
+    // of the guest address space answers `changed = false` here -- which `OwnedGuestRange`'s
+    // destructor escalates to a `fatal` (the same destructor
+    // `hvf_lane_starvation_probe` never reaches, since that probe fails earlier). Leaving the
+    // page mapped keeps a passed witness from being reported as a fatal backend failure.
+    spin_mapping.disarm();
+    if report.vtimer_exits == 0 {
+        return Err(HvfBackendError::Witness(
+            "the bound vCPU never took a VtimerActivated exit",
+        ));
+    }
+    if report.host_signal_fastpath == 0 || report.shim_interrupts == 0 {
+        return Err(HvfBackendError::Witness(
+            "a pending host signal did not turn a bound vtimer exit into EnterShim::interrupt",
+        ));
+    }
+    if !report.teardown_latched_kick
+        || report.teardown_kicks_issued == 0
+        || report.teardown_kicks_abandoned + report.teardown_kicks_expired_terminal == 0
+    {
+        return Err(HvfBackendError::Witness(
+            "unbinding a bound vCPU with a kick outstanding did not report the debit: `terminalize` is not discharging it",
+        ));
+    }
+    if report.bound_live_after != 0 {
+        return Err(HvfBackendError::Witness(
+            "a bound vCPU survived the witness's own teardown",
+        ));
+    }
+    if !report.drop_armed
+        || !report.drop_deregistered
+        || !report.drop_ran
+        || report.drop_unbinds_drop == 0
+        || report.drop_lost != 0
+        || report.drop_entries_left != 0
+        || report.drop_kicks_issued == 0
+        || report.drop_kicks_abandoned + report.drop_kicks_expired_terminal == 0
+    {
+        return Err(HvfBackendError::Witness(
+            "dropping a bound vCPU with a kick outstanding did not report the debit: `Drop` is not terminalizing it",
+        ));
+    }
+    // Phase 3b: the participant was left in place, so this is the only arm that can see whether
+    // the unwind teardown discharges it. A record left behind keeps `begin_destroy` at
+    // `AddressSpaceBusy` for the life of the process.
+    if !report.drop_undo_ran || !report.drop_undo_swept || report.drop_undo_sweep_removed != 0 {
+        return Err(HvfBackendError::Witness(
+            "dropping a bound vCPU left its participant record in the address space: the unwind teardown does not discharge it",
+        ));
+    }
+    // Phase 4: the sweep is what repairs a record no vCPU teardown can. If it cannot remove a
+    // deliberately stranded one, a space stays undestroyable -- and its stage-2 pages stay
+    // charged against the live-data budget -- forever.
+    if !report.sweep_armed || !report.sweep_ran || report.sweep_removed == 0 {
+        return Err(HvfBackendError::Witness(
+            "the stranded-participant sweep did not remove a deliberately stranded record: an address space would stay undestroyable",
+        ));
+    }
+    Ok(report)
 }
 
 /// Live, process-terminal-scale witness (it runs for slightly over
@@ -2445,8 +3372,12 @@ fn spin_probe_state(pc: usize) -> HvfArchitecturalState {
 /// Installs the process-global HVF backend.  Must run before the shim maps
 /// anything: every later page-management call is routed through it.
 pub(crate) fn install() -> Result<&'static HvfBackend, HvfBackendError> {
+    // CLASS A: rank-checked but NOT registered (see `RankedMutex::lock_unregistered`). The only
+    // waits inside this body are the vCPU creation barriers, one pair per lane, and no other
+    // thread can contend for this lock while it is held -- installation is a one-shot transition
+    // that runs before the backend is published.
     let _installation = HVF_BACKEND_INSTALL
-        .lock()
+        .lock_unregistered()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if HVF_BACKEND.get().is_some() {
         return Err(HvfBackendError::AlreadyInstalled);
@@ -2537,6 +3468,9 @@ pub(crate) fn install() -> Result<&'static HvfBackend, HvfBackendError> {
 
 impl HvfBackend {
     fn create() -> Result<Self, HvfBackendError> {
+        // CLASS A: the lock inventory is checked before any lock in this file can be taken, in
+        // every build, so a lock added without a rank is reported instead of silently invisible.
+        crate::diagnostics_counters::lock_inventory_selfcheck();
         let memory = process_hvf_memory()?;
         let default_space = memory.create_mirrored_address_space()?;
         // Created eagerly (not on the first origin) so the lifecycle residual witness sees the
@@ -2588,6 +3522,16 @@ impl HvfBackend {
                 "LITEBOX_HVF_VERIFY_STATE=1: every vCPU register install is read back and compared (diagnostics only, slow)"
             );
         }
+        // BCORE: a bound vCPU is a real architectural change to the run path (no lane
+        // hand-off, no owner thread), so say so once at startup -- a bound run's counters are
+        // otherwise indistinguishable from a very fast pooled one.
+        if bound_enabled() {
+            crate::diagnostics_counters::add_stat(crate::diagnostics_counters::BOUND_ENABLED, 1);
+            litebox_util_log::warn!(
+                trigger_exits:? = BOUND_TRIGGER_EXITS, reserve:? = crate::hvf_vcpu::BOUND_RESERVE;
+                "LITEBOX_HVF_BOUND=1: a hot guest thread takes a vCPU of its own instead of a pooled lane"
+            );
+        }
         let mut lanes = Vec::new();
         lanes
             .try_reserve_exact(lane_count)
@@ -2603,19 +3547,29 @@ impl HvfBackend {
                 view_tag: generation.view_tag.load(Ordering::Relaxed),
             });
             lanes.push(PooledLane {
-                state: Mutex::new(LaneSlotState::Ready(generation)),
+                state: RankedMutex::new(
+                    LaneSlotState::Ready(generation),
+                    crate::diagnostics_counters::RANK_LANE_SLOT,
+                ),
             });
         }
         let backend = Self {
             memory,
             default_space,
             origin_space,
-            view_spaces: Mutex::new(HashMap::new()),
-            pending_view_retirement: Mutex::new(Vec::new()),
+            view_spaces: RankedRwLock::new(
+                HashMap::new(),
+                crate::diagnostics_counters::RANK_VIEW_SPACES,
+            ),
+            pending_view_retirement: RankedMutex::new(
+                Vec::new(),
+                crate::diagnostics_counters::RANK_VIEW_RETIREMENT,
+            ),
             registry,
             el1,
             lanes,
-            free: Mutex::new(LanePool {
+            free: RankedMutex::new(
+                LanePool {
                 free: VecDeque::from(free),
                 checked_out: 0,
                 retiring: 0,
@@ -2623,31 +3577,56 @@ impl HvfBackend {
                 canceled_tickets: BTreeSet::new(),
                 next_ticket: 0,
                 next_serving: 0,
-            }),
+                },
+                crate::diagnostics_counters::RANK_LANE_POOL,
+            ),
             available: Condvar::new(),
+            lane_waiters: AtomicUsize::new(0),
+            lane_yield_epoch: AtomicU64::new(0),
+            retained_lanes: AtomicU64::new(0),
             lane_maintenance: LaneMaintenance {
-                requested: Mutex::new(false),
+                requested: RankedMutex::new(
+                    false,
+                    crate::diagnostics_counters::RANK_LANE_MAINTENANCE,
+                ),
                 wake: Condvar::new(),
-                owner: Mutex::new(None),
+                owner: RankedMutex::new(
+                    None,
+                    crate::diagnostics_counters::RANK_LANE_MAINTENANCE,
+                ),
             },
-            participant_recovery: Mutex::new(()),
+            participant_recovery: RankedMutex::new(
+                (),
+                crate::diagnostics_counters::RANK_PARTICIPANT_RECOVERY,
+            ),
             trampoline: SIGRETURN_TRAMPOLINE_GVA..SIGRETURN_TRAMPOLINE_GVA + PAGE_SIZE,
             vdso: VDSO_GVA..VDSO_GVA + 2 * PAGE_SIZE,
-            vdso_clock: Mutex::new(VdsoClock {
-                storage: 0,
-                values: crate::vdso::ClockValues {
-                    numer,
-                    denom,
-                    mono_epoch_ns: 0,
-                    real_offset_ns: crate::vdso::host_real_offset_ns(),
+            vdso_clock: RankedMutex::new(
+                VdsoClock {
+                    storage: 0,
+                    values: crate::vdso::ClockValues {
+                        numer,
+                        denom,
+                        mono_epoch_ns: 0,
+                        real_offset_ns: crate::vdso::host_real_offset_ns(),
+                    },
                 },
-            }),
-            shared_initialization: Mutex::new(SharedInitialization {
-                initialized: HashMap::new(),
-                in_progress: HashMap::new(),
-            }),
+                crate::diagnostics_counters::RANK_VDSO_CLOCK,
+            ),
+            shared_initialization: RankedMutex::new(
+                SharedInitialization {
+                    initialized: HashMap::new(),
+                    in_progress: HashMap::new(),
+                },
+                crate::diagnostics_counters::RANK_SHARED_INIT,
+            ),
             shared_initialization_changed: Condvar::new(),
             mutations: std::sync::atomic::AtomicU64::new(0),
+            // CLASS A: cannot block -- this `Vec` is pushed and removed under the bound-vCPU knob
+            // only (`LITEBOX_HVF_BOUND=1`, off by default), always for a handful of instructions,
+            // and never across another lock, a wait or a host call: the `BoundEntry` it names is
+            // signalled through an `AtomicBool`, not through this lock.
+            bound_entries: Mutex::new(Vec::new()),
             wx_toggle: WxToggle::default(),
             exception_counters: HvfExceptionCounters::default(),
         };
@@ -2667,11 +3646,18 @@ impl HvfBackend {
         handle.initialize_el1(el1)?;
         handle.set_vtimer(true, 0)?;
         let participant = space.register_vcpu_participant(handle.participant_capability()?)?;
+        // T1b: the lane's space tag starts as the space this participant was just registered in
+        // (see `LaneGeneration::space_tag`).
+        let space_tag = participant.address_space().value();
         Ok(Arc::new(LaneGeneration {
-            lane: Mutex::new(Some(lane)),
+            lane: RankedMutex::new(Some(lane), crate::diagnostics_counters::RANK_LANE),
             handle,
-            participant: Mutex::new((view, Some(participant))),
+            participant: RankedMutex::new(
+                (view, Some(participant)),
+                crate::diagnostics_counters::RANK_PARTICIPANT,
+            ),
             view_tag: AtomicU64::new(view_tag(view)),
+            space_tag: AtomicU64::new(space_tag),
         }))
     }
 
@@ -2683,7 +3669,7 @@ impl HvfBackend {
     /// `false`, matching `space_for_view`'s own "no entry yet" case exactly.
     pub(crate) fn has_view_space(&self, view: VmViewId) -> bool {
         self.view_spaces
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(&view)
     }
@@ -2713,7 +3699,7 @@ impl HvfBackend {
         {
             let spaces = self
                 .view_spaces
-                .lock()
+                .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(space) = spaces.get(&view) {
                 return Ok(ResolvedSpace::View(Arc::clone(space)));
@@ -2739,7 +3725,7 @@ impl HvfBackend {
         let new_space = Arc::new(created);
         let mut spaces = self
             .view_spaces
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match spaces.entry(view) {
             std::collections::hash_map::Entry::Occupied(entry) => {
@@ -2755,6 +3741,10 @@ impl HvfBackend {
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(Arc::clone(&new_space));
+                // T1f-a: one per-view address space minted (F5's churn numerator).
+                crate::diagnostics_counters::record_view_space(
+                    crate::diagnostics_counters::VIEW_SPACE_CREATED,
+                );
                 Ok(ResolvedSpace::View(new_space))
             }
         }
@@ -2804,7 +3794,7 @@ impl HvfBackend {
         for (candidate, family) in candidates {
             let space = self
                 .view_spaces
-                .lock()
+                .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&candidate)
                 .cloned();
@@ -2812,6 +3802,9 @@ impl HvfBackend {
                 continue;
             };
             if self.family_blocks_release(family, domain) {
+                crate::diagnostics_counters::record_view_space(
+                    crate::diagnostics_counters::VIEW_SPACE_DESTROY_DEFERRED,
+                );
                 still_pending.push((candidate, family));
                 continue;
             }
@@ -2822,17 +3815,25 @@ impl HvfBackend {
             // via this exact predicate (it no longer needs re-proving here), so only the
             // has-anything-to-reap check remains; a still-shared stash entry keeps the candidate
             // pending exactly as before.
-            if space.has_fork_cow_retention() {
+            if space.has_fork_cow_retention_checked() {
                 self.reap_fork_cow_retention(Some(candidate), &space);
             }
             match space.destroy() {
                 Ok(()) | Err(HvfMemoryError::AddressSpaceDestroyed(_)) => {
                     self.view_spaces
-                        .lock()
+                        .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&candidate);
+                    crate::diagnostics_counters::record_view_space(
+                        crate::diagnostics_counters::VIEW_SPACE_DESTROYED,
+                    );
                 }
-                Err(_) => still_pending.push((candidate, family)),
+                Err(_) => {
+                    crate::diagnostics_counters::record_view_space(
+                        crate::diagnostics_counters::VIEW_SPACE_DESTROY_DEFERRED,
+                    );
+                    still_pending.push((candidate, family));
+                }
             }
         }
         if !still_pending.is_empty() {
@@ -3001,11 +4002,17 @@ impl HvfBackend {
         };
         match target.migrate_vcpu_participant(&source, old, capability) {
             Ok(migrated) => {
+                // T1b: the tag follows the participant into the target space, under the same
+                // `slot` guard that swaps the participant itself, and before this lane's next
+                // attach to `target` -- so a mutator that sees this lane in flight in `target`
+                // (published under `target`'s `cell.state`) necessarily sees this value.
+                let target_tag = migrated.address_space().value();
                 slot.1 = Some(migrated);
                 slot.0 = Some(view);
                 generation
                     .view_tag
                     .store(view_tag(Some(view)), Ordering::Relaxed);
+                generation.space_tag.store(target_tag, Ordering::Release);
                 crate::diagnostics_counters::record_lane_migration(
                     crate::diagnostics_counters::elapsed_ns(migration_start),
                 );
@@ -3024,7 +4031,7 @@ impl HvfBackend {
     /// helpful fallback, so this deliberately returns `None` instead.
     fn existing_space_for_view(&self, view: VmViewId) -> Option<Arc<HvfAddressSpace>> {
         self.view_spaces
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&view)
             .cloned()
@@ -3128,6 +4135,7 @@ impl HvfBackend {
     /// mirror, one `protect_range(READ|EXECUTE)` that publishes the bytes executable and retires
     /// the mirror's writer -- outside every lock, other mappers of the same key waiting on the
     /// registry condvar), returning one `windows` reference on it.
+    #[track_caller]
     fn acquire_file_origin(&self, source: &'static [u8]) -> Result<OriginRef, CowAllocationError> {
         let Some(origin_space) = self.origin_space.as_ref() else {
             return Err(CowAllocationError::UnsupportedSourceRegion);
@@ -3138,7 +4146,10 @@ impl HvfBackend {
         };
         let pages = source.len() / PAGE_SIZE;
         let gva = {
-            let mut table = FILE_ORIGINS.lock();
+            let mut table = FILE_ORIGINS
+                .table
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
                 match table.by_key.get_mut(&key) {
                     Some(origin) if origin.state == FileOriginState::Ready => {
@@ -3151,10 +4162,13 @@ impl HvfBackend {
                     }
                     Some(_) => {
                         // `Populating` by another mapper, or `Releasing` (recreated below once
-                        // the entry is gone).
+                        // the entry is gone). `wait_on` is the ranked lock's own condvar wait: it
+                        // masks FILE_ORIGINS out of the held set for the park (the condvar
+                        // releases it) and counts the wait against everything ELSE held, so a
+                        // real park-while-holding here is still a named violation.
                         table = FILE_ORIGINS
-                            .changed
-                            .wait(table)
+                            .table
+                            .wait_on(&FILE_ORIGINS.changed, table)
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
                     None => {
@@ -3390,7 +4404,7 @@ impl HvfBackend {
         // unmap: retained promotions are reaped when no descendant inherits, the range's own
         // claims/lineage pages/file pages released (promoted window shadows retained for a live
         // inheriting descendant), the W^X bookkeeping dropped.
-        if !keep_mirror_for_descendant && space.has_fork_cow_retention() {
+        if !keep_mirror_for_descendant && space.has_fork_cow_retention_checked() {
             self.reap_fork_cow_retention(Some(view), &space);
         }
         if let Err(error) = self.mutate_with_retry(&space, MutationKind::Unmap, || {
@@ -3622,7 +4636,7 @@ impl HvfBackend {
                     "{} host_alias_state={:?} fork_write_protected={}",
                     space.describe_page(page),
                     space.host_alias_state(page),
-                    space.is_fork_write_protected(page)
+                    space.is_fork_write_protected(page).into_value_unvalidated()
                 );
             }
             None => {
@@ -3681,10 +4695,17 @@ impl HvfBackend {
             .iter()
             .map(|(view, _)| *view)
             .collect();
-        let mut spaces: Vec<(VmViewId, bool, usize, usize, [usize; 7])> = self
+        // CLASS C: clone the spaces out under a READ lock and sample them outside it -- those
+        // methods take `cell.state` / `acknowledgements`, and holding a lock across them is the
+        // shape that made this table's own lookup a convoy.
+        let live: Vec<(VmViewId, Arc<HvfAddressSpace>)> = self
             .view_spaces
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(view, space)| (*view, Arc::clone(space)))
+            .collect();
+        let mut spaces: Vec<(VmViewId, bool, usize, usize, [usize; 7])> = live
             .iter()
             .map(|(view, space)| {
                 (
@@ -3752,10 +4773,7 @@ impl HvfBackend {
         // File-COW state, appended after the pre-existing readout so its parsers stay valid:
         // per space (same order as above) windows/window_pages/file_aliases/retired_promoted,
         // then the origin registry (the origin space's own claims are the origins themselves).
-        let file_totals: Vec<(VmViewId, [usize; 4])> = self
-            .view_spaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let file_totals: Vec<(VmViewId, [usize; 4])> = live
             .iter()
             .map(|(view, space)| (*view, space.file_page_totals()))
             .collect();
@@ -3893,7 +4911,19 @@ impl HvfBackend {
         let mut failed: Vec<usize> = Vec::new();
         let remaining = revalidated_rounds(
             HOST_PREPARE_ROUNDS,
-            || space.fork_write_protected_pages_in(range),
+            || {
+                // CLASS R: settled here, not reported upward by `pass` -- see
+                // `prepare_guest_access`'s own snapshot closure for the measured reason (a round
+                // spent re-planning is a round not spent diverging, and `is_empty()` below is a
+                // judgment that must not be made from a plan the domain has moved on from: a page
+                // a concurrent fork write-protected after the listing was taken is absent from it,
+                // so the permission change it gates goes ahead undiverged).
+                space
+                    .settle_gate(GrSite::ForkWriteProtectedPagesIn, || {
+                        space.fork_write_protected_pages_in(range)
+                    })
+                    .0
+            },
             |pages| {
                 let mut acted = false;
                 for &page in pages {
@@ -3910,6 +4940,9 @@ impl HvfBackend {
                 acted
             },
         );
+        // `is_empty()` is the judgment: `true` means nothing in `range` is still protected, so the
+        // caller's permission change or host write may go ahead. The listing it judges was settled
+        // by the snapshot closure above, and it is the one a round had nothing left to diverge in.
         remaining.is_empty()
     }
 
@@ -4016,20 +5049,55 @@ impl HvfBackend {
         // T1h's first version walked ONE snapshot through every page's settles, so a sibling
         // thread's fault could alias a later page in between, its install then answered
         // `AddressOverlap`, the page was skipped, and a host write landed in the ancestor's page.
-        let last = revalidated_rounds(
+        // CLASS R: each round's plan is SETTLED before the round spends it, and the final snapshot
+        // is the one a round had nothing left to do in -- so it is both settled and post-condition.
+        //
+        // The settle belongs INSIDE the snapshot rather than in `pass` reporting staleness upward:
+        // `revalidated_rounds` spends one of its `HOST_PREPARE_ROUNDS` acting rounds on every
+        // `true` `pass` returns, so a round spent re-planning is a round not spent preparing, and
+        // the budget can run out with the preparation unfinished. Measured on `grs2 stress
+        // secs=300 workers=3 pages=8`: with `pass` bailing out (`return true`) on a stale plan the
+        // harness reported `iov_wrong_data` 5,042-6,187 (~11-18 % of its host-copy iterations) and
+        // the host-copy thread's throughput fell a third; with the settle here, 0.
+        //
+        // This is a RE-PLAN, never a refusal: the previous pass of this step added a
+        // `!judged_ok -> refused` branch, and a refusal is not a re-plan -- it changes what the
+        // guest gets instead of asking the domain again.
+        let mut last_agreed = true;
+        let remaining = revalidated_rounds(
             HOST_PREPARE_ROUNDS,
             || {
                 snapshots += 1;
-                space.host_access_plan(&(start..end))
+                if gr_stale_skips_round() {
+                    let plan = space.host_access_plan(&(start..end));
+                    let abandon = space.check_plan(&plan).is_err();
+                    last_agreed = !abandon;
+                    return RoundPlan {
+                        entries: plan.into_value_unvalidated(),
+                        abandon,
+                    };
+                }
+                let (entries, agreed) = space.settle_gate(GrSite::HostAccessPlan, || {
+                    space.host_access_plan(&(start..end))
+                });
+                last_agreed = agreed;
+                RoundPlan {
+                    entries,
+                    abandon: false,
+                }
             },
-            |plan| preparer.pass(plan),
+            |round| preparer.pass(round),
         );
         if snapshots > 1 {
             FILE_COW_COUNTERS
                 .host_prepare_resnapshots
                 .fetch_add(snapshots - 1, Ordering::Relaxed);
         }
-        let refused = last.iter().find(|entry| !preparer.usable(entry));
+        if !last_agreed {
+            GR_COUNTERS.judged_on_stale_plan.fetch_add(1, Ordering::Relaxed);
+        }
+        space.check_invariants_range(&(start..end), GrSite::HostAccessBoundary);
+        let refused = remaining.entries.iter().find(|entry| !preparer.usable(entry));
         if let Some(entry) = refused {
             file_cow_count(if write {
                 &FILE_COW_COUNTERS.host_prepare_refused_write
@@ -4064,7 +5132,7 @@ impl HvfBackend {
         let Some(origin) = self.origin_space.as_ref() else {
             return HostStepOutcome::NotApplicable;
         };
-        let Some(window) = space.file_window_at(page) else {
+        let Some(window) = space.settle_gate(GrSite::FileWindowAt, || space.file_window_at(page)).0 else {
             return HostStepOutcome::NotApplicable;
         };
         if window.perms == HvfGuestPermissions::NONE {
@@ -4182,12 +5250,59 @@ impl HvfBackend {
             PageKind::FileAlias => {
                 space.set_file_window_perms(&run, guest)?;
                 if space.reprotect_file_aliases(origin, &run, guest)? {
-                    self.kick_running_lanes();
+                    self.kick_running_lanes_in(space);
                 }
                 Ok(())
             }
             _ => Err(HvfMemoryError::RangeUnmapped(run)),
         }
+    }
+
+    /// GSIGSEGV2: this thread's consecutive attempts to service ONE fault, identified by
+    /// `(page, translation_generation)` -- never by the page alone.
+    ///
+    /// Both arms below ([`Self::try_resolve_cow_fault`]'s `page_writable_now` resume and
+    /// [`Self::try_repair_own_page`]) are unconditionally correct while their own precondition
+    /// holds: a write permission fault against a page that is writable in this space's CURRENT
+    /// mapping was taken through a translation older than that mapping, so re-executing it is
+    /// the only right answer. On a page every thread writes and every fork re-write-protects --
+    /// a process's shared BSS counter page -- that situation is ROUTINE and self-healing
+    /// (measured live on the standing `race-stress/grs2 stress`: 857564 of 2115955 raw exception
+    /// exits were stale-view reruns, ~1000/s).
+    ///
+    /// Keying the bound on the page alone (what both arms did before) counted EVERY transient
+    /// stale fault this thread ever took on that page, not one fault's retries. That total passes
+    /// the bound within seconds and then stays past it for the rest of the process's life --
+    /// nothing ever decrements it -- permanently disabling BOTH transparent recovery arms for
+    /// that `(thread, page)`. Every later, entirely benign fault then fell through to the shim,
+    /// whose own consecutive-fault bound finally turned it into a real, fatal SIGSEGV. That is
+    /// the standing gate's death at ~700-1200 s with every integrity counter at zero; measured
+    /// live at the fatal instant, `attempts=76` against a bound of 16, on a page whose live
+    /// stage-one descriptor read `ap=RW`, whose stage-two authority was `Writer` and whose
+    /// `writable_now` was `true` -- i.e. a healthy page the guest had merely faulted on stale.
+    ///
+    /// Keying on the translation generation the fault was taken against (`snapshot`'s
+    /// `pending_tlbi_generation`) makes the count mean what its bound claims: retries of the one
+    /// translation this fault was actually taken through. A fault taken after the space moved on
+    /// is a different fault and starts a fresh, bounded allowance; a genuine livelock -- the same
+    /// stale translation faulting over and over with nothing moving -- still reaches the bound and
+    /// still surfaces loudly.
+    fn fault_repeat_count(
+        slot: &'static std::thread::LocalKey<core::cell::Cell<(usize, u64, u32)>>,
+        page: usize,
+        translation_generation: u64,
+    ) -> u32 {
+        slot.try_with(|cell| {
+            let (last_page, last_generation, count) = cell.get();
+            let count = if last_page == page && last_generation == translation_generation {
+                count.saturating_add(1)
+            } else {
+                1
+            };
+            cell.set((page, translation_generation, count));
+            count
+        })
+        .unwrap_or(u32::MAX)
     }
 
     /// Consulted after `classify_wx_fault` declines a direct-guest abort: services the fork-COW
@@ -4215,6 +5330,10 @@ impl HvfBackend {
         class: u64,
         far: u64,
         esr: u64,
+        // GSIGSEGV2: this fault's own translation identity -- the `pending_tlbi_generation` of
+        // the snapshot the faulting run was attached with. Only used to key the two
+        // stale-translation retry bounds ([`Self::fault_repeat_count`]).
+        translation_generation: u64,
     ) -> bool {
         if !matches!(class, EC_INSTRUCTION_ABORT_LOWER_EL | EC_DATA_ABORT_LOWER_EL) {
             return false;
@@ -4229,10 +5348,18 @@ impl HvfBackend {
             crate::diagnostics_counters::ORIGIN_FORK_COW_FAULT,
         );
         let page = far & !(PAGE_SIZE - 1);
+        space.check_invariants_range(&(page..page + PAGE_SIZE), GrSite::FaultBoundary);
         if page == SIGRETURN_TRAMPOLINE_GVA || self.vdso.contains(&page) {
             // The trampoline's and the vDSO pages' permanent aliases are installed once, at
             // space creation, never torn down or promoted -- a stray write there must keep
             // faulting for real, exactly as it did before this mechanism existed.
+            // T1f-a: a fault this path declines by construction (`fault_arms.declined`).
+            crate::diagnostics_counters::record_fault_arm(
+                crate::diagnostics_counters::FAULT_ARM_DECLINED,
+                false,
+                space.id(),
+                page,
+            );
             return false;
         }
         let is_write_permission_fault = class == EC_DATA_ABORT_LOWER_EL
@@ -4252,7 +5379,10 @@ impl HvfBackend {
             // (`space` itself) taking a permission fault on its OWN page after `space` fork-time
             // write-protected it (`Platform::fork_time_ancestor_protect`, wired into
             // `do_process_clone`).
-            if space.is_fork_write_protected(page) {
+            let (protected, _) = space.settle_gate(GrSite::IsForkWriteProtected, || {
+                space.is_fork_write_protected(page)
+            });
+            if protected {
                 // FIX (chromium-zygote-stack-slot-reuse-stale-cow-alias-ping-corruption): always
                 // self-diverge here, never `restore_fork_write_protected_page` -- this permission
                 // fault is `space`'s own next write to a page ITS OWN prior fork protected, i.e.
@@ -4275,6 +5405,12 @@ impl HvfBackend {
                 let result = self.settle_single_page_mutation(space, MutationKind::Protect, || {
                     space.self_diverge_fork_protected_page(page)
                 });
+                crate::diagnostics_counters::record_fault_arm(
+                    crate::diagnostics_counters::FAULT_ARM_SELF_DIVERGE,
+                    result.is_ok(),
+                    space.id(),
+                    page,
+                );
                 litebox_util_log::debug!(
                     page:? = page, view:? = view, ok:? = result.is_ok();
                     "HVF fork-COW fault: resolved a fork-time ancestor write-protection fault"
@@ -4317,22 +5453,19 @@ impl HvfBackend {
             // fork-time protection (each divergence re-checks and drops the protection inside its
             // own commit -- T1h fix-up -- so the siblings that faulted on it find it resolved
             // rather than diverging it again and losing each other's writes). Resuming
-            // re-attaches onto the current root. Bounded per thread and page, so a page that keeps
-            // faulting on a current writable mapping still surfaces as a real fault.
-            if is_write_permission_fault && space.page_writable_now(page) {
+            // re-attaches onto the current root. Bounded per thread and per translation, so a
+            // page that keeps faulting under one unchanged stale translation still surfaces as a
+            // real fault -- see [`Self::fault_repeat_count`] for why the bound is keyed on the
+            // fault's own translation, not on the page.
+            let (writable_now, _) =
+                space.settle_gate(GrSite::PageWritableNow, || space.page_writable_now(page));
+            if is_write_permission_fault && writable_now {
                 const WRITABLE_NOW_RESUME_LIMIT: u32 = 64;
-                thread_local! {
-                    static WRITABLE_NOW_RESUMES: core::cell::Cell<(usize, u32)> =
-                        const { core::cell::Cell::new((0, 0)) };
-                }
-                let resumes = WRITABLE_NOW_RESUMES
-                    .try_with(|cell| {
-                        let (last, count) = cell.get();
-                        let count = if last == page { count.saturating_add(1) } else { 1 };
-                        cell.set((page, count));
-                        count
-                    })
-                    .unwrap_or(u32::MAX);
+                let resumes = Self::fault_repeat_count(
+                    &WRITABLE_NOW_RESUMES,
+                    page,
+                    translation_generation,
+                );
                 if resumes <= WRITABLE_NOW_RESUME_LIMIT {
                     return true;
                 }
@@ -4344,7 +5477,9 @@ impl HvfBackend {
             // this alias's (its descriptor carries EXECUTE whenever the window does) unless the
             // page sits in a toggle region, whose lazy flip already declined above; then the
             // promotion lands in the execute direction like a lineage alias's would.
-            if space.is_file_aliased(page) {
+            let (file_aliased, _) =
+                space.settle_gate(GrSite::IsFileAliased, || space.is_file_aliased(page));
+            if file_aliased {
                 let Some(origin) = self.origin_space.as_ref() else {
                     return false;
                 };
@@ -4358,6 +5493,12 @@ impl HvfBackend {
                 let result = self.settle_single_page_mutation(space, MutationKind::Protect, || {
                     space.promote_file_alias(origin, page, target)
                 });
+                crate::diagnostics_counters::record_fault_arm(
+                    crate::diagnostics_counters::FAULT_ARM_FILE_PROMOTE,
+                    result.is_ok(),
+                    space.id(),
+                    page,
+                );
                 litebox_util_log::debug!(
                     page:? = page, view:? = view, ok:? = result.is_ok(), target:? = target;
                     "HVF file COW fault: promoted a file alias after a permission fault"
@@ -4381,14 +5522,16 @@ impl HvfBackend {
                 }
                 return result.is_ok();
             }
-            if !space.is_cow_aliased(page) {
-                return false;
+            let (cow_aliased, _) =
+                space.settle_gate(GrSite::IsCowAliased, || space.is_cow_aliased(page));
+            if !cow_aliased {
+                return self.try_repair_own_page(space, view, page, translation_generation);
             }
             let Some(ancestor_view) = shim.cow_custody_ancestor(view, page) else {
-                return false;
+                return self.try_repair_own_page(space, view, page, translation_generation);
             };
             let Some(ancestor) = self.existing_space_for_view(ancestor_view) else {
-                return false;
+                return self.try_repair_own_page(space, view, page, translation_generation);
             };
             // `None` (the ordinary, non-W^X-toggle path) unless `page` is inside one of the W^X
             // toggle's own registered regions, in which case the promotion must derive its
@@ -4401,6 +5544,12 @@ impl HvfBackend {
             let result = self.settle_single_page_mutation(space, MutationKind::Protect, || {
                 space.promote_cow_alias(&ancestor, page, wx_toggle_want_execute)
             });
+            crate::diagnostics_counters::record_fault_arm(
+                crate::diagnostics_counters::FAULT_ARM_COW_PROMOTE,
+                result.is_ok(),
+                space.id(),
+                page,
+            );
             litebox_util_log::debug!(
                 page:? = page, ancestor_view:? = ancestor_view, ok:? = result.is_ok(),
                 execute:? = is_execute_permission_fault, wx_toggle:? = wx_toggle_want_execute.is_some();
@@ -4426,11 +5575,27 @@ impl HvfBackend {
             return result.is_ok();
         }
         if esr & ESR_FSC_TRANSLATION_FAULT_MASK != ESR_FSC_TRANSLATION_FAULT {
+            // T1f-a: neither a permission fault this path handles nor a translation fault: not
+            // ours to resolve (`fault_arms.declined`).
+            crate::diagnostics_counters::record_fault_arm(
+                crate::diagnostics_counters::FAULT_ARM_DECLINED,
+                false,
+                space.id(),
+                page,
+            );
             return false;
         }
-        if space.is_any_aliased(page) {
+        let (any_aliased, _) =
+            space.settle_gate(GrSite::IsAnyAliased, || space.is_any_aliased(page));
+        if any_aliased {
             // Already aliased, lineage or file (a concurrent fault on the same page already
             // installed it): resume and re-execute against the alias that is already there.
+            crate::diagnostics_counters::record_fault_arm(
+                crate::diagnostics_counters::FAULT_ARM_ALREADY_ALIASED,
+                true,
+                space.id(),
+                page,
+            );
             return true;
         }
         // FIX (chromium-zygote-stack-slot-reuse-stale-cow-alias-ping-corruption): try this fork
@@ -4445,11 +5610,22 @@ impl HvfBackend {
             let result = self.settle_single_page_mutation(space, MutationKind::Map, || {
                 space.install_cow_read_alias(&direct_parent, page)
             });
+            crate::diagnostics_counters::record_fault_arm(
+                crate::diagnostics_counters::FAULT_ARM_COW_ALIAS_DIRECT,
+                result.is_ok(),
+                space.id(),
+                page,
+            );
             litebox_util_log::debug!(
                 page:? = page, view:? = view, ok:? = result.is_ok();
                 "HVF fork-COW fault: installed a read alias directly from this view's own fork parent"
             );
             if result.is_ok() {
+                return true;
+            }
+            // GSIGSEGV: the source itself may be the reason this could not be aliased -- see
+            // [`Self::repair_source_then_alias`].
+            if self.repair_source_then_alias(&direct_parent, space, page) {
                 return true;
             }
         }
@@ -4463,6 +5639,12 @@ impl HvfBackend {
             let result = self.settle_single_page_mutation(space, MutationKind::Map, || {
                 space.install_cow_read_alias(ancestor, page)
             });
+            crate::diagnostics_counters::record_fault_arm(
+                crate::diagnostics_counters::FAULT_ARM_COW_ALIAS_CUSTODY,
+                result.is_ok(),
+                space.id(),
+                page,
+            );
             litebox_util_log::debug!(
                 page:? = page, ancestor_view:? = ancestor_view, ok:? = result.is_ok(),
                 error:? = result.as_ref().err().map(|error| error.to_string());
@@ -4471,16 +5653,196 @@ impl HvfBackend {
             if result.is_ok() {
                 return true;
             }
+            // GSIGSEGV: same as the direct-parent arm above -- `ancestor`'s own copy of `page`
+            // may be the thing that is missing, not anything about `space`.
+            if self.repair_source_then_alias(ancestor, space, page) {
+                return true;
+            }
         }
         // Terminal arm, after every lineage arm (a grandparent's pre-fork promotion of a window
         // page must win over the origin): a page inside one of this space's file windows aliases
         // the shared origin page read-only.
-        self.install_window_alias_for_fault(
+        let aliased = self.install_window_alias_for_fault(
             space,
             view,
             page,
             custody_ancestor.as_ref().map(|(_, ancestor)| ancestor.as_ref()),
-        )
+        );
+        // T1f-a: the file-window arm, the last of the fault arms (F1's fault-around target).
+        crate::diagnostics_counters::record_fault_arm(
+            crate::diagnostics_counters::FAULT_ARM_FILE_ALIAS,
+            aliased,
+            space.id(),
+            page,
+        );
+        if aliased {
+            return true;
+        }
+        // GSIGSEGV: the terminal repair arm, after every lineage/file arm has declined. See
+        // [`Self::try_repair_own_page`].
+        self.try_repair_own_page(space, view, page, translation_generation)
+    }
+
+    /// GSIGSEGV: the same repair as [`Self::try_repair_own_page`], applied to the *source* of a
+    /// COW read alias instead of to the faulting space.
+    ///
+    /// [`HvfAddressSpace::install_cow_read_alias`] fails closed with
+    /// `Witness("COW alias source page has no stage-two mapping")` whenever the ancestor's own
+    /// copy of `page` has lost its stage-2 translation -- the exact state
+    /// [`HvfAddressSpace::own_page_repair_target`] detects. Left alone that is unrecoverable for
+    /// the descendant as well as for the owner: the ancestor's content is the only source the
+    /// descendant can ever read, and every later fault takes the identical path. Measured live
+    /// (`fault_arms.cow_alias_custody err`) during the standing `race-stress/grs stress` gate.
+    /// Reinstall the ancestor's own page from its own claim, then retry the alias once.
+    fn repair_source_then_alias(
+        &self,
+        source: &HvfAddressSpace,
+        space: &HvfAddressSpace,
+        page: usize,
+    ) -> bool {
+        let Some(target) = source.own_page_repair_target(page) else {
+            return false;
+        };
+        let repaired = self.settle_single_page_mutation(source, MutationKind::Map, || {
+            source.protect_range(page..page + PAGE_SIZE, target)
+        });
+        crate::diagnostics_counters::record_fault_arm(
+            crate::diagnostics_counters::FAULT_ARM_REPAIR_OWN,
+            repaired.is_ok(),
+            source.id(),
+            page,
+        );
+        if repaired.is_err() {
+            if let Err(error) = &repaired
+                && guest_access_fault_trace()
+            {
+                litebox_util_log::warn!(
+                    page:? = page, source:? = source.id(), target:? = target, error:% = error,
+                    state:% = source.describe_page(page);
+                    "guest-access fault trace: a COW alias source page could not be reinstalled"
+                );
+            }
+            return false;
+        }
+        let result = self.settle_single_page_mutation(space, MutationKind::Map, || {
+            space.install_cow_read_alias(source, page)
+        });
+        litebox_util_log::debug!(
+            page:? = page, source:? = source.id(), target:? = target, ok:? = result.is_ok();
+            "HVF fork-COW fault: reinstalled a COW alias source page and retried the alias"
+        );
+        result.is_ok()
+    }
+
+    /// GSIGSEGV: the terminal repair arm for a guest fault no other arm could resolve.
+    ///
+    /// A page can end up logically owned -- the guest's `Vmem` covers it, so the shim classifies
+    /// a fault there as `SEGV_ACCERR` and the domain still shows this view's own custody -- while
+    /// physically unusable: no stage-2 translation at all, or one installed at an authority that
+    /// is not the permission this space's own claim records. Nothing in the fault chain could
+    /// ever fix that: every arm above needs a lineage ancestor, a file window or an alias, and a
+    /// plain anonymous private page has none of those, and
+    /// [`HvfAddressSpace::atomically_diverge_claimed_page`] refuses a page with no mapping
+    /// outright. The only outcome was `MacOsUserland::handle_page_fault` resuming the guest into
+    /// the identical fault `PAGE_FAULT_FALLBACK_RETRY_LIMIT` times and then delivering a real,
+    /// fatal `SIGSEGV` -- which is exactly what ended the standing `race-stress/grs stress` gate
+    /// at ~700-1200 s in every arm, with every integrity counter at zero.
+    ///
+    /// Reinstalling the claim's own recorded permission (read-only while a fork-time
+    /// write-protection is still in force, so a live descendant's COW content is untouched) is
+    /// what the page was always supposed to carry. It is deliberately a no-op -- `None` from
+    /// [`HvfAddressSpace::own_page_repair_target`] -- whenever the hardware already agrees, so
+    /// this can never replace the bounded, loud failure with an unbounded resume loop.
+    ///
+    /// GSIGSEGV2: that no-op case is not a malfunction, it is the common one. A fault that no arm
+    /// could explain while the claim already records the very permission the hardware carries is
+    /// a fault taken through a translation older than this space's current mapping -- and this
+    /// arm is then just the resume that re-attaches onto the current root. So its bound has to
+    /// count attempts against ONE translation, exactly like [`Self::fault_repeat_count`] says;
+    /// counted per page alone it disarmed this arm for the rest of the process after the first
+    /// sixteen faults of any kind on the process's hottest page.
+    fn try_repair_own_page(
+        &self,
+        space: &HvfAddressSpace,
+        view: VmViewId,
+        page: usize,
+        translation_generation: u64,
+    ) -> bool {
+        // A W^X toggle region legitimately carries R+X while its claim records R+W, and the
+        // toggle's own lazy flip is the only thing allowed to decide that direction.
+        if space.settle_gate(GrSite::IsAnyAliased, || space.is_any_aliased(page)).0
+            || space.settle_gate(GrSite::IsFileAliased, || space.is_file_aliased(page)).0
+            || self.wx_toggle_region_contains(page)
+        {
+            return false;
+        }
+        // A repair that succeeds but changes nothing the guest can observe would otherwise be
+        // an unbounded resume loop -- the one thing the bounded-refuse fallback exists to
+        // prevent. Bound it per thread and per translation like `try_resolve_cow_fault`'s own
+        // `WRITABLE_NOW_RESUME_LIMIT`: a handful of genuine repairs on one fault, then the
+        // ordinary loud `SIGSEGV` backstop.
+        const REPAIR_RESUME_LIMIT: u32 = 16;
+        let attempts =
+            Self::fault_repeat_count(&REPAIR_RESUMES, page, translation_generation);
+        if attempts > REPAIR_RESUME_LIMIT {
+            if guest_access_fault_trace() {
+                litebox_util_log::warn!(
+                    page:? = page, view:? = view, attempts:% = attempts,
+                    state:% = space.describe_page(page);
+                    "guest-access fault trace: own-page repair gave up after its bounded attempts"
+                );
+            }
+            return false;
+        }
+        let Some(target) = space.own_page_repair_target(page) else {
+            if guest_access_fault_trace() {
+                litebox_util_log::warn!(
+                    page:? = page, view:? = view, attempts:% = attempts,
+                    state:% = space.describe_page(page);
+                    "guest-access fault trace: own-page repair has no target for this page"
+                );
+            }
+            return false;
+        };
+        if guest_access_fault_trace() {
+            litebox_util_log::warn!(
+                page:? = page, view:? = view, attempts:% = attempts, target:? = target,
+                before:% = space.describe_page(page);
+                "guest-access fault trace: own-page repair attempt"
+            );
+        }
+        let result = self.settle_single_page_mutation(space, MutationKind::Map, || {
+            space.protect_range(page..page + PAGE_SIZE, target)
+        });
+        let ok = result.is_ok();
+        crate::diagnostics_counters::record_fault_arm(
+            crate::diagnostics_counters::FAULT_ARM_REPAIR_OWN,
+            ok,
+            space.id(),
+            page,
+        );
+        litebox_util_log::debug!(
+            page:? = page, view:? = view, target:? = target, ok:? = ok,
+            error:? = result.as_ref().err().map(|error| error.to_string());
+            "HVF fault: reinstalled a page this space owns but could not execute against"
+        );
+        if guest_access_fault_trace() {
+            litebox_util_log::warn!(
+                page:? = page, view:? = view, attempts:% = attempts, target:? = target, ok:? = ok,
+                after:% = space.describe_page(page);
+                "guest-access fault trace: own-page repair attempt result"
+            );
+        }
+        if let Err(error) = &result
+            && guest_access_fault_trace()
+        {
+            litebox_util_log::warn!(
+                page:? = page, view:? = view, target:? = target, error:% = error,
+                state:% = space.describe_page(page);
+                "guest-access fault trace: a page this space owns could not be reinstalled"
+            );
+        }
+        ok
     }
 
     /// The translation-fault window arm: installs `page`'s read-only alias onto its window's
@@ -4498,11 +5860,18 @@ impl HvfBackend {
         let Some(origin) = self.origin_space.as_ref() else {
             return false;
         };
-        let window = match space.file_window_at(page) {
+        let (window, _) = space.settle_gate(GrSite::FileWindowAt, || space.file_window_at(page));
+        let window = match window {
             Some(window) => window,
             None => {
-                let Some(window) = custody_ancestor.and_then(|ancestor| ancestor.file_window_at(page))
-                else {
+                // The one-hop fallback reads the ANCESTOR's window record; it is settled against
+                // the ANCESTOR's own domain, but whether that domain moved is not checked here
+                // (remainder: it needs a cross-space plan).
+                let Some(window) = custody_ancestor.and_then(|ancestor| {
+                    ancestor
+                        .settle_gate(GrSite::FileWindowAt, || ancestor.file_window_at(page))
+                        .0
+                }) else {
                     return false;
                 };
                 file_cow_count(&FILE_COW_COUNTERS.window_clone_failures);
@@ -4536,8 +5905,16 @@ impl HvfBackend {
         }
         let execute = window.perms.contains(HvfGuestPermissions::EXECUTE)
             || self.wx_toggle_region_contains(page);
+        let around = fault_around_pages();
         let result = self.settle_single_page_mutation(space, MutationKind::Map, || {
-            space.install_file_alias(origin, page, execute)
+            // T1f-b F1: alias the faulting page together with up to `around - 1` following pages
+            // of the same window, in one stage-1 rewrite. The execute bit is asked per page, so a
+            // W^X toggle region that covers only part of the window cannot leak EXECUTE onto a
+            // page a fault there would not have given it.
+            space.install_file_alias_around(origin, page, |candidate| {
+                window.perms.contains(HvfGuestPermissions::EXECUTE)
+                    || self.wx_toggle_region_contains(candidate)
+            }, around)
         });
         litebox_util_log::debug!(
             page:? = page, view:? = view, execute, ok:? = result.is_ok(),
@@ -4616,8 +5993,14 @@ impl HvfBackend {
             .retiring
     }
 
+    #[track_caller]
     fn lane_maintenance_loop(&'static self) {
         loop {
+            // CLASS A: `Condvar::wait` consumes a plain `MutexGuard`, so this lock is taken
+            // through the ranked wrapper's own condvar wait -- `wait_on` releases the rank for
+            // the park (which is what `Condvar::wait` does to the mutex) and re-takes it on
+            // return, so "parked on the maintenance condvar while holding something else" is
+            // still a named violation and the park itself is not a false positive.
             let mut requested = self
                 .lane_maintenance
                 .requested
@@ -4626,8 +6009,8 @@ impl HvfBackend {
             while !*requested {
                 requested = self
                     .lane_maintenance
-                    .wake
-                    .wait(requested)
+                    .requested
+                    .wait_on(&self.lane_maintenance.wake, requested)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
             *requested = false;
@@ -4651,6 +6034,10 @@ impl HvfBackend {
                     }
                 }
                 if !progressed && self.retiring_lane_count() != 0 {
+                    // CLASS A: the same primitive as the park above, with a timeout. The first
+                    // pass took this lock through the bare mutex with no hold at all, so the
+                    // acquisition was unchecked and the park invisible; `wait_timeout_on` does
+                    // both.
                     let requested = self
                         .lane_maintenance
                         .requested
@@ -4658,8 +6045,12 @@ impl HvfBackend {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let (mut requested, _) = self
                         .lane_maintenance
-                        .wake
-                        .wait_timeout(requested, LANE_REPLACEMENT_POLL)
+                        .requested
+                        .wait_timeout_on(
+                            &self.lane_maintenance.wake,
+                            requested,
+                            LANE_REPLACEMENT_POLL,
+                        )
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     *requested = false;
                 }
@@ -4753,6 +6144,7 @@ impl HvfBackend {
             handle,
             participant,
             view_tag: _,
+            space_tag: _,
         } = Arc::try_unwrap(old).map_err(|_| LaneMaintenanceFailure {
             failure: LaneReplacementFailure {
                 index,
@@ -4959,6 +6351,10 @@ impl HvfBackend {
         drop(pool);
         self.available.notify_all();
         self.kick_running_lanes();
+        // Step GF (b): a lane generation that failed must not stay in a thread's retained lease --
+        // that thread reads `pool.failure` only when it acquires, and a retained lease never
+        // acquires. Ask every holder back so the failure is seen.
+        bump_lane_yield_epoch();
     }
 
     fn current_lane_handle(&self, index: usize) -> Result<HvfVcpuLaneHandle, HvfBackendError> {
@@ -5160,6 +6556,12 @@ impl HvfBackend {
         view_tag: u64,
         preferred: Option<(usize, u64)>,
     ) -> Result<Option<LaneLease<'_>>, HvfBackendError> {
+        // CLASS A: the pool lock is the one a guest thread parks on (`available`), so it is taken
+        // and parked through the ranked wrapper itself -- `wait_on` / `wait_timeout_on` release
+        // the pool's rank for the park (which is what `Condvar::wait` does to the mutex) and
+        // re-take it on return. The explicit `rank_hold_scoped` the first pass used here kept the
+        // pool in the held set ACROSS the park, so every legitimate park was an asserted
+        // `wait_while_holding`.
         let mut pool = self
             .free
             .lock()
@@ -5252,10 +6654,15 @@ impl HvfBackend {
                 }));
             }
             let wait = interrupt.map_or(remaining, |_| remaining.min(Duration::from_millis(10)));
+            // Step GF (b): tell every thread holding a retained lane that someone is queued. It
+            // is incremented only around an actual park, so a thread that is served on its first
+            // look is never counted as a waiter.
+            self.lane_waiters.fetch_add(1, Ordering::SeqCst);
             let (next, _) = self
-                .available
-                .wait_timeout(pool, wait)
+                .free
+                .wait_timeout_on(&self.available, pool, wait)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.lane_waiters.fetch_sub(1, Ordering::SeqCst);
             pool = next;
         }
     }
@@ -5455,10 +6862,20 @@ impl HvfBackend {
     /// deferred retirements are pumped until none remain (or the bound
     /// expires, in which case they stay deferred and are pumped later).
     fn shootdown(&self, space: &HvfAddressSpace) {
+        // Step GF (fix-up): release this thread's own retained lane before the loop below tries to
+        // take every lane out of the pool. A shootdown is reached from the mutating thread's own
+        // dispatch (`settle_mutation`'s `ResourceLimit` arm), and that thread retained its lane
+        // *before* the dispatch -- so the lane it is about to wait for is the one it is holding,
+        // and it has no loop top of its own until this returns. Bumping the yield epoch cannot
+        // break that tie (the bump is only observed at the holder's next loop top), so without
+        // this the mutator spins here for the whole `SHOOTDOWN_TIMEOUT` and then reports
+        // `ResourceLimit` -- strictly worse than before stickiness existed, when the caller's lane
+        // was back in the pool and drainable.
+        release_retained_lane(crate::diagnostics_counters::LANE_STICKY_RELEASED_YIELD);
         let deadline = Instant::now()
             .checked_add(SHOOTDOWN_TIMEOUT)
             .unwrap_or_else(Instant::now);
-        self.kick_running_lanes();
+        self.kick_running_lanes_in(space);
         loop {
             let _ = space.pump_retirements();
             self.pump_quarantine();
@@ -5477,6 +6894,14 @@ impl HvfBackend {
                     return;
                 }
                 let Some(lease) = self.try_acquire_lane(index) else {
+                    // Step GF (fix-up): ask for the lane back only when it is one a thread is
+                    // actually keeping between runs. A bump here revokes every retained lease
+                    // process-wide, so doing it for a lane that is merely mid-run -- which this
+                    // loop just has to wait out, and which is the common case -- used to switch
+                    // stickiness off for every thread on every shootdown.
+                    if self.lane_is_retained(index) {
+                        bump_lane_yield_epoch();
+                    }
                     continue;
                 };
                 let mut retire = false;
@@ -5514,6 +6939,36 @@ impl HvfBackend {
                     drop(lease);
                 }
             }
+            // BCORE-4 (fix-up): the bound counterpart of the lane loop above. `kick_running_lanes`
+            // can only `request_kick` a bound entry, which answers `VcpuNotRunning` for an
+            // `Idle`/`Completing` one -- so a bound vCPU that is in flight but not running during
+            // this window used to have no drain path at all besides its own next exit, whenever
+            // that happened to be. Ask for one: the entry's owner thread re-evaluates at its loop
+            // top (interrupting it first, so a thread parked in a shim wait comes back with
+            // EINTR), and the attach there synchronizes and acknowledges what this vCPU owes.
+            // Only the owner may `hv_vcpu_run`, so asking is all a foreign thread can do -- and
+            // the wait below is bounded by this shootdown's own deadline either way.
+            if bound_enabled() {
+                let space_tag = space.id().value();
+                let entries: Vec<Arc<BoundEntry>> = {
+                    let entries = self
+                        .bound_entries
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    entries.clone()
+                };
+                for entry in entries {
+                    if entry.space_tag.load(Ordering::Acquire) != space_tag {
+                        continue;
+                    }
+                    entry.sync_requested.store(true, Ordering::Release);
+                    entry.thread.interrupt();
+                }
+                let _ = space.pump_retirements();
+                if space.pending_retirements() == 0 {
+                    return;
+                }
+            }
             let _ = space.pump_retirements();
             if space.pending_retirements() == 0 {
                 return;
@@ -5533,10 +6988,68 @@ impl HvfBackend {
     /// re-attaches (synchronizing onto the newest root) and acknowledges
     /// pending retirements.  Best effort: a lane that is not running simply
     /// reports so.
+    ///
+    /// VM-wide: used where there is no single mutated space to scope to (the lane-pool failure
+    /// path, where every lane of the VM may be about to be retired).
+    #[track_caller]
     fn kick_running_lanes(&self) {
+        self.kick_lanes(None, core::panic::Location::caller());
+    }
+
+    /// T1b (hvf-kick-only-lanes-in-mutated-space): [`Self::kick_running_lanes`] scoped to one
+    /// address space. A mutation of `space` only ever needs the participants of `space` to
+    /// acknowledge, so lanes (and bound vCPUs) registered elsewhere are skipped instead of being
+    /// asked to cancel a run that owes this mutation nothing -- today that is 11 requests per
+    /// round (one per lane in the VM) no matter how few spaces are involved.
+    #[track_caller]
+    fn kick_running_lanes_in(&self, space: &HvfAddressSpace) {
+        self.kick_lanes(Some(space.id().value()), core::panic::Location::caller());
+    }
+
+    /// `scope` is `Some(address space id)` to kick only that space's participants, `None` for
+    /// every lane in the VM. `caller` is the caller of the public wrapper, so the T1f-a kick-site
+    /// table keeps attributing each round to the mutation path that issued it.
+    fn kick_lanes(&self, scope: Option<u64>, caller: &'static core::panic::Location<'static>) {
         // hvf-exit-overhead-instrumentation: one `lane_kicks.rounds` per call, one
         // `lane_kicks.requests` per lane asked, split by what the lane answered.
         crate::diagnostics_counters::record_kick_round();
+        // T1f-a: and one row per `kick_running_lanes` call site, so a kick round can be traced
+        // back to the mutation path that issued it.
+        crate::diagnostics_counters::record_kick_round_at(caller);
+        crate::diagnostics_counters::record_kick_round_scope(scope.is_some());
+        // BCORE-4: bound vCPUs are participants of the mutated space too, so they owe the same
+        // acknowledgement and must be kicked the same way -- and, like the lane loop below, only
+        // when they are participants of the space being mutated.
+        if bound_enabled() {
+            let entries: Vec<Arc<BoundEntry>> = {
+                let entries = self
+                    .bound_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                entries.clone()
+            };
+            for entry in entries {
+                // T1b: a bound vCPU registered in another space owes this mutation nothing.
+                if let Some(tag) = scope
+                    && entry.space_tag.load(Ordering::Acquire) != tag
+                {
+                    crate::diagnostics_counters::record_kick_skip_other_space();
+                    continue;
+                }
+                crate::diagnostics_counters::record_kick_considered();
+                let outcome = match entry
+                    .control
+                    .request_kick(entry.generation, &entry.cancellation, None)
+                {
+                    Ok(()) => crate::diagnostics_counters::KickOutcome::Requested,
+                    Err(HvfVcpuLaneError::VcpuNotRunning) => {
+                        crate::diagnostics_counters::KickOutcome::Idle
+                    }
+                    Err(_) => crate::diagnostics_counters::KickOutcome::Error,
+                };
+                crate::diagnostics_counters::record_kick_request(outcome);
+            }
+        }
         for lane in &self.lanes {
             let handle = {
                 let slot = lane
@@ -5545,12 +7058,24 @@ impl HvfBackend {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match &*slot {
                     LaneSlotState::Ready(generation) | LaneSlotState::Retiring(generation) => {
-                        Some(generation.handle.clone())
+                        // T1b: read the lane's space tag in the same critical section that hands
+                        // out its handle, so the pair (handle, tag) describes one lane generation
+                        // at one instant.
+                        Some((generation.handle.clone(), generation.space_tag.load(Ordering::Acquire)))
                     }
                     LaneSlotState::Replacing { .. } | LaneSlotState::Failed(_) => None,
                 }
             };
-            if let Some(handle) = handle {
+            if let Some((handle, tag)) = handle {
+                // T1b: skip lanes that are participants of a different space. The identity
+                // `requests + skipped_other_space == considered` holds exactly per round.
+                if let Some(scope) = scope
+                    && tag != scope
+                {
+                    crate::diagnostics_counters::record_kick_skip_other_space();
+                    continue;
+                }
+                crate::diagnostics_counters::record_kick_considered();
                 let outcome = match handle.cancellation().request() {
                     Ok(()) => crate::diagnostics_counters::KickOutcome::Requested,
                     Err(HvfVcpuLaneError::VcpuNotRunning) => {
@@ -5582,25 +7107,36 @@ impl HvfBackend {
         space: &HvfAddressSpace,
         kind: MutationKind,
         mutation: Result<HvfRangeMutation, HvfMemoryError>,
+        site: u16,
+        closure_ticks: u64,
     ) -> Result<bool, HvfMemoryError> {
+        // T1f-a: `site` is the (call site, origin, kind) row `mutate_with_retry` /
+        // `settle_single_page_mutation` resolved for this call and `closure_ticks` is what the
+        // mutation's own closure (the stage-1/stage-2 work, before any settling) cost.
+        let kind_code = match kind {
+            MutationKind::Map => 0,
+            MutationKind::Protect => 1,
+            MutationKind::Unmap => 2,
+        };
         match mutation {
             Ok(mutation) => {
                 let changed = mutation.changed;
-                crate::diagnostics_counters::record_mutation(
-                    match kind {
-                        MutationKind::Map => 0,
-                        MutationKind::Protect => 1,
-                        MutationKind::Unmap => 2,
-                    },
+                crate::diagnostics_counters::record_mutation(kind_code, changed);
+                crate::diagnostics_counters::record_mutation_site(
+                    site,
                     changed,
+                    kind != MutationKind::Map,
+                    closure_ticks,
+                    false,
                 );
+                crate::diagnostics_counters::record_space_mutation(space.id());
                 space
                     .defer_retirement(mutation.retirement)
                     .map_err(|error| {
                         HvfMemoryError::after_publication("retirement deferral", error)
                     })?;
                 if kind != MutationKind::Map {
-                    self.kick_running_lanes();
+                    self.kick_running_lanes_in(space);
                 }
                 let _ = space.pump_retirements();
                 self.pump_quarantine();
@@ -5644,6 +7180,9 @@ impl HvfBackend {
                 requested,
                 limit,
             }) => {
+                // T1f-a: a resource limit is the one arm that kicks unconditionally (it drains
+                // every lane through `shootdown`), so it is recorded as kicked.
+                crate::diagnostics_counters::record_mutation_site(site, false, true, closure_ticks, true);
                 self.shootdown(space);
                 Err(HvfMemoryError::ResourceLimit {
                     resource,
@@ -5651,7 +7190,10 @@ impl HvfBackend {
                     limit,
                 })
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                crate::diagnostics_counters::record_mutation_site(site, false, false, closure_ticks, false);
+                Err(error)
+            }
         }
     }
 
@@ -5803,9 +7345,12 @@ impl HvfBackend {
             pinned_shared_backings: usage.pinned_shared_backings,
             claimed_pages: usage.claimed_pages,
             live_data_pages: usage.live_data_pages,
+            bound_vcpus: self.registry.bound(),
+            lost_vcpus: self.registry.lost(),
         }
     }
 
+    #[track_caller]
     fn mutate_with_retry(
         &self,
         space: &HvfAddressSpace,
@@ -5813,12 +7358,28 @@ impl HvfBackend {
         mut operation: impl FnMut() -> Result<HvfRangeMutation, HvfMemoryError>,
     ) -> Result<bool, HvfMemoryError> {
         let started = crate::diagnostics_counters::ticks();
-        let result = match self.settle_mutation(space, kind, operation()) {
-            Err(HvfMemoryError::ResourceLimit { .. }) => {
-                self.settle_mutation(space, kind, operation())
-            }
-            result => result,
+        // T1f-a: attribute this mutation to the (call site, origin, kind) row it belongs to; the
+        // origin is the guest activity that asked for it (a syscall number, a fault arm, a
+        // teardown, ...), recorded whichever of its two attempts settles.
+        let site = crate::diagnostics_counters::mutation_site_index(
+            core::panic::Location::caller(),
+            match kind {
+                MutationKind::Map => 0,
+                MutationKind::Protect => 1,
+                MutationKind::Unmap => 2,
+            },
+            crate::diagnostics_counters::current_origin(),
+        );
+        let attempt = |operation: &mut dyn FnMut() -> Result<HvfRangeMutation, HvfMemoryError>| {
+            let closure_started = crate::diagnostics_counters::ticks();
+            let outcome = operation();
+            let closure_ticks = crate::diagnostics_counters::ticks().wrapping_sub(closure_started);
+            self.settle_mutation(space, kind, outcome, site, closure_ticks)
         };
+        let mut result = attempt(&mut operation);
+        if matches!(result, Err(HvfMemoryError::ResourceLimit { .. })) {
+            result = attempt(&mut operation);
+        }
         crate::diagnostics_counters::record_mutation_duration(started);
         match result {
             Err(error) if error.published_before_failure() => {
@@ -5845,6 +7406,7 @@ impl HvfBackend {
     /// already treats any `Err` as an ordinary retryable miss and lets the guest re-fault, so
     /// escalating to `fatal` here would crash the whole host over a same-view concurrent
     /// thread race instead.
+    #[track_caller]
     fn settle_single_page_mutation(
         &self,
         space: &HvfAddressSpace,
@@ -5852,22 +7414,53 @@ impl HvfBackend {
         mut operation: impl FnMut() -> Result<HvfRangeMutation, HvfMemoryError>,
     ) -> Result<bool, HvfMemoryError> {
         let started = crate::diagnostics_counters::ticks();
-        let result = match self.settle_mutation(space, kind, operation()) {
-            Err(HvfMemoryError::ResourceLimit { .. }) => self.settle_mutation(space, kind, operation()),
-            result => result,
+        let site = crate::diagnostics_counters::mutation_site_index(
+            core::panic::Location::caller(),
+            match kind {
+                MutationKind::Map => 0,
+                MutationKind::Protect => 1,
+                MutationKind::Unmap => 2,
+            },
+            crate::diagnostics_counters::current_origin(),
+        );
+        let attempt = |operation: &mut dyn FnMut() -> Result<HvfRangeMutation, HvfMemoryError>| {
+            let closure_started = crate::diagnostics_counters::ticks();
+            let outcome = operation();
+            let closure_ticks = crate::diagnostics_counters::ticks().wrapping_sub(closure_started);
+            self.settle_mutation(space, kind, outcome, site, closure_ticks)
         };
+        let mut result = attempt(&mut operation);
+        if matches!(result, Err(HvfMemoryError::ResourceLimit { .. })) {
+            result = attempt(&mut operation);
+        }
         crate::diagnostics_counters::record_mutation_duration(started);
         result
     }
 
     /// Whether the address space has moved past the generations a run was
     /// attached with, i.e. whether that run may have executed on a stale
-    /// translation.  Only consulted on memory-abort exits, which are rare.
+    /// translation.  Only consulted on memory-abort exits.
+    ///
+    /// CLASS C: reads the three generations under the space's own `cell.state` lock
+    /// ([`HvfAddressSpace::generation_snapshot`]) instead of taking the exclusive VM operation
+    /// gate for a read, as [`HvfAddressSpace::vcpu_snapshot`] does. The generations are written
+    /// only under that same lock, so the answer is the one the exclusive read returned, and the
+    /// test's meaning is unchanged either way (a stale answer costs one rerun or one
+    /// fault-service attempt, exactly as today).
     fn view_was_stale(&self, space: &HvfAddressSpace, snapshot: &HvfVcpuMemorySnapshot) -> bool {
-        space.vcpu_snapshot().is_ok_and(|current| {
-            current.root_generation > snapshot.root_generation
-                || current.executable_generation > snapshot.executable_generation
-                || current.pending_tlbi_generation > snapshot.pending_tlbi_generation
+        // Step GC A/B knob: `LITEBOX_HVF_CLASSC=0` puts this read back under the exclusive VM
+        // operation (`vcpu_snapshot`), which is exactly what it did before this step.
+        if !crate::diagnostics_counters::class_c_enabled() {
+            return space.vcpu_snapshot().is_ok_and(|current| {
+                current.root_generation > snapshot.root_generation
+                    || current.executable_generation > snapshot.executable_generation
+                    || current.pending_tlbi_generation > snapshot.pending_tlbi_generation
+            });
+        }
+        space.generation_snapshot().is_ok_and(|(root, executable, tlbi)| {
+            root > snapshot.root_generation
+                || executable > snapshot.executable_generation
+                || tlbi > snapshot.pending_tlbi_generation
         })
     }
 
@@ -6042,7 +7635,7 @@ impl HvfBackend {
         // `keep_mirror_for_descendant` false is the caller's own (exec-aware) finding that no live
         // descendant still inherits this space's pages -- exactly when everything retained for
         // earlier descendants can go (see `reap_fork_cow_retention`).
-        if !keep_mirror_for_descendant && space.has_fork_cow_retention() {
+        if !keep_mirror_for_descendant && space.has_fork_cow_retention_checked() {
             self.reap_fork_cow_retention(view, &space);
         }
         let unmapped = self
@@ -6142,14 +7735,17 @@ impl HvfBackend {
         guest: HvfGuestPermissions,
         requested_execute: bool,
     ) -> Result<(), HvfMemoryError> {
-        if !space.has_cow_pages_in(&range) {
+        space.check_invariants_range(&range, GrSite::MutationBoundary);
+        let (has_cow, _) =
+            space.settle_gate(GrSite::HasCowPagesIn, || space.has_cow_pages_in(&range));
+        if !has_cow {
             return self
                 .mutate_with_retry(space, MutationKind::Protect, || {
                     space.protect_range(range.clone(), guest)
                 })
                 .map(|_| ());
         }
-        let kinds = space.page_kinds(&range);
+        let (kinds, _) = space.settle_gate(GrSite::PageKinds, || space.page_kinds(&range));
         let mut index = 0;
         while index < kinds.len() {
             let (page, kind) = kinds[index];
@@ -6230,7 +7826,8 @@ impl HvfBackend {
         let inherits_content = |page: usize| {
             ancestor_space(page).is_some_and(|ancestor| ancestor.has_page_content(page))
         };
-        let kinds = space.page_kinds(&range);
+        space.check_invariants_range(&range, GrSite::MutationBoundary);
+        let (kinds, _) = space.settle_gate(GrSite::PageKinds, || space.page_kinds(&range));
         let mut index = 0;
         while index < kinds.len() {
             let (page, kind) = kinds[index];
@@ -6380,6 +7977,7 @@ impl HvfBackend {
         }
     }
 
+    #[track_caller]
     pub(crate) fn initialize_shared_pages<E>(
         &self,
         backing_identity: usize,
@@ -6415,9 +8013,11 @@ impl HvfBackend {
                 .flat_map(|range| subtract_ranges(range, &in_progress))
                 .next();
             let Some(claim) = claimable else {
+                // CLASS A: the ranked lock's own condvar wait -- the registry's rank is released
+                // for the park, so this is a violation only when something ELSE is held.
                 registry = self
-                    .shared_initialization_changed
-                    .wait(registry)
+                    .shared_initialization
+                    .wait_on(&self.shared_initialization_changed, registry)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 drop(registry);
                 continue;
@@ -6432,6 +8032,8 @@ impl HvfBackend {
             let relative = (claim.start - backing_offset)..(claim.end - backing_offset);
             let result = initialize(relative);
 
+            // CLASS A: the registry is a ranked lock, so taking it through `lock()` is the check;
+            // nothing is parked on it here.
             let mut registry = self
                 .shared_initialization
                 .lock()
@@ -6450,7 +8052,10 @@ impl HvfBackend {
         }
     }
 
+    #[track_caller]
     fn wait_shared_initialization(&self, backing_identity: usize, requested: &Range<usize>) {
+        // CLASS A: same shape as the wait above -- the registry is taken and parked through the
+        // ranked wrapper, so its own rank is released for the park.
         let mut registry = self
             .shared_initialization
             .lock()
@@ -6464,8 +8069,8 @@ impl HvfBackend {
                 return;
             }
             registry = self
-                .shared_initialization_changed
-                .wait(registry)
+                .shared_initialization
+                .wait_on(&self.shared_initialization_changed, registry)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
@@ -6542,6 +8147,8 @@ impl HvfBackend {
     }
 
     fn mark_initialized(&self, backing_identity: usize, range: Range<usize>) {
+        // CLASS A: the registry is a ranked lock; nothing is parked on it here, so `lock()` is
+        // the whole check.
         let mut registry = self
             .shared_initialization
             .lock()
@@ -6552,6 +8159,891 @@ impl HvfBackend {
         self.shared_initialization_changed.notify_all();
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// BCORE: a vCPU a guest thread owns instead of borrowing from the lane pool.
+// ---------------------------------------------------------------------------
+//
+// A pooled run pays ~11-11.7 us of lane hand-off per guest syscall: the task thread stamps a
+// command, wakes the lane's owner thread, waits, and is woken back -- two kernel wakeups plus a
+// channel and whole-state copies -- because Hypervisor.framework only lets the thread that
+// created a vCPU run it. A bound vCPU removes the boundary: the guest thread creates its own
+// vCPU and calls `hv_vcpu_run` itself, so the hand-off disappears and only the hypervisor's
+// own entry/exit cost and the shim's service remain.
+//
+// Everything else stays exactly as it is on the pooled path: the bound vCPU registers an
+// ordinary memory-manager participant, attaches through `attach_submitted_vcpu`, takes the
+// synchronization monitor trip when the space's generations moved, is cancelled through the
+// same `RunControl` (`hv_vcpus_exit` is the one SDK call that is *not* owner-affine), and is
+// destroyed on its owner thread before the thread leaves the run loop.
+//
+// Behind `LITEBOX_HVF_BOUND=0` (the default) `bound_enabled()` is a cached `false`, every hook
+// is one predicted branch, and the pooled path is byte-for-byte the one it always was.
+
+/// BCORE: the knob. `LITEBOX_HVF_BOUND=1` turns the bound path on; anything else (including
+/// unset) leaves it off. Read once, cached -- the same default-off pattern `LITEBOX_HVF_LANES`
+/// uses in [`HvfBackend::create`].
+///
+/// Forced off under `LITEBOX_HVF_LANES`: the lane-count override exists to exercise the pooled
+/// path at a fixed pool size, and the two are mutually exclusive by construction.
+fn bound_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !std::env::var_os("LITEBOX_HVF_BOUND").is_some_and(|value| value == "1") {
+            return false;
+        }
+        if std::env::var_os("LITEBOX_HVF_LANES").is_some() {
+            litebox_util_log::warn!(
+                "LITEBOX_HVF_BOUND=1 ignored: LITEBOX_HVF_LANES is set (the lane-count override and the bound path are mutually exclusive)"
+            );
+            return false;
+        }
+        true
+    })
+}
+
+/// BCORE-4: how many pooled iterations inside [`BOUND_TRIGGER_WINDOW`] make a thread "hot"
+/// enough to take a vCPU of its own. 32 exits in 4 ms is a thread doing nothing but
+/// syscalling, which is exactly the shape the lane hand-off dominates.
+const BOUND_TRIGGER_EXITS: u32 = 32;
+const BOUND_TRIGGER_WINDOW: Duration = Duration::from_millis(4);
+/// BCORE-4: a bound thread that has not run for this long gives its vCPU back, so a thread
+/// that blocked in a slow syscall does not hold a vCPU while it waits.
+const BOUND_IDLE_UNBIND: Duration = Duration::from_millis(200);
+
+/// BCORE-4: the address space a bound thread's participant is registered in, owned. A lane
+/// reaches the same thing through `ResolvedSpace`, which borrows the backend; a bound thread
+/// outlives any single call, so it needs its own handle.
+enum BoundSpace {
+    Default,
+    View(Arc<HvfAddressSpace>),
+}
+
+impl BoundSpace {
+    fn get<'a>(&'a self, backend: &'a HvfBackend) -> &'a HvfAddressSpace {
+        match self {
+            Self::Default => &backend.default_space,
+            Self::View(space) => space,
+        }
+    }
+}
+
+/// BCORE-4: one live bound vCPU as the rest of the backend sees it. A mapping mutation kicks
+/// these exactly the way it kicks running lanes: they are participants of the mutated space
+/// too, so they owe the same acknowledgement.
+pub(crate) struct BoundEntry {
+    generation: u64,
+    /// The address space this vCPU's participant is registered in, so a mutation aimed at one
+    /// space's participants needs no look-up under a lock.
+    space_tag: AtomicU64,
+    control: Arc<RunControl>,
+    cancellation: HvfVcpuCancellation,
+    /// Host ticks of this vCPU's last exit: the pick for pressure eviction.
+    last_exit_ns: AtomicU64,
+    /// BCORE-4: another thread could not get a slot and picked this entry to give one up. The
+    /// victim unbinds at its own loop top -- never synchronously, so an unbind never runs
+    /// inside someone else's mutation.
+    evict_requested: AtomicBool,
+    /// BCORE-4 (fix-up): a mapping mutation's shootdown asked this vCPU to re-evaluate at its
+    /// own loop top. Only the owner thread may `hv_vcpu_run` (Hypervisor.framework is
+    /// owner-affine), so a shootdown cannot synchronize a bound vCPU the way it does an idle
+    /// lane; it can only ask, and the ask is answered here.
+    sync_requested: AtomicBool,
+    /// BCORE-5 (fix-up): a thread-exit unbind that had to wait because the thread was inside
+    /// its own dispatch when the shim asked for it.
+    unbind_requested: AtomicBool,
+    thread: crate::ThreadHandle,
+}
+
+/// BCORE-4: a guest thread's own vCPU, plus what the run loop needs to drive it.
+///
+/// `participant` is `None` only for the instant inside a view migration, where it has been
+/// moved out to be passed by value into `migrate_vcpu_participant`; every failure path there
+/// unbinds instead of leaving it empty.
+struct BoundThread {
+    vcpu: HvfBoundVcpu,
+    participant: Option<HvfVcpuParticipant>,
+    /// The view this vCPU's participant is registered against; a change migrates it.
+    view: Option<VmViewId>,
+    space: BoundSpace,
+    entry: Arc<BoundEntry>,
+    /// When this vCPU last exited: the idle-eviction clock.
+    last_exit: Instant,
+}
+
+impl Drop for BoundThread {
+    /// BCORE2-FX: the unwind arm of the teardown, made to discharge the participant too.
+    ///
+    /// `vcpu` is declared before `participant`, so Rust drops (and destroys) the vCPU first;
+    /// only afterwards would `HvfVcpuParticipant::drop` run, and that destructor does no more
+    /// than mark the capability `PARTICIPANT_ABANDONED` -- it does not remove the record from
+    /// `AddressSpaceState::participants`. `HvfAddressSpace::begin_destroy` refuses with
+    /// `AddressSpaceBusy` while that map is non-empty, so before this destructor existed one
+    /// unwound bound owner stranded its address space for the life of the process.
+    ///
+    /// This destructor runs before any field falls, so the participant is discharged BEFORE
+    /// the vCPU is destroyed -- the order `unbind_current_thread` uses, through the same
+    /// [`HvfBackend::discharge_bound_participant`] it calls.
+    fn drop(&mut self) {
+        // `active()` is `None` only once the backend itself is gone, in which case there is no
+        // space left to deregister against.
+        if let Some(backend) = crate::hvf_backend::active() {
+            backend.discharge_bound_participant(self);
+        }
+    }
+}
+
+/// What [`HvfBackend::bound_iteration`] decided for one loop pass.
+enum BoundOutcome {
+    /// The bound path ran one iteration; the caller continues its loop with this disposition.
+    Ran(ContinueOperation),
+    /// This thread is not bound (any more): fall through to the pooled path.
+    Unbound,
+}
+
+impl HvfBackend {
+    /// BCORE-4: gives the calling thread a vCPU of its own, registered as a participant of
+    /// `view`'s address space. `false`, with no side effects, when the registry refused, the
+    /// space could not be resolved, or the participant could not be registered -- the caller
+    /// then simply stays on the pool.
+    fn bind_current_thread(&self, view: Option<VmViewId>) -> bool {
+        if HVF_THREAD.with(|context| context.borrow().bound.is_some()) {
+            return true;
+        }
+        let space = match self.space_for_view(view) {
+            Ok(space) => space,
+            Err(error) => {
+                litebox_util_log::debug!(error:% = error; "HVF bound vCPU: address space unresolved");
+                return false;
+            }
+        };
+        let owned = match &space {
+            ResolvedSpace::Default(_) => BoundSpace::Default,
+            ResolvedSpace::View(space) => BoundSpace::View(Arc::clone(space)),
+        };
+        let space_tag = space.id().value();
+        let mut vcpu = match HvfBoundVcpu::bind(&self.registry, &self.el1) {
+            Ok(vcpu) => vcpu,
+            Err(error) => {
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_BIND_REFUSED,
+                    1,
+                );
+                // BCORE-4: the budget is spent. Ask the bound entry that has gone longest
+                // without an exit to give its vCPU up; it does so at its own loop top, so an
+                // unbind never runs inside someone else's mutation. This thread stays on the
+                // pool either way -- a refusal never waits.
+                self.request_bound_eviction();
+                litebox_util_log::debug!(error:% = error; "HVF bound vCPU: bind refused");
+                return false;
+            }
+        };
+        // A bound run installs the FULL register file, so the thread's authoritative SIMD/FP
+        // file must be on the host before the first one: a file still resident in a lane would
+        // otherwise be installed as zeros.
+        HVF_THREAD.with(|context| {
+            let _ = context.borrow_mut().materialized_fp();
+        });
+        let participant =
+            match owned
+                .get(self)
+                .register_vcpu_participant(vcpu.participant_capability())
+            {
+                Ok(participant) => participant,
+                Err(error) => {
+                    litebox_util_log::debug!(error:% = error; "HVF bound vCPU: participant registration failed");
+                    vcpu.stop_owner();
+                    let _ = vcpu.unbind(false);
+                    crate::diagnostics_counters::add_stat(
+                        crate::diagnostics_counters::BOUND_BIND_REFUSED,
+                        1,
+                    );
+                    return false;
+                }
+            };
+        let entry = Arc::new(BoundEntry {
+            generation: vcpu.generation(),
+            space_tag: AtomicU64::new(space_tag),
+            control: vcpu.control(),
+            cancellation: vcpu.sdk_cancellation(),
+            last_exit_ns: AtomicU64::new(crate::diagnostics_counters::ticks()),
+            evict_requested: AtomicBool::new(false),
+            sync_requested: AtomicBool::new(false),
+            unbind_requested: AtomicBool::new(false),
+            thread: crate::ThreadHandle::current(),
+        });
+        self.bound_entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::clone(&entry));
+        crate::diagnostics_counters::add_stat(crate::diagnostics_counters::BOUND_LIVE, 1);
+        HVF_THREAD.with(|context| {
+            context.borrow_mut().bound = Some(BoundThread {
+                vcpu,
+                participant: Some(participant),
+                view,
+                space: owned,
+                entry,
+                last_exit: Instant::now(),
+            });
+        });
+        true
+    }
+
+    /// BCORE-5: gives this thread's bound vCPU back and deregisters its participant.
+    ///
+    /// Order matters: `owner_stopped` must be set BEFORE the deregistration, because that is
+    /// what lets `deregister_vcpu_participant` acknowledge retirements this participant still
+    /// owes instead of refusing with `ParticipantRetirementPending` (which would strand a
+    /// retirement row and, with it, an address space). That order lives in
+    /// [`Self::discharge_bound_participant`], which `Drop for BoundThread` calls too -- so an
+    /// owner thread that unwinds past `unbind_current_thread` discharges its participant by
+    /// exactly the same steps instead of stranding the record.
+    pub(crate) fn unbind_current_thread(&self, reason: usize) {
+        let Some(mut bound) = HVF_THREAD.with(|context| context.borrow_mut().bound.take()) else {
+            return;
+        };
+        self.discharge_bound_participant(&mut bound);
+        self.remove_bound_entry(bound.vcpu.generation());
+        // BCORE-2 (fix-up): `unbind` terminalizes this vCPU's control before destroying it, so
+        // a kick still outstanding at teardown is reported (`kicks_abandoned` /
+        // `kicks_expired_terminal`) instead of silently dropped, and any thread still waiting
+        // on a cancellation attempt is completed with `Terminalized`. `BOUND_UNBINDS_FAILED` is
+        // the one reason that can follow a run error, so it is the one that terminalizes as
+        // untrusted; every orderly teardown is not.
+        let untrusted = reason == crate::diagnostics_counters::BOUND_UNBINDS_FAILED;
+        if bound.vcpu.unbind(untrusted).is_err() {
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_UNBINDS_FAILED,
+                1,
+            );
+        }
+        crate::diagnostics_counters::add_stat(reason, 1);
+        // `BOUND_LIVE` is a gauge: `u64::MAX` is a wrapping -1.
+        crate::diagnostics_counters::add_stat(crate::diagnostics_counters::BOUND_LIVE, u64::MAX);
+    }
+
+    /// BCORE2-FX: discharges a bound vCPU's participant -- the one step a destroyed vCPU cannot
+    /// do for itself, and the one that keeps its address space destroyable.
+    ///
+    /// `stop_owner` first: it is what lets `deregister_vcpu_participant` acknowledge the
+    /// retirements this participant owes instead of refusing with `ParticipantRetirementPending`
+    /// (which would strand a retirement row and, with it, an address space). Then the
+    /// deregistration; then, if that refused, participant recovery.
+    ///
+    /// Both teardown arms call it -- [`Self::unbind_current_thread`] (the orderly one) and
+    /// `Drop for BoundThread` (an owner thread that unwound) -- so the two cannot drift. It is
+    /// panic-safe on purpose: it runs inside a destructor on the unwind arm, where a second
+    /// panic would abort the process.
+    fn discharge_bound_participant(&self, bound: &mut BoundThread) {
+        bound.vcpu.stop_owner();
+        let Some(mut participant) = bound.participant.take() else {
+            return;
+        };
+        let generation = bound.vcpu.generation();
+        let space = bound.space.get(self);
+        let deregistered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            space.deregister_vcpu_participant(&mut participant)
+        }));
+        if matches!(deregistered, Ok(Ok(()))) {
+            return;
+        }
+        if let Ok(Err(error)) = &deregistered {
+            litebox_util_log::warn!(
+                error:% = error, generation:? = generation;
+                "HVF bound vCPU: participant deregistration failed; running participant recovery"
+            );
+        }
+        crate::diagnostics_counters::add_stat(
+            crate::diagnostics_counters::BOUND_DEREGISTER_FAILED,
+            1,
+        );
+        // The handle's own `Drop` marks the capability `PARTICIPANT_ABANDONED`, which is
+        // exactly the shape `recover_stopped_vcpu_participants` repairs: it removes the record
+        // from the space and acknowledges this participant's owed retirements on its behalf.
+        // Without it the record lives as long as the process does, and `begin_destroy` answers
+        // `AddressSpaceBusy` for that whole time.
+        drop(participant);
+        let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            space.recover_stopped_vcpu_participants()
+        }));
+        match recovered {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                litebox_util_log::warn!(
+                    error:% = error, generation:? = generation;
+                    "HVF bound vCPU: participant recovery failed"
+                );
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_DEREGISTER_RECOVERY_FAILED,
+                    1,
+                );
+            }
+            Err(_) => {
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_DEREGISTER_RECOVERY_FAILED,
+                    1,
+                );
+            }
+        }
+    }
+
+    /// BCORE-5: drops the [`BoundEntry`] for `generation`, if one is still listed.
+    ///
+    /// Both paths that destroy a bound vCPU call it -- [`Self::unbind_current_thread`] (the
+    /// orderly one) and `HvfBoundVcpu::drop` (an owner thread that unwound) -- so a vCPU that
+    /// is gone is never left in [`Self::bound_entries`] for the mutation kick rounds and the
+    /// pressure-eviction pick to walk.
+    pub(crate) fn remove_bound_entry(&self, generation: u64) {
+        self.bound_entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|entry| entry.generation != generation);
+    }
+
+    /// BCORE-4: moves a bound vCPU's participant to `view`'s address space. `false` on any
+    /// failure, after which the caller unbinds (a vCPU registered in the wrong space may not
+    /// run at all).
+    fn migrate_bound_thread(&self, view: Option<VmViewId>) -> bool {
+        let target = match self.space_for_view(view) {
+            Ok(space) => space,
+            Err(_) => return false,
+        };
+        let owned = match &target {
+            ResolvedSpace::Default(_) => BoundSpace::Default,
+            ResolvedSpace::View(space) => BoundSpace::View(Arc::clone(space)),
+        };
+        let target_tag = target.id().value();
+        let (capability, old) = match HVF_THREAD.with(|context| {
+            let mut context = context.borrow_mut();
+            let bound = context.bound.as_mut()?;
+            Some((bound.vcpu.participant_capability(), bound.participant.take()?))
+        }) {
+            Some(pair) => pair,
+            None => return false,
+        };
+        let source_view = HVF_THREAD.with(|context| context.borrow().bound.as_ref()?.view);
+        let source = match self.space_for_view(source_view) {
+            Ok(space) => space,
+            Err(_) => return false,
+        };
+        match owned
+            .get(self)
+            .migrate_vcpu_participant(&source, old, capability)
+        {
+            Ok(participant) => {
+                HVF_THREAD.with(|context| {
+                    let mut context = context.borrow_mut();
+                    if let Some(bound) = context.bound.as_mut() {
+                        bound.participant = Some(participant);
+                        bound.space = owned;
+                        bound.view = view;
+                        bound.entry.space_tag.store(target_tag, Ordering::Release);
+                    }
+                });
+                true
+            }
+            Err(error) => {
+                litebox_util_log::debug!(error:% = error; "HVF bound vCPU: view migration failed");
+                false
+            }
+        }
+    }
+
+    /// BCORE-4/BCORE-3: one bound run, or [`BoundOutcome::Unbound`] when this thread has no
+    /// bound vCPU (and did not just take one).
+    fn bound_iteration(
+        &self,
+        shim: &dyn EnterShim<ExecutionContext = PtRegs>,
+        ctx: &mut PtRegs,
+        slot: &HvfThreadSlot,
+        view: Option<VmViewId>,
+        streak: &mut (Instant, u32),
+    ) -> BoundOutcome {
+        use crate::diagnostics_counters::{
+            BOUND_ELIGIBLE_HANDOFFS, BOUND_GATE_LOCKS, BOUND_RUNS, BOUND_UNBINDS_FAILED,
+            BOUND_UNBINDS_IDLE, BOUND_UNBINDS_INELIGIBLE, BOUND_UNBINDS_PRESSURE,
+        };
+        // BCORE-5 (fix-up): everything below runs with this thread's bound vCPU live, so a
+        // `Task::drop` on this thread (a failed `spawn_thread`, an aborted `ProcessLaunch`) must
+        // not be able to unbind it from inside the dispatch -- it defers instead, and the loop
+        // top honours the request here.
+        BOUND_DISPATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        let _dispatch_scope = BoundDispatchScope;
+        let now = Instant::now();
+        // BCORE-5 (fix-up): a deferred unbind from this thread's own dispatch. Safe here:
+        // between exits, with the vCPU idle, and before any address space can be torn down.
+        if HVF_THREAD.with(|context| {
+            context
+                .borrow()
+                .bound
+                .as_ref()
+                .is_some_and(|bound| bound.entry.unbind_requested.swap(false, Ordering::AcqRel))
+        }) {
+            self.unbind_current_thread(crate::diagnostics_counters::BOUND_UNBINDS_EXIT);
+            return BoundOutcome::Unbound;
+        }
+        let bound_present = HVF_THREAD.with(|context| context.borrow().bound.is_some());
+        if !bound_present {
+            // A task whose process still shares its parent's address space (the vfork window)
+            // may not take a vCPU of its own: handing a shared space to a waiter requires
+            // quiescing every participant, and a bound participant is only quiesced at its own
+            // loop top.
+            if !crate::current_vcpu_bind_eligible() {
+                return BoundOutcome::Unbound;
+            }
+            if now.duration_since(streak.0) > BOUND_TRIGGER_WINDOW {
+                *streak = (now, 1);
+            } else {
+                streak.1 = streak.1.saturating_add(1);
+            }
+            crate::diagnostics_counters::add_stat(BOUND_ELIGIBLE_HANDOFFS, 1);
+            if streak.1 < BOUND_TRIGGER_EXITS {
+                return BoundOutcome::Unbound;
+            }
+            if !self.bind_current_thread(view) {
+                // Refused: stop trying for another window instead of retrying every exit.
+                *streak = (now, 0);
+                return BoundOutcome::Unbound;
+            }
+        }
+        // From here the thread is bound. Every path that gives the vCPU up unbinds and returns
+        // `Unbound`, so the caller falls through to the pool for exactly one pass.
+        //
+        // Step GF (fix-up): a bound thread runs on a vCPU of its own and never asks the pool for a
+        // lane, so a lease it retained on an earlier *unbound* pass would otherwise sit in
+        // [`RETAINED_LANE`] unchecked -- the caller's `BoundOutcome::Ran(_) => continue` returns
+        // before `take_retained_lane`, so neither the waiter check nor the retention bounds ever
+        // ran for it. Give it up at the point the thread becomes bound.
+        release_retained_lane(crate::diagnostics_counters::LANE_STICKY_RELEASED_YIELD);
+        if !crate::current_vcpu_bind_eligible() {
+            self.unbind_current_thread(BOUND_UNBINDS_INELIGIBLE);
+            return BoundOutcome::Unbound;
+        }
+        if HVF_THREAD.with(|context| {
+            context
+                .borrow()
+                .bound
+                .as_ref()
+                .is_some_and(|bound| now.duration_since(bound.last_exit) > BOUND_IDLE_UNBIND)
+        }) {
+            self.unbind_current_thread(BOUND_UNBINDS_IDLE);
+            return BoundOutcome::Unbound;
+        }
+        if HVF_THREAD.with(|context| {
+            context
+                .borrow()
+                .bound
+                .as_ref()
+                .is_some_and(|bound| bound.entry.evict_requested.load(Ordering::Acquire))
+        }) {
+            self.unbind_current_thread(BOUND_UNBINDS_PRESSURE);
+            return BoundOutcome::Unbound;
+        }
+        // BCORE-4 (fix-up): a mapping mutation's shootdown asked this vCPU to re-evaluate. It
+        // cannot synchronize a bound vCPU the way it synchronizes an idle lane -- only the
+        // thread that created the vCPU may `hv_vcpu_run` it -- so it asks, and the ask is
+        // answered here: the attach below sees the space's moved generation and synchronizes
+        // (acknowledging whatever retirement this vCPU owes) on this very iteration.
+        if HVF_THREAD.with(|context| {
+            context
+                .borrow()
+                .bound
+                .as_ref()
+                .is_some_and(|bound| bound.entry.sync_requested.swap(false, Ordering::AcqRel))
+        }) {
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_SHOOTDOWN_SYNC_REQUESTS,
+                1,
+            );
+        }
+        if HVF_THREAD.with(|context| {
+            context
+                .borrow()
+                .bound
+                .as_ref()
+                .is_some_and(|bound| bound.view != view)
+        }) && !self.migrate_bound_thread(view)
+        {
+            self.unbind_current_thread(BOUND_UNBINDS_FAILED);
+            return BoundOutcome::Unbound;
+        }
+
+        let iteration_start = crate::diagnostics_counters::ticks();
+        let control = HVF_THREAD.with(|context| context.borrow().bound.as_ref().map(|b| b.vcpu.control()));
+        let Some(control) = control else {
+            return BoundOutcome::Unbound;
+        };
+        let epoch = match HVF_THREAD.with(|context| {
+            let context = context.borrow();
+            match context.bound.as_ref() {
+                Some(bound) => bound.vcpu.reserve_run(),
+                None => Err(HvfVcpuLaneError::LaneClosed),
+            }
+        }) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                litebox_util_log::debug!(error:% = error; "HVF bound vCPU: run reservation failed");
+                self.unbind_current_thread(BOUND_UNBINDS_FAILED);
+                return BoundOutcome::Unbound;
+            }
+        };
+        // Publish this run's cancellation exactly the way the pooled path does, so an
+        // interrupt aimed at this thread from another thread reaches this vCPU (and so a kick
+        // that lands before guest entry latches instead of being lost).
+        let mine = {
+            let mut current = slot
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.take_pending() {
+                drop(current);
+                let _ = control.settle_reservation(epoch, true, false);
+                return BoundOutcome::Ran(shim.interrupt(ctx));
+            }
+            let mine = HVF_THREAD.with(|context| {
+                context
+                    .borrow()
+                    .bound
+                    .as_ref()
+                    .map(|bound| bound.vcpu.cancellation_for(epoch))
+            });
+            match mine {
+                Some(mine) => {
+                    *current = Some(mine.clone());
+                    mine
+                }
+                None => {
+                    drop(current);
+                    let _ = control.settle_reservation(epoch, true, false);
+                    self.unbind_current_thread(BOUND_UNBINDS_FAILED);
+                    return BoundOutcome::Unbound;
+                }
+            }
+        };
+        // BCORE-4: counted across the whole bound iteration's VM-operation work -- the merged
+        // attach/submit shared operation (4) plus the run scope (3) = 7 per trip-free run,
+        // against 20 on today's pooled path.
+        let gate_locks_before = crate::diagnostics_counters::gate_locks_this_thread();
+        let attached = HVF_THREAD.with(|context| {
+            let context = context.borrow();
+            let bound = context.bound.as_ref()?;
+            let participant = bound.participant.as_ref()?;
+            Some(bound.space.get(self).attach_submitted_vcpu(participant))
+        });
+        let attachment = match attached {
+            Some(Ok(attachment)) => attachment,
+            Some(Err(error)) => {
+                // Same expectation as the pooled path: a mutation landing in the window between
+                // attach and submit is ordinary contention, not a failure -- so this is not
+                // fatal here. Give the vCPU back and let the pooled path's own (bounded,
+                // counted) attachment-race retry resolve it with a fresh attachment; a genuine
+                // failure fails there, fatally, the same way it always did.
+                let _ = control.settle_reservation(epoch, true, true);
+                self.clear_slot_current(slot, &mine);
+                self.unbind_current_thread(BOUND_UNBINDS_FAILED);
+                litebox_util_log::debug!(error:% = error; "HVF bound vCPU: attachment race");
+                return BoundOutcome::Unbound;
+            }
+            None => {
+                let _ = control.settle_reservation(epoch, true, false);
+                self.clear_slot_current(slot, &mine);
+                self.unbind_current_thread(BOUND_UNBINDS_FAILED);
+                return BoundOutcome::Unbound;
+            }
+        };
+        let snapshot = attachment.snapshot().clone();
+        let deadline = time_slice_deadline();
+        let run = HVF_THREAD.with(|context| {
+            let mut context = context.borrow_mut();
+            let Some(generation) = context.bound.as_ref().map(|b| b.vcpu.generation()) else {
+                return Err(HvfVcpuLaneError::LaneClosed);
+            };
+            // `run_input` first: it may materialize a SIMD/FP file still resident in a lane,
+            // and a bound run installs the FULL register file, so the host copy has to be
+            // authoritative before the install.
+            let (state, _claim, _cell) = context.run_input(ctx, (usize::MAX, generation));
+            let Some(bound) = context.bound.as_mut() else {
+                return Err(HvfVcpuLaneError::LaneClosed);
+            };
+            bound
+                .vcpu
+                .execute(epoch, attachment, &state, Some(deadline))
+        });
+        self.clear_slot_current(slot, &mine);
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => {
+                self.unbind_current_thread(BOUND_UNBINDS_FAILED);
+                fatal("running the guest on a bound vCPU", &error.into());
+            }
+        };
+        if matches!(run.exit, HvfVcpuExit::Canceled) {
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_CANCELED_EXITS,
+                1,
+            );
+            if slot.has_pending() {
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_CANCELED_INTERRUPTS,
+                    1,
+                );
+            }
+        }
+        let gate_locks = crate::diagnostics_counters::gate_locks_this_thread()
+            .wrapping_sub(gate_locks_before);
+        crate::diagnostics_counters::add_stat(BOUND_RUNS, 1);
+        crate::diagnostics_counters::add_stat(BOUND_GATE_LOCKS, gate_locks);
+        crate::diagnostics_counters::record_bound_run_wall(run.run_wall_ns);
+        let exit_ticks = crate::diagnostics_counters::ticks();
+        HVF_THREAD.with(|context| {
+            let mut context = context.borrow_mut();
+            let state = match &run.state {
+                HvfVcpuExitState::DirectGuest(state) | HvfVcpuExitState::LowerElMonitor(state) => {
+                    state
+                }
+            };
+            // `run.fp` is `Materialized` on the bound path (the exit read is the full 74
+            // registers), so this keeps `FpLocation::Host`.
+            context.absorb_exit(state, run.fp, (usize::MAX, run.run_epoch));
+            if let Some(bound) = context.bound.as_mut() {
+                bound.last_exit = Instant::now();
+                bound.entry.last_exit_ns.store(exit_ticks, Ordering::Relaxed);
+            }
+        });
+        // Opportunistic acknowledgement work, exactly as the pooled path does it: the check
+        // never waits for the ledger, and a contended check skips this exit's pass.
+        // Take the space handle OUT of the thread-local first: `pump_retirements` (and, below,
+        // `dispatch`) may run shim callbacks that borrow `HVF_THREAD` themselves, and a
+        // `RefCell` borrow held across one is a panic.
+        let owned = self.bound_space_handle();
+        let space = self.bound_space(&owned);
+        if let Some(space) = space {
+            if matches!(space.pending_retirements_if_uncontended(), Some(pending) if pending != 0) {
+                let _ = space.pump_retirements();
+            }
+        }
+        // BCORE-3: a vtimer exit is the end of a time slice. On the pooled path it just
+        // re-queues the thread; here there is no queue, so the slice either delivers a host
+        // signal that is already pending (bounding interrupt latency by one slice) or yields
+        // once so another guest thread can have the core.
+        let disposition = if matches!(
+            (run.exit, &run.state),
+            (HvfVcpuExit::VtimerActivated, HvfVcpuExitState::DirectGuest(_))
+        ) {
+            let state = match &run.state {
+                HvfVcpuExitState::DirectGuest(state) | HvfVcpuExitState::LowerElMonitor(state) => {
+                    state
+                }
+            };
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_VTIMER_EXITS,
+                1,
+            );
+            write_direct_exit(ctx, state);
+            if crate::host_signals_pending() {
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_HOST_SIGNAL_FASTPATH,
+                    1,
+                );
+                shim.interrupt(ctx)
+            } else {
+                std::thread::yield_now();
+                ContinueOperation::Resume
+            }
+        } else {
+            self.dispatch_bound(shim, ctx, slot, &run, &snapshot)
+        };
+        crate::diagnostics_counters::record_bound_exit_overhead(
+            crate::diagnostics_counters::ticks_to_ns(
+                crate::diagnostics_counters::ticks().wrapping_sub(iteration_start),
+            ),
+        );
+        BoundOutcome::Ran(disposition)
+    }
+
+    /// BCORE-4: picks the bound entry that has gone longest without an exit and asks it to
+    /// give its vCPU up (`BoundEntry::evict_requested` plus a thread interrupt, so a victim
+    /// parked in a wait re-evaluates at its next loop top).
+    fn request_bound_eviction(&self) {
+        let victim = {
+            let entries = self
+                .bound_entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut oldest: Option<(u64, Arc<BoundEntry>)> = None;
+            for entry in entries.iter() {
+                let last = entry.last_exit_ns.load(Ordering::Relaxed);
+                // Wrapping comparison: `u64::MAX / 2` ahead means strictly older.
+                let older = oldest
+                    .as_ref()
+                    .is_none_or(|(best, _)| last.wrapping_sub(*best) > u64::MAX / 2);
+                if older {
+                    oldest = Some((last, Arc::clone(entry)));
+                }
+            }
+            oldest.map(|(_, entry)| entry)
+        };
+        if let Some(victim) = victim {
+            victim.evict_requested.store(true, Ordering::Release);
+            victim.thread.interrupt();
+        }
+    }
+
+    /// Clears this thread's published cancellation if it is still this run's.
+    fn clear_slot_current(&self, slot: &HvfThreadSlot, mine: &HvfVcpuLaneCancellation) {
+        let mut current = slot
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let still_mine = current
+            .as_ref()
+            .is_some_and(|current| current.is_same_run(mine));
+        if still_mine {
+            *current = None;
+        }
+    }
+
+    /// BCORE-4: this thread's bound address space, cloned out of the thread-local so the
+    /// `RefCell` borrow is over. `None` for the default space.
+    fn bound_space_handle(&self) -> Option<Arc<HvfAddressSpace>> {
+        HVF_THREAD.with(|context| match context.borrow().bound.as_ref()?.space {
+            BoundSpace::Default => None,
+            BoundSpace::View(ref space) => Some(Arc::clone(space)),
+        })
+    }
+
+    /// BCORE-4: `&HvfAddressSpace` for [`Self::bound_space_handle`]'s result (the default space
+    /// when it is `None`), with a lifetime tied to `self` rather than to `HVF_THREAD`.
+    fn bound_space<'a>(&'a self, handle: &'a Option<Arc<HvfAddressSpace>>) -> Option<&'a HvfAddressSpace> {
+        match handle {
+            Some(space) => Some(space),
+            None => HVF_THREAD
+                .with(|context| context.borrow().bound.is_some())
+                .then_some(&self.default_space),
+        }
+    }
+
+    /// BCORE-4: the exit dispatch for a bound run -- the ordinary `dispatch`, with the space and
+    /// view this vCPU is registered against.
+    ///
+    /// The `HVF_THREAD` borrow is deliberately over before `dispatch` runs: it calls back into
+    /// the shim (`EnterShim::syscall` / `exception` / `interrupt`), which borrows the same
+    /// thread-local (FP state, TPIDR, guest-access context).
+    fn dispatch_bound(
+        &self,
+        shim: &dyn EnterShim<ExecutionContext = PtRegs>,
+        ctx: &mut PtRegs,
+        slot: &HvfThreadSlot,
+        run: &HvfVcpuRunResult,
+        snapshot: &HvfVcpuMemorySnapshot,
+    ) -> ContinueOperation {
+        let view = HVF_THREAD.with(|context| context.borrow().bound.as_ref().and_then(|b| b.view));
+        let owned = self.bound_space_handle();
+        let Some(space) = self.bound_space(&owned) else {
+            // BCORE-4 (fix-up): the thread has no bound vCPU any more (a deferred unbind from
+            // its own loop top being the only way that can happen mid-iteration). Dispatching
+            // against the default space is still right -- the exit is a real guest exit and the
+            // shim must see it -- where dropping it would silently skip this iteration's exit
+            // and resume the guest without ever having looked at why it came out.
+            let mut stale_view_reruns = 0u32;
+            let mut alias_conflict_reruns = 0u32;
+            return self.dispatch(
+                shim,
+                ctx,
+                slot,
+                run,
+                snapshot,
+                &mut stale_view_reruns,
+                &mut alias_conflict_reruns,
+                &self.default_space,
+                None,
+            );
+        };
+        let mut stale_view_reruns = 0u32;
+        let mut alias_conflict_reruns = 0u32;
+        self.dispatch(
+            shim,
+            ctx,
+            slot,
+            run,
+            snapshot,
+            &mut stale_view_reruns,
+            &mut alias_conflict_reruns,
+            space,
+            view,
+        )
+    }
+}
+
+/// BCORE-5: gives the calling thread's bound vCPU back, if it has one.
+///
+/// Called from the shim's thread-exit path and from `run_thread`'s return, so a bound vCPU
+/// never outlives the guest thread that owns it -- an address space can only be destroyed once
+/// every participant is deregistered, and `prepare_for_exit` runs before
+/// `release_view_space`.
+///
+/// BCORE-5 (fix-up): `Task::prepare_for_exit` runs from EVERY `Task::drop`, not only from the
+/// owning thread's own: a failed `spawn_thread` drops the new `Task` on the *spawning* thread,
+/// and an aborted `ProcessLaunch` on the launcher. Both therefore used to arrive here from a
+/// thread that is in the middle of dispatching its own guest exit, and taking its bound vCPU
+/// away there meant that iteration's exit was never dispatched at all. So when this thread is
+/// inside its own bound dispatch, the unbind is deferred to its loop top (a few microseconds
+/// away, and still before the thread can leave the loop) rather than performed here.
+pub(crate) fn unbind_current_thread_vcpu() {
+    if !bound_enabled() {
+        return;
+    }
+    let Some(backend) = active() else {
+        return;
+    };
+    let deferred = bound_dispatch_depth() != 0
+        && HVF_THREAD.with(|context| {
+            let context = context.borrow();
+            let Some(bound) = context.bound.as_ref() else {
+                return false;
+            };
+            bound
+                .entry
+                .unbind_requested
+                .store(true, Ordering::Release);
+            true
+        });
+    if deferred {
+        crate::diagnostics_counters::add_stat(
+            crate::diagnostics_counters::BOUND_UNBINDS_DEFERRED,
+            1,
+        );
+        return;
+    }
+    backend.unbind_current_thread(crate::diagnostics_counters::BOUND_UNBINDS_EXIT);
+}
+
+/// BCORE-5 (fix-up): how deep the calling thread currently is inside its own bound
+/// dispatch ([`HvfBackend::bound_iteration`]). Zero between exits, i.e. exactly when an unbind
+/// requested from the shim can be performed on the spot.
+fn bound_dispatch_depth() -> u32 {
+    BOUND_DISPATCH_DEPTH.with(|depth| depth.get())
+}
+
+thread_local! {
+    /// BCORE-5 (fix-up): see [`bound_dispatch_depth`]. A depth, not a flag, so a nested entry
+    /// (a shim callback that re-enters the run loop) can never clear it early.
+    static BOUND_DISPATCH_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// BCORE-5 (fix-up): unwinds [`BOUND_DISPATCH_DEPTH`] on every exit from
+/// [`HvfBackend::bound_iteration`], including the error paths that `return` early.
+struct BoundDispatchScope;
+
+impl Drop for BoundDispatchScope {
+    fn drop(&mut self) {
+        BOUND_DISPATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+impl HvfBackend {
     // -- execution ---------------------------------------------------------
 
     /// Runs one guest thread to completion: the HVF counterpart of
@@ -6565,11 +9057,31 @@ impl HvfBackend {
         if shim.init(ctx) == ContinueOperation::Terminate {
             return;
         }
+        self.run_thread_loop(shim, ctx);
+        // Step GF (b): a thread that is leaving must not keep its lane -- this is the one exit
+        // path `run_thread_loop` itself cannot cover, because it returns from anywhere inside it.
+        release_retained_lane(crate::diagnostics_counters::LANE_STICKY_RELEASED_EXIT);
+        // BCORE-5: a bound vCPU is destroyed by its owner thread and nowhere else, so it is
+        // given back here -- before this thread's `ThreadHandle` goes away and before any
+        // address space it is registered in can be destroyed.
+        if bound_enabled() {
+            self.unbind_current_thread(crate::diagnostics_counters::BOUND_UNBINDS_EXIT);
+        }
+    }
+
+    fn run_thread_loop(
+        &self,
+        shim: &dyn EnterShim<ExecutionContext = PtRegs>,
+        ctx: &mut PtRegs,
+    ) {
         let thread = crate::ThreadHandle::current();
         let slot = thread.hvf_slot();
         let mut consecutive_attachment_races = 0u32;
         let mut stale_view_reruns = 0u32;
         let mut alias_conflict_reruns = 0u32;
+        // BCORE-4: `(window start, pooled iterations in this window)` for the bind trigger.
+        // Only read or written when the knob is on; the pooled path never touches it.
+        let mut bind_streak: (Instant, u32) = (Instant::now(), 0);
         use crate::diagnostics_counters::{
             GUEST_ATTACH, GUEST_DISPATCH, GUEST_EXECUTE, GUEST_LANE_WAIT, GUEST_LOOP_TOP,
             GUEST_PRE_EXECUTE, GUEST_PUMP, GUEST_RECORD, GUEST_RELEASE, GUEST_RESERVE,
@@ -6579,6 +9091,14 @@ impl HvfBackend {
         // this thread returned (host ticks), so the next submit can bank the whole-iteration
         // overhead (`exit_overhead`, minus the shim syscall time the dispatch in between recorded).
         let mut last_execute_end: Option<u64> = None;
+        // Step GF (b): the installed backend as a `&'static`, so a lease this thread keeps can
+        // outlive this call's `&self` borrow. `None` (only possible if some future caller runs a
+        // backend other than the installed one) simply disables retention for this thread.
+        let sticky_backend: Option<&'static HvfBackend> =
+            active().filter(|installed| std::ptr::eq(*installed, self));
+        // Step G: a thread is runnable from the moment it starts running here -- it has never
+        // waited yet -- so the first interval is measured against this stamp.
+        crate::diagnostics_counters::rbnr_became_ready(crate::diagnostics_counters::ticks(), 0);
         loop {
             let mut spans = crate::diagnostics_counters::GuestSpans::start();
             if slot.take_pending() && shim.interrupt(ctx) == ContinueOperation::Terminate {
@@ -6593,13 +9113,46 @@ impl HvfBackend {
             // `ensure_lane_attached_to_view` below attaches to (nothing between here and there
             // can change the thread-local it comes from).
             let view = crate::current_guest_view();
-            // FXR: the lane holding this thread's resident state (its vector file, or at least
-            // the integer file its cache last saw) is the one to ask the pool for.
-            let preferred = HVF_THREAD.with(|context| context.borrow().preferred_lane());
+            // BCORE-4: a thread with a vCPU of its own runs here and never reaches the pool.
+            // With `LITEBOX_HVF_BOUND=0` this is one load of a cached `false`.
+            if bound_enabled() {
+                match self.bound_iteration(shim, ctx, slot, view, &mut bind_streak) {
+                    BoundOutcome::Ran(ContinueOperation::Terminate) => return,
+                    BoundOutcome::Ran(_) => continue,
+                    BoundOutcome::Unbound => {}
+                }
+            }
+            // Step GF (b): reuse the lane this thread kept from its previous run when it has one
+            // and nothing has asked for it back. `preferred` (FXR's resident-state hint) is only
+            // read on the pool path -- a retained lease IS the lane holding this thread's
+            // resident state, so asking the pool to prefer it would be tautological.
             spans.mark(GUEST_LOOP_TOP);
-            let acquired = self.acquire_lane_for_thread(slot, view, preferred);
+            let retained = self.take_retained_lane();
+            let retained_hit = retained.is_some();
+            // Step GF (fix-up): the run count the retained lease has already served. It is carried
+            // into this iteration's `retain_lane`, which is what makes `LANE_STICKY_MAX_RUNS` a
+            // real bound; it was dropped on the floor before, so every retain restarted at 0 and
+            // the cap was unreachable. Reset to 0 whenever this iteration does not reuse a lease.
+            let mut carried_runs = 0u32;
+            let acquired = match retained {
+                Some(retained) => {
+                    carried_runs = retained.runs;
+                    Ok(Some(retained.lease))
+                }
+                // FXR: the lane holding this thread's resident state (its vector file, or at
+                // least the integer file its cache last saw) is the one to ask the pool for.
+                None => {
+                    let preferred = HVF_THREAD.with(|context| context.borrow().preferred_lane());
+                    self.acquire_lane_for_thread(slot, view, preferred)
+                }
+            };
             crate::diagnostics_counters::record_lane_wait(ticks_to_ns(spans.mark(GUEST_LANE_WAIT)));
             let lane_held_start = spans.last();
+            crate::diagnostics_counters::record_lane_sticky(if retained_hit {
+                crate::diagnostics_counters::LANE_STICKY_REUSED
+            } else {
+                crate::diagnostics_counters::LANE_STICKY_ACQUIRED
+            });
             let lease = match acquired {
                 Ok(Some(lease)) => lease,
                 Ok(None) => {
@@ -6676,7 +9229,9 @@ impl HvfBackend {
                     .participant
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                space.attach_vcpu(participant.1.as_ref().expect("lane participant present outside migration"))
+                // T2d: attach and submit in one shared operation (seven gate mutex acquisitions
+                // per syscall -> four).
+                space.attach_submitted_vcpu(participant.1.as_ref().expect("lane participant present outside migration"))
             };
             spans.mark(GUEST_ATTACH);
             let outcome = match attached {
@@ -6686,6 +9241,9 @@ impl HvfBackend {
                     let reservation = active.take_reservation();
                     spans.mark(GUEST_PRE_EXECUTE);
                     let execute_start = spans.last();
+                    // Step G: `running_at`. Everything from this thread's `ready_at` to here is
+                    // time it was runnable but not running; `rbnr_record` names the spans.
+                    crate::diagnostics_counters::rbnr_record(space.id(), &spans);
                     if let Some(previous_end) = last_execute_end.take() {
                         crate::diagnostics_counters::record_iteration(
                             ticks_to_ns(execute_start.wrapping_sub(previous_end)),
@@ -6715,6 +9273,28 @@ impl HvfBackend {
             };
             let guest_gate_locks = crate::diagnostics_counters::gate_locks_this_thread()
                 .wrapping_sub(gate_locks_before);
+            // Step GF (b): decide here whether this thread keeps the lane for its next run. The
+            // run has returned, so the attachment is consumed and the lane is quiescent -- the
+            // only moment at which keeping it is legal. Everything that can invalidate the
+            // decision afterwards (a waiter appearing, a shootdown, this thread parking) is
+            // handled at the next loop top by [`Self::take_retained_lane`], or before the park
+            // itself by [`release_retained_lane`].
+            if outcome.is_ok()
+                && crate::diagnostics_counters::lane_sticky_enabled()
+                // The vfork window: a parent parked hand-off-hand must not hold a lane.
+                && crate::current_vcpu_bind_eligible()
+                && let Some(lease) = active.settle_keeping_lane()
+                && let Some(backend) = sticky_backend
+            {
+                crate::diagnostics_counters::record_lane_sticky(
+                    crate::diagnostics_counters::LANE_STICKY_KEPT,
+                );
+                let epoch = self.lane_yield_epoch.load(Ordering::Acquire);
+                let deadline = Instant::now()
+                    .checked_add(lane_sticky_max_hold())
+                    .unwrap_or_else(Instant::now);
+                retain_lane(lease.with_backend(backend), carried_runs, epoch, deadline);
+            }
             drop(active);
             spans.mark(GUEST_RELEASE);
             let lane_held_ns = ticks_to_ns(spans.last().wrapping_sub(lane_held_start));
@@ -6783,6 +9363,13 @@ impl HvfBackend {
             );
             spans.mark(GUEST_DISPATCH);
             crate::diagnostics_counters::record_guest_iteration(&spans);
+            // Step G: the iteration is over. If the dispatch in between left this thread blocked
+            // in a wait, `rbnr_became_ready` has already been stamped by the wake (or the
+            // timeout) exactly at the moment it became runnable; otherwise it is runnable now.
+            crate::diagnostics_counters::rbnr_iteration_end(
+                spans.last(),
+                ticks_to_ns(spans.span(GUEST_PUMP)),
+            );
             if disposition == ContinueOperation::Terminate {
                 return;
             }
@@ -6839,14 +9426,23 @@ impl HvfBackend {
                     // `ctx` was just populated by `write_direct_exit` above,
                     // so `ctx.regs[29]` (x29/FP) already reflects the
                     // faulting frame's own real guest register value.
-                    backtrace: capture_frame_backtrace(ctx.regs[29]),
+                    backtrace: if exception_backtrace_wanted() {
+                        capture_frame_backtrace(ctx.regs[29])
+                    } else {
+                        litebox::shim::FrameBacktrace::EMPTY
+                    },
                 };
                 // Never routes through `kernel_mode`-gated `PageManager::handle_page_fault` (see
                 // `kernel_mode: false` above), so this is always a genuine delivered signal, not
                 // a candidate for `guest_faults_serviced` -- credited to the shared
                 // process-global static directly, same as the non-abort catch-all below.
                 checked_increment(&GUEST_FAULTS_DELIVERED);
-                shim.exception(ctx, &info)
+                let exception_started = Instant::now();
+                let op = shim.exception(ctx, &info);
+                crate::diagnostics_counters::record_exception_service(
+                    crate::diagnostics_counters::elapsed_ns(exception_started),
+                );
+                op
             }
             (HvfVcpuExit::Exception(exception), HvfVcpuExitState::DirectGuest(state))
                 if matches!(
@@ -6931,6 +9527,7 @@ impl HvfBackend {
                     class,
                     exception.virtual_address,
                     exception.syndrome,
+                    snapshot.pending_tlbi_generation.value(),
                 ) {
                     // FIX (hvf-cow-fault-resolution-uncredited-exception-bucket): this exit was
                     // already counted into `raw_exception_exits` above (before any of the arms in
@@ -6959,7 +9556,11 @@ impl HvfBackend {
                     kernel_mode: true,
                     // `ctx` was populated by `write_direct_exit` earlier in this
                     // same arm; see the `EC_BRK64` arm's identical comment.
-                    backtrace: capture_frame_backtrace(ctx.regs[29]),
+                    backtrace: if exception_backtrace_wanted() {
+                        capture_frame_backtrace(ctx.regs[29])
+                    } else {
+                        litebox::shim::FrameBacktrace::EMPTY
+                    },
                 };
                 litebox_util_log::debug!(
                     class:? = class, esr:? = exception.syndrome, far:? = exception.virtual_address,
@@ -6969,7 +9570,12 @@ impl HvfBackend {
                 // `guest_faults_delivered` is credited downstream (by whether
                 // `handle_page_fault` services or delivers it), same as the monitor path's
                 // abort arm -- crediting it here too would double-count one raw exit.
-                shim.exception(ctx, &info)
+                let exception_started = Instant::now();
+                let op = shim.exception(ctx, &info);
+                crate::diagnostics_counters::record_exception_service(
+                    crate::diagnostics_counters::elapsed_ns(exception_started),
+                );
+                op
             }
             (HvfVcpuExit::Canceled, HvfVcpuExitState::LowerElMonitor(state))
                 if state.pc == MONITOR_LOWER_EL_SYNC_OFFSET =>
@@ -7154,9 +9760,14 @@ impl HvfBackend {
                 // blocked/service split below is exactly this one syscall's.
                 let _ = crate::diagnostics_counters::take_blocked_ns();
                 let origin = crate::diagnostics_counters::enter_syscall_origin(ctx.syscallno);
+                // hvf-glive-unattributed-slow-syscall-mass: host-thread CPU time across this
+                // syscall, so a slow record can say whether its wall time was spent running or
+                // not running. 0 (and no mach call at all) unless LITEBOX_HVF_SYSCALL_CPU=1.
+                let cpu_start = crate::diagnostics_counters::thread_cpu_ns();
                 let syscall_start = Instant::now();
                 let outcome = shim.syscall(ctx);
                 let elapsed_ns = u64::try_from(syscall_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let cpu_ns = crate::diagnostics_counters::thread_cpu_ns_since(cpu_start);
                 drop(origin);
                 let blocked_ns = crate::diagnostics_counters::take_blocked_ns();
                 // Bit-preserving reinterpretation of the raw x0 return value as signed -- the
@@ -7168,6 +9779,7 @@ impl HvfBackend {
                     result,
                     elapsed_ns,
                     blocked_ns,
+                    cpu_ns,
                 );
                 outcome
             }
@@ -7289,7 +9901,15 @@ impl HvfBackend {
                     }
                 }
                 if is_abort
-                    && self.try_resolve_cow_fault(space, shim, view, class, state.far_el1, state.esr_el1)
+                    && self.try_resolve_cow_fault(
+                        space,
+                        shim,
+                        view,
+                        class,
+                        state.far_el1,
+                        state.esr_el1,
+                        snapshot.pending_tlbi_generation.value(),
+                    )
                 {
                     // FIX (hvf-cow-fault-resolution-uncredited-exception-bucket): see the
                     // identical credit in `dispatch`'s own direct-guest abort arm -- this exit is
@@ -7306,7 +9926,20 @@ impl HvfBackend {
                 *alias_conflict_reruns = 0;
                 let info = ExceptionInfo {
                     exception: Exception(u8::try_from(class).unwrap_or(0)),
-                    fault_address: usize::try_from(state.far_el1).unwrap_or(usize::MAX),
+                    // RUNWALL FC2 review fix-up: FAR_EL1 is architecturally updated only on an
+                    // abort (EC 0x20/0x21/0x24/0x25), so on every other class the register still
+                    // holds the previous abort's address -- and an EL0 entry no longer reinstalls
+                    // it, because measuring that reinstall cost ~260 ns of raw `hv_vcpu_run` p50
+                    // per run under load. Zero it here instead: this is the only reader of
+                    // `far_el1` that is not already `is_abort`-gated (`classify_wx_fault` and
+                    // `try_resolve_cow_fault` above, and the two debug logs), and
+                    // `litebox_shim_linux` has always derived 0 for non-abort classes anyway, so
+                    // this makes the platform's own contract explicit rather than inherited.
+                    fault_address: if is_abort {
+                        usize::try_from(state.far_el1).unwrap_or(usize::MAX)
+                    } else {
+                        0
+                    },
                     esr: state.esr_el1,
                     // A real EL0 data/instruction abort (`is_abort`) is exactly
                     // the case `litebox_shim_linux`'s `exception()` gates
@@ -7321,7 +9954,11 @@ impl HvfBackend {
                     // `ctx` was populated by `write_monitor_exit` at the top
                     // of `dispatch_monitor_exit`; see the direct-guest
                     // `EC_BRK64` arm's identical comment.
-                    backtrace: capture_frame_backtrace(ctx.regs[29]),
+                    backtrace: if exception_backtrace_wanted() {
+                        capture_frame_backtrace(ctx.regs[29])
+                    } else {
+                        litebox::shim::FrameBacktrace::EMPTY
+                    },
                 };
                 // Permanent diagnostic aid: every non-SVC/non-WFx monitor
                 // exception is rare enough in practice (aborts, undefined
@@ -7343,7 +9980,12 @@ impl HvfBackend {
                     // here too would double-count one raw exit across two buckets.
                     checked_increment(&GUEST_FAULTS_DELIVERED);
                 }
-                shim.exception(ctx, &info)
+                let exception_started = Instant::now();
+                let op = shim.exception(ctx, &info);
+                crate::diagnostics_counters::record_exception_service(
+                    crate::diagnostics_counters::elapsed_ns(exception_started),
+                );
+                op
             }
         }
     }
@@ -7471,10 +10113,8 @@ impl HvfBackend {
         // bytes; a file alias only ever carries READ or READ|EXECUTE (the write direction
         // leaves it READ and the next store promotes); an untouched window page has nothing to
         // flip yet -- its first touch installs the alias in the toggle's direction.
-        let kind = space
-            .page_kinds(&flip_range)
-            .first()
-            .map_or(PageKind::Missing, |(_, kind)| *kind);
+        let (kinds, _) = space.settle_gate(GrSite::PageKinds, || space.page_kinds(&flip_range));
+        let kind = kinds.first().map_or(PageKind::Missing, |(_, kind)| *kind);
         let flip = match kind {
             PageKind::Promoted => self.settle_single_page_mutation(&space, MutationKind::Protect, || {
                 space.materialize_page_with_permissions(None, req.page, want)
@@ -7484,7 +10124,7 @@ impl HvfBackend {
                     .reprotect_file_aliases(origin, &flip_range, want)
                     .map(|changed| {
                         if changed {
-                            self.kick_running_lanes();
+                            self.kick_running_lanes_in(&space);
                         }
                         changed
                     }),
@@ -7737,6 +10377,38 @@ pub(crate) fn guest_access_fault_trace() -> bool {
     })
 }
 
+/// T1f-b F1: how many pages of one file window a single fault may alias at once
+/// (`LITEBOX_HVF_FAULT_AROUND`; `1` is the default, i.e. one page per fault -- what every
+/// measurement before this step used, and what this step's own measurement selected).
+///
+/// Measured on the idle desktop (five 60 s windows, same signed binary, arm `t1f-desk-c1` at 4
+/// against arm `t1f-desk-c0` at 1 -- that pair is the baseline quoted below, and it is the one
+/// `.gm/syscall-bench/steps/t1f/notes.md` tabulates): fault-around cut the file-window installs
+/// by 63 %, the guest faults by 46 %, the mutation attempts by 45 % and the settled mutations by
+/// 32 % per 1000 guest syscalls. Against the earlier instrumentation-only arm `t1f-desk-a1`
+/// (a different, quieter session) the same four figures read 61 % / 42 % / 42 % / 29 % -- both
+/// are correct for their own baseline, so quote the arm with them.
+///
+/// It left the runner's idle CPU per 1000 syscalls unchanged (1.53 -> 1.56, inside the arm's own
+/// 1.01-1.75 window spread) while raising `file_alias_pages_live` by 77 %, `host_slots` by 17 %
+/// and `live_data_pages` by 15 % (every speculative page carries a host slot and an origin alias
+/// reference), and it made xterm typing 200x worse (11.8 -> 2436 ms median). Not worth shipping
+/// by default on a host whose live-data budget is the known failure mode, so the mechanism stays
+/// wired for the next measurement behind this knob. Its multi-page path has **no** race witness:
+/// `--hvf-alias-race` exercises anonymous `map_range`/`unmap_range` and never reaches this
+/// function, so running it with the knob set proves nothing about it (PRD row
+/// `hvf-t1f-fault-around-multipage-path-has-no-race-witness`). Read once, so the shipped path
+/// costs one `OnceLock` load.
+pub(crate) fn fault_around_pages() -> usize {
+    static AROUND: OnceLock<usize> = OnceLock::new();
+    *AROUND.get_or_init(|| {
+        std::env::var("LITEBOX_HVF_FAULT_AROUND")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(1, |value| value.min(16))
+    })
+}
+
 /// How many acting rounds a host-side access's page preparation may run (see
 /// [`revalidated_rounds`]) before its next snapshot is judged as it stands. A page needs at most
 /// three steps in sequence (ancestor-side divergence, alias install, promotion), each run in its
@@ -7839,6 +10511,15 @@ impl AncestorCache<'_> {
     }
 }
 
+/// One round's plan, plus how this build spends one the domain has moved on from (see
+/// [`HostPagePreparer::pass`]).
+struct RoundPlan {
+    entries: Vec<HostAccessEntry>,
+    /// Abandon the round instead of walking `entries`: only ever set by the
+    /// `LITEBOX_HVF_GR_STALE_SKIPS_ROUND` control arm.
+    abandon: bool,
+}
+
 /// One host-side access's page preparation (`HvfBackend::prepare_guest_access`), driven through
 /// [`revalidated_rounds`] over `HvfAddressSpace::host_access_plan` snapshots.
 struct HostPagePreparer<'a> {
@@ -7894,9 +10575,14 @@ impl HostPagePreparer<'_> {
     /// One round over one snapshot: at most one ACTING step per page (a step with nothing to run
     /// against is recorded as failed and the page's next step is tried at once: no state
     /// changed). Returns whether any step acted.
-    fn pass(&mut self, plan: &[HostAccessEntry]) -> bool {
+    fn pass(&mut self, round: &RoundPlan) -> bool {
+        // CLASS R: `abandon` is the control arm's shape only (`LITEBOX_HVF_GR_STALE_SKIPS_ROUND`);
+        // the shipped shape never reaches this branch because its plan is settled by the snapshot.
+        if round.abandon {
+            return true;
+        }
         let mut acted = false;
-        for (index, entry) in plan.iter().enumerate() {
+        for (index, entry) in round.entries.iter().enumerate() {
             let Some(mut failed) = self.failed.get(index).copied() else {
                 continue;
             };
@@ -7960,7 +10646,8 @@ impl HostPagePreparer<'_> {
                     return HostStepOutcome::NotApplicable;
                 };
                 let target = space
-                    .file_window_at(page)
+                    .settle_gate(GrSite::FileWindowAt, || space.file_window_at(page))
+                    .0
                     .map_or(PromoteTarget::Inherit, |window| PromoteTarget::Exact(window.perms));
                 let result = backend.settle_single_page_mutation(space, MutationKind::Protect, || {
                     space.promote_file_alias(origin, page, target)

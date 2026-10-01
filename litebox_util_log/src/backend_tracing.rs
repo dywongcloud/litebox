@@ -72,6 +72,17 @@ macro_rules! __log_impl {
     };
 }
 
+/// Internal macro backing [`log_enabled!`](crate::log_enabled) for the `tracing` backend.
+///
+/// Not intended for direct use; called by the public macro.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __log_enabled_impl {
+    (target: $target:expr, $level:expr) => {
+        $crate::__private::tracing::enabled!(target: $target, $crate::Level::to_tracing_level($level))
+    };
+}
+
 /// Unified internal macro to dispatch and process key-value pairs for tracing.
 ///
 /// Uses a tt-muncher pattern to transform fields from our unified syntax

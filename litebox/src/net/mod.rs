@@ -17,10 +17,18 @@ use crate::{LiteBox, platform, sync};
 use bitflags::bitflags;
 use smoltcp::socket::{icmp, raw, tcp, udp};
 
+mod counters;
 pub mod errors;
 pub mod local_ports;
 mod phy;
+mod registry;
 pub mod socket_channel;
+pub mod wake;
+
+pub use counters::{
+    WorkerWake, counters_json, note_worker_immediate_cap_hit, note_worker_wake,
+    worker_wake_sources,
+};
 
 #[cfg(test)]
 mod tests;
@@ -124,6 +132,26 @@ where
     /// `close()`; they are moved into smoltcp first and the FIN follows (see
     /// [`Self::drain_closing_with_pending_tx`]).
     closing_with_pending_tx: Vec<DrainingSocket<Platform>>,
+    /// NETFIX: every live socket description, so the worker finds the sockets it must service
+    /// without walking the process-global descriptor table (see `net::registry`).
+    registry: registry::SocketRegistry<Platform>,
+    /// NETFIX: the channels' dirty list and the platform doorbell (see `net::wake`).
+    hook: alloc::sync::Arc<wake::NetWakeHook<Platform>>,
+    /// Sockets a `Network` operation changed in a way the worker must act on (queued under the
+    /// Network mutex, serviced at the top of the next poll).
+    service_queue: Vec<wake::RegistryKey>,
+    /// Reused key buffer for a poll's work list and full passes (no allocation per poll).
+    scratch: Vec<wake::RegistryKey>,
+    /// A kick arrived while a poll was running: answer `CallAgainImmediately` once more.
+    kick_pending: bool,
+    /// Set for the duration of a poll, so a kick raised by the poll itself (a close it finished)
+    /// does not ring the worker's own doorbell.
+    in_poll: bool,
+    /// The earliest deadline the stack advised at the end of the last idle poll (a smoltcp timer
+    /// or an orphan reap); a poll that starts at or after it services every socket, because a
+    /// timer can change a socket's state without moving a packet (a connect timing out, TIME-WAIT
+    /// expiring).
+    next_timer: Option<smoltcp::time::Instant>,
 }
 
 /// A TCP socket whose file descriptor is gone but whose smoltcp state machine is still finishing
@@ -199,6 +227,12 @@ where
             Ok(None) => {}
             _ => unreachable!(),
         }
+        // The doorbell is the platform's; the boxed closure keeps `NetWakeHook` (and every socket
+        // channel that holds it) free of the platform's network bound.
+        let platform: &'static Platform = litebox.x.platform;
+        let hook = alloc::sync::Arc::new(wake::NetWakeHook::new(alloc::boxed::Box::new(
+            move || platform.notify_network_worker(),
+        )));
         Self {
             litebox: litebox.clone(),
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
@@ -211,6 +245,13 @@ where
             queued_for_closure: vec![],
             closing_in_background: vec![],
             closing_with_pending_tx: vec![],
+            registry: registry::SocketRegistry::new(),
+            hook,
+            service_queue: vec![],
+            scratch: vec![],
+            kick_pending: false,
+            in_poll: false,
+            next_timer: None,
         }
     }
 }
@@ -219,8 +260,12 @@ where
 /// from [`SocketFd`], _except_ the `Socket` itself which is stored in the [`Network::socket_set`].
 pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Whether this socket handle is going away soon (i.e., `close` has been invoked upon it but
-    /// it lingers for a bit to allow pending data to be sent).
-    consider_closed: bool,
+    /// it lingers for a bit to allow pending data to be sent). Atomic so the network worker can
+    /// finish the close holding only the entry's read lock (NETFIX section 2.4).
+    consider_closed: AtomicBool,
+    /// This description's key in the `Network`'s socket registry (NETFIX section 2.2); fixed for
+    /// the description's whole life.
+    reg: wake::RegistryKey,
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
     // Protocol-specific data
@@ -259,7 +304,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
 
     // Convenience function to perform a mutable operation depending on the socket type
     fn with_socket_mut<TCP, UDP, R>(
-        &mut self,
+        &self,
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         tcp: TCP,
         udp: UDP,
@@ -572,8 +617,15 @@ where
             matches!(self.platform_interaction, PlatformInteraction::Manual),
             "Requires manual-mode interactions"
         );
-        match self.internal_perform_platform_interaction() {
+        let started = self.device.platform.now();
+        let result = self.internal_perform_platform_interaction();
+        let advice = match result {
             smoltcp::iface::PollResult::SocketStateChanged => {
+                PlatformInteractionReinvocationAdvice::CallAgainImmediately
+            }
+            // A kick raised by this very poll (it finished a close whose RST/FIN must go out):
+            // one more poll, now.
+            smoltcp::iface::PollResult::None if self.kick_pending => {
                 PlatformInteractionReinvocationAdvice::CallAgainImmediately
             }
             smoltcp::iface::PollResult::None => {
@@ -582,47 +634,235 @@ where
                     timeout: poll_at,
                 }
             }
-        }
+        };
+        let busy = self.device.platform.now().duration_since(&started);
+        counters::note_poll(
+            matches!(result, smoltcp::iface::PollResult::SocketStateChanged),
+            advice.call_again_immediately(),
+            u64::try_from(busy.as_nanos()).unwrap_or(u64::MAX),
+        );
+        advice
     }
 
     /// Return a _soft timeout_ (duration to wait) before calling [`Self::perform_platform_interaction`] again.
     ///
     /// Returns `None` if there is no pending timeout (i.e., no scheduled work requiring network operations).
+    ///
+    /// The deadline is the earlier of smoltcp's own timers and the orphan reap of a closed socket
+    /// that is still open on the wire ([`TCP_ORPHAN_TIMEOUT`], acted on by
+    /// [`Self::remove_dead_sockets`] / [`Self::drain_closing_with_pending_tx`]): a worker that
+    /// parks until it is woken must not depend on unrelated traffic to reap an orphan. It is also
+    /// remembered as `next_timer` (see that field).
     fn poll_at(&mut self) -> Option<core::time::Duration> {
         let timestamp = self.now();
-        self.interface
-            .poll_at(timestamp, &self.socket_set)
-            .map(|instant| {
-                if timestamp < instant {
-                    let diff = instant - timestamp;
-                    diff.into()
-                } else {
-                    core::time::Duration::ZERO
-                }
-            })
+        let stack_at = self.interface.poll_at(timestamp, &self.socket_set);
+        let socket_set = &self.socket_set;
+        let orphan_at = self
+            .closing_in_background
+            .iter()
+            .filter(|closing| socket_set.get::<tcp::Socket>(closing.handle).is_open())
+            .map(|closing| closing.closed_at)
+            .chain(
+                self.closing_with_pending_tx
+                    .iter()
+                    .map(|draining| draining.closed_at),
+            )
+            .min()
+            .map(|closed_at| closed_at + TCP_ORPHAN_TIMEOUT);
+        let at = match (stack_at, orphan_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.next_timer = at;
+        at.map(|instant| {
+            if timestamp < instant {
+                let diff = instant - timestamp;
+                diff.into()
+            } else {
+                core::time::Duration::ZERO
+            }
+        })
     }
 
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
+    ///
+    /// NETFIX: the poll never touches the process-global descriptor table (except the sanctioned
+    /// queued-close drain, taken only when it will remove something) and does work proportional
+    /// to the sockets that have work: the ones a channel marked, the ones a `Network` operation
+    /// queued, the ones waiting for a deferred close, and -- only after a poll that moved packets
+    /// or one a timer was due for -- every live socket in the registry (smoltcp 0.12 has no
+    /// per-socket wakers, so after `SocketStateChanged` it cannot say which sockets changed; that
+    /// pass is O(live sockets) with no table lock, the same order as smoltcp's own egress pass).
     fn internal_perform_platform_interaction(&mut self) -> smoltcp::iface::PollResult {
+        self.in_poll = true;
+        self.kick_pending = false;
+        let now = self.now();
+        // `Automatic` mode polls only inline with an operation and never computes the advice, so
+        // it keeps the old "every poll services every socket" behaviour (over the registry now,
+        // not the descriptor table).
+        let timer_due = matches!(self.platform_interaction, PlatformInteraction::Automatic)
+            || self.next_timer.is_some_and(|deadline| now >= deadline);
+
         self.attempt_to_close_queued();
         self.remove_dead_sockets();
-        self.close_pending_sockets();
         self.drain_closing_with_pending_tx();
 
-        // Drain all socket channel buffers before polling to ensure data flows
-        self.drain_all_socket_channel_buffers();
-        self.interface
-            .poll(self.now(), &mut self.device, &mut self.socket_set)
+        // Work queued since the last poll, serviced before the interface poll so the TX it moves
+        // into smoltcp goes out in this poll's egress. Duplicates are harmless (a second service
+        // of the same socket finds nothing left to move).
+        let mut work = core::mem::take(&mut self.scratch);
+        work.clear();
+        self.hook.drain_into(&mut work);
+        counters::DIRTY_DRAINED.fetch_add(work.len() as u64, Ordering::Relaxed);
+        work.append(&mut self.service_queue);
+        work.extend_from_slice(self.registry.pending_close_keys());
+        for &key in &work {
+            self.service(key, now);
+        }
+
+        let result = self
+            .interface
+            .poll(self.now(), &mut self.device, &mut self.socket_set);
+
+        if matches!(result, smoltcp::iface::PollResult::SocketStateChanged) || timer_due {
+            work.clear();
+            work.extend_from_slice(self.registry.live_keys());
+            counters::REGISTRY_SCANS.fetch_add(1, Ordering::Relaxed);
+            counters::REGISTRY_SCANNED.fetch_add(work.len() as u64, Ordering::Relaxed);
+            let now = self.now();
+            for &key in &work {
+                self.service(key, now);
+            }
+        }
+        self.scratch = work;
+        self.in_poll = false;
+        result
     }
 
     /// (Internal-only API) Perform the queued interactions.
+    ///
+    /// In `Manual` mode this is a kick: the operation changed smoltcp state that a poll must act
+    /// on (a SYN or FIN to send, a socket to reap), so the worker is woken instead of waiting for
+    /// its next timer.
     fn automated_platform_interaction(&mut self, _direction: PollDirection) {
         match self.platform_interaction {
             PlatformInteraction::Automatic => {
                 self.internal_perform_platform_interaction();
             }
-            PlatformInteraction::Manual => {}
+            PlatformInteraction::Manual => self.kick(),
         }
+    }
+
+    /// The `Automatic`-mode ingress an operation performs before (and after) it reads smoltcp
+    /// state. In `Manual` mode the worker does all ingress, and these operations change nothing
+    /// a poll must act on, so they do not kick: the host-service pollers call `receive`/`accept`
+    /// hundreds of times a second and must not keep the worker awake.
+    fn ingress_before_op(&mut self) {
+        if let PlatformInteraction::Automatic = self.platform_interaction {
+            self.internal_perform_platform_interaction();
+        }
+    }
+
+    /// Ask the worker for a poll now (NETFIX section 3.6).
+    fn kick(&mut self) {
+        counters::KICKS.fetch_add(1, Ordering::Relaxed);
+        self.kick_pending = true;
+        if !self.in_poll {
+            self.hook.notify();
+        }
+    }
+
+    /// Queue `key`'s socket for a service at the top of the next poll.
+    fn queue_service(&mut self, key: wake::RegistryKey) {
+        if key != wake::REGISTRY_NONE {
+            self.service_queue.push(key);
+        }
+    }
+
+    /// Service one socket: move data between its channel and smoltcp, publish its state and
+    /// readiness, and finish a deferred close (NETFIX section 2.3). Takes only the entry's read
+    /// lock -- never the descriptor table.
+    fn service(&mut self, key: wake::RegistryKey, now: smoltcp::time::Instant) {
+        let Some(record) = self.registry.get(key) else {
+            // Closed since it was queued.
+            return;
+        };
+        let Some(entry) = record.entry.upgrade() else {
+            // Unreachable while every teardown goes through `close_handle` under the Network
+            // mutex (which removes the record first); counted so a leak path shows up.
+            self.registry.remove(key);
+            counters::REGISTRY_DEAD_WEAK.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        counters::SERVICES.fetch_add(1, Ordering::Relaxed);
+        let socket_set = &mut self.socket_set;
+        let still_pending = entry.with_entry(|descriptor| {
+            let socket_handle = &descriptor.entry;
+            if let Some(proxy) = &socket_handle.proxy {
+                // Clear BEFORE draining (clear-then-drain, see `net::wake`).
+                proxy.clear_wake();
+            }
+            Self::drain_socket_channel_buffers(socket_set, socket_handle, now);
+            Self::continue_deferred_close(socket_set, socket_handle)
+        });
+        drop(entry);
+        self.registry.set_pending_close(key, still_pending);
+    }
+
+    /// The deferred-close half of a service (what `close_pending_sockets` did on every poll for
+    /// every socket): once a `close()` deferred for pending data finds the ring and the send queue
+    /// empty, send the FIN. Returns whether the socket still waits -- for that, or for the FIN of a
+    /// `shutdown(SHUT_WR)` that is still behind ring data -- so it stays on the per-poll list.
+    fn continue_deferred_close(
+        socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        socket_handle: &SocketHandle<Platform>,
+    ) -> bool {
+        let mut pending = false;
+        if socket_handle.consider_closed.load(Ordering::Acquire) {
+            if socket_handle
+                .proxy
+                .as_ref()
+                .is_some_and(|proxy| proxy.has_pending_tx())
+            {
+                pending = true;
+            } else {
+                let closed = socket_handle.with_socket_mut(
+                    socket_set,
+                    |tcp_socket| {
+                        let has_pending_data = tcp_socket.may_send() && tcp_socket.send_queue() > 0;
+                        if !has_pending_data {
+                            tcp_socket.close();
+                        }
+                        !has_pending_data
+                    },
+                    |udp_socket| {
+                        let has_pending_data = udp_socket.is_open() && udp_socket.send_queue() > 0;
+                        if !has_pending_data {
+                            udp_socket.close();
+                        }
+                        !has_pending_data
+                    },
+                );
+                if closed {
+                    socket_handle
+                        .consider_closed
+                        .store(false, Ordering::Release);
+                } else {
+                    pending = true;
+                }
+            }
+        }
+        if let ProtocolSpecific::Tcp(tcp_specific) = &socket_handle.specific
+            && tcp_specific.write_shutdown.load(Ordering::Acquire)
+            && matches!(
+                socket_set.get::<tcp::Socket>(socket_handle.handle).state(),
+                tcp::State::SynReceived | tcp::State::Established | tcp::State::CloseWait
+            )
+        {
+            // The FIN of `shutdown(SHUT_WR)` is still waiting behind ring data.
+            pending = true;
+        }
+        pending
     }
 
     /// Remove dead sockets that were closing in the background
@@ -699,58 +939,13 @@ where
         }
     }
 
-    /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
-    fn close_pending_sockets(&mut self) {
-        let table = self.litebox.descriptor_table();
-        for (_, mut handle) in table.iter_mut::<Network<Platform>>() {
-            let socket_handle = &mut handle.entry;
-            if socket_handle.consider_closed {
-                // check if there is pending data to be sent
-                if let Some(proxy) = &socket_handle.proxy
-                    && proxy.has_pending_tx()
-                {
-                    continue;
-                }
-
-                let closed = socket_handle.with_socket_mut(
-                    &mut self.socket_set,
-                    |tcp_socket| {
-                        let has_pending_data = tcp_socket.may_send() && tcp_socket.send_queue() > 0;
-                        if !has_pending_data {
-                            tcp_socket.close();
-                        }
-                        !has_pending_data
-                    },
-                    |udp_socket| {
-                        let has_pending_data = udp_socket.is_open() && udp_socket.send_queue() > 0;
-                        if !has_pending_data {
-                            udp_socket.close();
-                        }
-                        !has_pending_data
-                    },
-                );
-                if closed {
-                    socket_handle.consider_closed = false;
-                }
-            }
-        }
-    }
-
-    /// Drain all socket channel buffers
-    fn drain_all_socket_channel_buffers(&mut self) {
-        let now = self.now();
-        let table = self.litebox.descriptor_table();
-        for (_, entry) in table.iter::<Network<Platform>>() {
-            Self::drain_socket_channel_buffers(&mut self.socket_set, &entry.entry, now);
-        }
-    }
-
     /// Drain data between socket channels and smoltcp sockets.
     ///
     /// This transfers data from the TX ring buffer (user writes) to the smoltcp socket,
     /// and from the smoltcp socket to the RX ring buffer (user reads).
     ///
-    /// Should be called periodically by the network worker to keep data flowing.
+    /// Called by the network worker's per-socket service ([`Self::service`]) whenever the socket
+    /// may have work: its channel marked it, an operation queued it, or a poll moved packets.
     fn drain_socket_channel_buffers(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         socket_handle: &SocketHandle<Platform>,
@@ -1059,7 +1254,8 @@ where
         };
 
         Ok(self.new_socket_fd_for(SocketHandle {
-            consider_closed: false,
+            consider_closed: AtomicBool::new(false),
+            reg: wake::REGISTRY_NONE,
             handle,
             specific: match protocol {
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific::new(None)),
@@ -1073,9 +1269,23 @@ where
         }))
     }
 
-    /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`].
-    fn new_socket_fd_for(&mut self, socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
-        self.litebox.descriptor_table_mut().insert(socket_handle)
+    /// Creates a new [`SocketFd`] for a newly-created [`SocketHandle`], and registers the new
+    /// socket description with the worker's registry (NETFIX section 2.2).
+    fn new_socket_fd_for(&mut self, mut socket_handle: SocketHandle<Platform>) -> SocketFd<Platform> {
+        // The key lives in the (immutable) handle, so it is claimed before the entry exists; the
+        // weak handle exists only once it is inserted. Both happen under the Network mutex and the
+        // same table guard, so the worker never sees one without the other.
+        let key = self.registry.reserve();
+        socket_handle.reg = key;
+        let mut dt = self.litebox.descriptor_table_mut();
+        let fd: SocketFd<Platform> = dt.insert(socket_handle);
+        let weak = dt
+            .entry_handle(&fd)
+            .expect("a just-inserted descriptor is live")
+            .downgrade();
+        drop(dt);
+        self.registry.fill(key, weak);
+        fd
     }
 
     /// Set the network proxy for the socket at `fd`
@@ -1098,7 +1308,19 @@ where
             return false;
         };
         let socket_handle = &mut table_entry.entry;
+        // NETFIX: from now on the channel's ring operations queue this socket for the worker.
+        // Attached here, under the Network mutex and before the descriptor is handed to the guest
+        // (`initialize_socket` calls this before `insert_raw_fd`), so no ring operation can
+        // precede it.
+        proxy.attach_wake(&self.hook, socket_handle.reg);
         socket_handle.proxy = Some(proxy);
+        let key = socket_handle.reg;
+        drop(table_entry);
+        drop(descriptor_table);
+        // Anything smoltcp already holds for it (an accepted connection's first bytes arrived
+        // before it had a channel) is moved on the next poll.
+        self.queue_service(key);
+        self.kick();
         true
     }
 
@@ -1150,13 +1372,30 @@ where
                 // It seems like there might be other duplicates around (e.g., due to `dup`), so we
                 // can't immediately close it out.
                 // We attempt to queue it for future closure and then just return.
+                let key = dt.with_entry(&dup_fd, |entry| entry.entry.reg);
+                drop(dt);
                 self.queued_for_closure.push(dup_fd);
+                if let Some(key) = key {
+                    self.registry.note_queued(key);
+                }
+                counters::QUEUED_CLOSE_LIVE
+                    .store(self.queued_for_closure.len() as u64, Ordering::Relaxed);
+                // NETFIX section 2.2: the common "last alias just closed" case (a fork child's
+                // copy, then the parent's) resolves here, on the closing thread, instead of
+                // waiting for the worker.
+                self.attempt_to_close_queued();
             }
             super::fd::CloseResult::Deferred => {
-                let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
-                else {
+                let Some(key) = dt.with_entry(fd, |entry| {
+                    entry.entry.consider_closed.store(true, Ordering::Release);
+                    entry.entry.reg
+                }) else {
                     unreachable!()
                 };
+                drop(dt);
+                // The worker sends the FIN once the ring and the send queue have drained.
+                self.registry.set_pending_close(key, true);
+                self.kick();
                 return Err(CloseError::DataPending);
             }
         }
@@ -1165,14 +1404,26 @@ where
 
     /// Attempt to close as many queued-to-close FDs as possible. Returns `true` iff any of them
     /// were closed.
+    ///
+    /// NETFIX section 2.5: the global descriptor table is taken (write) only when the registry's
+    /// counts say a drain will remove something -- a description whose every strong handle is a
+    /// queued descriptor -- instead of on every poll for as long as any alias lives (a dup held by
+    /// a long-lived child used to cost a table write lock and a `HashMap` per poll for the child's
+    /// whole life). On the network worker that acquisition is its one sanctioned table access.
     fn attempt_to_close_queued(&mut self) -> bool {
-        if self.queued_for_closure.is_empty() {
-            // fast path
+        if self.queued_for_closure.is_empty() || !self.registry.any_queued_close_complete() {
             return false;
         }
-        let mut dt = self.litebox.descriptor_table_mut();
-        let entries = dt.drain_entries_full_covered_by(&mut self.queued_for_closure);
-        drop(dt);
+        counters::QUEUED_CLOSE_DRAINS.fetch_add(1, Ordering::Relaxed);
+        let litebox = &self.litebox;
+        let queued = &mut self.queued_for_closure;
+        let entries = litebox
+            .platform()
+            .with_sanctioned_descriptor_table_access(|| {
+                let mut dt = litebox.descriptor_table_mut();
+                dt.drain_entries_full_covered_by(queued)
+            });
+        counters::QUEUED_CLOSE_LIVE.store(self.queued_for_closure.len() as u64, Ordering::Relaxed);
         if entries.is_empty() {
             return false;
         }
@@ -1186,10 +1437,13 @@ where
     fn close_handle(&mut self, socket_handle: SocketHandle<Platform>) {
         let SocketHandle {
             consider_closed: _,
+            reg,
             handle,
             mut specific,
             proxy,
         } = socket_handle;
+        // NETFIX: the description is gone; the worker must never service it again.
+        self.registry.remove(reg);
         match specific.protocol() {
             Protocol::Raw { .. } | Protocol::Icmp => {
                 // There is no close/abort for raw and icmp sockets
@@ -1328,9 +1582,16 @@ where
             }
             Protocol::Icmp | Protocol::Raw { protocol: _ } => unimplemented!(),
         }
+        let key = socket_handle.reg;
         drop(table_entry);
         drop(descriptor_table);
 
+        // NETFIX: the worker acts on the new flags (discard RX, FIN after the ring drains); a
+        // pending `SHUT_WR` FIN keeps the socket on the per-poll list until it is sent.
+        self.queue_service(key);
+        if write {
+            self.registry.set_pending_close(key, true);
+        }
         self.automated_platform_interaction(PollDirection::Both);
         Ok(())
     }
@@ -1478,10 +1739,18 @@ where
                 Err(_) => {}
             }
         }
+        let key = socket_handle.reg;
         drop(table_entry);
         drop(descriptor_table);
 
-        self.automated_platform_interaction(PollDirection::Both);
+        if !check_progress {
+            // A fresh connect queued a SYN (or set a UDP default destination): poll now. A
+            // progress check changed nothing, so it does not wake the worker.
+            self.queue_service(key);
+            self.automated_platform_interaction(PollDirection::Both);
+        } else {
+            self.ingress_before_op();
+        }
         result
     }
 
@@ -1652,9 +1921,11 @@ where
             Protocol::Raw { protocol: _ } => unimplemented!(),
         }
 
+        let key = socket_handle.reg;
         drop(table_entry);
         drop(descriptor_table);
 
+        self.queue_service(key);
         self.automated_platform_interaction(PollDirection::Both);
         Ok(())
     }
@@ -1741,9 +2012,11 @@ where
             proxy.set_state(socket_channel::SocketState::Listening);
         }
 
+        let key = socket_handle.reg;
         drop(table_entry);
         drop(descriptor_table);
 
+        self.queue_service(key);
         self.automated_platform_interaction(PollDirection::Ingress);
         Ok(())
     }
@@ -1759,12 +2032,13 @@ where
         fd: &SocketFd<Platform>,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd<Platform>, AcceptError> {
-        self.automated_platform_interaction(PollDirection::Both);
+        self.ingress_before_op();
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(AcceptError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
+        let listener_key = socket_handle.reg;
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
                 let Some(server_socket) = &mut handle.server_socket else {
@@ -1808,7 +2082,8 @@ where
                 drop(descriptor_table);
                 // Create a new FD to hand it back out to the user
                 let handle = SocketHandle {
-                    consider_closed: false,
+                    consider_closed: AtomicBool::new(false),
+                    reg: wake::REGISTRY_NONE,
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific::new(local_port)),
                     proxy: None,
@@ -1819,7 +2094,12 @@ where
                     };
                     *peer = remote_addr;
                 }
-                Ok(self.new_socket_fd_for(handle))
+                let accepted = self.new_socket_fd_for(handle);
+                // NETFIX: the listener's readiness was just reset and its backlog refilled; the
+                // worker re-evaluates it (another connection may already be ready).
+                self.queue_service(listener_key);
+                self.kick();
+                Ok(accepted)
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
             ProtocolSpecific::Icmp(_) => unimplemented!(),
@@ -1918,7 +2198,9 @@ where
         // Note that we do an earlier-than-usual automated interaction to ingress packets since it
         // doesn't hurt to do this too often (other than wasting energy), and this allows us to
         // possibly get packets where we might otherwise return with size 0 on the `receive`.
-        self.automated_platform_interaction(PollDirection::Ingress);
+        // (`Automatic` mode only: in `Manual` mode the worker ingresses, and the host-service
+        // pollers that call this hundreds of times a second must not wake it.)
+        self.ingress_before_op();
         let descriptor_table = self.litebox.descriptor_table();
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
@@ -1994,10 +2276,18 @@ where
             Protocol::Raw { protocol: _ } => unimplemented!(),
         };
 
+        // Bytes taken out of a TCP socket's smoltcp buffer reopen its window: the worker should
+        // poll so the window update goes out. A datagram receive frees nothing the peer waits on.
+        let window_reopened = matches!(socket_handle.protocol(), Protocol::Tcp)
+            && matches!(ret, Ok(n) if n > 0);
         drop(table_entry);
         drop(descriptor_table);
 
-        self.automated_platform_interaction(PollDirection::Ingress);
+        if window_reopened {
+            self.automated_platform_interaction(PollDirection::Ingress);
+        } else {
+            self.ingress_before_op();
+        }
         ret
     }
 
@@ -2029,6 +2319,13 @@ where
                         _ => unimplemented!(),
                     },
                 }
+                // NETFIX: an option change (Nagle off, keep-alive on) can make smoltcp send or
+                // arm a timer; let the worker poll and service the socket.
+                let key = socket_handle.reg;
+                drop(table_entry);
+                drop(descriptor_table);
+                self.queue_service(key);
+                self.kick();
                 Ok(())
             }
             Protocol::Udp | Protocol::Icmp | Protocol::Raw { .. } => {

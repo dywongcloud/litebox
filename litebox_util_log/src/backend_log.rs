@@ -81,6 +81,17 @@ macro_rules! __log_impl {
     };
 }
 
+/// Internal macro backing [`log_enabled!`](crate::log_enabled) for the `log` backend.
+///
+/// Not intended for direct use; called by the public macro.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __log_enabled_impl {
+    (target: $target:expr, $level:expr) => {
+        $crate::__private::log::log_enabled!(target: $target, $crate::Level::to_log_level($level))
+    };
+}
+
 /// Internal macro for span implementation with log backend.
 ///
 /// Creates a [`SpanGuard`] and emits a `[SPAN ENTER]` log message. The guard

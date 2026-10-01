@@ -129,6 +129,18 @@ impl<T> ShimPlatform for T where
 /// with nothing logged), and an ungated per-call line at that rate would bury
 /// everything else. See [`unsupported`] for the bounded dedupe table.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
+    // T1e (`shim-exception-path-lazy-formatting`): `shape_of` plus the global dedupe table's
+    // spin lock is real work on every unsupported guest request (a Chromium startup asks for
+    // `mseal`/`prctl(PR_SET_VMA)` thousands of times), and it is work whose only product is a
+    // `warn!`/`trace!` line -- so skip it outright when neither level that reports it is
+    // enabled. The shape is the dedupe key *and* the message, so unlike the exception block this
+    // one cannot be made lazy without losing the dedupe; gating the whole thing is the cheap,
+    // behavior-preserving equivalent.
+    if !(litebox_util_log::log_enabled!(litebox_util_log::Level::Warn)
+        || litebox_util_log::log_enabled!(litebox_util_log::Level::Trace))
+    {
+        return;
+    }
     let shape = unsupported::shape_of(args);
     match unsupported::record(None, &shape) {
         unsupported::Sighting::First => {
@@ -337,7 +349,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         // kernel_mode data/instruction abort that `PageManager::handle_page_fault`
         // ends up refusing is exactly the case this diagnostic is most needed
         // for, and the early `return` below used to skip it entirely.
-        {
+        // T1e (`shim-exception-path-lazy-formatting`): every line in this block exists only to
+        // build a debug-level log. The log macros are already lazy about their own field
+        // expressions, but the work OUTSIDE them was not: a 31-register `String` and up to
+        // `FrameBacktrace::MAX_FRAMES` + pc/x30 symbolizations, each of which locks
+        // `loaded_images`, clones a `String` and looks up the containing image -- all paid on
+        // every delivered exception, in every build, with the level off. Gate the whole block on
+        // the level instead; with debug enabled the output is byte-identical, and nothing after
+        // the block (the page-fault fast path and the generic dispatch) changes.
+        if litebox_util_log::log_enabled!(litebox_util_log::Level::Debug) {
             let symbolize = |addr: usize| match self.task.symbolize_guest_address(addr) {
                 Some((path, offset)) => alloc::format!("{path}+{offset:#x}"),
                 None => alloc::format!("{addr:#x} (no image)"),
@@ -466,6 +486,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShimEntrypoints<Platform, FS> {
         f: impl FnOnce(&Task<Platform, FS>, &mut litebox_common_linux::PtRegs),
     ) -> ContinueOperation {
         self.task.refresh_guest_memory_access_context();
+        // Step G: publish this guest thread's identity for the platform's per-space
+        // runnable-not-running readout. The `Cell` is passed, not a copied `comm`, so the only
+        // work on this side is taking a reference: whatever the receiver does with the 16 bytes
+        // -- including reading them at all -- is decided inside the platform, behind its own
+        // switch (`LITEBOX_HVF_RBNR=0` makes this call one predicted branch).
+        self.task
+            .global
+            .platform
+            .note_task_identity(self.task.pid, &self.task.comm);
         if !is_init {
             self.task.enter_from_guest();
         }
@@ -538,7 +567,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
         let (fs, proc_handle, framebuffer, input_registry) =
-            default_fs(&self.litebox, in_mem_fs, tar_data);
+            default_fs(&self.litebox, self.platform, in_mem_fs, tar_data);
         self.proc_handle.set(Some(proc_handle));
         self.framebuffer.set(Some(framebuffer));
         self.input_registry.set(Some(input_registry));
@@ -821,6 +850,7 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
 /// generic `FS` type.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
+    platform: &'static Platform,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_data: Cow<'static, [u8]>,
 ) -> (
@@ -831,7 +861,7 @@ fn default_fs<Platform: ShimPlatform>(
 ) {
     let mut proc_handle = None;
     let mut framebuffer = None;
-    let input_registry = litebox::fs::devices::InputRegistry::new();
+    let input_registry = litebox::fs::devices::InputRegistry::new(platform);
     let input_registry_for_mount = input_registry.clone();
     let current_user = in_mem_fs.current_user();
     let dev_stdio = litebox::fs::resolver::Resolver::new_with_user(
@@ -1168,6 +1198,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .limits
                 .get_rlimit_cur(litebox_common_linux::RlimitResource::STACK),
         ));
+        // BCORE-4: a task whose process still shares its parent's address space (the `vfork`
+        // window) must not take a vCPU of its own: handing a shared space to a waiter requires
+        // quiescing every execution participant of it, and a bound participant is only ever
+        // quiesced at its own loop top. One relaxed store per shim entry; the default
+        // implementation is a no-op, so non-HVF platforms pay nothing.
+        Platform::set_current_vcpu_bind_eligible(!self.process().shares_parent_vm());
     }
 
     /// Handle Linux syscalls and dispatch them to LiteBox implementations.
@@ -1765,6 +1801,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // mseal(2): nothing seals mappings yet; ENOSYS is what a pre-6.10 kernel says and
             // PartitionAlloc's probe tolerates it. Decoded (rather than "unknown syscall 462")
             // so the trace shows what was asked.
+            SyscallRequest::CloseRange { first, last, flags } => {
+                syscall!(sys_close_range(first, last, flags))
+            }
+            SyscallRequest::GetMempolicy {
+                mode,
+                nodemask,
+                maxnode,
+                addr,
+                flags,
+            } => syscall!(sys_get_mempolicy(mode, nodemask, maxnode, addr, flags)),
             SyscallRequest::Mseal { addr, len, flags } => {
                 // One line per flags value, not per call (Chromium probes this on every
                 // large mapping); `addr`/`len` are in the trace-level `syscall req=` record.

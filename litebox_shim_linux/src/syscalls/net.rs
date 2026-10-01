@@ -1772,6 +1772,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+        // A `NETLINK_ROUTE` socket's peer is a `sockaddr_nl`, which the inet/unix
+        // parser below rejects with `EAFNOSUPPORT`. This model has no userspace
+        // netlink peers at all -- every request goes to the one modelled kernel --
+        // so a well-formed `sockaddr_nl` is answered `EOPNOTSUPP` instead of a
+        // family error; Linux's own family/length check still runs first.
+        if self.netlink_fd(fd).is_some() {
+            self.check_netlink_addr(sockaddr, addrlen)?;
+            return Err(Errno::EOPNOTSUPP);
+        }
         let sockaddr = read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?;
         self.socket_restart_on_eintr(fd, true, self.do_connect(fd, sockaddr))
     }
@@ -1806,7 +1815,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // parsing the address (which would otherwise reject AF_NETLINK). Accept it
         // as a no-op: there is no per-socket netlink group state to register.
         if self.netlink_fd(sockfd).is_some() {
-            return Ok(());
+            return self.check_netlink_addr(sockaddr, addrlen);
         }
         let sockaddr = read_sockaddr_from_user::<Platform>(sockaddr, addrlen)?;
         self.do_bind(sockfd, sockaddr)
@@ -1872,6 +1881,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok()
     }
 
+    /// `sizeof(struct sockaddr_nl)`: `{ u16 nl_family, u16 nl_pad, u32 nl_pid,
+    /// u32 nl_groups }`.
+    const SOCKADDR_NL_LEN: usize = 12;
+
+    /// Validate a `sockaddr_nl` the guest supplied for a `NETLINK_ROUTE` socket,
+    /// the way Linux's `netlink_bind`/`netlink_connect`/`netlink_sendmsg` each
+    /// begin: the address must be at least `sizeof(struct sockaddr_nl)` wide and
+    /// must name `AF_NETLINK`, or the call is `EINVAL` (a short or unreadable
+    /// buffer is `EINVAL`/`EFAULT` for the same reason).
+    ///
+    /// There is no per-socket netlink peer or group state to record -- every
+    /// request goes to the one modelled kernel -- so an address that passes is
+    /// accepted and then ignored by each caller. This is the check the inet/unix
+    /// parser in `read_sockaddr_from_user` cannot make: it rejects `AF_NETLINK`
+    /// with `EAFNOSUPPORT`, which is what turned Chromium's
+    /// `sendto(fd, req, len, 0, sockaddr_nl, 12)` in
+    /// `AddressTrackerLinux::DumpInitialAddressesAndWatch` into
+    /// "Could not send NETLINK request: Address family not supported by
+    /// protocol (97)" before `do_sendto`'s own netlink branch could ever run.
+    fn check_netlink_addr(&self, addr: UserPtr<u8>, addrlen: usize) -> Result<(), Errno> {
+        // `sizeof(struct sockaddr_nl)` == 12.
+        if addrlen < Self::SOCKADDR_NL_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let family = UserPtr::<u16>::from_usize(addr.as_usize())
+            .read_at_offset::<Platform>(0)
+            .ok_or(Errno::EFAULT)?;
+        if u32::from(family) != AddressFamily::NETLINK as u32 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
     /// `send`/`sendto`/`write` on a netlink socket: enqueue the dump the matching
     /// reads will drain. `Some` iff `sockfd` is a netlink socket.
     pub(crate) fn netlink_send(&self, sockfd: u32, buf: &[u8]) -> Option<Result<usize, Errno>> {
@@ -1914,6 +1956,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
+    /// Resolve the destination address a `sendto` names, for any socket kind.
+    ///
+    /// A `NETLINK_ROUTE` socket's destination is a `sockaddr_nl`, which the
+    /// inet/unix parser (`read_sockaddr_from_user`) rejects with `EAFNOSUPPORT`.
+    /// There is no per-socket netlink destination to route to -- every request
+    /// goes to the one modelled kernel -- so a valid `sockaddr_nl` is accepted and
+    /// then ignored, with `check_netlink_addr` still enforcing Linux's own
+    /// family/length rule. Skipping that parse here is what lets Chromium's
+    /// `sendto(fd, request, len, 0, sockaddr_nl, 12)` reach `netlink_send` at all
+    /// instead of failing with error 97.
+    fn destination_addr(
+        &self,
+        sockfd: u32,
+        addr: Option<UserPtr<u8>>,
+        addrlen: usize,
+    ) -> Result<Option<SocketAddress>, Errno> {
+        // A plain `send()` names no destination at all, so there is nothing to
+        // resolve -- and nothing the netlink case below could apply to.
+        let Some(addr) = addr else {
+            return Ok(None);
+        };
+        if self.netlink_fd(sockfd).is_some() {
+            return self.check_netlink_addr(addr, addrlen).map(|()| None);
+        }
+        read_sockaddr_from_user::<Platform>(addr, addrlen).map(Some)
+    }
+
     /// Handle syscall `sendto`
     pub(crate) fn sys_sendto(
         &self,
@@ -1927,9 +1996,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let sockaddr = addr
-            .map(|addr| read_sockaddr_from_user::<Platform>(addr, addrlen as usize))
-            .transpose()?;
+        let sockaddr = self.destination_addr(fd, addr, addrlen as usize)?;
         let buf = buf.to_owned_slice::<Platform>(len).ok_or(Errno::EFAULT)?;
         self.socket_restart_on_eintr(fd, true, self.do_sendto(fd, &buf, flags, sockaddr))
     }

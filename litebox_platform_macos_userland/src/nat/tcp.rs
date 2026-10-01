@@ -112,7 +112,10 @@ enum DialOutcome {
 /// then nonblocking, reporting back over the channel. If the flow is reaped
 /// while dialing, the send fails and the stream is dropped -- that is the
 /// cancellation path, so a late answer can never resurrect a dead flow.
-fn spawn_dial(peer: SocketAddr) -> mpsc::Receiver<std::io::Result<TcpStream>> {
+fn spawn_dial(
+    peer: SocketAddr,
+    doorbell: Option<&'static crate::net_doorbell::NetDoorbell>,
+) -> mpsc::Receiver<std::io::Result<TcpStream>> {
     let (dial_tx, dial_rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .stack_size(DIAL_THREAD_STACK)
@@ -123,6 +126,11 @@ fn spawn_dial(peer: SocketAddr) -> mpsc::Receiver<std::io::Result<TcpStream>> {
                 Ok(stream)
             });
             let _ = dial_tx.send(result);
+            // NETFIX: the outcome is collected by the engine's next tick; wake a parked worker
+            // so the guest's SYN-ACK (or RST) is not held until its next timer.
+            if let Some(doorbell) = doorbell {
+                doorbell.notify();
+            }
         });
     // A thread the host refused to create (its per-process thread limit)
     // never runs: `dial_tx` drops with the closure, the next tick's
@@ -211,7 +219,7 @@ impl NatEngine {
                 return;
             }
         }
-        let dial_rx = spawn_dial(SocketAddr::from((dst, key.dst_port)));
+        let dial_rx = spawn_dial(SocketAddr::from((dst, key.dst_port)), self.doorbell);
         let flow = TcpFlow {
             state: TcpFlowState::Dialing {
                 syn_bytes: packet.to_vec(),
@@ -382,6 +390,14 @@ impl NatEngine {
                             }
                             reap.push(*key);
                             continue;
+                        }
+                        // NETFIX: also wake the parked network worker when the host sends;
+                        // edge-triggered there (see `net_doorbell`), so data the engine holds
+                        // back under guest back-pressure cannot turn the park into a spin.
+                        if let Some(doorbell) = self.doorbell
+                            && !doorbell.watch_readable(stream.as_raw_fd())
+                        {
+                            litebox_util_log::debug!(dst:% = key.dst_ip, dst_port:% = key.dst_port; "nat: worker kqueue refused the host stream; its data waits for the worker's safety cap");
                         }
                         self.tcp_host_fds.insert(stream.as_raw_fd(), *key);
                         let handle = self.sockets.add(socket);

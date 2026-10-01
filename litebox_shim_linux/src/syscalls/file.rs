@@ -181,6 +181,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         (*new.shared_file_mappings.lock()).clone_from(&self.shared_file_mappings.lock());
         let alive_fds: alloc::vec::Vec<usize> =
             self.raw_descriptor_store.read().iter_alive().collect();
+        let copied = (|| -> Result<(), Errno> {
         for raw_fd in alive_fds {
             let cloexec = get_file_descriptor_flags(raw_fd, &task.global, self)
                 .is_ok_and(|flags| flags.contains(FileDescriptorFlags::FD_CLOEXEC));
@@ -216,7 +217,88 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             }
             dup_result??;
         }
+        Ok(())
+        })();
+        if let Err(errno) = copied {
+            // NETFIX leak L2: every descriptor duplicated before the failure holds a slot in the
+            // global descriptor table (and a strong reference on its open description). Slots are
+            // reclaimed only by an explicit close -- `OwnedFd`'s drop is a no-op -- so dropping
+            // the half-built table here used to leak them all for the rest of the session (and a
+            // leaked socket alias could never be covered by a queued close again).
+            new.release_failed_fork_copy(task);
+            return Err(errno);
+        }
         Ok(new)
+    }
+
+    /// Close every descriptor of a half-built `fork` copy (see the caller in [`Self::fork_copy`])
+    /// through its subsystem's own close, so a description the parent closed concurrently is
+    /// finished properly rather than dropped. Deliberately NOT the full `do_close`: the child never
+    /// ran, so there is no `flock` it owns (that holder identity is the fd *number*, which this
+    /// copy shares with the parent's own descriptor) and no ELF patch to finalize.
+    fn release_failed_fork_copy(&self, task: &Task<Platform, FS>) {
+        let alive: alloc::vec::Vec<usize> = self.raw_descriptor_store.read().iter_alive().collect();
+        for raw_fd in alive {
+            let inotify = self
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::inotify::InotifySubsystem<Platform>>(raw_fd);
+            if let Ok(fd) = inotify {
+                let entry = task.global.litebox.descriptor_table_mut().remove(&fd);
+                drop(entry);
+                continue;
+            }
+            let remove = |fd: &TypedFd<_>| {
+                let entry = task.global.litebox.descriptor_table_mut().remove(fd);
+                // do not hold any locks while dropping the entry
+                drop(entry);
+            };
+            let _ = self.run_on_raw_fd(
+                raw_fd,
+                |fd| {
+                    let _ = self.fs.close(fd);
+                },
+                |fd| {
+                    let _ = task
+                        .global
+                        .net
+                        .lock()
+                        .close(fd, litebox::net::CloseBehavior::Graceful);
+                },
+                |fd| {
+                    let _ = task.global.close_linux_pipe(fd);
+                },
+                |fd| {
+                    let entry = task.global.litebox.descriptor_table_mut().remove(fd);
+                    drop(entry);
+                },
+                |fd| {
+                    let entry = task.global.litebox.descriptor_table_mut().remove(fd);
+                    drop(entry);
+                },
+                |fd| {
+                    // `dup_into` counted a pty slave descriptor for this copy; give it back.
+                    let (entry, slave) = {
+                        let mut dt = task.global.litebox.descriptor_table_mut();
+                        let slave = dt
+                            .with_metadata(fd, |endpoint: &PtyEndpoint<Platform, FS>| {
+                                (endpoint.side == PtySide::Slave)
+                                    .then(|| (endpoint.number, endpoint.state.clone()))
+                            })
+                            .ok()
+                            .flatten();
+                        (dt.remove(fd), slave)
+                    };
+                    drop(entry);
+                    if let Some((number, state)) = slave {
+                        task.global
+                            .pty_registry
+                            .release_slave_descriptor(number, &state);
+                    }
+                },
+                remove,
+            );
+        }
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
@@ -3792,21 +3874,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
-        // See the matching comment in `do_read`: inotify fds sit outside `do_close_and_replace`'s
-        // `ConsumedFd` enumeration, so resolve them directly first. Inotify fds have no
-        // replace-into-same-slot use case in this codebase (unlike `do_close_and_replace`'s
-        // general `S`-typed `replace` parameter, only ever driven by `dup2`-style callers), so a
-        // direct consume-and-drop is the whole close.
-        {
-            let files = self.files.borrow();
-            let mut rds = files.raw_descriptor_store.write();
-            if rds
-                .fd_consume_raw_integer::<super::inotify::InotifySubsystem<Platform>>(raw_fd)
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
+        // Inotify fds are closed by `do_close_and_replace` like every other subsystem. They used
+        // to be special-cased here as a consume-and-drop of the raw integer, which never removed
+        // the descriptor from the global table: every closed inotify fd (dbus-daemon, GLib file
+        // monitors, Chromium's config watchers) leaked its slot and its entry for the rest of the
+        // session (NETFIX, leak class L3: a `TypedFd` dropped without `remove`).
         self.do_close_and_replace::<FS>(raw_fd, None)
     }
 
@@ -3826,6 +3898,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
             Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>>),
             Netlink(alloc::sync::Arc<TypedFd<super::netlink::NetlinkSubsystem<Platform>>>),
+            Inotify(alloc::sync::Arc<TypedFd<super::inotify::InotifySubsystem<Platform>>>),
         }
 
         let files = self.files.borrow();
@@ -3866,6 +3939,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     rds.fd_consume_raw_integer::<super::netlink::NetlinkSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Netlink(fd)
+                } else if let Ok(fd) = rds
+                    .fd_consume_raw_integer::<super::inotify::InotifySubsystem<Platform>>(raw_fd)
+                {
+                    // Also reached by `dup2`/`dup3` onto an inotify fd, which used to hit the
+                    // `unreachable!` below.
+                    ConsumedFd::Inotify(fd)
                 } else {
                     unreachable!("all subsystems covered")
                 }
@@ -4018,6 +4097,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 drop(entry);
                 Ok(())
             }
+            ConsumedFd::Inotify(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
         }
     }
 
@@ -4027,6 +4115,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         self.do_close(raw_fd)
+    }
+
+    /// Handle syscall `close_range`.
+    ///
+    /// Implemented rather than refused because the semantics are fully real here:
+    /// LiteBox owns the descriptor table, so a descriptor this closes is genuinely
+    /// gone (or genuinely marked close-on-exec) when it returns, and a caller can
+    /// rely on that exactly as on Linux. Contrast the `landlock_*` family, which is
+    /// refused: that one promises a *restriction* LiteBox does not enforce, and a
+    /// successful call there would hand the guest a boundary that does not exist.
+    ///
+    /// Matching Linux: descriptors in the range that are not open are skipped
+    /// silently (never `EBADF`), an empty range is a successful no-op, and the walk
+    /// is over the descriptors that are actually open rather than over every number
+    /// in the range, so `close_range(3, ~0U, 0)` costs what closing costs.
+    /// `CLOSE_RANGE_UNSHARE` is refused: it exists to undo `CLONE_FILES`, and
+    /// reporting success for it would assert something about descriptor-table
+    /// sharing this shim does not model.
+    pub(crate) fn sys_close_range(&self, first: u32, last: u32, flags: u32) -> Result<(), Errno> {
+        const CLOSE_RANGE_CLOEXEC: u32 = 0x04;
+        const CLOSE_RANGE_UNSHARE: u32 = 0x02;
+        if flags & !(CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & CLOSE_RANGE_UNSHARE != 0 {
+            log_unsupported!("close_range(CLOSE_RANGE_UNSHARE) -> EINVAL");
+            return Err(Errno::EINVAL);
+        }
+        if first > last {
+            return Err(Errno::EINVAL);
+        }
+        let range = usize::try_from(first).unwrap()..=usize::try_from(last).unwrap();
+        let in_range: alloc::vec::Vec<usize> = {
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            rds.iter_alive().filter(|fd| range.contains(fd)).collect()
+        };
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            for raw_fd in in_range {
+                let files = self.files.borrow();
+                let _ = set_file_descriptor_flags(
+                    raw_fd,
+                    &self.global,
+                    &files,
+                    FileDescriptorFlags::FD_CLOEXEC,
+                );
+            }
+        } else {
+            for raw_fd in in_range {
+                // A descriptor that went away between the walk and this close is not
+                // an error, same as on Linux.
+                let _ = self.do_close(raw_fd);
+            }
+        }
+        Ok(())
     }
 
     /// Handle syscall `preadv`

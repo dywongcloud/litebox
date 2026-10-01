@@ -28,7 +28,8 @@ use litebox::sync::{
 use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
+    ArchPrctlArg, CapabilityPrctl, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg,
+    TimeParam,
     errno::Errno,
     signal::{SIG_IGN, SaFlags, SigAction, Signal},
 };
@@ -1986,6 +1987,16 @@ pub(crate) fn task_diagnostics_json<Platform: ShimPlatform>(
         ptrace.attach_events, ptrace.detach_events
     );
 
+    // CLASS C (`shim-futex-private-skip-mapping-lock`): how many futex operations derived a
+    // `FUTEX_PRIVATE` key without taking the process-global mapping read lock, and how many
+    // still took it (shared futexes, whose key depends on the mapping table).
+    let _ = write!(
+        out,
+        "\"futex\":{{\"private_unlocked\":{},\"shared_locked\":{}}},",
+        FUTEX_PRIVATE_UNLOCKED.load(Ordering::Relaxed),
+        FUTEX_SHARED_LOCKED.load(Ordering::Relaxed),
+    );
+
     let (role_counters, abnormal_ring) = role_lifecycle_counters();
     out.push_str("\"role_lifecycle\":[");
     for (i, c) in role_counters.iter().enumerate() {
@@ -2087,6 +2098,14 @@ pub(crate) fn task_diagnostics_json<Platform: ShimPlatform>(
     {
         out.push_str("\"per_process_mm\":[],\"live_tasks_per_real_uid\":[]");
     }
+
+    // NETFIX permanent guard (spec section 5.2): the network worker's poll/wake/registry counters
+    // and the descriptor table's slot/walk/guard counters ride this same fragment, so every
+    // `-Z --counters` snapshot and `/proc/litebox/counters` read carries them.
+    out.push_str(",\"net\":");
+    out.push_str(&litebox::net::counters_json());
+    out.push_str(",\"fd\":");
+    out.push_str(&litebox::fd::counters_json());
 
     out.push('}');
     out
@@ -3724,7 +3743,9 @@ impl<Platform: ShimPlatform> Process<Platform> {
         self.shares_parent_vm.store(false, Ordering::Release);
     }
 
-    fn shares_parent_vm(&self) -> bool {
+    /// BCORE-4: also `pub(crate)` so the shim's own entry path can publish bind eligibility
+    /// from it (see `refresh_guest_memory_access_context`).
+    pub(crate) fn shares_parent_vm(&self) -> bool {
         self.shares_parent_vm.load(Ordering::Acquire)
     }
 
@@ -3817,6 +3838,13 @@ impl<Platform: ShimPlatform> Process<Platform> {
         signal: Signal,
     ) {
         wake_one_eligible_thread(&self.inner, shared_pending, signal);
+    }
+
+    /// Whether the fork gate is currently closed: the same load
+    /// [`Self::park_while_fork_gate_closed`]'s fast path already does, exposed so callers that
+    /// must not pay two clock reads per guest re-entry can gate on it first (step G).
+    fn fork_gate_is_closed(&self) -> bool {
+        self.fork_gate.underlying_atomic().load(Ordering::Acquire) & FORK_GATE_CLOSED != 0
     }
 
     /// Parks the calling thread while this process's fork gate is closed.
@@ -4041,6 +4069,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.thread.process.cred_guard.wake_all();
     }
 
+    /// Parks this task while the process's fork gate is closed, and returns at once when it is
+    /// open -- which is the case on every re-entry outside a concurrent multithreaded `fork`.
+    /// [`Process::park_while_fork_gate_closed`] for this task; see `Process::fork_gate`. Called
+    /// from the two guest-memory choke points in `crate::wait`.
+    ///
+    /// Step G: the runnable-not-running stamp is inside the gate-open early return below, not in
+    /// front of it, so a thread that does not park pays one `Acquire` load of the same word
+    /// `Process::park_while_fork_gate_closed` loads for its own fast path -- nothing this step
+    /// added can widen the fork-COW window.
+    pub(crate) fn park_while_fork_gate_closed(&self) {
+        // Step G: the gate-open case is the only one any thread sees outside a concurrent
+        // multithreaded `fork`, so the runnable-not-running clock reads are behind that same load
+        // rather than in front of it -- see `Process::park_while_fork_gate_closed`'s own note.
+        if !self.process().fork_gate_is_closed() {
+            return;
+        }
+        self.note_rbnr_wait(litebox::platform::RunnableWaitKind::ForkGate, || {
+            self.process()
+                .park_while_fork_gate_closed(self.is_exiting())
+        });
+    }
+
     /// Closes the process's fork gate and waits until every sibling thread is
     /// parked at it, so the caller can take the address-space turn (see
     /// [`SharedAddressSpace`]) with the same guarantees a single-threaded
@@ -4059,14 +4109,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// taken after this returns cannot lose an in-flight write. Siblings that
     /// exit instead of parking are handled by `detach_thread` waking the gate
     /// so the count converges either way.
-    /// [`Process::park_while_fork_gate_closed`] for this task; see
-    /// `Process::fork_gate`. Called from the two guest-memory choke points in
-    /// `crate::wait`.
-    pub(crate) fn park_while_fork_gate_closed(&self) {
-        self.process()
-            .park_while_fork_gate_closed(self.is_exiting());
-    }
-
     fn park_sibling_threads_for_fork(&self) -> ForkGateGuard<'_, Platform> {
         let process = self.process();
         let word = process.fork_gate.underlying_atomic();
@@ -4513,6 +4555,10 @@ pub(crate) fn quiesce_handoff_counters() -> (u64, u64) {
 // ---------------------------------------------------------------------------
 
 static MM_MUTATION_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+/// CLASS C (`shim-futex-private-skip-mapping-lock`): futex operations that took the
+/// process-global mapping read lock (shared futexes), and those that did not (private).
+static FUTEX_SHARED_LOCKED: AtomicU64 = AtomicU64::new(0);
+static FUTEX_PRIVATE_UNLOCKED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn mm_mutation_syscall_count() -> u64 {
     MM_MUTATION_SYSCALLS.load(Ordering::Acquire)
@@ -5479,6 +5525,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 "seccomp filter denied a syscall"
             );
             // TMP-GPU0X11F: temporary diagnostic, removed before landing.
+            //
+            // T1e (`shim-exception-path-lazy-formatting`): every line below exists only to build
+            // the `debug!` at the end of the block -- a symbolized 28-frame walk plus a formatted
+            // argument dump, all of it eagerly built on every denied syscall in every build.
+            // Gate it on the level, the same idiom the exception path uses.
+            if litebox_util_log::log_enabled!(litebox_util_log::Level::Debug) {
             #[cfg(target_arch = "aarch64")]
             {
                 use core::fmt::Write as _;
@@ -5541,6 +5593,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     frames:% = frames, detail:% = detail;
                     "TMP-GPU0X11F seccomp denial context"
                 );
+            }
             }
         }
         match action_only {
@@ -5654,19 +5707,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.set_task_comm(&name_buf);
                 Ok(0)
             }
-            PrctlArg::CapBSetRead(cap) => {
-                // Return 1 if the capability specified in cap is in the calling
-                // thread's capability bounding set, or 0 if it is not.
-                if cap
-                    > litebox_common_linux::CapSet::LAST_CAP
-                        .bits()
-                        .trailing_zeros() as usize
-                {
-                    return Err(Errno::EINVAL);
+            // The whole capability surface, one rule (see `CapabilityPrctl`): LiteBox
+            // grants no capabilities, so a read of capability state reports "none held"
+            // and a request that would grant one is `EPERM` -- what Linux answers for a
+            // caller without `CAP_SETPCAP`. Nothing here restricts what a process can
+            // do, so none of these answers claims an isolation boundary.
+            //
+            // Deliberately *not* `ENOSYS`: Chromium's sandbox setup treats `EINVAL`/
+            // `ENOSYS` from these options as "this kernel has no capability support",
+            // which is a different (and fatal) answer from "you hold no capabilities".
+            PrctlArg::Capability(op) => match op {
+                // Reads: no capability is held, and no secure bit is set.
+                CapabilityPrctl::GetSecureBits
+                | CapabilityPrctl::AmbientIsSet(_)
+                | CapabilityPrctl::AmbientClearAll => Ok(0),
+                // `PR_CAPBSET_READ`: `1` if the capability is in the bounding set, `0`
+                // otherwise. LiteBox has none, but an out-of-range `cap` is `EINVAL`
+                // exactly as Linux's `cap_valid()` check answers it.
+                CapabilityPrctl::CapBSetRead(cap) => {
+                    if cap > litebox_common_linux::CapSet::LAST_CAP.bits().trailing_zeros()
+                        as usize
+                    {
+                        return Err(Errno::EINVAL);
+                    }
+                    Ok(0)
                 }
-                // Note we don't support capabilities in LiteBox, so we always return 0.
-                Ok(0)
-            }
+                // Clearing what is already clear: the postcondition genuinely holds.
+                CapabilityPrctl::AmbientLower(cap) => {
+                    if cap > litebox_common_linux::CapSet::LAST_CAP.bits().trailing_zeros()
+                        as usize
+                    {
+                        return Err(Errno::EINVAL);
+                    }
+                    Ok(0)
+                }
+                // Would grant a capability (or set a secure bit): refused.
+                CapabilityPrctl::SetSecureBits(bits) => {
+                    if bits == 0 {
+                        Ok(0)
+                    } else {
+                        Err(Errno::EPERM)
+                    }
+                }
+                CapabilityPrctl::CapBSetDrop(_) | CapabilityPrctl::AmbientRaise(_) => {
+                    Err(Errno::EPERM)
+                }
+                _ => Err(Errno::EINVAL),
+            },
             PrctlArg::GetDumpable => Ok(usize::from(self.process().dumpable())),
             // Only `SUID_DUMP_DISABLE` (0) and `SUID_DUMP_USER` (1) may be set; Linux refuses
             // `SUID_DUMP_ROOT` (2) and anything else with `EINVAL`.
@@ -5945,6 +6032,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(not(target_arch = "aarch64"))]
         let ptraced_at_exit = false;
 
+        // BCORE-5: give this thread's own execution resource back FIRST. Nothing above runs the
+        // guest (this is straight-line teardown), and the address space this thread's vCPU
+        // participant is registered in is destroyed below, once the last thread detaches --
+        // `HvfAddressSpace::destroy` refuses while a participant is still registered, so an
+        // unbound-here participant would strand the space. Never blocks.
+        //
+        // This runs from every `Task::drop`, not only from the owning thread's own: a failed
+        // `spawn_thread` drops the new `Task` on the *spawning* thread, and an aborted
+        // `ProcessLaunch` on the launcher, so the task being torn down here is frequently not
+        // this thread's. A platform whose execution resource belongs to the calling thread may
+        // therefore defer the release (see `ThreadProvider::release_thread_execution_resources`)
+        // rather than take an innocent thread's resource away in the middle of its dispatch.
+        Platform::release_thread_execution_resources(&self.global.platform);
         // Keep this thread counted until every exit-time access to guest memory is complete. An
         // execing sibling waits for `nr_threads == 1` before tearing the old address space down.
         let is_last_thread = self.thread.detach_from_process();
@@ -7337,6 +7437,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // (e.g. once `hvf-wx-custody-crosscrate-commit-and-ledger` lands); it correctly reads
         // zero today, an honest finding rather than a placeholder.
         record_quiesce_handoff(QuiesceTrigger::Syscall);
+        // Step G: everything from here to the gate reopening is a thread that is runnable (its
+        // own wait is over) but cannot touch guest memory yet. `started` below already brackets
+        // it for the debug line; report it once at the end, so the clock is read twice per
+        // hand-off rather than per guest re-entry.
         let started = self.global.platform.now();
         let guard = self.park_sibling_threads_for_fork();
         let quiesced = self.global.platform.now();
@@ -7380,6 +7484,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         membership.quiescing.store(false, Ordering::Release);
         drop(guard);
+        if let Some(elapsed) = self.global.platform.now().checked_duration_since(&started)
+            && elapsed >= core::time::Duration::from_micros(1)
+        {
+            self.global.platform.note_rbnr_wait(
+                litebox::platform::RunnableWaitKind::AddressSpaceHandOff,
+                u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            );
+        }
     }
 
     /// Takes the address space back and restores this process's memory into it, blocking until
@@ -7394,6 +7506,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if membership.holding() {
             return true;
         }
+        // Step G: from here on this thread is runnable (its wait is over) but cannot touch guest
+        // memory until it holds the shared address space again.
+        let started = self.global.platform.now();
         if !membership.shared.acquire(
             self.pid,
             || membership.holding(),
@@ -7403,6 +7518,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Preserve the non-holding membership until exit cleanup. Dropping it here would make
             // `prepare_for_exit` mistake whichever sibling's image is live for this task's own and
             // dereference stale robust-list/child-TID pointers into that sibling.
+            self.note_address_space_acquire(started);
             return false;
         }
         if !membership.holding() {
@@ -7412,7 +7528,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             membership.holding.store(true, Ordering::Release);
             membership.mark_acquired(self.global.platform.now());
         }
+        self.note_address_space_acquire(started);
         true
+    }
+
+    /// Reports the runnable-not-running wait [`Self::acquire_address_space`] just ended, if it
+    /// cost anything (step G, W4).
+    fn note_address_space_acquire(&self, started: Platform::Instant) {
+        if let Some(elapsed) = self.global.platform.now().checked_duration_since(&started)
+            && elapsed >= core::time::Duration::from_micros(1)
+        {
+            self.global.platform.note_rbnr_wait(
+                litebox::platform::RunnableWaitKind::AddressSpaceAcquire,
+                u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            );
+        }
     }
 
     /// Leaves the shared address space for good, waking anything waiting for it.
@@ -9749,6 +9879,72 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Err(Errno::ENOSYS)
     }
 
+    /// Handle syscall `get_mempolicy`.
+    ///
+    /// Truthful, not a stub: LiteBox has exactly one, undifferentiated memory space, so
+    /// "which NUMA policy governs this task (or this address)?" has a real answer --
+    /// the default policy, over an empty node mask -- and that is what a NUMA-aware
+    /// caller is asking to learn. Reporting it is not the same as claiming to enforce
+    /// a policy: `set_mempolicy`/`mbind`, which would bind future allocations to a
+    /// node, stay `ENOSYS` because LiteBox has no second node to bind to and no way to
+    /// honour such a binding. Refusing the read would only make the caller guess.
+    ///
+    /// `MPOL_F_MEMS_ALLOWED` asks which nodes the caller may use; the honest answer
+    /// here is "node 0", i.e. the single node LiteBox has.
+    pub(crate) fn sys_get_mempolicy(
+        &self,
+        mode: UserPtrMut<i32>,
+        nodemask: UserPtrMut<u64>,
+        maxnode: usize,
+        _addr: usize,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        const MPOL_F_NODE: u32 = 1 << 0;
+        const MPOL_F_ADDR: u32 = 1 << 1;
+        const MPOL_F_MEMS_ALLOWED: u32 = 1 << 2;
+        /// `MPOL_DEFAULT`: allocate wherever, the only policy LiteBox has.
+        const MPOL_DEFAULT: i32 = 0;
+
+        if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // Linux: `MPOL_F_MEMS_ALLOWED` is a query about the task, not about an
+        // address or a node, and `MPOL_F_NODE` and `MPOL_F_ADDR` exclude each other.
+        if (flags & MPOL_F_MEMS_ALLOWED != 0 && flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0)
+            || (flags & (MPOL_F_NODE | MPOL_F_ADDR)) == (MPOL_F_NODE | MPOL_F_ADDR)
+        {
+            return Err(Errno::EINVAL);
+        }
+        if !nodemask.is_null() && maxnode == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        if !mode.is_null() {
+            mode.write_at_offset::<Platform>(0, MPOL_DEFAULT)
+                .ok_or(Errno::EFAULT)?;
+        }
+        if !nodemask.is_null() {
+            // The mask is `maxnode` bits, rounded up to whole `unsigned long`s; the
+            // caller's buffer is at least that big and LiteBox never has more than
+            // the one node to report, so everything past the first word is zero.
+            let words = maxnode.div_ceil(u64::BITS as usize).max(1);
+            let first = if flags & MPOL_F_MEMS_ALLOWED != 0 {
+                1u64
+            } else {
+                0
+            };
+            nodemask
+                .write_at_offset::<Platform>(0, first)
+                .ok_or(Errno::EFAULT)?;
+            for index in 1..words {
+                nodemask
+                    .write_at_offset::<Platform>(isize::try_from(index).unwrap_or(isize::MAX), 0u64)
+                    .ok_or(Errno::EFAULT)?;
+            }
+        }
+        Ok(0)
+    }
+
     /// Handle syscall `sched_getaffinity`.
     ///
     /// Note this is a dummy implementation that always returns the same CPU set
@@ -9870,6 +10066,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !addr.as_usize().is_multiple_of(align_of::<u32>()) {
             return Err(Errno::EINVAL);
         }
+        // Every caller that still reaches this method took the mapping guard, i.e. this is the
+        // locked class (`futex_key_private` is the unlocked one).
+        Self::record_futex_class(true);
         let key = if flags.contains(litebox_common_linux::FutexFlags::PRIVATE) {
             FutexKey::new(self.process().futex_namespace(), addr.as_usize())
         } else {
@@ -9886,6 +10085,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(key)
     }
 
+    /// CLASS C counters: futex operations by key-derivation class (see
+    /// [`Self::futex_key_private`]).
+    fn record_futex_class(locked: bool) {
+        if locked {
+            FUTEX_SHARED_LOCKED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            FUTEX_PRIVATE_UNLOCKED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// CLASS C (`shim-futex-private-skip-mapping-lock`): a `FUTEX_PRIVATE` key is the process's
+    /// own futex namespace plus the raw address -- the `PRIVATE` branch of [`Self::futex_key`]
+    /// already never consults `mappings` -- so deriving it needs no mapping guard and no
+    /// process-global `vmem` read share. Linux equally takes no `mmap_lock` for a private futex;
+    /// what we were buying with the lock was a stall behind any writer that holds `vmem` across
+    /// an HVF unmap/protect on another thread.
+    fn futex_key_private(&self, addr: UserPtrMut<u32>) -> Result<FutexKey, Errno> {
+        if !addr.as_usize().is_multiple_of(align_of::<u32>()) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(FutexKey::new(
+            self.process().futex_namespace(),
+            addr.as_usize(),
+        ))
+    }
+
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
         let res = match arg {
@@ -9895,8 +10120,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // raw values both mean one wake rather than zero or an enormous unsigned quota.
                 let count = if (count as i32) <= 0 { 1 } else { count };
                 let count = core::num::NonZeroU32::new(count).unwrap();
-                let mappings = self.global.pm.lock_mappings();
-                let key = self.futex_key(&mappings, addr, &flags)?;
+                // CLASS C: a private futex never reads the mapping table, so take no mapping
+                // guard for it (`futex_private_unlocked` counts the skip).
+                let mappings = (!flags.contains(litebox_common_linux::FutexFlags::PRIVATE))
+                    .then(|| self.global.pm.lock_mappings());
+                let key = match &mappings {
+                    Some(mappings) => self.futex_key(mappings, addr, &flags)?,
+                    None => {
+                        Self::record_futex_class(false);
+                        self.futex_key_private(addr)?
+                    }
+                };
                 self.process()
                     .futex_manager()
                     .wake_keyed(key, count, None)? as usize
@@ -9910,8 +10144,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let count = if (count as i32) <= 0 { 1 } else { count };
                 let count = core::num::NonZeroU32::new(count).unwrap();
                 let bitmask = core::num::NonZeroU32::new(bitmask).ok_or(Errno::EFAULT)?;
-                let mappings = self.global.pm.lock_mappings();
-                let key = self.futex_key(&mappings, addr, &flags)?;
+                let mappings = (!flags.contains(litebox_common_linux::FutexFlags::PRIVATE))
+                    .then(|| self.global.pm.lock_mappings());
+                let key = match &mappings {
+                    Some(mappings) => self.futex_key(mappings, addr, &flags)?,
+                    None => {
+                        Self::record_futex_class(false);
+                        self.futex_key_private(addr)?
+                    }
+                };
                 self.process()
                     .futex_manager()
                     .wake_keyed(key, count, Some(bitmask))? as usize
@@ -9924,15 +10165,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 let timeout = timeout.read::<Platform>()?;
                 let deadline = timeout.and_then(|t| self.deadline_after(t));
-                let mappings = self.global.pm.lock_mappings();
-                let key = self.futex_key(&mappings, addr, &flags)?;
+                let private = flags.contains(litebox_common_linux::FutexFlags::PRIVATE);
+                let mappings = (!private).then(|| self.global.pm.lock_mappings());
+                let key = match &mappings {
+                    Some(mappings) => self.futex_key(mappings, addr, &flags)?,
+                    None => {
+                        Self::record_futex_class(false);
+                        self.futex_key_private(addr)?
+                    }
+                };
                 // Read the futex word through this same, already-held mapping guard rather than
                 // through a path that takes the page manager's lock again: a second, nested read
                 // share would self-deadlock behind a concurrently queued writer (this lock is
                 // writer-preferring and not reentrant). Boxed in a `RefCell` so the value-check
                 // closure can borrow it and the later drop-closure can still take it, without the
                 // two needing to fight over ownership of one captured variable.
-                let mappings = RefCell::new(Some(mappings));
+                // CLASS C: with no guard (private), the value check reads the same raw word
+                // through the same fallible path, without any page-manager lock; the shared arm
+                // keeps today's read through the held guard (a nested read share would
+                // self-deadlock behind a queued writer).
+                let mappings = RefCell::new(mappings);
                 match self.process().futex_manager().wait_keyed(
                     &self.wait_cx().with_deadline(deadline),
                     key,
@@ -9940,10 +10192,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     val,
                     None,
                     || {
-                        mappings
-                            .borrow()
-                            .as_ref()
-                            .and_then(|m| m.read_u32_unlocked(addr.as_usize()))
+                        if private {
+                            self.global.pm.read_u32_unguarded(addr.as_usize())
+                        } else {
+                            mappings
+                                .borrow()
+                                .as_ref()
+                                .and_then(|m| m.read_u32_unlocked(addr.as_usize()))
+                        }
                     },
                     || drop(mappings.borrow_mut().take()),
                 ) {
@@ -9979,12 +10235,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 } else {
                     None
                 };
-                let mappings = self.global.pm.lock_mappings();
-                let key = self.futex_key(&mappings, addr, &flags)?;
-                // See the `Wait` arm above: read through the already-held guard instead of
-                // re-locking, to avoid a same-thread recursive-read-lock deadlock against a
-                // concurrently queued writer.
-                let mappings = RefCell::new(Some(mappings));
+                let private = flags.contains(litebox_common_linux::FutexFlags::PRIVATE);
+                let mappings = (!private).then(|| self.global.pm.lock_mappings());
+                let key = match &mappings {
+                    Some(mappings) => self.futex_key(mappings, addr, &flags)?,
+                    None => {
+                        Self::record_futex_class(false);
+                        self.futex_key_private(addr)?
+                    }
+                };
+                // See the `Wait` arm above.
+                let mappings = RefCell::new(mappings);
                 match self.process().futex_manager().wait_keyed(
                     &self.wait_cx().with_deadline(deadline),
                     key,
@@ -9992,10 +10253,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     val,
                     Some(bitmask),
                     || {
-                        mappings
-                            .borrow()
-                            .as_ref()
-                            .and_then(|m| m.read_u32_unlocked(addr.as_usize()))
+                        if private {
+                            self.global.pm.read_u32_unguarded(addr.as_usize())
+                        } else {
+                            mappings
+                                .borrow()
+                                .as_ref()
+                                .and_then(|m| m.read_u32_unlocked(addr.as_usize()))
+                        }
                     },
                     || drop(mappings.borrow_mut().take()),
                 ) {
@@ -10019,9 +10284,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 num_to_requeue,
                 addr2,
             } => {
-                let mappings = self.global.pm.lock_mappings();
-                let key1 = self.futex_key(&mappings, addr, &flags)?;
-                let key2 = self.futex_key(&mappings, addr2, &flags)?;
+                let mappings = (!flags.contains(litebox_common_linux::FutexFlags::PRIVATE))
+                    .then(|| self.global.pm.lock_mappings());
+                let (key1, key2) = match &mappings {
+                    Some(mappings) => (
+                        self.futex_key(mappings, addr, &flags)?,
+                        self.futex_key(mappings, addr2, &flags)?,
+                    ),
+                    None => {
+                        Self::record_futex_class(false);
+                        (
+                            self.futex_key_private(addr)?,
+                            self.futex_key_private(addr2)?,
+                        )
+                    }
+                };
                 self.process().futex_manager().requeue_keyed(
                     key1,
                     key2,
@@ -10039,9 +10316,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 addr2,
                 expected_value,
             } => {
-                let mappings = self.global.pm.lock_mappings();
-                let key1 = self.futex_key(&mappings, addr, &flags)?;
-                let key2 = self.futex_key(&mappings, addr2, &flags)?;
+                let mappings = (!flags.contains(litebox_common_linux::FutexFlags::PRIVATE))
+                    .then(|| self.global.pm.lock_mappings());
+                let (key1, key2) = match &mappings {
+                    Some(mappings) => (
+                        self.futex_key(mappings, addr, &flags)?,
+                        self.futex_key(mappings, addr2, &flags)?,
+                    ),
+                    None => {
+                        Self::record_futex_class(false);
+                        (
+                            self.futex_key_private(addr)?,
+                            self.futex_key_private(addr2)?,
+                        )
+                    }
+                };
                 self.process().futex_manager().requeue_keyed(
                     key1,
                     key2,

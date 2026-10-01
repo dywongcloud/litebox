@@ -861,7 +861,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         let descriptor_snapshot: Vec<_> = self
             .litebox
             .descriptor_table()
-            .iter::<Self>()
+            .iter_at::<Self>(crate::fd::WalkSite::LayeredRebind)
             .map(|(_, descriptor)| {
                 (
                     descriptor.entry.path.clone(),

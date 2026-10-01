@@ -22,6 +22,8 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{sync::Mutex, utils::ReinterpretUnsignedExt as _};
+// Step G (W6): `Platform::Instant::checked_duration_since`, for the signal-frame delivery span.
+use litebox::platform::Instant as _;
 use litebox_common_linux::signal::{
     MINSIGSTKSZ, NSIG, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SI_TKILL, SI_USER, SIG_DFL, SIG_IGN,
     SaFlags, SigAction, SigAltStack,
@@ -1427,7 +1429,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Deliver any pending signals.
+    ///
+    /// Step G (W6): when this actually dequeues a signal, the time from the first dequeue to the
+    /// end of the delivery -- the handler-table lock, the frame push into guest memory and the
+    /// syscall-restart settle -- is reported as the `SignalFrame` runnable-not-running span. The
+    /// stamp is taken lazily, so a re-entry with nothing to deliver (the overwhelming majority)
+    /// pays one `Option` test.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+        let mut delivery_started = None;
         self.thread_remote()
             .drain_remote_signals_into(&mut self.signals.pending.borrow_mut());
         let mut consult_shared = false;
@@ -1440,6 +1449,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // Don't deliver any more signals if exiting -- and don't dequeue either: a
                 // process-directed one belongs to a surviving sibling (see
                 // `retarget_shared_pending_on_exit`).
+                self.note_signal_frame_delivery(delivery_started.take());
                 return;
             }
             let blocked = self.signals.blocked.get();
@@ -1465,6 +1475,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             };
 
+            if delivery_started.is_none() {
+                delivery_started = Some(self.global.platform.now());
+            }
             let action = self.signals.handlers.borrow().inner.lock()[signal].action;
             #[expect(clippy::match_same_arms)]
             match action.sigaction {
@@ -1543,6 +1556,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(target_arch = "aarch64")]
         if let Some(prepared) = restart {
             self.settle_syscall_restart(ctx, prepared, None);
+        }
+        self.note_signal_frame_delivery(delivery_started.take());
+    }
+
+    /// Reports the W6 span for a signal delivery that actually happened: `started` is the stamp
+    /// taken when the first signal was dequeued, `None` when nothing was delivered.
+    fn note_signal_frame_delivery(&self, started: Option<Platform::Instant>) {
+        let Some(started) = started else {
+            return;
+        };
+        let ended = self.global.platform.now();
+        let Some(elapsed) = ended.checked_duration_since(&started) else {
+            return;
+        };
+        // Sub-microsecond deliveries are indistinguishable from the two clock reads themselves.
+        if elapsed >= core::time::Duration::from_micros(1) {
+            self.global.platform.note_rbnr_wait(
+                litebox::platform::RunnableWaitKind::SignalFrame,
+                u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            );
         }
     }
 

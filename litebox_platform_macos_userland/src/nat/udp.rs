@@ -63,7 +63,10 @@ impl UdpFlow {
     /// Bind an ephemeral host UDP socket for a new flow, nonblocking: the
     /// engine loop services it on its tick rather than blocking a thread the
     /// way `net_proxy`'s resolver does.
-    fn dial(guest_ip: core::net::Ipv4Addr) -> Option<Self> {
+    fn dial(
+        guest_ip: core::net::Ipv4Addr,
+        doorbell: Option<&'static crate::net_doorbell::NetDoorbell>,
+    ) -> Option<Self> {
         let host = match UdpSocket::bind("0.0.0.0:0") {
             Ok(host) => host,
             Err(e) => {
@@ -74,6 +77,14 @@ impl UdpFlow {
         if let Err(e) = host.set_nonblocking(true) {
             litebox_util_log::debug!(error:% = e; "nat: udp flow nonblocking setup failed");
             return None;
+        }
+        // NETFIX: a reply (a DNS answer, a QUIC packet) wakes the parked network worker. Edge-
+        // triggered, so a socket that reports readable forever (the macOS pending-error case
+        // below) wakes it once, not continuously; `poll_to_guest` still decides what to read.
+        if let Some(doorbell) = doorbell
+            && !doorbell.watch_readable(host.as_raw_fd())
+        {
+            litebox_util_log::debug!(fd:? = host.as_raw_fd(); "nat: kqueue refused a udp flow socket; its replies wait for the worker's safety cap");
         }
         Some(Self {
             host,
@@ -92,6 +103,7 @@ pub(crate) fn relay_from_guest(
     key: FlowKey,
     guest_ip: core::net::Ipv4Addr,
     payload: &[u8],
+    doorbell: Option<&'static crate::net_doorbell::NetDoorbell>,
 ) {
     let dst = SocketAddr::from((key.dst_ip, key.dst_port));
     // A send that fails gets exactly one retry on a fresh host socket. Witnessed on this
@@ -106,7 +118,7 @@ pub(crate) fn relay_from_guest(
             if flows.len() >= UDP_FLOWS_MAX {
                 evict_idlest(flows);
             }
-            let Some(flow) = UdpFlow::dial(guest_ip) else {
+            let Some(flow) = UdpFlow::dial(guest_ip, doorbell) else {
                 return;
             };
             flows.insert(key, flow);

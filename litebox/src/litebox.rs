@@ -124,6 +124,16 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         }
     }
 
+    /// The platform this instance was created with.
+    ///
+    /// Step G: subsystems that publish a diagnostic through a [`crate::platform::Provider`]
+    /// method (the runnable-not-running readout) need the instance they are built against, and
+    /// `&'static Platform` is exactly what [`Self::new`] was handed -- handing it back costs
+    /// nothing and keeps those subsystems from having to thread it separately.
+    pub fn platform(&self) -> &'static Platform {
+        self.x.platform
+    }
+
     /// Access to the file descriptor table.
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
@@ -131,6 +141,9 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     pub fn descriptor_table(
         &self,
     ) -> impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform> {
+        // NETFIX guard: the network worker must never take this lock (see
+        // `fd::note_table_access`); one thread-local read on the platforms that track it.
+        crate::fd::note_table_access(self.x.platform.descriptor_table_access());
         self.x.descriptors.read()
     }
 
@@ -141,6 +154,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     pub fn descriptor_table_mut(
         &self,
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
+        crate::fd::note_table_access(self.x.platform.descriptor_table_access());
         self.x.descriptors.write()
     }
 

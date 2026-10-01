@@ -357,18 +357,31 @@ where
     /// in-aperture address that turns out not to be backed still only faults, which the
     /// underlying fallible read catches and reports as `None` rather than crashing.
     pub fn read_u32_unlocked(&self, address: usize) -> Option<u32> {
-        if !address.is_multiple_of(core::mem::align_of::<u32>())
-            || address < Platform::TASK_ADDR_MIN
-            || address.checked_add(core::mem::size_of::<u32>())? > Platform::TASK_ADDR_MAX
-        {
-            return None;
-        }
-        // SAFETY: `address` was just checked to lie within the guest's own
-        // `TASK_ADDR_MIN..TASK_ADDR_MAX` aperture, which is exactly the precondition
-        // `read_u32_fallible` needs beyond its own hardware-fault tolerance (a genuinely
-        // unbacked-but-in-aperture address still only faults, caught below as `Err`).
-        unsafe { crate::mm::exception_table::read_u32_fallible(address as *const u32).ok() }
+        read_guest_u32_fallible::<Platform, ALIGN>(address)
     }
+}
+
+/// [`MappingReadGuard::read_u32_unlocked`]'s body, as a free function so a caller that holds no
+/// mapping guard can ask the same question with the same aperture check and the same fault
+/// tolerance (CLASS C, `shim-futex-private-skip-mapping-lock`: a `FUTEX_PRIVATE` futex never
+/// consults the mapping table, so its syscall must not take the process-global mapping lock).
+fn read_guest_u32_fallible<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>(
+    address: usize,
+) -> Option<u32>
+where
+    Platform: RawSyncPrimitivesProvider,
+{
+    if !address.is_multiple_of(core::mem::align_of::<u32>())
+        || address < Platform::TASK_ADDR_MIN
+        || address.checked_add(core::mem::size_of::<u32>())? > Platform::TASK_ADDR_MAX
+    {
+        return None;
+    }
+    // SAFETY: `address` was just checked to lie within the guest's own
+    // `TASK_ADDR_MIN..TASK_ADDR_MAX` aperture, which is exactly the precondition
+    // `read_u32_fallible` needs beyond its own hardware-fault tolerance (a genuinely
+    // unbacked-but-in-aperture address still only faults, caught below as `Err`).
+    unsafe { crate::mm::exception_table::read_u32_fallible(address as *const u32).ok() }
 }
 
 /// How `PageManager::protect_range_for_view` treats one address-ordered piece of a range.
@@ -2064,6 +2077,16 @@ where
 
     /// A view of the mapping metadata for identity-sensitive point queries (futex keys, fault
     /// classification); see [`MappingReadGuard`] for what it does (not) hold.
+    /// The same raw word read as [`MappingReadGuard::read_u32_unlocked`], for a caller that
+    /// deliberately holds no mapping guard (CLASS C: a `FUTEX_PRIVATE` futex's value check,
+    /// whose key never depended on the mapping table -- Linux takes no `mmap_lock` there
+    /// either). Identical semantics: the same aperture check, the same fallible read, and an
+    /// unbacked address still reports `None` (`FutexError::Fault` -> `EFAULT`) rather than
+    /// crashing.
+    pub fn read_u32_unguarded(&self, address: usize) -> Option<u32> {
+        read_guest_u32_fallible::<Platform, ALIGN>(address)
+    }
+
     pub fn lock_mappings(&self) -> MappingReadGuard<'_, Platform, ALIGN> {
         MappingReadGuard {
             mirror: &self.mirror,
@@ -2299,6 +2322,38 @@ where
         result
     }
 
+    /// GSIGSEGV diagnostic aid (opt-in, `LITEBOX_GUEST_ACCESS_FAULT_TRACE=1`). A refused guest
+    /// page fault becomes a real `SIGSEGV` for the guest, and the refusal reason is otherwise
+    /// invisible: it only ever travels inside a [`PageFaultError`] payload that
+    /// `litebox_shim_linux`'s `deliver_page_fault_segv` logs at debug level. Six distinct
+    /// refusals live inside [`Self::handle_page_fault_inner`] alone, and telling them apart after
+    /// the fact was the whole cost of diagnosing the 30-minute stress death, so each one now
+    /// names itself, with the domain's own view of the page -- which is what distinguishes
+    /// "no mapping at all" from "a mapping exists but this view's family has no custody of it",
+    /// the two that look identical from the guest side (`si_addr` inside a live VMA, `SEGV_ACCERR`).
+    fn trace_refused_fault(
+        &self,
+        fault_addr: usize,
+        reason: &'static str,
+        vma: Option<crate::mm::linux::VmFlags>,
+    ) {
+        if !Platform::guest_access_fault_trace() {
+            return;
+        }
+        let (view, custody) = match Platform::current_guest_access() {
+            Some((view, _task, _pm)) => (
+                Some(view),
+                Some(self.domain.custody_at_via_lineage(view, fault_addr)),
+            ),
+            None => (None, None),
+        };
+        litebox_util_log::warn!(
+            fault_addr:? = fault_addr, reason:% = reason, view:? = view,
+            vma_flags:? = vma, custody:? = custody;
+            "guest-access fault trace: guest page fault refused -- delivering SIGSEGV"
+        );
+    }
+
     unsafe fn handle_page_fault_inner(
         &self,
         fault_addr: usize,
@@ -2348,6 +2403,7 @@ where
                 candidates.next()
             };
             let Some((r, vma)) = found else {
+                self.trace_refused_fault(fault_addr, "no mapping", None);
                 return Err(PageFaultError::AccessError("no mapping"));
             };
             (r.clone(), *vma)
@@ -2376,6 +2432,7 @@ where
                 self.domain.custody_at_via_lineage(view, ownership_probe),
                 domain::Custody::Present { .. } | domain::Custody::Retiring { .. }
             ) {
+                self.trace_refused_fault(fault_addr, "no custody for this view's family", Some(vma.flags()));
                 return Err(PageFaultError::AccessError("no custody for this view's family"));
             }
         }
@@ -2503,6 +2560,7 @@ where
         }
 
         if <Platform as VmemPageFaultHandler>::access_error(error_code, vma.flags()) {
+            self.trace_refused_fault(fault_addr, "access error", Some(vma.flags()));
             return Err(PageFaultError::AccessError("access error"));
         }
 

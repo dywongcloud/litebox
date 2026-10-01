@@ -18,6 +18,30 @@ macro_rules! log {
     };
 }
 
+/// True when a record at `$level` would actually be emitted for the given target.
+///
+/// The log macros themselves evaluate their own field expressions lazily (both backends check
+/// the level before building a record), so an ordinary `debug!(x:% = f(); "..")` costs nothing
+/// when the level is off. Anything computed *before* the macro -- a `String` built for the
+/// message, a symbolization, a frame walk -- does not get that for free, and this is the one
+/// idiom to gate it with. `$level` is a [`Level`](crate::Level); `module_path!()` is used as
+/// the target when no explicit `target:` is given, so per-module filters keep working.
+///
+/// ```
+/// if litebox_util_log::log_enabled!(litebox_util_log::Level::Debug) {
+///     // .. work that is only worth doing for a debug line ..
+/// }
+/// ```
+#[macro_export]
+macro_rules! log_enabled {
+    (target: $target:expr, $level:expr) => {
+        $crate::__log_enabled_impl!(target: $target, $level)
+    };
+    ($level:expr) => {
+        $crate::__log_enabled_impl!(target: module_path!(), $level)
+    };
+}
+
 /// Create a span at the specified level. Returns a guard that exits the span when dropped.
 #[macro_export]
 macro_rules! span {

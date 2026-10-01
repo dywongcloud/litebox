@@ -28,16 +28,17 @@
 //!   its own attachment.
 
 use core::fmt;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::hvf::{
-    HvfArchitecturalState, HvfEl1State, HvfError, HvfFpInstall, HvfGuestFp, HvfPstateContext,
-    HvfVcpu, HvfVcpuCancellation, HvfVcpuExit, process_hvf_vm,
+    HvfArchitecturalState, HvfEl1State, HvfError, HvfFpInstall, HvfGuestFp, HvfOperationError,
+    HvfPstateContext, HvfRunScope, HvfVcpu, HvfVcpuCancellation, HvfVcpuExit, process_hvf_vm,
 };
 use crate::hvf_memory::{HvfMemoryError, HvfVcpuRunAttachment};
 
@@ -143,6 +144,10 @@ impl HvfVcpuSynchronizationBarrier {
             if remaining.is_zero() {
                 return Err(HvfVcpuLaneError::OperationTimeout);
             }
+            crate::diagnostics_counters::rank_note_blocking_wait(
+                crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                std::panic::Location::caller(),
+            );
             let (next, _) = barrier
                 .changed
                 .wait_timeout(state, remaining.min(CONTROL_WAIT_POLL))
@@ -178,6 +183,7 @@ impl Drop for HvfVcpuSynchronizationBarrier {
     }
 }
 
+#[track_caller]
 fn hold_vcpu_synchronization_barrier() {
     let barrier = synchronization_barrier();
     let mut state = barrier
@@ -190,6 +196,10 @@ fn hold_vcpu_synchronization_barrier() {
     state.reached = Some(generation);
     barrier.changed.notify_all();
     while state.armed == Some(generation) {
+        crate::diagnostics_counters::rank_note_blocking_wait(
+            crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+            std::panic::Location::caller(),
+        );
         state = barrier
             .changed
             .wait(state)
@@ -298,6 +308,10 @@ impl HvfVcpuRunCompletionBarrier {
             if remaining.is_zero() {
                 return Err(HvfVcpuLaneError::OperationTimeout);
             }
+            crate::diagnostics_counters::rank_note_blocking_wait(
+                crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                std::panic::Location::caller(),
+            );
             let (next, _) = barrier
                 .changed
                 .wait_timeout(state, remaining.min(CONTROL_WAIT_POLL))
@@ -334,10 +348,21 @@ impl Drop for HvfVcpuRunCompletionBarrier {
     }
 }
 
+/// Deterministic-completion rendezvous. Diagnostic-only: returns immediately unless a witness
+/// armed the barrier (no armer runs in an ordinary run).
+///
+/// The wait is bounded (T2d fix-up): this runs *inside* the run scope's single existing-vCPU
+/// operation, so parking here holds that operation, an `active_vcpu_owners` slot and a published
+/// frame, and keeps `promote_poison_if_quiescent` / `abandoned_cleanup_ready` from seeing the VM
+/// as quiescent. An armed-but-never-released arm must therefore not be able to park the owner
+/// indefinitely; the deadline is the same one the arming side's `wait_until_reached` uses.
 fn hold_vcpu_run_completion_barrier(lane_generation: u64, run_epoch: u64) {
     if !RUN_COMPLETION_BARRIER_ARMED.load(Ordering::Acquire) {
         return;
     }
+    let Ok(deadline) = operation_deadline() else {
+        return;
+    };
     let barrier = run_completion_barrier();
     let mut state = barrier
         .state
@@ -352,10 +377,22 @@ fn hold_vcpu_run_completion_barrier(lane_generation: u64, run_epoch: u64) {
     state.reached = Some(target.generation);
     barrier.changed.notify_all();
     while state.armed == Some(target) {
-        state = barrier
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Give up the hold rather than park the owner inside the admission; the arming
+            // witness reports a timeout instead of a hang.
+            crate::diagnostics_counters::record_barrier_hold_timeout();
+            break;
+        }
+        crate::diagnostics_counters::rank_note_blocking_wait(
+            crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+            std::panic::Location::caller(),
+        );
+        let (next, _) = barrier
             .changed
-            .wait(state)
+            .wait_timeout(state, remaining.min(CONTROL_WAIT_POLL))
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state = next;
     }
     if state.reached == Some(target.generation) {
         state.reached = None;
@@ -572,6 +609,18 @@ impl HvfVcpuLaneError {
 
 impl std::error::Error for HvfVcpuLaneError {}
 
+/// T2d: the run scope's single existing-vCPU operation ([`HvfVcpu::with_run_scope`]) is generic
+/// over its body's error, and a failure observed after the frame was published has to be tagged
+/// exactly as the per-operation path tagged it.
+impl HvfOperationError for HvfVcpuLaneError {
+    fn after_hvf_publication(self) -> Self {
+        match self {
+            Self::Hvf(error) => Self::Hvf(error.after_hvf_publication()),
+            other => other,
+        }
+    }
+}
+
 impl From<HvfError> for HvfVcpuLaneError {
     fn from(value: HvfError) -> Self {
         Self::Hvf(value)
@@ -664,7 +713,6 @@ pub struct HvfVcpuRunResult {
     pub exit: HvfVcpuExit,
     pub state: HvfVcpuExitState,
     pub run_epoch: u64,
-    pub execution_time: u64,
     /// Wall nanoseconds the owner thread spent inside `hv_vcpu_run` for this result (summed
     /// over reruns): the subtrahend of `diagnostics_counters`' exit-to-reentry handoff cost.
     pub run_wall_ns: u64,
@@ -819,6 +867,10 @@ impl HvfGuestRegisterCell {
             if remaining.is_zero() {
                 return (None, discarded);
             }
+            crate::diagnostics_counters::rank_note_blocking_wait(
+                crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                std::panic::Location::caller(),
+            );
             mailbox = self
                 .deposited
                 .wait_timeout(mailbox, remaining)
@@ -1159,6 +1211,10 @@ impl CancellationAttempt {
             if remaining.is_zero() {
                 return None;
             }
+            crate::diagnostics_counters::rank_note_blocking_wait(
+                crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                std::panic::Location::caller(),
+            );
             let (next, _) = self
                 .changed
                 .wait_timeout(progress, remaining.min(CONTROL_WAIT_POLL))
@@ -1197,9 +1253,29 @@ struct RunControlState {
     /// be reported as "not running" and lost until the guest's next exit.
     latched: Option<Arc<CancellationAttempt>>,
     shutdown_requested: bool,
-    /// A kick was issued after its target run had already exited; the SDK may
+    /// BCORE-2: a kick was issued after its target run had already exited; the SDK may
     /// deliver it as an immediate `Canceled` on the next `hv_vcpu_run`.
-    stale_kick_possible: bool,
+    ///
+    /// This is a COUNT, not a bool. A bound run is ~2-3 us wide where a pooled run is ~2.2 us
+    /// of `hv_vcpu_run` plus ~11 us of hand-off, so on the bound path kicks arrive while the
+    /// same vCPU is already several runs further along and each of them owes one spurious
+    /// `Canceled`; a bool merged them and the accounting was not exact. Lane behaviour is
+    /// unchanged: at most one attempt exists per epoch (`next_cancellation_attempt` refuses a
+    /// second) and every epoch's first exit resolves the previous count, so outside the
+    /// shutdown / issue-failure arms `n <= 1` and `n > 0` is exactly the old bool.
+    pending_stale_kicks: u32,
+    /// BCORE-2: kicks issued for this vCPU that no exit has resolved yet (the debit ledger of
+    /// the identity `issued == consumed + drained + expired_unlatched + expired_terminal +
+    /// expired_latched + abandoned`).
+    /// Maintained only while [`RunControl::bound`]. Every resolution discharges one debit
+    /// (`note_consumed_kick`, `note_expired_kick`, or `note_stale_kick`, which moves it onto
+    /// `pending_stale_kicks` until a later `drain_stale_kick` / `expire_unlatched` /
+    /// `terminalize` resolves it); `terminalize` is the discharger of last resort, and a bound
+    /// vCPU's `unbind`/`Drop` call it before destroying the vCPU, so a bound teardown reports
+    /// what it abandoned instead of dropping the debit in silence.
+    issued_unresolved: u32,
+    /// BCORE-2: whether this control drives a bound vCPU (kick accounting is published).
+    bound: bool,
     /// The terminal phase was reached because the vCPU's state can no longer
     /// be trusted (inconsistent phase, unauthenticated exit, lost kick), as
     /// opposed to an orderly shutdown.  Only an untrusted vCPU is quarantined;
@@ -1207,13 +1283,22 @@ struct RunControlState {
     untrusted: bool,
 }
 
-struct RunControl {
+pub(crate) struct RunControl {
     state: Mutex<RunControlState>,
     changed: Condvar,
 }
 
 impl RunControl {
+    /// A pooled lane's control (`bound = false`: lane kick behaviour, no published
+    /// accounting).
     fn new() -> Self {
+        Self::new_bound(false)
+    }
+
+    /// BCORE-2: `bound = true` for a control that drives a bound vCPU, which publishes the
+    /// kick identity `issued == consumed + drained + expired_unlatched + expired_terminal +
+    /// expired_latched + abandoned`.
+    pub(crate) fn new_bound(bound: bool) -> Self {
         Self {
             state: Mutex::new(RunControlState {
                 phase: ExecutionPhase::Idle,
@@ -1223,7 +1308,9 @@ impl RunControl {
                 cancellation: None,
                 latched: None,
                 shutdown_requested: false,
-                stale_kick_possible: false,
+                pending_stale_kicks: 0,
+                issued_unresolved: 0,
+                bound,
                 untrusted: false,
             }),
             changed: Condvar::new(),
@@ -1234,6 +1321,86 @@ impl RunControl {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// BCORE-2: one kick was issued for this vCPU. Charges the debit ledger.
+    fn note_issued_kick(&self, state: &mut RunControlState) {
+        if state.bound {
+            state.issued_unresolved = state.issued_unresolved.saturating_add(1);
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_KICKS_ISSUED,
+                1,
+            );
+        }
+    }
+
+    /// BCORE-2: an exit came back `Canceled` and this attempt caused it. Discharges the debit.
+    fn note_consumed_kick(&self, state: &mut RunControlState) {
+        if state.bound {
+            state.issued_unresolved = state.issued_unresolved.saturating_sub(1);
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_KICKS_CONSUMED,
+                1,
+            );
+        }
+    }
+
+    /// BCORE-2: a kick landed too late (or its requester stopped waiting), so the SDK may
+    /// still deliver it as a spurious `Canceled` on a later run. Moves one debit onto
+    /// `pending_stale_kicks`.
+    fn note_stale_kick(&self, state: &mut RunControlState) {
+        state.pending_stale_kicks = state.pending_stale_kicks.saturating_add(1);
+        if state.bound {
+            state.issued_unresolved = state.issued_unresolved.saturating_sub(1);
+        }
+    }
+
+    /// BCORE-2 (fix-up): a kick whose requester gave up waiting is discharged as `expired`
+    /// rather than moved onto `pending_stale_kicks`: the attempt that expired here had already
+    /// been taken out of the kick slot (`state.latched`), so no SDK `hv_vcpus_exit` was ever
+    /// issued for it and there is no spurious `Canceled` still owed. Without this the debit
+    /// `note_issued_kick` charged stays on `issued_unresolved` until the vCPU is terminalized,
+    /// which is why the identity used to close only "once the vCPU is idle".
+    fn note_expired_kick(&self, state: &mut RunControlState) {
+        if state.bound {
+            state.issued_unresolved = state.issued_unresolved.saturating_sub(1);
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_KICKS_EXPIRED_LATCHED,
+                1,
+            );
+        }
+    }
+
+    /// BCORE-2: a spurious `Canceled` was consumed by `pending_stale_kicks`, so the run is
+    /// rerun instead of delivered. Returns `false` when nothing was pending (a genuinely
+    /// unauthenticated cancellation).
+    fn drain_stale_kick(&self, state: &mut RunControlState) -> bool {
+        match state.pending_stale_kicks.checked_sub(1) {
+            Some(pending) => {
+                state.pending_stale_kicks = pending;
+                if state.bound {
+                    crate::diagnostics_counters::add_stat(
+                        crate::diagnostics_counters::BOUND_KICKS_DRAINED,
+                        1,
+                    );
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// BCORE-2: a non-`Canceled` exit proves no HVF latch was pending at entry (a latched
+    /// kick ends the next run as `Canceled` before guest entry), so every still-pending stale
+    /// kick expired without ever latching.
+    fn expire_unlatched(&self, state: &mut RunControlState) {
+        let pending = core::mem::take(&mut state.pending_stale_kicks);
+        if state.bound && pending != 0 {
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_KICKS_EXPIRED_UNLATCHED,
+                u64::from(pending),
+            );
+        }
     }
 
     fn phase(&self) -> ExecutionPhase {
@@ -1286,7 +1453,25 @@ impl RunControl {
         );
         Self::complete_attempt(&mut state.latched, latched_completion);
         state.phase = ExecutionPhase::Terminal;
-        state.stale_kick_possible = false;
+        // BCORE-2: `terminalize` is the discharger of last resort -- a vCPU that is going
+        // away can never consume a stale kick, and the debits it still owes move onto
+        // `expired_terminal` so the identity closes.
+        let pending = core::mem::take(&mut state.pending_stale_kicks);
+        let unresolved = core::mem::take(&mut state.issued_unresolved);
+        if state.bound {
+            if pending != 0 {
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_KICKS_EXPIRED_TERMINAL,
+                    u64::from(pending),
+                );
+            }
+            if unresolved != 0 {
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_KICKS_ABANDONED,
+                    u64::from(unresolved),
+                );
+            }
+        }
         state.untrusted |= untrusted;
         self.changed.notify_all();
     }
@@ -1371,7 +1556,8 @@ impl RunControl {
                 Err(error) => {
                     let _ = attempt.complete(CancellationCompletion::Terminalized);
                     state.shutdown_requested = true;
-                    state.stale_kick_possible = true;
+                    self.expire_unlatched(state);
+                    self.note_stale_kick(state);
                     state.untrusted = true;
                     self.changed.notify_all();
                     Err(error)
@@ -1380,13 +1566,15 @@ impl RunControl {
             Err(error) => {
                 if !attempt.complete(CancellationCompletion::Failed(error.clone())) {
                     state.shutdown_requested = true;
-                    state.stale_kick_possible = true;
+                    self.expire_unlatched(state);
+                    self.note_stale_kick(state);
                     state.untrusted = true;
                     self.changed.notify_all();
                     return Err(HvfVcpuLaneError::RegistryAccounting);
                 }
                 state.shutdown_requested = true;
-                state.stale_kick_possible = true;
+                self.expire_unlatched(state);
+                self.note_stale_kick(state);
                 state.untrusted = true;
                 self.changed.notify_all();
                 Err(error.into())
@@ -1536,14 +1724,14 @@ impl RunControl {
                     }
                 }
                 state.cancellation = None;
+                self.note_consumed_kick(&mut state);
                 self.set_orderly_terminal(&mut state);
                 Ok(SynchronizationDisposition::Canceled(
                     HvfVcpuCancellationReceipt::from_key(attempt.key()),
                 ))
             }
             (true, None) => {
-                if state.stale_kick_possible {
-                    state.stale_kick_possible = false;
+                if self.drain_stale_kick(&mut state) {
                     self.settle_synchronization(&mut state, run_epoch, false);
                     Ok(SynchronizationDisposition::Rerun)
                 } else {
@@ -1560,10 +1748,12 @@ impl RunControl {
                             self.set_terminal(&mut state);
                             return Err(HvfVcpuLaneError::RegistryAccounting);
                         }
-                        state.stale_kick_possible = true;
+                        self.expire_unlatched(&mut state);
+                        self.note_stale_kick(&mut state);
                     }
                     CancellationProgress::Completed(CancellationCompletion::Expired) => {
-                        state.stale_kick_possible = true;
+                        self.expire_unlatched(&mut state);
+                        self.note_stale_kick(&mut state);
                     }
                     CancellationProgress::Completed(CancellationCompletion::Failed(_)) => {}
                     _ => {
@@ -1576,7 +1766,7 @@ impl RunControl {
                 Ok(SynchronizationDisposition::Completed)
             }
             (false, None) => {
-                state.stale_kick_possible = false;
+                self.expire_unlatched(&mut state);
                 self.settle_synchronization(&mut state, run_epoch, exit.is_err());
                 Ok(SynchronizationDisposition::Completed)
             }
@@ -1627,8 +1817,12 @@ impl RunControl {
                     self.set_terminal(state);
                     return Err(HvfVcpuLaneError::RegistryAccounting);
                 }
+                // BCORE-2: the latched kick is what ends this run as `Canceled`.
+                self.note_consumed_kick(state);
             }
-            CancellationProgress::Completed(CancellationCompletion::Expired) => {}
+            CancellationProgress::Completed(CancellationCompletion::Expired) => {
+                self.note_expired_kick(state);
+            }
             _ => {
                 self.set_terminal(state);
                 return Err(HvfVcpuLaneError::RegistryAccounting);
@@ -1656,7 +1850,9 @@ impl RunControl {
         Ok(())
     }
 
-    fn settle_reservation(
+    /// BCORE-4: settles a run reservation directly. A lane does this through its
+    /// `HvfVcpuRunReservation`; a bound vCPU has no lane object, so it calls this.
+    pub(crate) fn settle_reservation(
         &self,
         run_epoch: u64,
         lane_live: bool,
@@ -1699,8 +1895,12 @@ impl RunControl {
                                 self.set_terminal(&mut state);
                                 return Err(HvfVcpuLaneError::RegistryAccounting);
                             }
+                            // BCORE-2: a pre-entry latch consumed here.
+                            self.note_consumed_kick(&mut state);
                         }
-                        CancellationProgress::Completed(CancellationCompletion::Expired) => {}
+                        CancellationProgress::Completed(CancellationCompletion::Expired) => {
+                            self.note_expired_kick(&mut state);
+                        }
                         _ => {
                             self.set_terminal(&mut state);
                             return Err(HvfVcpuLaneError::RegistryAccounting);
@@ -1774,12 +1974,12 @@ impl RunControl {
                     }
                 }
                 state.cancellation = None;
+                self.note_consumed_kick(&mut state);
                 self.settle_run(&mut state, run_epoch, false);
                 Ok(RunDisposition::Deliver)
             }
             (true, None) => {
-                if state.stale_kick_possible {
-                    state.stale_kick_possible = false;
+                if self.drain_stale_kick(&mut state) {
                     if state.shutdown_requested {
                         self.set_orderly_terminal(&mut state);
                         Ok(RunDisposition::Deliver)
@@ -1800,10 +2000,12 @@ impl RunControl {
                             self.set_terminal(&mut state);
                             return Err(HvfVcpuLaneError::RegistryAccounting);
                         }
-                        state.stale_kick_possible = true;
+                        self.expire_unlatched(&mut state);
+                        self.note_stale_kick(&mut state);
                     }
                     CancellationProgress::Completed(CancellationCompletion::Expired) => {
-                        state.stale_kick_possible = true;
+                        self.expire_unlatched(&mut state);
+                        self.note_stale_kick(&mut state);
                     }
                     CancellationProgress::Completed(CancellationCompletion::Failed(_)) => {}
                     _ => {
@@ -1816,7 +2018,7 @@ impl RunControl {
                 Ok(RunDisposition::Deliver)
             }
             (false, None) => {
-                state.stale_kick_possible = false;
+                self.expire_unlatched(&mut state);
                 self.settle_run(&mut state, run_epoch, exit.is_err());
                 Ok(RunDisposition::Deliver)
             }
@@ -1859,19 +2061,58 @@ impl RunControl {
                 return Err(HvfVcpuLaneError::RegistryAccounting);
             }
             let attempt =
-                Self::next_cancellation_attempt(&mut state, lane_generation, cancellation, target)?;
+                match Self::next_cancellation_attempt(&mut state, lane_generation, cancellation, target)
+                {
+                    Ok(attempt) => attempt,
+                    Err(error @ HvfVcpuLaneError::CancellationInFlight { .. }) => {
+                        // BCORE-2: a bound run's second kick merges into the one already in
+                        // flight -- no second `hv_vcpus_exit`, so no second debit.
+                        if state.bound {
+                            crate::diagnostics_counters::add_stat(
+                                crate::diagnostics_counters::BOUND_KICKS_MERGED,
+                                1,
+                            );
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
             self.issue_cancellation(&mut state, &attempt, cancellation)?;
+            // BCORE-2: charged exactly where the SDK kick lands, so
+            // `issued == consumed + drained + expired_unlatched + expired_terminal +
+            // expired_latched + abandoned` closes once the vCPU is idle or terminalized.
+            self.note_issued_kick(&mut state);
             // hvf-exit-overhead-instrumentation: a real `hv_vcpus_exit` against a running lane.
             crate::diagnostics_counters::record_kick_issued();
             Ok(attempt)
         } else {
             let attempt =
                 Self::latch_cancellation(&mut state, lane_generation, cancellation, target)?;
+            if state.bound {
+                self.note_issued_kick(&mut state);
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_KICKS_LATCHED,
+                    1,
+                );
+            }
             // hvf-exit-overhead-instrumentation: latched -- the imminent run returns `Canceled`
             // without entering the guest (see `execute_once`).
             crate::diagnostics_counters::record_kick_latched();
             Ok(attempt)
         }
+    }
+
+    /// BCORE-4: a kick aimed at this vCPU from another thread (a mutation's settle does this
+    /// to every running lane and every bound vCPU). The same admission path a lane's
+    /// `HvfVcpuLaneCancellation::request_attempt` takes.
+    pub(crate) fn request_kick(
+        &self,
+        generation: u64,
+        cancellation: &HvfVcpuCancellation,
+        requested_run_epoch: Option<u64>,
+    ) -> Result<(), HvfVcpuLaneError> {
+        self.request_public(generation, cancellation, requested_run_epoch)
+            .map(|_| ())
     }
 
     fn latch_cancellation(
@@ -1937,7 +2178,8 @@ impl RunControl {
                 CancellationProgress::Issuing | CancellationProgress::Issued => {
                     let _ = attempt.complete(CancellationCompletion::Terminalized);
                     state.cancellation = None;
-                    state.stale_kick_possible = true;
+                    self.expire_unlatched(&mut state);
+                    self.note_stale_kick(&mut state);
                 }
                 CancellationProgress::Completed(
                     CancellationCompletion::Expired
@@ -2054,6 +2296,10 @@ impl RunControl {
                 self.changed.notify_all();
                 return Err(HvfVcpuLaneError::OperationTimeout);
             }
+            crate::diagnostics_counters::rank_note_blocking_wait(
+                crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                std::panic::Location::caller(),
+            );
             let (next, _) = self
                 .changed
                 .wait_timeout(state, remaining.min(CONTROL_WAIT_POLL))
@@ -2103,6 +2349,24 @@ impl fmt::Debug for HvfVcpuLaneParticipantCapability {
 impl HvfVcpuLaneParticipantCapability {
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// BCORE-4: the same capability for a bound vCPU (created and driven on one guest
+    /// thread). The memory manager only ever sees the resulting
+    /// [`HvfVcpuLaneRegistration`], so a bound participant is indistinguishable from a lane's
+    /// -- `owner_stopped` is the bound vCPU's own flag and is what makes
+    /// `deregister_vcpu_participant` acknowledge owed retirements on the way out.
+    pub(crate) fn for_bound(
+        generation: u64,
+        lifecycle: Arc<AtomicU8>,
+        owner_stopped: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            generation,
+            lifecycle,
+            owner_stopped,
+            admission: Arc::new(Mutex::new(())),
+        }
     }
 
     pub(crate) fn with_live_registration<R>(
@@ -2174,8 +2438,7 @@ impl HvfVcpuRunReservation {
         self.active = false;
         if result.is_err() || self.cancellation.control.is_untrusted() {
             raise_lane_lifecycle(&self.cancellation.lifecycle, LANE_ABANDONED);
-            self.cancellation.command_queue.wake();
-            self.cancellation.reaper.unpark();
+            self.cancellation.wake_recovery();
         }
         result
     }
@@ -2187,16 +2450,33 @@ impl Drop for HvfVcpuRunReservation {
     }
 }
 
+/// T2e: where a cancellation handle memoizes the [`CancellationAttempt`] it asked
+/// [`RunControl`] for, so repeated kick requests within one run issue one attempt.
+#[derive(Clone)]
+enum AttemptCell {
+    /// The lane's cell, shared by every run on that lane and keyed by run epoch: an attempt is
+    /// reused only for the run that minted it. Created once per lane, so a run's first request
+    /// no longer allocates. Epoch `0` means nothing cached; [`RunControl::reserve_run`] hands out
+    /// `1, 2, ..` and never `0`.
+    Lane(Arc<Mutex<(u64, Option<Arc<CancellationAttempt>>)>>),
+    /// A cell private to this handle: a kick-round cancellation ([`HvfVcpuLaneCancellation`] with
+    /// `run_epoch == None`, which names no run) and a BCORE bound vCPU's.
+    Own(Arc<Mutex<Option<Arc<CancellationAttempt>>>>),
+}
+
 #[derive(Clone)]
 pub struct HvfVcpuLaneCancellation {
     lane_generation: u64,
     run_epoch: Option<u64>,
     cancellation: HvfVcpuCancellation,
-    attempt: Arc<Mutex<Option<Arc<CancellationAttempt>>>>,
+    attempt: AttemptCell,
     lifecycle: Arc<AtomicU8>,
     control: Arc<RunControl>,
-    command_queue: Arc<CommandQueue>,
-    reaper: std::thread::Thread,
+    /// The lane's owner-thread command queue; `None` for a BCORE bound vCPU, which has no
+    /// owner thread to wake.
+    command_queue: Option<Arc<CommandQueue>>,
+    /// The process reaper's thread; `None` for a bound vCPU (no reaper slot).
+    reaper: Option<std::thread::Thread>,
 }
 
 impl fmt::Debug for HvfVcpuLaneCancellation {
@@ -2212,43 +2492,113 @@ impl fmt::Debug for HvfVcpuLaneCancellation {
 }
 
 impl HvfVcpuLaneCancellation {
+    /// BCORE-2: a bound vCPU's cancellation handle. It has no owner thread to wake and no
+    /// reaper slot, so those two fields are `None`; every kick path goes through
+    /// [`RunControl::request_public`] exactly as a lane's does.
+    fn for_bound(
+        lane_generation: u64,
+        run_epoch: Option<u64>,
+        cancellation: HvfVcpuCancellation,
+        lifecycle: Arc<AtomicU8>,
+        control: Arc<RunControl>,
+    ) -> Self {
+        Self {
+            lane_generation,
+            run_epoch,
+            cancellation,
+            attempt: AttemptCell::Own(Arc::new(Mutex::new(None))),
+            lifecycle,
+            control,
+            command_queue: None,
+            reaper: None,
+        }
+    }
+
     pub const fn lane_generation(&self) -> u64 {
         self.lane_generation
     }
 
+    /// Wakes whatever can retire this vCPU after a failed kick: a lane's owner thread and
+    /// reaper.  A bound vCPU has neither -- its owner thread *is* the caller -- so this is a
+    /// no-op there.
+    fn wake_recovery(&self) {
+        if let Some(queue) = self.command_queue.as_ref() {
+            queue.wake();
+        }
+        if let Some(reaper) = self.reaper.as_ref() {
+            reaper.unpark();
+        }
+    }
+
     pub(crate) fn is_same_run(&self, other: &Self) -> bool {
+        // T2e: the attempt cell is shared per lane and keyed by run epoch, so its pointer identity
+        // no longer separates two runs of one lane -- `run_epoch` does, and it is `Some` for
+        // exactly the handles that name a run.
         self.run_epoch.is_some()
             && self.lane_generation == other.lane_generation
             && self.run_epoch == other.run_epoch
             && self.cancellation.generation() == other.cancellation.generation()
-            && Arc::ptr_eq(&self.attempt, &other.attempt)
             && Arc::ptr_eq(&self.lifecycle, &other.lifecycle)
             && Arc::ptr_eq(&self.control, &other.control)
     }
 
     fn request_attempt(&self) -> Result<Arc<CancellationAttempt>, HvfVcpuLaneError> {
-        let mut requested = self
-            .attempt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(attempt) = requested.as_ref() {
-            return Ok(Arc::clone(attempt));
+        match &self.attempt {
+            AttemptCell::Own(cell) => {
+                let mut requested = cell
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(attempt) = requested.as_ref() {
+                    return Ok(Arc::clone(attempt));
+                }
+                let result = self.mint_attempt();
+                if let Ok(attempt) = &result {
+                    *requested = Some(Arc::clone(attempt));
+                }
+                self.note_refused_request(&result);
+                result
+            }
+            AttemptCell::Lane(cell) => {
+                let epoch = self.run_epoch;
+                let mut requested = cell
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // T2e: reuse only an attempt minted for THIS run. `epoch` is `Some` for every
+                // reservation, so the guard also keeps a `None`-epoch handle (impossible on this
+                // variant) from ever reusing a cached attempt.
+                if epoch.is_some_and(|epoch| requested.0 == epoch)
+                    && let Some(attempt) = requested.1.as_ref()
+                {
+                    return Ok(Arc::clone(attempt));
+                }
+                let result = self.mint_attempt();
+                if let Ok(attempt) = &result {
+                    requested.0 = epoch.unwrap_or(0);
+                    requested.1 = Some(Arc::clone(attempt));
+                }
+                self.note_refused_request(&result);
+                result
+            }
         }
+    }
+
+    /// The uncached half of [`Self::request_attempt`]: asks [`RunControl`] for this run's
+    /// cancellation attempt.
+    fn mint_attempt(&self) -> Result<Arc<CancellationAttempt>, HvfVcpuLaneError> {
         if self.lifecycle.load(Ordering::Acquire) != LANE_LIVE {
             return Err(HvfVcpuLaneError::LaneClosed);
         }
-        let result =
-            self.control
-                .request_public(self.lane_generation, &self.cancellation, self.run_epoch);
-        if let Ok(attempt) = &result {
-            *requested = Some(Arc::clone(attempt));
-        }
+        self.control
+            .request_public(self.lane_generation, &self.cancellation, self.run_epoch)
+    }
+
+    /// Shared tail of [`Self::request_attempt`]: a refused request that left the run untrusted
+    /// retires the lane and wakes whatever can reap it.
+    fn note_refused_request(&self, result: &Result<Arc<CancellationAttempt>, HvfVcpuLaneError>) {
         if result.is_err() && self.control.is_untrusted() {
             raise_lane_lifecycle(&self.lifecycle, LANE_ABANDONED);
-            self.command_queue.wake();
-            self.reaper.unpark();
+            self.wake_recovery();
         }
-        result
     }
 
     pub fn request(&self) -> Result<(), HvfVcpuLaneError> {
@@ -2261,11 +2611,139 @@ impl HvfVcpuLaneCancellation {
         let result = self.control.await_attempt(&attempt, deadline);
         if result.is_err() && self.control.is_untrusted() {
             raise_lane_lifecycle(&self.lifecycle, LANE_ABANDONED);
-            self.command_queue.wake();
-            self.reaper.unpark();
+            self.wake_recovery();
         }
         result
     }
+}
+
+// ---------------------------------------------------------------------------
+// T2c: bounded adaptive spin-then-park for the lane hand-off.
+// ---------------------------------------------------------------------------
+
+/// The most one wait may spin before it parks. This is what makes the mechanism safe: a spinning
+/// thread can burn at most this much CPU per wait, and it never holds a core for long enough to
+/// delay the other side it is waiting for.
+const SPIN_BUDGET_MAX_NS: u64 = 20_000;
+/// Where a new waiter starts.
+const SPIN_BUDGET_START_NS: u32 = 10_000;
+/// The floor: a budget is never set below this, and halving one that is already here turns
+/// spinning off instead.
+const SPIN_BUDGET_MIN_NS: u32 = 2_000;
+/// What a waiter with spinning turned off pays every [`SPIN_PROBE_EVERY_PARKS`]-th wait so a lane
+/// that becomes busy again is noticed. It is the start budget rather than a token 2 us for a
+/// measured reason: a probe smaller than the wait it is probing for can never hit, so turning
+/// spinning off would be permanent. Measured with a 2 us probe every 64 waits on cg2 `single`
+/// (5 runs x ~100 k hand-offs): 105453 of 107134 owner waits and 105437 guest waits took the
+/// disabled branch, 1648 probes all missed, and 23 of 107134 hand-offs hit -- the budget
+/// collapsed during the boot phase (seconds-long waits) and never came back.
+const SPIN_PROBE_NS: u64 = SPIN_BUDGET_START_NS as u64;
+/// Consecutive misses that halve the budget.
+const SPIN_MISS_LIMIT: u8 = 4;
+/// How many waits a turned-off waiter skips between probes. 16 keeps the worst case at
+/// [`SPIN_PROBE_NS`] / 16 = 625 ns per wait, and bounds how long a lane that has gone hot again
+/// spins nothing at all.
+const SPIN_PROBE_EVERY_PARKS: u16 = 16;
+/// Iterations between clock reads inside a spin (`spin_loop` is a few cycles; `Instant::elapsed`
+/// is not).
+const SPIN_CLOCK_CHECK_MASK: u32 = 31;
+
+/// One thread's spin budget for one wait site, adapted to how long that site's waits take.
+///
+/// A hit (the wait finished inside the budget) sets the budget to twice what this wait cost:
+/// the next wait of the same shape still fits, and a wait that is habitually short stops paying
+/// for a kernel wakeup without ever spinning for long. A miss counts towards halving the budget,
+/// and four in a row below the floor turn spinning off entirely -- a waiter that keeps missing is
+/// waiting on something that cannot arrive quickly (a mutation, a stalled lane, a lane that is
+/// not running at all), and burning a core there delays the very work it waits for.
+#[derive(Clone, Copy)]
+struct AdaptiveSpin {
+    budget_ns: u32,
+    misses: u8,
+    parks_since_probe: u16,
+}
+
+impl AdaptiveSpin {
+    const fn new() -> Self {
+        Self {
+            budget_ns: SPIN_BUDGET_START_NS,
+            misses: 0,
+            parks_since_probe: 0,
+        }
+    }
+
+    /// Spins until `ready()` is true, the budget runs out, or `cap_ns` is reached. Returns
+    /// whether `ready()` became true, in which case the caller consumes whatever it spun for.
+    ///
+    /// Both call sites are outside any VM-operation frame and hold no pool or queue mutex while
+    /// this runs (asserted in debug builds at both); the owner side holds nothing at all.
+    fn try_spin(&mut self, owner: bool, cap_ns: u64, ready: impl Fn() -> bool) -> bool {
+        // A spin inside a VM-operation frame would burn CPU while holding an admission every
+        // other mutator waits for. Debug builds catch that loudly; release builds just park.
+        let operation_depth = crate::hvf::operation_depth();
+        debug_assert_eq!(
+            operation_depth, 0,
+            "T2c: an adaptive hand-off spin must not run inside a VM-operation frame"
+        );
+        if operation_depth != 0 {
+            return false;
+        }
+        let budget = if self.budget_ns == 0 {
+            self.parks_since_probe = self.parks_since_probe.wrapping_add(1);
+            if self.parks_since_probe % SPIN_PROBE_EVERY_PARKS != 0 {
+                crate::diagnostics_counters::record_handoff_spin_disabled(owner);
+                return false;
+            }
+            SPIN_PROBE_NS
+        } else {
+            u64::from(self.budget_ns)
+        }
+        .min(cap_ns)
+        .min(SPIN_BUDGET_MAX_NS);
+        if budget == 0 {
+            return false;
+        }
+        let start = Instant::now();
+        let mut iterations = 0u32;
+        loop {
+            if ready() {
+                let waited_ns = start.elapsed().as_nanos() as u64;
+                self.budget_ns = waited_ns
+                    .saturating_mul(2)
+                    .clamp(u64::from(SPIN_BUDGET_MIN_NS), SPIN_BUDGET_MAX_NS)
+                    as u32;
+                self.misses = 0;
+                crate::diagnostics_counters::record_handoff_spin(owner, true, waited_ns);
+                return true;
+            }
+            iterations = iterations.wrapping_add(1);
+            if iterations & SPIN_CLOCK_CHECK_MASK == 0
+                && start.elapsed().as_nanos() as u64 >= budget
+            {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        let spun_ns = start.elapsed().as_nanos() as u64;
+        self.misses = self.misses.saturating_add(1);
+        if self.misses >= SPIN_MISS_LIMIT {
+            self.misses = 0;
+            let halved = self.budget_ns / 2;
+            self.budget_ns = if halved < SPIN_BUDGET_MIN_NS {
+                0
+            } else {
+                halved
+            };
+        }
+        crate::diagnostics_counters::record_handoff_spin(owner, false, spun_ns);
+        false
+    }
+}
+
+thread_local! {
+    /// T2c: this thread's guest-side reply-wait spin budget. One per thread, because how long a
+    /// thread waits for a reply is a property of what that thread is running, not of the lane.
+    static GUEST_REPLY_SPIN: Cell<AdaptiveSpin> = const { Cell::new(AdaptiveSpin::new()) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2280,6 +2758,10 @@ struct CommandQueueState {
 struct CommandQueue {
     capacity: usize,
     state: Mutex<CommandQueueState>,
+    /// T2c: how many commands are queued, published (Release) together with the push or pop that
+    /// changed it so the owner's adaptive spin can see work without taking `state`. Always exact:
+    /// every mutation of `commands` inside `state` publishes the new length before releasing it.
+    queued: AtomicUsize,
     owner: OnceLock<std::thread::Thread>,
 }
 
@@ -2300,6 +2782,7 @@ impl CommandQueue {
                 commands,
                 closed: false,
             }),
+            queued: AtomicUsize::new(0),
             owner: OnceLock::new(),
         })
     }
@@ -2326,17 +2809,23 @@ impl CommandQueue {
             return Err(PushRejection::Full(command));
         }
         state.commands.push_back(command);
+        // T2c: published while `state` is still held, so a spinning owner that sees a non-zero
+        // count is guaranteed to find the command when it takes the lock.
+        self.queued.store(state.commands.len(), Ordering::Release);
         drop(state);
         self.wake();
         Ok(())
     }
 
     fn pop(&self) -> Option<Command> {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .commands
-            .pop_front()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let command = state.commands.pop_front();
+        self.queued.store(state.commands.len(), Ordering::Release);
+        drop(state);
+        command
     }
 
     /// Refuses every future push and returns everything still queued.  The
@@ -2348,7 +2837,9 @@ impl CommandQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.closed = true;
-        core::mem::take(&mut state.commands)
+        let drained = core::mem::take(&mut state.commands);
+        self.queued.store(0, Ordering::Release);
+        drained
     }
 
     fn wake(&self) {
@@ -2366,6 +2857,15 @@ struct RegistryState {
     next_generation: u64,
     active: u32,
     custodial: u32,
+    /// BCORE-1: vCPUs a guest thread created and drives on its own host thread (the bound
+    /// path).  They hold the same registry capacity a lane does -- the SDK's own caps count
+    /// every live vCPU of the VM -- but they are not lanes: no owner thread, no command
+    /// queue, no reaper slot.
+    bound: u32,
+    /// BCORE-1: bound vCPUs whose owner thread unwound past its own vCPU, so the bound path
+    /// can no longer destroy them.  Counted forever (they never come back) so the budget a
+    /// later bind sees is honest.
+    lost: u32,
 }
 
 struct RegistryShared {
@@ -2400,6 +2900,71 @@ fn adjust_registry_custodial(shared: &RegistryShared, delta: i32) -> bool {
     match next {
         Some(custodial) => {
             state.custodial = custodial;
+            true
+        }
+        None => false,
+    }
+}
+
+/// BCORE-1: registry slots the bound path keeps clear of the lane pool, so binding a hot
+/// guest thread can never take the last slot a lane replacement needs.
+pub(crate) const BOUND_RESERVE: u32 = 8;
+
+/// BCORE-1: takes one bound-vCPU slot under the registry lock.
+///
+/// Refused when the VM's own cap is already reached on the same
+/// `active + custodial + bound + lost` sum every other admission uses, or when the bound
+/// reservation would eat into [`BOUND_RESERVE`].  Never waits: a refusal just leaves the
+/// thread on the pooled path.
+fn reserve_registry_bound(shared: &RegistryShared) -> bool {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let used = state
+        .active
+        .saturating_add(state.custodial)
+        .saturating_add(state.bound)
+        .saturating_add(state.lost);
+    let ceiling = shared
+        .limit
+        .saturating_sub(BOUND_RESERVE)
+        .saturating_sub(state.active)
+        .saturating_sub(state.custodial)
+        .saturating_sub(state.lost);
+    if used >= shared.limit || state.bound.saturating_add(1) > ceiling {
+        return false;
+    }
+    state.bound = state.bound.saturating_add(1);
+    true
+}
+
+/// BCORE-1: gives one bound-vCPU slot back (a successful destroy on the owner thread).
+fn release_registry_bound(shared: &RegistryShared) -> bool {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match state.bound.checked_sub(1) {
+        Some(bound) => {
+            state.bound = bound;
+            true
+        }
+        None => false,
+    }
+}
+
+/// BCORE-1: moves one bound slot to `lost` -- the vCPU still exists (the SDK still counts
+/// it) but nothing on our side can destroy it any more.
+fn record_registry_lost(shared: &RegistryShared) -> bool {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match state.bound.checked_sub(1) {
+        Some(bound) => {
+            state.bound = bound;
+            state.lost = state.lost.saturating_add(1);
             true
         }
         None => false,
@@ -2534,6 +3099,7 @@ fn process_vcpu_reaper(limit: u32) -> Result<&'static VcpuReaper, HvfVcpuLaneErr
     Ok(reaper)
 }
 
+#[track_caller]
 fn vcpu_reaper_loop(slots: &ReaperSlots, mut finished: Vec<VcpuReapEntry>) {
     loop {
         let mut custodial = false;
@@ -2597,6 +3163,10 @@ fn vcpu_reaper_loop(slots: &ReaperSlots, mut finished: Vec<VcpuReapEntry>) {
         if custodial || shutting_down {
             std::thread::park_timeout(OWNER_CLEANUP_RETRY_INTERVAL);
         } else {
+            crate::diagnostics_counters::rank_note_blocking_wait(
+                crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                std::panic::Location::caller(),
+            );
             std::thread::park();
         }
     }
@@ -2636,6 +3206,8 @@ impl HvfVcpuRegistry {
                     next_generation: 1,
                     active: 0,
                     custodial: 0,
+                    bound: 0,
+                    lost: 0,
                 }),
             })
         });
@@ -2669,6 +3241,57 @@ impl HvfVcpuRegistry {
             .custodial
     }
 
+    /// BCORE-1: vCPUs created on a guest thread itself (the bound path).  They hold registry
+    /// capacity but are not lanes.
+    pub fn bound(&self) -> u32 {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bound
+    }
+
+    /// BCORE-1: bound vCPUs no thread can destroy any more (an owner unwound past its own
+    /// vCPU).  Permanent, and still counted against the SDK's cap.
+    pub fn lost(&self) -> u32 {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lost
+    }
+
+    /// BCORE-1: reserves one bound-vCPU slot, or refuses (never waits).
+    pub fn reserve_bound(&self) -> bool {
+        reserve_registry_bound(&self.shared)
+    }
+
+    /// BCORE-1: releases one bound-vCPU slot after a successful destroy.
+    pub fn release_bound(&self) -> bool {
+        release_registry_bound(&self.shared)
+    }
+
+    /// BCORE-1: moves one bound slot to `lost`.
+    pub fn record_lost(&self) -> bool {
+        record_registry_lost(&self.shared)
+    }
+
+    /// BCORE-4: allocates the next vCPU generation from the same counter the lanes use, so a
+    /// bound vCPU's participant generation can never collide with a lane's (the memory
+    /// manager compares `lane_generation` to detect a stale participant record).
+    pub fn next_generation(&self) -> Result<u64, HvfVcpuLaneError> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = state.next_generation;
+        state.next_generation = generation
+            .checked_add(1)
+            .ok_or(HvfVcpuLaneError::RegistryAccounting)?;
+        Ok(generation)
+    }
+
     /// Triggers an immediate custodial retry wave instead of waiting for the
     /// reaper's next tick.
     pub fn wake_custodians(&self) {
@@ -2687,7 +3310,15 @@ impl HvfVcpuRegistry {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.active >= self.shared.limit {
+            // BCORE-1: a lane creation and a bind draw on the same capacity, so a lane can
+            // never take a slot the bound path is holding (and vice versa). Identical to the
+            // old test while `bound` and `lost` are 0.
+            let used = state
+                .active
+                .saturating_add(state.custodial)
+                .saturating_add(state.bound)
+                .saturating_add(state.lost);
+            if used >= self.shared.limit {
                 return Err(HvfVcpuLaneError::Capacity {
                     active: state.active,
                     limit: self.shared.limit,
@@ -2813,6 +3444,8 @@ impl HvfVcpuRegistry {
             reaper: reaper_thread,
             admission,
             control,
+            execute_reply: Arc::new(ExecuteReplySlot::new()),
+            run_attempt: Arc::new(Mutex::new((0, None))),
         };
         Ok(HvfVcpuLane {
             handle,
@@ -2838,6 +3471,11 @@ pub struct HvfVcpuLaneHandle {
     reaper: std::thread::Thread,
     admission: Arc<Mutex<()>>,
     control: Arc<RunControl>,
+    /// T2e: this lane's reply cell for [`Command::Execute`], created once with the lane.
+    execute_reply: Arc<ExecuteReplySlot>,
+    /// T2e: this lane's cancellation-attempt cell, created once with the lane and keyed by run
+    /// epoch (see [`AttemptCell::Lane`]).
+    run_attempt: Arc<Mutex<(u64, Option<Arc<CancellationAttempt>>)>>,
 }
 
 impl fmt::Debug for HvfVcpuLaneHandle {
@@ -2908,11 +3546,13 @@ impl HvfVcpuLaneHandle {
             lane_generation: self.generation,
             run_epoch: None,
             cancellation: self.cancellation.clone(),
-            attempt: Arc::new(Mutex::new(None)),
+            // T2e: a kick-round handle names no run, so it must not share the lane's epoch-keyed
+            // cell; it memoizes in a cell of its own (as every reservation did before).
+            attempt: AttemptCell::Own(Arc::new(Mutex::new(None))),
             lifecycle: Arc::clone(&self.lifecycle),
             control: Arc::clone(&self.control),
-            command_queue: Arc::clone(&self.command_queue),
-            reaper: self.reaper.clone(),
+            command_queue: Some(Arc::clone(&self.command_queue)),
+            reaper: Some(self.reaper.clone()),
         }
     }
 
@@ -2932,11 +3572,11 @@ impl HvfVcpuLaneHandle {
                 lane_generation: self.generation,
                 run_epoch: Some(run_epoch),
                 cancellation: self.cancellation.clone(),
-                attempt: Arc::new(Mutex::new(None)),
+                attempt: AttemptCell::Lane(Arc::clone(&self.run_attempt)),
                 lifecycle: Arc::clone(&self.lifecycle),
                 control: Arc::clone(&self.control),
-                command_queue: Arc::clone(&self.command_queue),
-                reaper: self.reaper.clone(),
+                command_queue: Some(Arc::clone(&self.command_queue)),
+                reaper: Some(self.reaper.clone()),
             },
             active: true,
         })
@@ -3089,14 +3729,33 @@ impl HvfVcpuLaneHandle {
         guest: Option<HvfGuestRun>,
         vtimer_deadline: Option<u64>,
     ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
+        // T2d: `attach_submitted_vcpu` hands this a SUBMITTED attachment, so every early return
+        // from here on must finish it: a SUBMITTED lease's `Drop` calls `abandon()`, which flags
+        // the address space so every mutator stays refused until recovery runs. The two returns
+        // below used to precede `submit` and were harmless on an ALLOCATED lease.
         if !reservation.belongs_to(self) {
-            return Err(HvfVcpuLaneError::RegistryAccounting);
+            return Err(finish_attachment_with_error(
+                attachment,
+                HvfVcpuLaneError::RegistryAccounting,
+            ));
         }
-        let deadline = operation_deadline()?;
+        let deadline = match operation_deadline() {
+            Ok(deadline) => deadline,
+            Err(error) => return Err(finish_attachment_with_error(attachment, error)),
+        };
         let submit_start = crate::diagnostics_counters::ticks();
-        attachment.submit(self.generation)?;
+        if !attachment.is_submitted() {
+            attachment.submit(self.generation)?;
+        } else if attachment.lane_generation() != self.generation {
+            return Err(finish_attachment_with_error(
+                attachment,
+                HvfVcpuLaneError::RegistryAccounting,
+            ));
+        }
         let submit_end = crate::diagnostics_counters::ticks();
-        let (reply, response) = mpsc::sync_channel(1);
+        // T2e: the reply comes back through the lane's preallocated slot, so this path allocates
+        // nothing (the channel it replaces cost three allocations per syscall).
+        let ticket = self.execute_reply.next_ticket();
         let stamped = crate::diagnostics_counters::ticks();
         let command = Command::Execute {
             kind,
@@ -3106,7 +3765,11 @@ impl HvfVcpuLaneHandle {
             guest,
             vtimer_deadline,
             stamped_at: stamped,
-            reply,
+            reply: ExecuteReply {
+                slot: Arc::clone(&self.execute_reply),
+                ticket,
+                answered: false,
+            },
         };
         if let Err((command, primary)) = self.admit(command) {
             return Err(match command {
@@ -3124,12 +3787,11 @@ impl HvfVcpuLaneHandle {
                 _ => HvfVcpuLaneError::RegistryAccounting,
             });
         }
-        let outcome = match receive_until(response, deadline) {
-            Err(error @ (HvfVcpuLaneError::OperationTimeout | HvfVcpuLaneError::LaneClosed)) => {
-                self.abandon_after_wait_failure();
-                return Err(error);
-            }
-            result => result?,
+        // T2e: `None` is the only wait failure (the deadline passed with no reply); every reply
+        // the owner or a dropped command posted, `LaneClosed` included, comes back in `Some`.
+        let Some(outcome) = self.execute_reply.wait(ticket, deadline) else {
+            self.abandon_after_wait_failure();
+            return Err(HvfVcpuLaneError::OperationTimeout);
         };
         if let Ok(run) = &outcome
             && run.replied_at_ticks != 0
@@ -3343,6 +4005,213 @@ impl Drop for HvfVcpuLane {
 
 type Reply<T> = mpsc::SyncSender<Result<T, HvfVcpuLaneError>>;
 
+/// How long one [`ExecuteReplySlot::wait`] park may last before the deadline is re-checked.
+/// The deadline is the real bound; this only bounds the cost of a park whose wakeup was spent by
+/// an unrelated `unpark`, and it is the hook T2c's adaptive spin replaces.
+const REPLY_PARK_SLICE: Duration = Duration::from_millis(10);
+
+/// T2e: one lane's preallocated reply cell for [`Command::Execute`].
+///
+/// A pooled lane carries at most one Execute at a time ([`RunControl::reserve_run`] refuses a
+/// second reservation while a run is outstanding), so a single slot per lane suffices and the
+/// per-syscall `mpsc::sync_channel(1)` -- three allocations plus the channel protocol, measured
+/// with a counting allocator by `.gm/syscall-bench/t2ealloc/allocprobe.rs` -- is gone from the
+/// execute path. `ticket` numbers each Execute; a waiter accepts the stored value only
+/// when `posted == ticket`, so a reply that arrives after its waiter gave up (a timeout, or a
+/// lane the owner rejected after the wait) can never be read as the next run's.
+///
+/// Lost-wakeup-free: the waiter registers under `waiter` and *then* re-reads `posted`, while the
+/// poster stores the value, publishes `posted` (Release) and only then takes and unparks the
+/// registered waiter. Either order is covered by `std`'s park token, which an unpark sets
+/// whether or not the target is parked yet.
+struct ExecuteReplySlot {
+    /// The ticket whose value sits in `value`. Monotonic; `0` means nothing posted yet.
+    posted: AtomicU64,
+    next_ticket: AtomicU64,
+    value: Mutex<Option<(u64, Result<HvfVcpuRunResult, HvfVcpuLaneError>)>>,
+    waiter: Mutex<Option<std::thread::Thread>>,
+}
+
+impl ExecuteReplySlot {
+    fn new() -> Self {
+        Self {
+            posted: AtomicU64::new(0),
+            next_ticket: AtomicU64::new(0),
+            value: Mutex::new(None),
+            waiter: Mutex::new(None),
+        }
+    }
+
+    /// The next Execute ticket. Tickets start at 1, so `posted == 0` means "nothing posted".
+    fn next_ticket(&self) -> u64 {
+        self.next_ticket
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    fn take_value(&self, ticket: u64) -> Option<Result<HvfVcpuRunResult, HvfVcpuLaneError>> {
+        let mut value = self
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match value.as_ref() {
+            Some((posted_ticket, _)) if *posted_ticket == ticket => {
+                value.take().map(|(_, result)| result)
+            }
+            _ => None,
+        }
+    }
+
+    /// Owner side: hand `result` to `ticket`'s waiter.
+    fn post(&self, ticket: u64, result: Result<HvfVcpuRunResult, HvfVcpuLaneError>) {
+        let mut value = self
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *value = Some((ticket, result));
+        drop(value);
+        self.posted.store(ticket, Ordering::Release);
+        let waiter = self
+            .waiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match waiter {
+            Some(waiter) => {
+                crate::diagnostics_counters::record_reply_slot_post(false);
+                waiter.unpark();
+            }
+            // Nobody was registered. Three cases, all of which still deliver the reply:
+            //   1. T2c, the ordinary one and now by far the largest: the waiter was spinning and
+            //      read `posted` itself, so it never registered. Counted on the waiter side as
+            //      `spin_posts` -- subtract it before reading anything into this arm.
+            //   2. The waiter had not registered yet -- it re-reads `posted` immediately after
+            //      registering and still takes this value.
+            //   3. The waiter timed out (a late post into a lane that is already abandoned, so no
+            //      further Execute can be issued on it); the value is left for a stale reader.
+            // Only (2) and (3) -- i.e. `late_posts - spin_posts` -- are interesting, and neither
+            // is a lost reply. `unpark` is never missed: the waiter registers before it parks and
+            // re-reads `posted` after registering, under this same mutex.
+            None => crate::diagnostics_counters::record_reply_slot_post(true),
+        }
+    }
+
+    /// Guest side: wait for `ticket`'s reply, bounded by `deadline`.
+    ///
+    /// `Some` is the reply itself -- an `Err` in it is a run failure, not a wait failure, exactly
+    /// as the old channel delivered it. `None` means the deadline passed with no reply at all,
+    /// which is the only case that leaves the lane's own liveness in question (the caller
+    /// abandons it). A command dropped unanswered posts `LaneClosed` instead, so an owner that
+    /// died mid-run is reported at once rather than after the whole timeout.
+    #[track_caller]
+    fn wait(
+        &self,
+        ticket: u64,
+        deadline: Instant,
+    ) -> Option<Result<HvfVcpuRunResult, HvfVcpuLaneError>> {
+        if self.posted.load(Ordering::Acquire) == ticket
+            && let Some(value) = self.take_value(ticket)
+        {
+            // T2c: read without registering, so `post` counts this reply in its `late` arm. It is
+            // not late -- it is the fast path -- and `spin_posts` says so.
+            crate::diagnostics_counters::record_reply_slot_direct_read();
+            return Some(value);
+        }
+        // T2c: the owner answers a run in a few microseconds (its share of the hand-off is the
+        // marshalling plus one `hv_vcpu_run`), far less than a park/unpark pair costs, so spin
+        // for the reply before registering as a waiter. The spin is bounded by this wait's own
+        // deadline as well as by the budget, so it can never delay a timeout. It holds no lock
+        // and no operation frame: the attachment was submitted and finished before `execute()`
+        // got here, and the pool mutex was released by `acquire_lane`.
+        let remaining_ns = u64::try_from(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        if remaining_ns != 0
+            && GUEST_REPLY_SPIN.with(|cell| {
+                let mut spin = cell.get();
+                let hit = spin.try_spin(false, remaining_ns, || {
+                    self.posted.load(Ordering::Acquire) == ticket
+                });
+                cell.set(spin);
+                hit
+            })
+            && let Some(value) = self.take_value(ticket)
+        {
+            // T2c: the spin won, again without registering -- counted as `spin_posts` so that
+            // `post`'s growing `late` share is not mistaken for lost wakeups or timeouts.
+            crate::diagnostics_counters::record_reply_slot_direct_read();
+            return Some(value);
+        }
+        crate::diagnostics_counters::rank_note_blocking_wait(
+            crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+            std::panic::Location::caller(),
+        );
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Do not leave this thread registered: a late post would then unpark a thread
+                // that is already back in its guest loop.
+                self.waiter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                return None;
+            }
+            let mut waiter = self
+                .waiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *waiter = Some(std::thread::current());
+            drop(waiter);
+            // Re-read after registering: `post` publishes `posted` before it takes the
+            // registration, so a reply landing in between is found here instead of parked on.
+            if self.posted.load(Ordering::Acquire) == ticket
+                && let Some(value) = self.take_value(ticket)
+            {
+                self.waiter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                return Some(value);
+            }
+            crate::diagnostics_counters::record_reply_slot_park();
+            std::thread::park_timeout(remaining.min(REPLY_PARK_SLICE));
+        }
+    }
+}
+
+/// T2e: an Execute command's half of [`ExecuteReplySlot`].
+///
+/// Dropping one that was never posted posts `LaneClosed`, which is exactly what the old
+/// `mpsc::SyncSender` did when the command was dropped unanswered (an owner panic inside a run,
+/// or the final drain): the waiter saw a disconnected channel at once instead of hanging for the
+/// whole 30 s command timeout.
+struct ExecuteReply {
+    slot: Arc<ExecuteReplySlot>,
+    ticket: u64,
+    answered: bool,
+}
+
+impl ExecuteReply {
+    fn post(mut self, result: Result<HvfVcpuRunResult, HvfVcpuLaneError>) {
+        self.answered = true;
+        self.slot.post(self.ticket, result);
+    }
+}
+
+impl Drop for ExecuteReply {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.answered = true;
+            self.slot
+                .post(self.ticket, Err(HvfVcpuLaneError::LaneClosed));
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ExecutionKind {
     Start,
@@ -3367,7 +4236,9 @@ enum Command {
         guest: Option<HvfGuestRun>,
         vtimer_deadline: Option<u64>,
         stamped_at: u64,
-        reply: Reply<HvfVcpuRunResult>,
+        /// T2e: the lane's preallocated reply slot plus this run's ticket. The other commands
+        /// keep their `sync_channel`: none of them is on the per-syscall path.
+        reply: ExecuteReply,
     },
     /// FXR: hand a copy of the resident SIMD/FP file `(cell, seq)` back to its thread's cell.
     /// No reply: the requester waits on its cell, which every path that gives the file up
@@ -3418,7 +4289,7 @@ impl Command {
                     Ok(()) => error,
                     Err(cleanup) => error.with_cleanup(cleanup),
                 };
-                reply_result(reply, Err(error));
+                reply.post(Err(error));
             }
             Self::Synchronize { attachment, reply } => {
                 reply_result(reply, Err(finish_attachment_with_error(attachment, error)))
@@ -3448,6 +4319,7 @@ fn operation_deadline() -> Result<Instant, HvfVcpuLaneError> {
         .ok_or(HvfVcpuLaneError::OperationTimeout)
 }
 
+#[track_caller]
 fn receive_until<T>(receiver: mpsc::Receiver<T>, deadline: Instant) -> Result<T, HvfVcpuLaneError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -3457,6 +4329,10 @@ fn receive_until<T>(receiver: mpsc::Receiver<T>, deadline: Instant) -> Result<T,
             Err(mpsc::TryRecvError::Disconnected) => Err(HvfVcpuLaneError::LaneClosed),
         };
     }
+    crate::diagnostics_counters::rank_note_blocking_wait(
+        crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+        std::panic::Location::caller(),
+    );
     match receiver.recv_timeout(remaining) {
         Ok(value) => Ok(value),
         Err(mpsc::RecvTimeoutError::Timeout) => Err(HvfVcpuLaneError::OperationTimeout),
@@ -3658,6 +4534,7 @@ fn owner_thread(context: OwnerThreadContext) {
     reaper.unpark();
 }
 
+#[track_caller]
 fn owner_loop(
     lane_generation: u64,
     lifecycle: &AtomicU8,
@@ -3666,6 +4543,10 @@ fn owner_loop(
     vcpu: &mut Option<HvfVcpu>,
     residency: &mut LaneResidency,
 ) -> Result<(), HvfVcpuLaneError> {
+    // T2c: this owner's own spin budget. It is a loop local, so it dies with the lane: a lane
+    // that is replaced starts again from [`SPIN_BUDGET_START_NS`] rather than inheriting a
+    // budget tuned for the vCPU it used to have.
+    let mut spin = AdaptiveSpin::new();
     loop {
         if lifecycle.load(Ordering::Acquire) != LANE_LIVE {
             return Ok(());
@@ -3676,6 +4557,21 @@ fn owner_loop(
                 raise_lane_lifecycle(lifecycle, LANE_ABANDONED);
                 return Ok(());
             }
+            // T2c: an owner whose lane is hot usually has the next command within a couple of
+            // microseconds, far less than the two kernel wakeups a park costs, so spin for it
+            // first. The budget adapts down (to nothing) when this lane is genuinely idle, which
+            // is what keeps an idle desktop's owners off the CPU. This holds no lock and no
+            // operation frame: the only thing it reads is the queue's published length.
+            if spin.try_spin(true, SPIN_BUDGET_MAX_NS, || {
+                command_queue.queued.load(Ordering::Acquire) != 0
+                    || lifecycle.load(Ordering::Acquire) != LANE_LIVE
+            }) {
+                continue;
+            }
+            crate::diagnostics_counters::rank_note_blocking_wait(
+                crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                std::panic::Location::caller(),
+            );
             std::thread::park();
             continue;
         };
@@ -3774,7 +4670,8 @@ fn owner_loop(
                     run.owner_wake_ticks = owner_wake_ticks;
                     run.replied_at_ticks = crate::diagnostics_counters::ticks();
                 }
-                reply_result(reply, result);
+                // T2e: into the lane's slot instead of a per-run channel.
+                reply.post(result);
             }
             Command::MaterializeFp { cell, seq } => {
                 if let Err(error) = residency.materialize(raw, &cell, seq) {
@@ -4020,6 +4917,10 @@ fn execute_attached(
     let mut trace = crate::diagnostics_counters::OwnerTrace::start();
     let gate_locks_before = crate::diagnostics_counters::gate_locks_this_thread();
     let run_epoch = reservation.run_epoch();
+    // RUNWALL FC2: arm the run's time slice only when the arm is actually due -- once per slice
+    // instead of once per run. `None` here means "do not touch the timer this run", which leaves
+    // the deadline of the last arm in force. See [`HvfVcpu::vtimer_arm_due`].
+    let vtimer_deadline = vtimer_deadline.filter(|cval| vcpu.vtimer_arm_due(*cval));
     let result = (|| {
         let mut desired = *state;
         let mut run_fp = reconcile_fp(vcpu, residency, guest.as_ref())?;
@@ -4052,47 +4953,62 @@ fn execute_attached(
         }
         attachment.begin_running(lane_generation)?;
         trace.spans.mark(OWNER_BEGIN_RUNNING);
-        // A guest run arms its time slice inside its resident install (one entry point, one
-        // admission); a full-mode run keeps the separate arm.
-        if run_fp == RunFp::Full
-            && let Some(cval) = vtimer_deadline
-        {
-            vcpu.arm_vtimer(cval)?;
-        }
-        trace.spans.mark(OWNER_ARM_VTIMER);
-        match (kind, run_fp) {
-            (ExecutionKind::Start, RunFp::Full) => run_once(
-                vcpu,
-                control,
-                lane_generation,
-                run_epoch,
-                &desired,
-                HvfPstateContext::UserEl0t,
-                &mut trace,
-            ),
-            (ExecutionKind::Start, RunFp::Guest(fp)) => {
-                let Some(guest) = guest.as_ref() else {
-                    return Err(HvfVcpuLaneError::RegistryAccounting);
-                };
-                run_guest_once(
-                    vcpu,
+        // T2d: one existing-vCPU operation for the whole run -- the vtimer arm, the state install,
+        // `hv_vcpu_run`, the execution-time read and the exit read. Ten gate mutex acquisitions
+        // become three. Everything before it (the FP reconciliation and the synchronization trip)
+        // keeps its own operations: the first is a per-lane-tenant change, the second is rare.
+        vcpu.with_run_scope(|scope| {
+            // A guest run arms its time slice inside its resident install (one entry point, one
+            // admission); a full-mode run keeps the separate arm.
+            if run_fp == RunFp::Full
+                && let Some(cval) = vtimer_deadline
+            {
+                scope.arm_vtimer(cval)?;
+            }
+            trace.spans.mark(OWNER_ARM_VTIMER);
+            match (kind, run_fp) {
+                (ExecutionKind::Start, RunFp::Full) => run_once(
+                    scope,
                     control,
                     lane_generation,
                     run_epoch,
                     &desired,
-                    fp,
-                    vtimer_deadline,
-                    guest,
-                    residency,
+                    HvfPstateContext::UserEl0t,
                     &mut trace,
-                )
+                ),
+                (ExecutionKind::Start, RunFp::Guest(fp)) => {
+                    let Some(guest) = guest.as_ref() else {
+                        return Err(HvfVcpuLaneError::RegistryAccounting);
+                    };
+                    run_guest_once(
+                        scope,
+                        control,
+                        lane_generation,
+                        run_epoch,
+                        &desired,
+                        fp,
+                        vtimer_deadline,
+                        guest,
+                        residency,
+                        &mut trace,
+                    )
+                }
+                (ExecutionKind::Resume, RunFp::Full) => {
+                    resume_once(scope, control, lane_generation, run_epoch, &desired, &mut trace)
+                }
+                (ExecutionKind::Resume, RunFp::Guest(_)) => Err(HvfVcpuLaneError::RegistryAccounting),
             }
-            (ExecutionKind::Resume, RunFp::Full) => {
-                resume_once(vcpu, control, lane_generation, run_epoch, &desired, &mut trace)
-            }
-            (ExecutionKind::Resume, RunFp::Guest(_)) => Err(HvfVcpuLaneError::RegistryAccounting),
-        }
+        })
     })();
+    // RUNWALL FC2 review fix-up: `vtimer_arm_due` only decides; the deadline the vCPU actually
+    // holds is recorded here, after the run scope that issues the arm has succeeded. Every path
+    // that refuses in between quarantines the vCPU, so this was latent rather than live, but the
+    // cache must not claim a deadline hardware never received.
+    if result.is_ok()
+        && let Some(cval) = vtimer_deadline
+    {
+        vcpu.mark_vtimer_armed(cval);
+    }
     let untrusted = result
         .as_ref()
         .is_err_and(HvfVcpuLaneError::terminalizes_execution_vcpu)
@@ -4148,12 +5064,12 @@ fn synchronize_attached(
 }
 
 fn execute_once(
-    vcpu: &mut HvfVcpu,
+    scope: &mut HvfRunScope<'_, '_>,
     control: &RunControl,
     lane_generation: u64,
     run_epoch: u64,
     trace: &mut crate::diagnostics_counters::OwnerTrace,
-) -> Result<(HvfVcpuExit, u64, u64, u64), HvfVcpuLaneError> {
+) -> Result<(HvfVcpuExit, u64, u64), HvfVcpuLaneError> {
     use crate::diagnostics_counters::{
         OWNER_EXECUTION_TIME, OWNER_RUN_CONTROL_BEGIN, OWNER_RUN_CONTROL_FINISH,
         OWNER_RUN_WRAPPER, RUN_CLASS_AFTER_FULL_SET, RUN_CLASS_NO_SET,
@@ -4170,19 +5086,22 @@ fn execute_once(
                 );
                 trace.latched = true;
                 trace.spans.mark(OWNER_RUN_CONTROL_BEGIN);
-                let execution_time = vcpu.execution_time()?;
+                // T2d: the per-run `hv_vcpu_get_exec_time` is gone -- its only consumer was
+                // `HvfVcpuRunResult::execution_time`, which no reader ever read (the one live
+                // `execution_time` field belongs to `HvfOwnerSynchronizationProof`, and the
+                // synchronization trip still calls the SDK for its own).
                 trace.spans.mark(OWNER_EXECUTION_TIME);
-                return Ok((HvfVcpuExit::Canceled, execution_time, run_epoch, run_wall_ns));
+                return Ok((HvfVcpuExit::Canceled, run_epoch, run_wall_ns));
             }
             Err(error) => return Err(error),
         }
         trace.spans.mark(OWNER_RUN_CONTROL_BEGIN);
-        let run = vcpu.run();
+        let run = scope.run();
         let wrapper_ticks = trace.spans.mark(OWNER_RUN_WRAPPER);
         run_wall_ns =
             run_wall_ns.saturating_add(crate::diagnostics_counters::ticks_to_ns(wrapper_ticks));
         if run.is_ok() {
-            let (raw_ticks, installs_before) = vcpu.last_run_profile();
+            let (raw_ticks, installs_before) = scope.last_run_profile();
             crate::diagnostics_counters::record_run_split(
                 if installs_before == 0 {
                     RUN_CLASS_NO_SET
@@ -4208,14 +5127,14 @@ fn execute_once(
             }
         };
         hold_vcpu_run_completion_barrier(lane_generation, run_epoch);
-        let execution_time = vcpu.execution_time()?;
+        // T2d: dropped, see the `LatchedCancellation` arm above.
         trace.spans.mark(OWNER_EXECUTION_TIME);
-        return Ok((exit, execution_time, run_epoch, run_wall_ns));
+        return Ok((exit, run_epoch, run_wall_ns));
     }
 }
 
 fn run_once(
-    vcpu: &mut HvfVcpu,
+    scope: &mut HvfRunScope<'_, '_>,
     control: &RunControl,
     lane_generation: u64,
     run_epoch: u64,
@@ -4224,14 +5143,14 @@ fn run_once(
     trace: &mut crate::diagnostics_counters::OwnerTrace,
 ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
     use crate::diagnostics_counters::{OWNER_CLASSIFY, OWNER_GET_STATE, OWNER_SET_STATE};
-    vcpu.set_architectural_state(state, context)?;
+    scope.set_architectural_state(state, context)?;
     crate::diagnostics_counters::record_set_state(trace.spans.mark(OWNER_SET_STATE));
-    let (exit, execution_time, run_epoch, run_wall_ns) =
-        execute_once(vcpu, control, lane_generation, run_epoch, trace)?;
+    let (exit, run_epoch, run_wall_ns) =
+        execute_once(scope, control, lane_generation, run_epoch, trace)?;
     if matches!(exit, HvfVcpuExit::Unknown | HvfVcpuExit::Malformed { .. }) {
         return Err(HvfVcpuLaneError::RejectedExit(exit));
     }
-    let raw_state = vcpu.architectural_state_unclassified()?;
+    let raw_state = scope.architectural_state_unclassified()?;
     crate::diagnostics_counters::record_get_state(trace.spans.mark(OWNER_GET_STATE));
     let state = classify_exit_state(exit, raw_state)?;
     trace.spans.mark(OWNER_CLASSIFY);
@@ -4239,7 +5158,6 @@ fn run_once(
         exit,
         state,
         run_epoch,
-        execution_time,
         run_wall_ns,
         owner_ns: 0,
         owner_gate_locks: 0,
@@ -4274,7 +5192,7 @@ fn classify_exit_state(
 /// does not already hold (`fp` decides the SIMD file), runs, reads back the 39 exit registers,
 /// and leaves the SIMD file resident under a fresh identity recorded as this lane's holder.
 fn run_guest_once(
-    vcpu: &mut HvfVcpu,
+    scope: &mut HvfRunScope<'_, '_>,
     control: &RunControl,
     lane_generation: u64,
     run_epoch: u64,
@@ -4286,14 +5204,14 @@ fn run_guest_once(
     trace: &mut crate::diagnostics_counters::OwnerTrace,
 ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
     use crate::diagnostics_counters::{OWNER_CLASSIFY, OWNER_GET_STATE, OWNER_SET_STATE};
-    vcpu.install_guest_state(state, HvfPstateContext::UserEl0t, fp, vtimer_deadline)?;
+    scope.install_guest_state(state, HvfPstateContext::UserEl0t, fp, vtimer_deadline)?;
     crate::diagnostics_counters::record_set_state(trace.spans.mark(OWNER_SET_STATE));
-    let (exit, execution_time, run_epoch, run_wall_ns) =
-        execute_once(vcpu, control, lane_generation, run_epoch, trace)?;
+    let (exit, run_epoch, run_wall_ns) =
+        execute_once(scope, control, lane_generation, run_epoch, trace)?;
     if matches!(exit, HvfVcpuExit::Unknown | HvfVcpuExit::Malformed { .. }) {
         return Err(HvfVcpuLaneError::RejectedExit(exit));
     }
-    let raw_state = vcpu.read_guest_exit_state()?;
+    let raw_state = scope.read_guest_exit_state()?;
     crate::diagnostics_counters::record_get_state(trace.spans.mark(OWNER_GET_STATE));
     let state = classify_exit_state(exit, raw_state)?;
     let seq = residency.next_seq;
@@ -4317,7 +5235,6 @@ fn run_guest_once(
         exit,
         state,
         run_epoch,
-        execution_time,
         run_wall_ns,
         owner_ns: 0,
         owner_gate_locks: 0,
@@ -4332,7 +5249,7 @@ fn run_guest_once(
 }
 
 fn resume_once(
-    vcpu: &mut HvfVcpu,
+    scope: &mut HvfRunScope<'_, '_>,
     control: &RunControl,
     lane_generation: u64,
     run_epoch: u64,
@@ -4351,7 +5268,7 @@ fn resume_once(
     state.require_cpsr(HvfPstateContext::MonitorEl1h)?;
     state.require_spsr_el1(HvfPstateContext::UserEl0t)?;
     run_once(
-        vcpu,
+        scope,
         control,
         lane_generation,
         run_epoch,
@@ -4542,3 +5459,389 @@ fn read_vtimer(vcpu: &mut HvfVcpu) -> Result<HvfVtimerState, HvfVcpuLaneError> {
         offset: vcpu.vtimer_offset()?,
     })
 }
+
+// ---------------------------------------------------------------------------
+// BCORE: a vCPU a guest thread creates and drives on its own host thread.
+// ---------------------------------------------------------------------------
+//
+// The whole point of the pooled lane is that Hypervisor.framework is owner-affine: only the
+// thread that called `hv_vcpu_create` may run or destroy the vCPU. A lane pays for that with
+// two kernel wakeups per guest exit (task thread -> owner thread -> task thread), ~7.1-7.6 us
+// of the ~12 us a guest syscall costs. A BOUND vCPU removes the round trip: the guest thread
+// *is* the owner thread, so `hv_vcpu_run` is called directly and there is no channel, no
+// reply, no second wakeup.
+//
+// Everything else is unchanged. The bound vCPU registers an ordinary memory-manager
+// participant, attaches and submits through `attach_submitted_vcpu`, takes a synchronization
+// monitor trip when the space's generations moved, and is cancelled through the same
+// `RunControl` a lane uses (`hv_vcpus_exit` is the one SDK call that is not owner-affine).
+// Behind `LITEBOX_HVF_BOUND=0` (the default) none of this code runs.
+
+/// BCORE-4: one guest thread's own vCPU.
+///
+/// Held in thread-local storage, so it is never `Send`. `Drop` is the containment of last
+/// resort: dropping a live `HvfVcpu` silently would poison the VM (`impl Drop for HvfVcpu`
+/// requests poison when it cannot destroy), so the destructor tries to destroy it on this
+/// thread and, failing that, records the slot as `lost`.
+pub(crate) struct HvfBoundVcpu {
+    vcpu: Option<HvfVcpu>,
+    generation: u64,
+    control: Arc<RunControl>,
+    cancellation: HvfVcpuCancellation,
+    lifecycle: Arc<AtomicU8>,
+    owner_stopped: Arc<AtomicBool>,
+    registry: HvfVcpuRegistry,
+}
+
+impl fmt::Debug for HvfBoundVcpu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfBoundVcpu")
+            .field("generation", &self.generation)
+            .field("live", &self.vcpu.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HvfBoundVcpu {
+    /// Creates and initializes a vCPU on the CALLING thread, which becomes its owner and is
+    /// therefore the only thread that may run or destroy it.
+    pub(crate) fn bind(
+        registry: &HvfVcpuRegistry,
+        el1: &HvfEl1State,
+    ) -> Result<Self, HvfVcpuLaneError> {
+        if !registry.reserve_bound() {
+            return Err(HvfVcpuLaneError::Capacity {
+                active: registry.active(),
+                limit: registry.capacity(),
+            });
+        }
+        let generation = match registry.next_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                registry.release_bound();
+                return Err(error);
+            }
+        };
+        let vm = process_hvf_vm()?;
+        let mut vcpu = match vm.create_vcpu() {
+            Ok(vcpu) => vcpu,
+            Err(error) => {
+                registry.release_bound();
+                return Err(error.into());
+            }
+        };
+        let lifecycle = Arc::new(AtomicU8::new(LANE_LIVE));
+        let owner_stopped = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(RunControl::new_bound(true));
+        let cancellation = match Self::initialize(&mut vcpu, el1) {
+            Ok(cancellation) => cancellation,
+            Err(error) => {
+                // `vcpu` is still live here, so the only way to retire it is the explicit
+                // destroy; letting it drop would poison the VM.
+                let _ = vcpu.destroy();
+                registry.release_bound();
+                return Err(error);
+            }
+        };
+        crate::diagnostics_counters::add_stat(crate::diagnostics_counters::BOUND_BINDS, 1);
+        Ok(Self {
+            vcpu: Some(vcpu),
+            generation,
+            control,
+            cancellation,
+            lifecycle,
+            owner_stopped,
+            registry: registry.clone(),
+        })
+    }
+
+    /// EL1 setup plus the vtimer baseline of a freshly created bound vCPU. Split out of
+    /// [`Self::bind`] so every failure path there can still destroy the vCPU it created.
+    fn initialize(
+        vcpu: &mut HvfVcpu,
+        el1: &HvfEl1State,
+    ) -> Result<HvfVcpuCancellation, HvfVcpuLaneError> {
+        vcpu.initialize_el1(el1)?;
+        // Guest `CNTVCT_EL0` with offset 0: `mach_absolute_time` reads the same counter the
+        // guest sees, so a deadline computed from it is directly a `CNTV_CVAL_EL0`.
+        set_vtimer(vcpu, true, 0)?;
+        vcpu.cancellation().map_err(HvfVcpuLaneError::from)
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn control(&self) -> Arc<RunControl> {
+        Arc::clone(&self.control)
+    }
+
+    /// The raw SDK cancellation handle, for a kick aimed at this vCPU from another thread
+    /// (`HvfBackend::kick_running_lanes`).
+    pub(crate) fn sdk_cancellation(&self) -> HvfVcpuCancellation {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn participant_capability(&self) -> HvfVcpuLaneParticipantCapability {
+        HvfVcpuLaneParticipantCapability::for_bound(
+            self.generation,
+            Arc::clone(&self.lifecycle),
+            Arc::clone(&self.owner_stopped),
+        )
+    }
+
+    /// Reserves one run epoch. `Ok` moves the control to `Reserved`; the caller must settle it
+    /// (directly, or through [`Self::execute`], which always does).
+    pub(crate) fn reserve_run(&self) -> Result<u64, HvfVcpuLaneError> {
+        if self.lifecycle.load(Ordering::Acquire) != LANE_LIVE {
+            return Err(HvfVcpuLaneError::LaneClosed);
+        }
+        self.control.reserve_run()
+    }
+
+    /// The cancellation handle this thread publishes into its `HvfThreadSlot` for one run, so
+    /// an interrupt aimed at the running guest thread reaches this vCPU.
+    pub(crate) fn cancellation_for(&self, run_epoch: u64) -> HvfVcpuLaneCancellation {
+        HvfVcpuLaneCancellation::for_bound(
+            self.generation,
+            Some(run_epoch),
+            self.cancellation.clone(),
+            Arc::clone(&self.lifecycle),
+            Arc::clone(&self.control),
+        )
+    }
+
+    /// BCORE-4: one guest run, Start shape, full architectural install and full exit read.
+    ///
+    /// The resident-state diff-and-set and the 39-get exit read are BRES's job; until then a
+    /// bound run installs and reads the same 74 registers a pooled full-mode run does, so the
+    /// only difference from the lane path is that no thread boundary is crossed.
+    pub(crate) fn execute(
+        &mut self,
+        run_epoch: u64,
+        attachment: HvfVcpuRunAttachment,
+        state: &HvfArchitecturalState,
+        vtimer_deadline: Option<u64>,
+    ) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
+        let vcpu = self
+            .vcpu
+            .as_mut()
+            .ok_or(HvfVcpuLaneError::LaneClosed)?;
+        execute_bound_attached(
+            vcpu,
+            &self.control,
+            self.generation,
+            run_epoch,
+            attachment,
+            state,
+            vtimer_deadline,
+        )
+    }
+
+    /// BCORE-5: marks this vCPU's owner stopped, which is what lets
+    /// `deregister_vcpu_participant` acknowledge retirements this participant still owes
+    /// instead of refusing with `ParticipantRetirementPending`.
+    pub(crate) fn stop_owner(&self) {
+        self.owner_stopped.store(true, Ordering::Release);
+    }
+
+    /// BCORE-2 (fix-up): discharges this vCPU's control BEFORE the vCPU is destroyed.
+    ///
+    /// Every other `terminalize` call site is a lane/phase path, none of which is reachable
+    /// from a bound vCPU's teardown -- so before this existed, a bound vCPU destroyed while a
+    /// kick was still outstanding silently dropped the debit. That is why
+    /// `BOUND_KICKS_ABANDONED` and `BOUND_KICKS_EXPIRED_TERMINAL` were 0 in every bound run
+    /// ever taken: not because nothing was ever abandoned, but because the counter that would
+    /// report it never ran. It also completes any in-flight `CancellationAttempt` with
+    /// `Terminalized`, so a thread that kicked this vCPU and is still waiting gets
+    /// `HvfVcpuLaneError::LaneClosed` instead of waiting on a vCPU that no longer exists.
+    fn terminalize_control(&self, untrusted: bool) {
+        let mut state = self.control.lock();
+        self.control.terminalize(
+            &mut state,
+            untrusted,
+            CancellationCompletion::Terminalized,
+        );
+    }
+
+    /// BCORE-5: destroys the vCPU on this (owner) thread and gives the registry slot back.
+    /// Called only after the participant has been deregistered.
+    ///
+    /// BCORE2-FX: takes `&mut self` instead of `self` because `BoundThread` now has its own
+    /// destructor (it is what discharges the participant on the unwind arm), and a type with a
+    /// `Drop` impl does not let a field be moved out of it. Semantics are unchanged: the vCPU
+    /// is taken out of the `Option`, so the destructor that follows is a no-op.
+    ///
+    /// `untrusted` is true when the unbind follows a run error rather than an orderly thread
+    /// exit: it is the same distinction the lane paths make, and it is what `terminalize`
+    /// records so a teardown that lost track of a kick is not reported as a clean one.
+    pub(crate) fn unbind(&mut self, untrusted: bool) -> Result<(), HvfVcpuLaneError> {
+        self.stop_owner();
+        self.terminalize_control(untrusted);
+        let Some(vcpu) = self.vcpu.take() else {
+            return Ok(());
+        };
+        let result = vcpu.destroy().map_err(HvfVcpuLaneError::from);
+        if result.is_ok() {
+            self.registry.release_bound();
+        } else {
+            self.registry.record_lost();
+        }
+        result
+    }
+}
+
+impl Drop for HvfBoundVcpu {
+    fn drop(&mut self) {
+        let Some(vcpu) = self.vcpu.take() else {
+            return;
+        };
+        self.owner_stopped.store(true, Ordering::Release);
+        // BCORE-2 (fix-up): same discharger as `unbind`. A `Drop` is an unwind, so it is
+        // untrusted by definition: this thread is not completing an orderly teardown.
+        self.terminalize_control(true);
+        // Best-effort: this is the TLS destructor of a thread that is already unwinding. Any
+        // other outcome would drop a live `HvfVcpu`, whose own destructor poisons the VM.
+        let destroyed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vcpu.destroy()));
+        // BCORE-5: this vCPU's `BoundEntry` -- the row `kick_running_lanes` and pressure
+        // eviction walk -- lives on the backend, not on the vCPU, and an owner thread that
+        // unwinds never reaches `unbind_current_thread`. A destructor that left it behind
+        // would keep a dead generation in that list for the rest of the process: kicked on
+        // every mutation round, and eligible to be picked as an eviction victim no thread
+        // can honour. Removing it here is what makes the two teardown paths equivalent AS FAR
+        // AS THE ENTRY LIST GOES -- the participant half of the teardown is discharged by
+        // `Drop for BoundThread`, which runs before this one because `BoundThread` owns both
+        // fields. If either half is missing, an unwound owner strands its address space
+        // (`begin_destroy` refuses with `AddressSpaceBusy` while a participant record
+        // remains).
+        if let Some(backend) = crate::hvf_backend::active() {
+            backend.remove_bound_entry(self.generation);
+        }
+        // `BOUND_LIVE` is a gauge of live bound vCPUs, so it comes down in BOTH arms: a vCPU
+        // that could not be destroyed is gone from this process's point of view just the same
+        // (it was recorded as lost, and the VM is asked to poison rather than keep it).
+        crate::diagnostics_counters::add_stat(crate::diagnostics_counters::BOUND_LIVE, u64::MAX);
+        match destroyed {
+            Ok(Ok(())) => {
+                self.registry.release_bound();
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_UNBINDS_DROP,
+                    1,
+                );
+            }
+            _ => {
+                self.registry.record_lost();
+                crate::diagnostics_counters::add_stat(crate::diagnostics_counters::BOUND_LOST, 1);
+            }
+        }
+    }
+}
+
+/// BCORE-4: the owner-side body of one bound run.
+///
+/// Shaped exactly like `execute_attached`, minus everything a lane needs and a bound vCPU does
+/// not: no reservation object (the caller settles `control` directly), no resident SIMD/FP
+/// custody (the install and the read are both full, so `FpLocation` stays `Host`), no
+/// `ExecutionKind::Resume` (a bound vCPU is never mid-monitor, so it always starts from EL0).
+fn execute_bound_attached(
+    vcpu: &mut HvfVcpu,
+    control: &RunControl,
+    generation: u64,
+    run_epoch: u64,
+    attachment: HvfVcpuRunAttachment,
+    state: &HvfArchitecturalState,
+    vtimer_deadline: Option<u64>,
+) -> Result<HvfVcpuRunResult, HvfVcpuLaneError> {
+    use crate::diagnostics_counters::{
+        OWNER_ARM_VTIMER, OWNER_ATTACHMENT_FINISH, OWNER_BEGIN_RUNNING, OWNER_SETTLE, OWNER_SYNC,
+    };
+    let mut trace = crate::diagnostics_counters::OwnerTrace::start();
+    let gate_locks_before = crate::diagnostics_counters::gate_locks_this_thread();
+    // BCORE-3: arm only when the previous slice's deadline is spent (or nothing is armed).
+    // `vtimer_arm_due` is a pure predicate; `mark_vtimer_armed` records what hardware got.
+    let vtimer_deadline = vtimer_deadline.filter(|cval| vcpu.vtimer_arm_due(*cval));
+    let result = (|| {
+        if attachment.requires_synchronization() {
+            crate::diagnostics_counters::record_sync_trip();
+            crate::diagnostics_counters::add_stat(
+                crate::diagnostics_counters::BOUND_SYNC_TRIPS,
+                1,
+            );
+            // BCORE-3: the trip's own `suppress_internal_interrupts` /
+            // `restore_internal_side_state` pair can leave `CNTV_CVAL_EL0` in the past (the
+            // timer fired and auto-masked inside the trip), so the cached armed deadline is
+            // not trustworthy afterwards: force a fresh arm on the next run.
+            vcpu.clear_vtimer_armed();
+            attachment.begin_synchronizing(generation)?;
+            let proof = synchronize_once(
+                vcpu,
+                control,
+                generation,
+                Some(run_epoch),
+                attachment.synchronization_request(),
+            )?;
+            attachment.acknowledge_owner_synchronization(proof)?;
+            trace.spans.mark(OWNER_SYNC);
+        }
+        attachment.begin_running(generation)?;
+        trace.spans.mark(OWNER_BEGIN_RUNNING);
+        // T2d: one existing-vCPU operation for the arm, the install, `hv_vcpu_run` and the
+        // exit read -- the same shape the pooled path gets after T2d.
+        vcpu.with_run_scope(|scope| {
+            if let Some(cval) = vtimer_deadline {
+                scope.arm_vtimer(cval)?;
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::BOUND_VTIMER_REARMS,
+                    1,
+                );
+            }
+            trace.spans.mark(OWNER_ARM_VTIMER);
+            run_once(
+                scope,
+                control,
+                generation,
+                run_epoch,
+                state,
+                HvfPstateContext::UserEl0t,
+                &mut trace,
+            )
+        })
+    })();
+    if result.is_ok()
+        && let Some(cval) = vtimer_deadline
+    {
+        vcpu.mark_vtimer_armed(cval);
+    }
+    if trace.latched {
+        // BCORE-2: an interrupt aimed at this run arrived before the guest was entered, so the
+        // run completed as `Canceled` without ever executing guest code.
+        crate::diagnostics_counters::add_stat(
+            crate::diagnostics_counters::BOUND_INTERRUPTS_LATCHED_PRE_ENTRY,
+            1,
+        );
+    }
+    let untrusted = result
+        .as_ref()
+        .is_err_and(HvfVcpuLaneError::terminalizes_execution_vcpu)
+        || control.is_untrusted();
+    let mut cleanup_error = control.settle_reservation(run_epoch, true, untrusted).err();
+    trace.spans.mark(OWNER_SETTLE);
+    if let Err(error) = attachment.finish().map_err(HvfVcpuLaneError::from) {
+        append_lane_error(&mut cleanup_error, error);
+    }
+    trace.spans.mark(OWNER_ATTACHMENT_FINISH);
+    match (result, cleanup_error) {
+        (Ok(mut result), None) => {
+            result.owner_ns = trace.total_ns();
+            result.owner_gate_locks = crate::diagnostics_counters::gate_locks_this_thread()
+                .wrapping_sub(gate_locks_before);
+            result.owner_end_ticks = trace.spans.last();
+            crate::diagnostics_counters::record_owner_run(&trace);
+            Ok(result)
+        }
+        (Err(primary), None) => Err(primary),
+        (Err(primary), Some(cleanup)) => Err(primary.with_cleanup(cleanup)),
+        (Ok(_), Some(cleanup)) => Err(cleanup),
+    }
+}
+

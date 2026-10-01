@@ -101,7 +101,12 @@ mod hvf_vcpu_diagnostic;
 // `IPInterfaceProvider` bodies by `enable_nat_engine`.
 mod nat;
 mod net;
+// NETFIX: the network worker's kqueue park/wake (doorbell + utun/NAT readiness).
+mod net_doorbell;
 mod seatbelt;
+
+/// Exposed for the runner's host-only `--net-wake-probe` witness, which drives the real doorbell.
+pub use net_doorbell::NetDoorbell;
 mod vdso;
 
 pub(crate) trait HvfCompletionCapability {
@@ -118,11 +123,12 @@ pub use hvf::{
     hvf_smoke_retry_residual, publish_hvf_executable_bytes,
 };
 pub use hvf_backend::{
-    HvfBackendError, HvfLaneReplacementReport, HvfLaneStarvationReport,
+    HvfBackendError, HvfBoundHostSignalReport, HvfLaneReplacementReport, HvfLaneStarvationReport,
     HvfLifecycleResidualSnapshot, HvfSchedulerLatencyReport, HvfSchedulerScalingLevel,
-    HvfSchedulerScalingReport, HvfVtimerMonitorRaceReport, hvf_lane_replacement_probe,
-    hvf_lane_starvation_probe, hvf_lifecycle_residual_snapshot, hvf_sandbox_probe,
-    hvf_scheduler_latency_probe, hvf_scheduler_scaling_probe, hvf_vtimer_monitor_race_probe,
+    HvfSchedulerScalingReport, HvfVtimerMonitorRaceReport, hvf_bound_host_signal_probe,
+    hvf_lane_replacement_probe, hvf_lane_starvation_probe, hvf_lifecycle_residual_snapshot,
+    hvf_sandbox_probe, hvf_scheduler_latency_probe, hvf_scheduler_scaling_probe,
+    hvf_vtimer_monitor_race_probe,
 };
 pub use hvf_backing::{
     HvfHostBackingError, HvfHostBackingReport, HvfHostResourceReport,
@@ -229,6 +235,10 @@ pub struct MacOsUserland {
     /// self`; the mutex is what makes them sound to call through the shared
     /// platform reference.
     nat: OnceLock<Mutex<nat::NatEngine>>,
+    /// NETFIX: the network worker's park/wake kqueue (doorbell, `utun`, NAT host sockets); see
+    /// [`net_doorbell`]. Created before the sandbox; `None` only if `kqueue()` failed, in which
+    /// case the worker keeps its legacy bounded sleep.
+    net_doorbell: Option<net_doorbell::NetDoorbell>,
     /// CoW-eligible memory regions registered via [`Self::register_cow_region`].
     /// Maps the start address of the static slice to the info needed to re-mmap
     /// the backing file. Mirrors `litebox_platform_linux_userland`'s identical
@@ -691,6 +701,24 @@ impl MacOsUserland {
             net::open_utun(name).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
         });
 
+        // NETFIX: the worker's park/wake kqueue, pre-sandbox like every other host resource. A
+        // `utun` device wakes the worker when a packet arrives; the NAT engine's host sockets are
+        // added as they are created (`enable_nat_engine`).
+        let net_doorbell = match net_doorbell::NetDoorbell::new() {
+            Ok(doorbell) => {
+                if let Some(tun) = tun.as_ref()
+                    && !doorbell.watch_readable(std::os::fd::AsRawFd::as_raw_fd(tun))
+                {
+                    litebox_util_log::warn!("net worker: kqueue refused the utun device; utun packets wait for the worker's safety cap");
+                }
+                Some(doorbell)
+            }
+            Err(error) => {
+                litebox_util_log::warn!(error:% = error; "net worker: no kqueue doorbell; the worker falls back to its bounded legacy sleep");
+                None
+            }
+        };
+
         let mut reserved_pages = read_memory_maps();
         if let Some(backend) = backend {
             reserved_pages.extend(backend.reserved_ranges());
@@ -716,6 +744,7 @@ impl MacOsUserland {
             shared_page_init_condvar: Condvar::new(),
             tun,
             nat: OnceLock::new(),
+            net_doorbell,
             cow_regions: std::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         };
 
@@ -831,6 +860,18 @@ impl litebox::platform::Provider for MacOsUserland {
         } else {
             litebox::platform::SeccompMediationCapability::Incomplete
         }
+    }
+
+    fn note_rbnr_wait(&self, kind: litebox::platform::RunnableWaitKind, ns: u64) {
+        diagnostics_counters::note_rbnr_wait(kind, ns);
+    }
+
+    fn note_input_consume_ns(&self, ns: u64) {
+        diagnostics_counters::note_input_consume(ns);
+    }
+
+    fn note_task_identity(&self, pid: i32, comm: &core::cell::Cell<[u8; 16]>) {
+        diagnostics_counters::note_task_identity(pid, comm);
     }
 }
 
@@ -1912,6 +1953,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
             else {
                 // Every missing byte is being initialized by another mapping. Wait without holding
                 // the registry, then re-derive the gaps; a failed peer leaves them claimable again.
+                crate::diagnostics_counters::rank_note_blocking_wait(
+                    crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                    std::panic::Location::caller(),
+                );
                 registry = self.shared_page_init_condvar.wait(registry).unwrap();
                 drop(registry);
                 continue;
@@ -2592,6 +2637,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Ma
         GUEST_STACK_RLIMIT.with(|cell| cell.set(rlimit_bytes));
     }
 
+    fn current_vcpu_bind_eligible() -> bool {
+        crate::current_vcpu_bind_eligible()
+    }
+
+    fn set_current_vcpu_bind_eligible(eligible: bool) {
+        crate::set_current_vcpu_bind_eligible(eligible);
+    }
+
     fn record_guest_fault_serviced() {
         hvf_backend::record_guest_fault_serviced();
     }
@@ -2808,16 +2861,67 @@ impl litebox::platform::RawMutexProvider for MacOsUserland {
             None => diagnostics_counters::wait_ended(),
         }
     }
+
+    /// NETFIX guard (spec section 5.3): the thread the runner marked with
+    /// [`mark_network_worker_thread`] is the network worker; every other thread is ordinary.
+    fn descriptor_table_access(&self) -> litebox::platform::DescriptorTableAccess {
+        if !NETWORK_WORKER_THREAD.with(core::cell::Cell::get) {
+            litebox::platform::DescriptorTableAccess::Ordinary
+        } else if NETWORK_WORKER_SANCTIONED_DEPTH.with(core::cell::Cell::get) > 0 {
+            litebox::platform::DescriptorTableAccess::NetworkWorkerSanctioned
+        } else {
+            litebox::platform::DescriptorTableAccess::NetworkWorker
+        }
+    }
+
+    fn with_sanctioned_descriptor_table_access<R>(&self, f: impl FnOnce() -> R) -> R {
+        /// Restores the depth even if `f` unwinds, so a panic inside the sanctioned scope can
+        /// never leave the worker permanently "sanctioned" (which would blind the guard).
+        struct Leave;
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                NETWORK_WORKER_SANCTIONED_DEPTH.with(|depth| depth.set(depth.get() - 1));
+            }
+        }
+        NETWORK_WORKER_SANCTIONED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let _leave = Leave;
+        f()
+    }
+}
+
+thread_local! {
+    /// Set once, by [`mark_network_worker_thread`], on the runner's network worker thread.
+    static NETWORK_WORKER_THREAD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Nesting depth of `with_sanctioned_descriptor_table_access` on this thread.
+    static NETWORK_WORKER_SANCTIONED_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Mark the calling thread as the network worker for the descriptor-table guard (NETFIX spec
+/// section 5.3): from now on every acquisition of the global descriptor table on this thread is
+/// counted in `fd.net_worker_table_takes` (and trapped by a debug assertion) unless it happens
+/// inside the one sanctioned scope. The runner calls this first thing in its worker thread.
+pub fn mark_network_worker_thread() {
+    NETWORK_WORKER_THREAD.with(|marked| marked.set(true));
 }
 
 /// A futex-equivalent built on Darwin's `ulock` compare-and-wait primitives.
+///
+/// `runnable_at` is the runnable-not-running guard's wake stamp (step G): a waker stores the tick
+/// it issued the wake at, and the thread that was blocked in [`RawMutex::block`] /
+/// [`RawMutex::block_or_timeout`] takes it on the way out, which is what lets the interval a
+/// guest thread spends runnable-but-not-running start at the wake rather than at the reschedule.
+/// One relaxed store per wake and one swap per block; a stale stamp (a wake with no waiter, or a
+/// waiter that never came back for it) is consumed by whatever blocks next and is at worst a
+/// slightly pessimistic interval, never a wrong one.
 pub struct RawMutex {
     inner: AtomicU32,
+    runnable_at: AtomicU64,
 }
 
 impl litebox::platform::RawMutex for RawMutex {
     const INIT: Self = Self {
         inner: AtomicU32::new(0),
+        runnable_at: AtomicU64::new(0),
     };
 
     fn underlying_atomic(&self) -> &AtomicU32 {
@@ -2828,6 +2932,11 @@ impl litebox::platform::RawMutex for RawMutex {
         if n == 0 {
             return 0;
         }
+        // Step G: stamp the wake before issuing it, so the woken thread's runnable-not-running
+        // interval starts at the wake (and the kernel's own delivery latency lands in its
+        // `w1_host_wake` span) rather than at whatever tick it happens to resume on.
+        self.runnable_at
+            .store(crate::diagnostics_counters::ticks(), Ordering::Relaxed);
         // `ulock` can wake exactly one waiter or all of them, with nothing in
         // between, so anything above one wakes all. The trait permits this: a
         // wake is allowed to be spurious, and the return value is allowed to be
@@ -2862,11 +2971,56 @@ impl RawMutex {
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        match ulock_wait(&self.inner, val, timeout) {
+        // Step G: a wait with a deadline has a known "runnable from" instant -- the deadline
+        // itself, not whatever tick the kernel got around to resuming this thread on -- so read
+        // the clock once here (only on the timed path, which is already a sleep).
+        let started = timeout.map(|_| crate::diagnostics_counters::ticks());
+        // Step GF (b): this thread is about to park, so it cannot give its retained vCPU lane back
+        // at a loop top -- and a lane held across an unbounded wait is a lane no other guest
+        // thread can ever run on. Give it up here, before the park, not after. The same primitive
+        // backs the shim's own lock waits, which is deliberate: those park too.
+        crate::hvf_backend::release_retained_lane(
+            crate::diagnostics_counters::LANE_STICKY_RELEASED_BLOCK,
+        );
+        let result = match ulock_wait(&self.inner, val, timeout) {
             darwin::UlockWaitResult::Woken => Ok(UnblockedOrTimedOut::Unblocked),
             darwin::UlockWaitResult::TimedOut => Ok(UnblockedOrTimedOut::TimedOut),
             darwin::UlockWaitResult::ValueChanged => Err(ImmediatelyWokenUp),
+        };
+        let now = crate::diagnostics_counters::ticks();
+        let stamp = self.runnable_at.swap(0, Ordering::Relaxed);
+        // Only an interruptible guest-condition wait (`WaitContext::commit_wait`) is a
+        // runnable-not-running transition; the same primitive backs the shim's own lock waits,
+        // whose time is already accounted as service time by the syscall histogram.
+        let in_guest_wait = crate::diagnostics_counters::in_interruptible_wait();
+        if in_guest_wait {
+            match (&result, started, stamp) {
+                // Woken: runnable from the wake the waker stamped; the difference is the host
+                // wake latency (W1).
+                (Ok(UnblockedOrTimedOut::Unblocked), _, stamp) => {
+                    let ready = if stamp != 0 { stamp } else { now };
+                    crate::diagnostics_counters::rbnr_became_ready(
+                        ready,
+                        crate::diagnostics_counters::ticks_to_ns(now.saturating_sub(ready)),
+                    );
+                }
+                // Timed out: runnable from the deadline.
+                (Ok(UnblockedOrTimedOut::TimedOut), Some(started), _) => {
+                    let ready = started.saturating_add(
+                        crate::diagnostics_counters::ns_to_ticks(
+                            u64::try_from(timeout.unwrap_or_default().as_nanos())
+                                .unwrap_or(u64::MAX),
+                        ),
+                    );
+                    crate::diagnostics_counters::rbnr_became_ready(
+                        ready,
+                        crate::diagnostics_counters::ticks_to_ns(now.saturating_sub(ready)),
+                    );
+                }
+                _ => {}
+            }
         }
+        result
     }
 }
 
@@ -3142,6 +3296,10 @@ impl litebox::platform::StdioProvider for MacOsUserland {
             // timeout is a safety net against a lost wakeup in the (check, then wait) window
             // above, not the primary wakeup path.
             let (lock, cvar) = &self.stdin_doorbell;
+            crate::diagnostics_counters::rank_note_blocking_wait(
+                crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                std::panic::Location::caller(),
+            );
             let guard = lock.lock().unwrap();
             let _ = cvar.wait_timeout(guard, Duration::from_millis(50)).unwrap();
         }
@@ -3562,7 +3720,7 @@ fn allocate_pages_no_longer_refuses_shared_anonymous_mappings() {
     // SAFETY: `ptr`'s range was returned by the matching `allocate_pages` call above and has
     // not been deallocated yet.
     unsafe {
-        <MacOsUserland as PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>>::deallocate_pages(
+        <MacOsUserland as PageManagementProvider<ALIGN>>::deallocate_pages(
             platform,
             ptr.as_usize()..ptr.as_usize() + len,
         )
@@ -3647,6 +3805,42 @@ impl litebox::platform::DerivedKeyProvider for MacOsUserland {
 thread_local! {
     static PENDING_SIGNALS: core::cell::Cell<*const AtomicU64> =
         const { core::cell::Cell::new(core::ptr::null()) };
+}
+
+/// BCORE-3: whether a host signal has been recorded for the calling thread and not yet drained
+/// -- the same bitmap `take_pending_signals` drains, read without taking it.
+///
+/// A bound vCPU runs guest code with no host signal able to reach it (a POSIX signal never ends
+/// `hv_vcpu_run`), so this is what bounds host-signal delivery latency by one time slice: a
+/// `VtimerActivated` exit with a nonzero word routes into `EnterShim::interrupt` instead of
+/// resuming the guest. One relaxed load, and only on a vtimer exit.
+pub(crate) fn host_signals_pending() -> bool {
+    let pending = PENDING_SIGNALS.get();
+    if pending.is_null() {
+        return false;
+    }
+    // SAFETY: non-null only while `run_with_handle` has this thread registered, and cleared
+    // before that registration is torn down -- the identical precondition
+    // `async_signal_handler` documents for its own read of the same pointer.
+    unsafe { (*pending).load(Ordering::Relaxed) != 0 }
+}
+
+thread_local! {
+    /// BCORE-4: whether the calling thread may take a vCPU of its own. Cleared for the window
+    /// in which a task's process still shares its parent's address space (the `vfork`
+    /// hand-off), because handing a shared space to a waiter requires quiescing every
+    /// participant of it, and a bound participant is only ever quiesced at its own loop top.
+    static BOUND_ELIGIBLE: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+}
+
+/// BCORE-4: see [`BOUND_ELIGIBLE`].
+pub(crate) fn set_current_vcpu_bind_eligible(eligible: bool) {
+    BOUND_ELIGIBLE.set(eligible);
+}
+
+/// BCORE-4: see [`BOUND_ELIGIBLE`].
+pub(crate) fn current_vcpu_bind_eligible() -> bool {
+    BOUND_ELIGIBLE.get()
 }
 
 unsafe extern "C" fn async_signal_handler(signum: libc::c_int) {
@@ -3943,6 +4137,10 @@ fn timer_thread(state: &TimerState) {
         match *command {
             TimerCommand::Deleted => return,
             TimerCommand::Disarmed => {
+                crate::diagnostics_counters::rank_note_blocking_wait(
+                    crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                    std::panic::Location::caller(),
+                );
                 command = state.changed.wait(command).unwrap();
             }
             TimerCommand::ArmedFor(deadline) => {
@@ -3958,6 +4156,10 @@ fn timer_thread(state: &TimerState) {
                     state.target.interrupt();
                     continue;
                 };
+                crate::diagnostics_counters::rank_note_blocking_wait(
+                    crate::diagnostics_counters::RK_WAIT_WHILE_HOLDING,
+                    std::panic::Location::caller(),
+                );
                 let (next, _) = state.changed.wait_timeout(command, remaining).unwrap();
                 command = next;
             }
@@ -4071,7 +4273,9 @@ impl ThreadHandle {
         })
     }
 
-    fn interrupt(&self) {
+    /// BCORE-4: also `pub(crate)` so the HVF backend can interrupt a bound vCPU's owner thread
+    /// when it asks that thread to give its vCPU up under pressure.
+    pub(crate) fn interrupt(&self) {
         if let Some(thread) = *self.0.id.lock().unwrap() {
             // SAFETY: the identifier is live for as long as this lock is held.
             unsafe { libc::pthread_kill(thread.0, INTERRUPT_SIGNAL) };
@@ -4183,6 +4387,14 @@ impl litebox::platform::ThreadProvider for MacOsUserland {
         ThreadHandle::current()
     }
 
+    /// BCORE-5: gives this thread's bound vCPU back, if it has one. The shim calls this
+    /// immediately before `detach_from_process`, i.e. before `release_view_space` can try to
+    /// destroy the address space this vCPU's participant is registered in -- `destroy` refuses
+    /// while a participant is still registered, so without this the space leaks.
+    fn release_thread_execution_resources(&self) {
+        hvf_backend::unbind_current_thread_vcpu();
+    }
+
     fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
         thread.interrupt();
     }
@@ -4243,8 +4455,12 @@ impl MacOsUserland {
     /// address; a runner overriding `--gateway-ip` must not enable it until
     /// the address can be plumbed through.
     pub fn enable_nat_engine(&'static self) {
-        self.nat
-            .get_or_init(|| Mutex::new(nat::NatEngine::new(litebox::net::GATEWAY_IP_ADDR)));
+        self.nat.get_or_init(|| {
+            Mutex::new(nat::NatEngine::new(
+                litebox::net::GATEWAY_IP_ADDR,
+                self.net_doorbell.as_ref(),
+            ))
+        });
         litebox_util_log::debug!(gateway:% = litebox::net::GATEWAY_IP_ADDR; "nat: engine enabled");
     }
 }
@@ -4291,6 +4507,24 @@ impl litebox::platform::IPInterfaceProvider for MacOsUserland {
 
     fn has_external_interface(&self) -> bool {
         self.tun.is_some() || self.nat.get().is_some()
+    }
+
+    /// NETFIX (spec 4.1/4.3): park on the doorbell kqueue. Without one, `Unsupported` keeps the
+    /// runner's legacy bounded sleep.
+    fn wait_for_network_activity(
+        &self,
+        timeout: Option<core::time::Duration>,
+    ) -> litebox::platform::NetworkWait {
+        match self.net_doorbell.as_ref() {
+            Some(doorbell) => doorbell.wait(timeout),
+            None => litebox::platform::NetworkWait::Unsupported,
+        }
+    }
+
+    fn notify_network_worker(&self) {
+        if let Some(doorbell) = self.net_doorbell.as_ref() {
+            doorbell.notify();
+        }
     }
 }
 
@@ -5091,8 +5325,19 @@ const PAGE_FAULT_FALLBACK_RETRY_LIMIT: u32 = 64;
 /// [`PAGE_FAULT_FALLBACK_RETRY_LIMIT`]. A coincidental interleaving from an unrelated concurrent
 /// fault sharing the same address and ESR merely resets the run (detected a little later, never
 /// incorrectly), not a correctness hazard.
-static PAGE_FAULT_FALLBACK_LAST: std::sync::Mutex<Option<(usize, u64, u32)>> =
-    std::sync::Mutex::new(None);
+/// GSIGSEGV2: this was a process-global slot, which is the wrong identity for what it measures.
+/// "The guest re-executed the identical fault" is a per-thread notion -- ten threads each taking
+/// one transient stale fault on the same hot page are not one thread livelocking -- but a single
+/// global slot interleaves them into one run and reaches
+/// [`PAGE_FAULT_FALLBACK_RETRY_LIMIT`] while no individual thread has gone round twice. On the
+/// standing `race-stress/grs2 stress` gate that is exactly what turned routine, self-healing
+/// stale-translation faults on the process's shared BSS counter page into a fatal SIGSEGV at
+/// ~700-1200 s. Per-thread, a genuinely stuck thread still reaches the limit (and still surfaces
+/// loudly); a busy page shared by many healthy threads no longer does.
+thread_local! {
+    static PAGE_FAULT_FALLBACK_LAST: core::cell::Cell<Option<(usize, u64, u32)>> =
+        const { core::cell::Cell::new(None) };
+}
 
 /// `error_code` here is the raw `ESR_EL1` value of the aborting exception,
 /// forwarded unmodified all the way from `litebox_shim_linux`'s
@@ -5137,24 +5382,48 @@ impl litebox::mm::linux::VmemPageFaultHandler for MacOsUserland {
         error_code: u64,
     ) -> Result<(), litebox::mm::linux::PageFaultError> {
         let page = fault_addr & !(litebox::mm::linux::PAGE_SIZE - 1);
-        let mut last = PAGE_FAULT_FALLBACK_LAST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let repeats = match *last {
-            Some((last_page, last_error_code, count))
-                if last_page == page && last_error_code == error_code =>
-            {
-                count + 1
+        let mut repeats = 1u32;
+        let mut over_limit = false;
+        let _ = PAGE_FAULT_FALLBACK_LAST.try_with(|cell| {
+            repeats = match cell.get() {
+                Some((last_page, last_error_code, count))
+                    if last_page == page && last_error_code == error_code =>
+                {
+                    count + 1
+                }
+                _ => 1,
+            };
+            if repeats > PAGE_FAULT_FALLBACK_RETRY_LIMIT {
+                cell.set(None);
+                over_limit = true;
+            } else {
+                cell.set(Some((page, error_code, repeats)));
             }
-            _ => 1,
-        };
-        if repeats > PAGE_FAULT_FALLBACK_RETRY_LIMIT {
-            *last = None;
+        });
+        if over_limit {
+            // GSIGSEGV diagnostic aid (opt-in, `LITEBOX_GUEST_ACCESS_FAULT_TRACE=1`). This is the
+            // one refusal no earlier stage of the fault chain can explain: it fires only after
+            // the guest has re-executed the identical fault `PAGE_FAULT_FALLBACK_RETRY_LIMIT`
+            // times in a row with nothing installing a fix, so the page state it prints is the
+            // state the whole COW/W^X/materialization chain left behind. Without it the guest's
+            // only evidence is a `SIGSEGV` whose `si_addr` sits inside a perfectly ordinary VMA.
+            if <Self as litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>>::guest_access_fault_trace()
+            {
+                let view = <Self as litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>>::current_guest_access()
+                    .map(|(view, _, _)| view);
+                let state = view.map_or_else(String::new, |v| {
+                    <Self as litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>>::describe_guest_page(v, page)
+                });
+                litebox_util_log::warn!(
+                    page:? = page, error_code:? = error_code, repeats:% = repeats, view:? = view,
+                    state:% = state;
+                    "guest-access fault trace: page fault fallback made no forward progress -- delivering SIGSEGV"
+                );
+            }
             return Err(litebox::mm::linux::PageFaultError::AccessError(
                 "page fault fallback made no forward progress on a repeated fault",
             ));
         }
-        *last = Some((page, error_code, repeats));
         Ok(())
     }
 

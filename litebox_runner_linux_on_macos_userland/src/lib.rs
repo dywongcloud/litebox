@@ -41,6 +41,287 @@ impl litebox_rfb::FramebufferSource for FramebufferAdapter {
     }
 }
 
+/// NETFIX (spec section 4.2): the network worker's loop.
+///
+/// Poll while the stack asks to be called again (capped, so a burst cannot starve the other
+/// users of the Network mutex), then park on the platform until a guest or host thread hands the
+/// worker work (a socket channel's mark, a `Network` operation's kick, a NAT dial finishing), a
+/// device or NAT host socket becomes readable, the stack's own next timer is due, or
+/// `SAFETY_MAX` passes. The cap exists because the rootless NAT engine runs a private smoltcp
+/// stack whose timers (delayed ACK and minimum RTO, both 10 ms) are invisible to the guest
+/// stack's `poll_at` and are clocked only by these polls; it is not a latency floor, since every
+/// guest-originated operation wakes the worker directly.
+///
+/// The legacy loop slept `min(poll_at or 200 us, 1 ms)` between polls whatever happened -- at
+/// least 1000 polls a second forever -- and each poll walked the whole descriptor table.
+fn run_network_worker(
+    perform: impl Fn() -> litebox::net::PlatformInteractionReinvocationAdvice,
+    platform: &'static Platform,
+    shutdown: &core::sync::atomic::AtomicBool,
+) {
+    use litebox::net::{PlatformInteractionReinvocationAdvice as Advice, WorkerWake};
+    use litebox::platform::{IPInterfaceProvider as _, NetworkWait};
+    const SAFETY_MAX: core::time::Duration = core::time::Duration::from_millis(10);
+    // Only when the platform has no wake mechanism: the legacy bound.
+    const LEGACY_SLEEP_CAP: core::time::Duration = core::time::Duration::from_millis(1);
+    // Consecutive immediate re-polls before the worker yields the CPU (and so the Network
+    // mutex) once; a poll result can only stay `SocketStateChanged` while packets keep moving.
+    const IMMEDIATE_CAP: u32 = 64;
+    let as_ns = |d: core::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    while !shutdown.load(core::sync::atomic::Ordering::Relaxed) {
+        let mut immediate = 0u32;
+        let timeout = loop {
+            match perform() {
+                Advice::CallAgainImmediately => {
+                    immediate += 1;
+                    if immediate >= IMMEDIATE_CAP {
+                        litebox::net::note_worker_immediate_cap_hit();
+                        immediate = 0;
+                        std::thread::yield_now();
+                    }
+                }
+                Advice::WaitOnDeviceOrSocketInteraction { timeout } => break timeout,
+            }
+        };
+        let park = timeout.map_or(SAFETY_MAX, |t| t.min(SAFETY_MAX));
+        let (marks_before, kicks_before) = litebox::net::worker_wake_sources();
+        let parked = std::time::Instant::now();
+        let outcome = platform.wait_for_network_activity(Some(park));
+        let wake = match outcome {
+            NetworkWait::Unsupported => {
+                std::thread::sleep(park.min(LEGACY_SLEEP_CAP));
+                WorkerWake::UnsupportedSleep
+            }
+            NetworkWait::Woken => {
+                let (marks, kicks) = litebox::net::worker_wake_sources();
+                if marks != marks_before {
+                    WorkerWake::Dirty
+                } else if kicks != kicks_before {
+                    WorkerWake::Kick
+                } else {
+                    WorkerWake::Other
+                }
+            }
+            NetworkWait::PacketReady => WorkerWake::Packet,
+            NetworkWait::TimedOut if park < SAFETY_MAX => WorkerWake::Timer,
+            NetworkWait::TimedOut => WorkerWake::Cap,
+        };
+        litebox::net::note_worker_wake(wake, as_ns(parked.elapsed()));
+    }
+    // Final flush so a socket with data still queued at guest exit gets one last chance to
+    // drain.
+    while perform().call_again_immediately() {}
+}
+
+/// NETFIX witness W2 (`-Z --net-wake-probe`, host only, no guest): the kqueue semantics the
+/// worker's park relies on, then a lost-wake-up stress of the real `NetWakeHook` + `NetDoorbell`
+/// protocol (marker threads queue keys and ring; one worker clears-then-drains and parks with
+/// the production 10 ms cap). Prints `NETWAKE ...` lines; fails on any lost mark.
+fn net_wake_probe() -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    fn kev(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent {
+        libc::kevent {
+            ident,
+            filter,
+            flags,
+            fflags,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        }
+    }
+    fn apply(kq: i32, change: &libc::kevent) -> bool {
+        // SAFETY: one initialized change record, no event list, no timeout.
+        unsafe { libc::kevent(kq, change, 1, std::ptr::null_mut(), 0, std::ptr::null()) == 0 }
+    }
+    /// Returns the events delivered within `timeout_ms` (filter, ident) pairs.
+    fn collect(kq: i32, timeout_ms: i64) -> Vec<(i16, usize)> {
+        let mut events = [kev(0, 0, 0, 0); 16];
+        let ts = libc::timespec {
+            tv_sec: timeout_ms / 1000,
+            tv_nsec: (timeout_ms % 1000) * 1_000_000,
+        };
+        // SAFETY: `events` is an exclusively borrowed array; `ts` outlives the call.
+        let n = unsafe { libc::kevent(kq, std::ptr::null(), 0, events.as_mut_ptr(), 16, &raw const ts) };
+        events[..usize::try_from(n).unwrap_or(0)]
+            .iter()
+            .map(|e| (e.filter, e.ident))
+            .collect()
+    }
+    fn new_kq() -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: plain system call.
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(anyhow!("kqueue: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: a fresh descriptor we own.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(kq) })
+    }
+
+    // ---- part 1: kqueue semantics --------------------------------------------------------
+    let (a, b) = std::os::unix::net::UnixStream::pair()?;
+    let level = new_kq()?;
+    let edge = new_kq()?;
+    let fd = usize::try_from(b.as_raw_fd())?;
+    let ok = apply(level.as_raw_fd(), &kev(fd, libc::EVFILT_READ, libc::EV_ADD, 0))
+        && apply(edge.as_raw_fd(), &kev(fd, libc::EVFILT_READ, libc::EV_ADD | libc::EV_CLEAR, 0));
+    if !ok {
+        return Err(anyhow!("kevent registration failed: {}", std::io::Error::last_os_error()));
+    }
+    std::io::Write::write_all(&mut &a, b"x")?;
+    // level-triggered: a blocking wait returns it, and an immediate second wait returns it again
+    let level_first = collect(level.as_raw_fd(), 1000).iter().any(|&(f, i)| f == libc::EVFILT_READ && i == fd);
+    let level_again = collect(level.as_raw_fd(), 0).iter().any(|&(f, i)| f == libc::EVFILT_READ && i == fd);
+    let level_retrigger = level_first && level_again;
+    // edge-triggered (EV_CLEAR) in a second kqueue: returned once, then not again while the byte
+    // sits unread, then again on the next arrival; independent of the level registration
+    let edge_first = collect(edge.as_raw_fd(), 1000).iter().any(|&(f, i)| f == libc::EVFILT_READ && i == fd);
+    let edge_quiet = collect(edge.as_raw_fd(), 1).is_empty();
+    std::io::Write::write_all(&mut &a, b"y")?;
+    let edge_second = collect(edge.as_raw_fd(), 1000).iter().any(|&(f, i)| f == libc::EVFILT_READ && i == fd);
+    let edge_rearm = edge_first && edge_quiet && edge_second;
+    let level_independent = collect(level.as_raw_fd(), 0).iter().any(|&(f, i)| f == libc::EVFILT_READ && i == fd);
+    // the production doorbell: a trigger posted before the wait is not lost; consumed once
+    let doorbell = litebox_platform_macos_userland::NetDoorbell::new()?;
+    doorbell.notify();
+    let t = std::time::Instant::now();
+    let first = doorbell.wait(Some(core::time::Duration::from_secs(1)));
+    let sticky_us = t.elapsed().as_micros();
+    let user_sticky = first == litebox::platform::NetworkWait::Woken && sticky_us < 100_000;
+    let second = doorbell.wait(Some(core::time::Duration::from_millis(1)));
+    let user_cleared = second == litebox::platform::NetworkWait::TimedOut;
+    // a readable watched descriptor wakes the park as PacketReady
+    let (c, d) = std::os::unix::net::UnixStream::pair()?;
+    let watch_ok = doorbell.watch_readable(d.as_raw_fd());
+    std::io::Write::write_all(&mut &c, b"z")?;
+    let third = doorbell.wait(Some(core::time::Duration::from_secs(1)));
+    let fd_wake = watch_ok && third == litebox::platform::NetworkWait::PacketReady;
+    let all = level_retrigger && edge_rearm && level_independent && user_sticky && user_cleared && fd_wake;
+    println!(
+        "NETWAKE kq level-retrigger={} edge-rearm={} level-independent={} user-sticky={} (wait_us={sticky_us}) user-cleared={} fd-wake={} pass={}",
+        u8::from(level_retrigger),
+        u8::from(edge_rearm),
+        u8::from(level_independent),
+        u8::from(user_sticky),
+        u8::from(user_cleared),
+        u8::from(fd_wake),
+        u8::from(all),
+    );
+    drop((a, b, c, d));
+
+    // ---- part 2: lost-wake-up stress -------------------------------------------------------
+    const KEYS: usize = 64;
+    const MARKERS: usize = 4;
+    const MARKS_PER_MARKER: u64 = 200_000;
+    let doorbell: &'static litebox_platform_macos_userland::NetDoorbell =
+        Box::leak(Box::new(litebox_platform_macos_userland::NetDoorbell::new()?));
+    let hook: Arc<litebox::net::wake::NetWakeHook<Platform>> = Arc::new(
+        litebox::net::wake::NetWakeHook::new(Box::new(move || doorbell.notify())),
+    );
+    // Per key: the channel's coalescing flag and its "ring" (stamps of marks not yet serviced).
+    let flags: Arc<Vec<AtomicBool>> = Arc::new((0..KEYS).map(|_| AtomicBool::new(false)).collect());
+    let rings: Arc<Vec<std::sync::Mutex<Vec<std::time::Instant>>>> =
+        Arc::new((0..KEYS).map(|_| std::sync::Mutex::new(Vec::new())).collect());
+    let drained = Arc::new(AtomicU64::new(0));
+    let max_latency_ns = Arc::new(AtomicU64::new(0));
+    let markers_done = Arc::new(AtomicBool::new(false));
+    let cap_wakes = Arc::new(AtomicU64::new(0));
+    let worker = {
+        let (hook, flags, rings, drained, max_latency_ns, markers_done, cap_wakes) = (
+            hook.clone(),
+            flags.clone(),
+            rings.clone(),
+            drained.clone(),
+            max_latency_ns.clone(),
+            markers_done.clone(),
+            cap_wakes.clone(),
+        );
+        std::thread::Builder::new().name("netwake-worker".into()).spawn(move || {
+            let mut keys = Vec::new();
+            let total = MARKS_PER_MARKER * MARKERS as u64;
+            let deadline_after_markers = std::time::Duration::from_secs(2);
+            let mut markers_finished_at: Option<std::time::Instant> = None;
+            loop {
+                keys.clear();
+                hook.drain_into(&mut keys);
+                for &key in &keys {
+                    let key = key as usize;
+                    // clear-then-drain, exactly as `Network::service`
+                    litebox::net::wake::NetWakeHook::<Platform>::clear(&flags[key]);
+                    let stamps = core::mem::take(&mut *rings[key].lock().unwrap());
+                    let now = std::time::Instant::now();
+                    for stamp in &stamps {
+                        let lat = u64::try_from(now.duration_since(*stamp).as_nanos()).unwrap_or(u64::MAX);
+                        max_latency_ns.fetch_max(lat, Ordering::Relaxed);
+                    }
+                    drained.fetch_add(stamps.len() as u64, Ordering::Relaxed);
+                }
+                if drained.load(Ordering::Relaxed) >= total {
+                    break;
+                }
+                if markers_done.load(Ordering::Acquire) {
+                    let at = *markers_finished_at.get_or_insert_with(std::time::Instant::now);
+                    if at.elapsed() > deadline_after_markers {
+                        break;
+                    }
+                }
+                if doorbell.wait(Some(core::time::Duration::from_millis(10)))
+                    == litebox::platform::NetworkWait::TimedOut
+                {
+                    cap_wakes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })?
+    };
+    let started = std::time::Instant::now();
+    let markers: Vec<_> = (0..MARKERS)
+        .map(|m| {
+            let (hook, flags, rings) = (hook.clone(), flags.clone(), rings.clone());
+            std::thread::spawn(move || {
+                // xorshift for the key choice and the 0-50 us gaps
+                let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ (m as u64 + 1);
+                for i in 0..MARKS_PER_MARKER {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let key = (x as usize) % KEYS;
+                    // the "push" (bytes into the ring) precedes the mark, as in `try_write`
+                    rings[key].lock().unwrap().push(std::time::Instant::now());
+                    hook.mark(u32::try_from(key).unwrap(), &flags[key]);
+                    if i % 64 == 0 {
+                        std::thread::sleep(core::time::Duration::from_micros(x % 51));
+                    }
+                }
+            })
+        })
+        .collect();
+    for m in markers {
+        let _ = m.join();
+    }
+    markers_done.store(true, Ordering::Release);
+    let _ = worker.join();
+    let total = MARKS_PER_MARKER * MARKERS as u64;
+    let got = drained.load(Ordering::Relaxed);
+    let lost = total.saturating_sub(got);
+    let max_us = max_latency_ns.load(Ordering::Relaxed) / 1000;
+    let pass = lost == 0 && max_us < 50_000;
+    println!(
+        "NETWAKE stress marks={total} drained={got} max_latency_us={max_us} cap_wakes={} lost={lost} wall_ms={} pass={}",
+        cap_wakes.load(Ordering::Relaxed),
+        started.elapsed().as_millis(),
+        u8::from(pass),
+    );
+    println!("NETWAKE END pass={}", u8::from(pass && all));
+    if pass && all {
+        Ok(())
+    } else {
+        Err(anyhow!("net wake probe failed"))
+    }
+}
+
 /// Run Linux programs with LiteBox on unmodified macOS.
 ///
 /// The program binary and all its dependencies must be provided inside a tar
@@ -63,7 +344,7 @@ pub struct CliArgs {
     /// `--initial-files`. All binaries must be pre-rewritten with the syscall
     /// rewriter.
     #[arg(
-        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling", "hvf_vtimer_monitor_race", "hvf_pump_owner_bypass", "counters"],
+        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling", "hvf_vtimer_monitor_race", "hvf_bound_host_signal", "hvf_pump_owner_bypass", "counters", "net_wake_probe"],
         trailing_var_arg = true,
         value_hint = clap::ValueHint::CommandWithArguments
     )]
@@ -81,7 +362,7 @@ pub struct CliArgs {
     #[arg(
         long = "initial-files",
         value_name = "PATH_TO_TAR",
-        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling", "hvf_vtimer_monitor_race", "hvf_pump_owner_bypass", "counters"],
+        required_unless_present_any = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_published_panic", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling", "hvf_vtimer_monitor_race", "hvf_bound_host_signal", "hvf_pump_owner_bypass", "counters", "net_wake_probe"],
         value_hint = clap::ValueHint::FilePath
     )]
     pub initial_files: Option<PathBuf>,
@@ -96,6 +377,11 @@ pub struct CliArgs {
     /// startup). See `diagnostics-counter-readout-surface`.
     #[arg(long = "counters", value_name = "RUN_DIR", requires = "unstable", help_heading = "Unstable Options")]
     pub counters: Option<PathBuf>,
+    /// NETFIX witness W2: a host-only probe of the network worker's park/wake -- the kqueue
+    /// semantics its park relies on, then a lost-wake-up stress of the real `NetWakeHook` and
+    /// `NetDoorbell` -- and exit. No guest, no HVF entitlement needed.
+    #[arg(long = "net-wake-probe", requires = "unstable", help_heading = "Unstable Options")]
+    pub net_wake_probe: bool,
     /// Directory a live instance publishes its counters snapshot file into (see `--counters`).
     /// Defaults to a fresh temporary directory under `$TMPDIR` (printed to the log at startup)
     /// when unset.
@@ -401,6 +687,23 @@ pub struct CliArgs {
         help_heading = "HVF diagnostics"
     )]
     pub hvf_vtimer_monitor_race: bool,
+    /// BCORE-3: prove the bound-vCPU host-signal fast path actually runs.
+    ///
+    /// Binds a real bound vCPU to this thread, runs a real spinning guest on it so its
+    /// exits really are `VtimerActivated`, delivers a real `pthread_kill(SIGALRM)` (the
+    /// production handler, the production pending-signal bitmap) from a helper thread, and
+    /// requires that a subsequent vtimer exit routes into `EnterShim::interrupt` --
+    /// i.e. that `bound.host_signal_fastpath` moves off zero. `setitimer` is `ENOSYS`, so no
+    /// guest can produce that signal itself and this branch has no other way to be exercised.
+    /// Requires `LITEBOX_HVF_BOUND=1`. The runner executable must carry the
+    /// `com.apple.security.hypervisor` entitlement.
+    #[arg(
+        long = "hvf-bound-host-signal",
+        requires = "unstable",
+        conflicts_with_all = ["hvf_smoke", "hvf_boundary", "hvf_memory", "hvf_memory_failure", "hvf_alias_panic_failure", "hvf_poison", "hvf_register_failure", "hvf_unmap_failure", "hvf_vcpu", "hvf_vcpu_failure", "hvf_vcpu_custody", "hvf_vcpu_totality", "hvf_mirrored_view", "hvf_alias_race", "hvf_sandbox", "hvf_lane_starvation", "hvf_scheduler_latency", "hvf_scheduler_scaling", "hvf_vtimer_monitor_race"],
+        help_heading = "HVF diagnostics"
+    )]
+    pub hvf_bound_host_signal: bool,
     /// Connect to a `utun` device with this name (e.g. `utun4`).
     ///
     /// Creating the interface needs root on this host, so the guest has no
@@ -809,6 +1112,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         return Ok(());
     }
 
+    if cli_args.net_wake_probe {
+        return net_wake_probe();
+    }
+
     if cli_args.hvf_smoke {
         let report = litebox_platform_macos_userland::hvf_smoke_probe()
             .map_err(|error| anyhow!("HVF smoke failed: {error}"))?;
@@ -982,6 +1289,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let report = litebox_platform_macos_userland::hvf_vtimer_monitor_race_probe()
             .map_err(|error| anyhow!("HVF vtimer/EL1-monitor race witness failed: {error}"))?;
         println!("HVF vtimer/EL1-monitor race witness passed:\n{report:#?}");
+        return Ok(());
+    }
+
+    if cli_args.hvf_bound_host_signal {
+        Platform::new_with_hvf(cli_args.tun_device_name.as_deref(), false)
+            .map_err(|error| anyhow!("failed to install the HVF guest backend: {error}"))?;
+        let report = litebox_platform_macos_userland::hvf_bound_host_signal_probe()
+            .map_err(|error| anyhow!("HVF bound-vCPU host-signal witness failed: {error}"))?;
+        println!("HVF bound-vCPU host-signal witness passed:\n{report:#?}");
         return Ok(());
     }
 
@@ -1338,24 +1654,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let net_worker = {
         let shim = shim.clone();
         let shutdown = shutdown.clone();
-        std::thread::spawn(move || {
-            const IDLE_SLEEP: core::time::Duration = core::time::Duration::from_micros(200);
-            const MAX_SLEEP: core::time::Duration = core::time::Duration::from_millis(1);
-            while !shutdown.load(core::sync::atomic::Ordering::Relaxed) {
-                let timeout = loop {
-                    match shim.perform_network_interaction() {
-                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
-                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction { timeout } => {
-                            break timeout;
-                        }
-                    }
-                };
-                std::thread::sleep(timeout.unwrap_or(IDLE_SLEEP).min(MAX_SLEEP));
-            }
-            // Final flush so a socket with data still queued at guest exit gets
-            // one last chance to drain.
-            while shim.perform_network_interaction().call_again_immediately() {}
-        })
+        // Named so `ps -M` / `sample` attribute it (NETFIX: the unnamed worker that pegged a core
+        // on the live desktop had to be found by its stack).
+        std::thread::Builder::new()
+            .name("litebox-net-worker".into())
+            .spawn(move || {
+                // NETFIX guard: from here on, every descriptor-table acquisition on this thread
+                // outside the sanctioned queued-close drain is counted as a violation.
+                litebox_platform_macos_userland::mark_network_worker_thread();
+                run_network_worker(|| shim.perform_network_interaction(), platform, &shutdown);
+            })
+            .map_err(|e| anyhow!("failed to spawn the network worker thread: {e}"))?
     };
 
     // Read before the root guest task ever executes a single instruction, and again after

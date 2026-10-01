@@ -9,8 +9,10 @@ use core::ops::{BitOr, BitOrAssign, Bound, Range};
 use core::ptr::NonNull;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+
+use crate::diagnostics_counters::RankedMutex;
 use std::time::{Duration, Instant};
 
 use crate::HvfCompletionCapability;
@@ -310,9 +312,23 @@ pub(crate) mod install_mask {
     /// Every register a guest thread's EL0 execution owns, SIMD/FP excepted: what the exit
     /// read refreshes and what a resident install compares.
     pub(crate) const INTEGER: u64 = X_ALL | SP_EL0 | PC | CPSR | TPIDR_EL0;
-    /// The EL1 exception registers litebox installs as 0 and never reads before hardware
-    /// rewrites them: exception entry writes ELR/SPSR/ESR (and FAR on aborts) before the
-    /// monitor's first instruction, and the monitor never uses SP_EL1. Dead between exits.
+    /// The EL1 exception registers litebox installs as 0 and never reads before hardware rewrites
+    /// them: exception entry from EL0 rewrites `ELR_EL1`/`SPSR_EL1`/`ESR_EL1` before the monitor's
+    /// first instruction (the monitor reads none of them -- `hvf_monitor.S` is `hvc`/`eret`/
+    /// `dsb;ic;tlbi;msr ttbr0` only), and `SP_EL1` is that monitor's EL1h stack pointer, which
+    /// never touches a stack -- no push, no call, no `sp`-relative access -- so the installed 0 is
+    /// what it still holds when the next exception is taken.
+    ///
+    /// `FAR_EL1` is in this set but is the odd one out, and the difference is documented because it
+    /// is the reason [`install_mask::INTEGER`] alone is not a safe release compared set: the
+    /// architecture updates FAR_EL1 only on EC 0x20/0x21/0x24/0x25 (instruction/data abort), so on
+    /// an SVC (0x15) and on every other non-abort class it keeps whatever the last abort wrote.
+    /// Skipping its reinstall on an EL0 entry therefore leaves a stale fault address in the
+    /// register file -- never in the host's view of one, because every consumer is gated on
+    /// `is_abort`: `classify_wx_fault`/`try_resolve_cow_fault` are called only for abort classes and
+    /// `ExceptionInfo::fault_address` is zeroed for every other class at the platform boundary in
+    /// `hvf_backend.rs`. Verify mode installs and compares the whole of
+    /// [`install_mask::SCALAR`] including FAR_EL1, so that path is still witnessed end to end.
     pub(crate) const DEAD_EL1: u64 = SP_EL1 | SPSR_EL1 | ELR_EL1 | ESR_EL1 | FAR_EL1;
     /// Every non-SIMD register.
     pub(crate) const SCALAR: u64 = INTEGER | DEAD_EL1;
@@ -1825,6 +1841,13 @@ impl<'vm> HvfOperationFrame<'vm> {
         self.direct_published.set(true);
         thread.admission_published = true;
         HVF_OPERATION_STATE.with(|cell| cell.set(thread));
+        // CLASS C guard: a *positive* test of the class. `note_class_regression` only catches a
+        // site that already declared itself read/shared; a newly written read that calls
+        // `with_operation` declares Exclusive and is invisible to it. Counting publications per
+        // site makes the shape measurable instead: a site with many exclusive admissions and
+        // (nearly) no publication is an exclusive admission that never had an HVF effect -- i.e.
+        // a read, or a loop that admits per item without ever publishing.
+        crate::diagnostics_counters::record_site_publication(self.site);
         Ok(())
     }
 
@@ -1908,6 +1931,15 @@ impl<'vm> HvfOperationFrame<'vm> {
     fn disarm_abandoned(&mut self) {
         self.finished = true;
     }
+}
+
+/// T2c: how many VM-operation frames the calling thread has open right now (`0` = none).
+///
+/// The adaptive hand-off spin asserts on this: a spin that ran inside an operation frame would
+/// burn CPU while holding an admission every other mutator is waiting for, which is exactly the
+/// saturation this mechanism is not allowed to make worse.
+pub(crate) fn operation_depth() -> usize {
+    HVF_OPERATION_STATE.with(|cell| cell.get().total_depth)
 }
 
 impl Drop for HvfOperationFrame<'_> {
@@ -2227,14 +2259,182 @@ impl HvfPublicationCapability for HvfExistingVcpuOperation<'_> {
     }
 }
 
+/// The publication half of [`HvfRunScope`]: the scope's single existing-vCPU operation plus the
+/// one-shot flag that makes [`HvfPublicationCapability::mark_hvf_published`] idempotent inside the
+/// scope. A run body that refuses before its first mutating HVF call therefore leaves the frame
+/// unpublished, exactly as the per-operation path it replaces did (T2d).
+struct HvfRunPublication<'a, 'vm> {
+    operation: &'a HvfExistingVcpuOperation<'vm>,
+    published: Cell<bool>,
+}
+
+impl HvfPublicationCapability for HvfRunPublication<'_, '_> {
+    /// The publication side effect is idempotent (`direct_published` / `admission_published` are
+    /// sticky booleans), so the gate lock is taken once, but the *predicate* is re-evaluated on
+    /// every call: the memo covers the side effect only, never the check (T2d fix-up).
+    ///
+    /// The lock-free half is re-run here. The `class_live` half
+    /// (`current == owner && active_vcpu_owners.count(owner) == 1`, hvf_sdk) cannot change while
+    /// this thread is inside the scope, so re-testing it would only re-take the gate mutex:
+    ///  * `owner` is fixed at vCPU creation and `with_run_scope` proves `current == owner` at
+    ///    entry; nothing inside the scope can migrate the vCPU, because a migration takes an
+    ///    operation and the scope admits none (B4 would poison the VM).
+    ///  * `active_vcpu_owners` has exactly two mutation sites: `begin_existing_vcpu_operation`
+    ///    (push) and `finish_existing_vcpu_operation` (`swap_remove`, reached only when
+    ///    `current == owner`). A second push by this thread needs a nested admission, which the
+    ///    scope cannot express; a removal needs this thread, which is inside the scope. So no
+    ///    thread can take this owner's entry out from under the scope.
+    fn mark_hvf_published(&self) -> Result<(), HvfError> {
+        if self.published.get() {
+            let vm = self.operation.frame.vm;
+            if vm.operation_gate.abandoned.load(Ordering::Acquire) {
+                return Err(HvfError::OperationAbandoned);
+            }
+            if vm.cleanup_required.load(Ordering::Acquire) {
+                return Err(HvfError::Poisoned);
+            }
+            return Ok(());
+        }
+        self.operation.mark_published()?;
+        self.published.set(true);
+        Ok(())
+    }
+}
+
+/// T2d: ONE existing-vCPU operation spanning a whole run -- the vtimer arm, the state install,
+/// `hv_vcpu_run`, the execution-time read and the exit read, which used to be five separate
+/// admissions (ten gate mutex acquisitions per run, five of the process-global `operation_gate`
+/// state mutex and five of `vcpu_ownership`).
+///
+/// Every check the five admissions made still runs: B1-B6 once at scope entry (the same effect the
+/// first of today's admissions has), O1 once (only the owner can change its own record, and the
+/// only in-scope invalidation is the scope's own quarantine, which sets `live = false`), M1 lazily
+/// before the first mutating HVF call, Q per SDK failure and F once. A poison or abandon published
+/// after entry is still observed: lock-free before `hv_vcpu_run` ([`Self::run`], atomics only) and
+/// at F, where `PoisonRequested` makes `finish_operation` poison the VM and discard the result --
+/// the same outcome class as today's next-admission refusal. The only widening is a
+/// `poison_requested`-only request (mutex state, no atomic) landing after M1 and before the run,
+/// which lets one run execute until the guest's own next exit. That bound is honest and NOT "up to
+/// its vtimer slice": `time_slice_deadline` reads the host counter, so the 10 ms slice never fires
+/// (filed PRD row), and a guest thread in a compute loop with no vtimer armed has no exit deadline
+/// at all. Today already allows exactly this when the request lands during the `run` admission
+/// itself, because admission closure -- not preemption -- is the poison contract.
+///
+/// The scope exposes no way to nest another admission (B4 would poison the VM on a duplicate
+/// owner), so nothing inside it may take another operation.
+pub(crate) struct HvfRunScope<'a, 'vm> {
+    vcpu: &'a mut HvfVcpu,
+    publication: HvfRunPublication<'a, 'vm>,
+}
+
+impl HvfRunScope<'_, '_> {
+    /// [`HvfVcpu::last_run_profile`] of this scope's vCPU.
+    pub(crate) fn last_run_profile(&self) -> (u64, u32) {
+        self.vcpu.last_run_profile()
+    }
+
+    /// Re-check of the in-scope invalidations, lock-free.
+    ///
+    /// `live` catches the scope's own quarantine (and a destroy in it). `handle_state` catches
+    /// every *cross-thread* move of this vCPU's registry record: the record is removed only in
+    /// `destroy_registered_vcpu` (owner-only, and it stores `VCPU_HANDLE_CLOSING` first), or in
+    /// `record_vcpu_cleanup` / `quarantine_vcpu_without_cleanup` / the cleanup sweep, which touch
+    /// only records already marked non-`LIVE` under the same `vcpu_ownership` lock -- so a record
+    /// still reading `VCPU_HANDLE_LIVE` cannot have been moved by anyone else. `abandoned` and
+    /// `cleanup_required` are the two atomics each of the five admissions this collapses tested at
+    /// entry; a sticky `cleanup_required` means unrecoverable and every setter also requests
+    /// poison. These four loads are what `begin_existing_vcpu_operation` would have run per step.
+    fn require_live(&self) -> Result<(), HvfError> {
+        let vm = self.vcpu.vm;
+        if !self.vcpu.live
+            || self.vcpu.handle_state.load(Ordering::Acquire) != VCPU_HANDLE_LIVE
+        {
+            return Err(HvfError::VcpuNotLive);
+        }
+        if vm.operation_gate.abandoned.load(Ordering::Acquire) {
+            return Err(HvfError::OperationAbandoned);
+        }
+        if vm.cleanup_required.load(Ordering::Acquire) {
+            return Err(HvfError::Poisoned);
+        }
+        Ok(())
+    }
+
+    /// Arms the run's time slice inside the scope's single admission.
+    pub(crate) fn arm_vtimer(&mut self, cval: u64) -> Result<(), HvfError> {
+        self.require_live()?;
+        let HvfRunScope { vcpu, publication } = self;
+        HvfVcpu::arm_vtimer_in_operation(vcpu, publication, cval)
+    }
+
+    /// [`HvfVcpu::set_architectural_state`] inside the scope.
+    pub(crate) fn set_architectural_state(
+        &mut self,
+        state: &HvfArchitecturalState,
+        context: HvfPstateContext,
+    ) -> Result<(), HvfError> {
+        self.require_live()?;
+        let HvfRunScope { vcpu, publication } = self;
+        HvfVcpu::install_full_state_in_operation(vcpu, publication, state, context)
+    }
+
+    /// [`HvfVcpu::install_guest_state`] inside the scope: the run's whole per-run install (arm
+    /// included) with no admission of its own.
+    pub(crate) fn install_guest_state(
+        &mut self,
+        desired: &HvfArchitecturalState,
+        context: HvfPstateContext,
+        fp: HvfFpInstall,
+        vtimer_cval: Option<u64>,
+    ) -> Result<HvfInstallReport, HvfError> {
+        self.require_live()?;
+        let HvfRunScope { vcpu, publication } = self;
+        HvfVcpu::install_resident_state_in_operation(vcpu, publication, desired, context, fp, vtimer_cval)
+    }
+
+    /// The raw `hv_vcpu_run`, preceded by [`Self::require_live`] so a poison or abandon that
+    /// landed after scope entry never enters the guest.
+    pub(crate) fn run(&mut self) -> Result<HvfVcpuExit, HvfError> {
+        self.require_live()?;
+        self.vcpu.last_run_installs_before = core::mem::take(&mut self.vcpu.installs_since_run);
+        self.vcpu.last_run_raw_ticks = 0;
+        let HvfRunScope { vcpu, publication } = self;
+        HvfVcpu::run_in_operation(vcpu, publication)
+    }
+
+    pub(crate) fn architectural_state_unclassified(
+        &mut self,
+    ) -> Result<HvfArchitecturalState, HvfError> {
+        self.require_live()?;
+        let HvfRunScope { vcpu, publication } = self;
+        HvfVcpu::read_full_state_in_operation(vcpu, publication)
+    }
+
+    /// [`HvfVcpu::read_guest_exit_state`] inside the scope.
+    pub(crate) fn read_guest_exit_state(&mut self) -> Result<HvfArchitecturalState, HvfError> {
+        self.require_live()?;
+        let HvfRunScope { vcpu, publication } = self;
+        HvfVcpu::read_exit_state_in_operation(vcpu, publication)
+    }
+}
+
 pub(crate) struct HvfVm {
     report: HvfVmReport,
     monitor: HvfMonitor,
     admitted_features: HvfFeatureRegisters,
     operation_gate: HvfVmOperationGate,
-    mapping_registry: Mutex<HvfMappingRegistry>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_MAPPING_REGISTRY`]).
+    mapping_registry: RankedMutex<HvfMappingRegistry>,
     cleanup_required: AtomicBool,
-    vcpu_ownership: Mutex<HvfVcpuOwnership>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_VCPU_OWNERSHIP`]). Locked through
+    /// [`crate::diagnostics_counters::lock_vcpu_ownership`] or directly, both of which join the
+    /// held set.
+    vcpu_ownership: RankedMutex<HvfVcpuOwnership>,
+    /// CLASS C: a lock-free mirror of `vcpu_ownership`'s structural version. Bumped (Release)
+    /// under the `vcpu_ownership` lock on every change to `active`, read (Acquire) by
+    /// [`HvfVcpu::require_owner_live`] so the vast majority of membership checks never take the
+    /// VM-global mutex. Never 0, so a fresh memo (0) always misses.
+    vcpu_ownership_version: AtomicU64,
 }
 
 impl fmt::Debug for HvfVm {
@@ -2248,6 +2448,13 @@ impl fmt::Debug for HvfVm {
 }
 
 impl HvfVm {
+    /// CLASS C: publishes a structural change to `vcpu_ownership.active` to every vCPU's cached
+    /// membership verdict. Callers MUST hold the `vcpu_ownership` lock, so no memo can be computed
+    /// against a version whose change it does not see.
+    fn bump_vcpu_ownership_version(&self) {
+        self.vcpu_ownership_version.fetch_add(1, Ordering::Release);
+    }
+
     /// Promotes a published poison request only when no admission remains.
     /// Called while `operation_gate.state` is locked by every finish path, so
     /// the final departing admission performs one allocation-free state
@@ -2429,9 +2636,16 @@ impl HvfVm {
                     idle: Condvar::new(),
                     abandoned: AtomicBool::new(false),
                 },
-                mapping_registry: Mutex::new(HvfMappingRegistry::default()),
+                mapping_registry: RankedMutex::new(
+                    HvfMappingRegistry::default(),
+                    crate::diagnostics_counters::RANK_MAPPING_REGISTRY,
+                ),
                 cleanup_required: AtomicBool::new(false),
-                vcpu_ownership: Mutex::new(vcpu_ownership),
+                vcpu_ownership: RankedMutex::new(
+                    vcpu_ownership,
+                    crate::diagnostics_counters::RANK_VCPU_OWNERSHIP,
+                ),
+                vcpu_ownership_version: AtomicU64::new(1),
             })
         })
     }
@@ -2486,11 +2700,29 @@ impl HvfVm {
             .is_some_and(|owner| owner == current)
     }
 
+    /// CLASS A: every wait on the operation-gate FIFO goes through here, so this is the one
+    /// place that can see a thread joining the FIFO (a wait of up to `OPERATION_WAIT_TIMEOUT`)
+    /// while it holds a lock -- the shape T1g was. Counted per wait round, at the waiting
+    /// thread's call site.
+    #[track_caller]
     fn wait_for_operation_state<'a>(
         &self,
         state: MutexGuard<'a, HvfVmOperationState>,
         deadline: Instant,
     ) -> (MutexGuard<'a, HvfVmOperationState>, bool) {
+        crate::diagnostics_counters::rank_note_blocking_wait(
+            crate::diagnostics_counters::RK_GATE_ADMIT,
+            std::panic::Location::caller(),
+        );
+        // Step GF (fix-up): this is the one place every wait on the operation-gate FIFO goes
+        // through, and it is the desktop's single largest blocked wait (4.13 thread-seconds per
+        // wall-second during the drive phase, against 0.77 typing and 1.13 idle). A guest thread
+        // reaches it from inside its own dispatch, i.e. while the lane it retained before that
+        // dispatch is parked in `RETAINED_LANE` -- a lane no other thread can run on and no loop
+        // top is coming to reclaim. Give it back before parking; the next loop top re-acquires.
+        crate::hvf_backend::release_retained_lane(
+            crate::diagnostics_counters::LANE_STICKY_RELEASED_GATE,
+        );
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return (state, true);
@@ -3260,6 +3492,40 @@ impl HvfVm {
         self.with_operation_inner(true, OPERATION_WAIT_TIMEOUT, body)
     }
 
+    /// CLASS C: exactly [`Self::with_cleanup_operation`], except that the site is declared
+    /// `Batched` in the per-site admission table: one admission deliberately covers N items (the
+    /// retirement pump's tickets), each with its own `mark_published`. The declaration is what
+    /// makes the batching visible in `--counters` and what lets the class guard tell a batched
+    /// exclusive admission apart from a per-item one.
+    #[track_caller]
+    pub(crate) fn with_batched_cleanup_operation<T, E>(
+        &self,
+        body: impl FnOnce(&HvfVmOperation<'_>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: HvfOperationError,
+    {
+        let operation = self
+            .begin_operation_inner(true, OPERATION_WAIT_TIMEOUT, std::panic::Location::caller())
+            .map_err(E::from)?;
+        // RAII: released on every path out of this frame, including a panic in
+        // `declare_site_class` or in `operation.finish` (a manual release used to leak one hold
+        // into this thread's held set for the rest of the thread's life).
+        let gate_own = crate::diagnostics_counters::rank_hold_gate_own();
+        crate::diagnostics_counters::declare_site_class(
+            operation.frame.site,
+            crate::diagnostics_counters::SITE_KIND_BATCHED,
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&operation)));
+        let body_panicked = result.is_err();
+        let finish = operation.finish(body_panicked);
+        drop(gate_own);
+        match result {
+            Ok(result) => self.finish_operation(result, finish),
+            Err(payload) => self.resume_operation_panic(payload, finish),
+        }
+    }
+
     #[track_caller]
     pub(crate) fn with_capability_operation<T, E>(
         &self,
@@ -3272,6 +3538,7 @@ impl HvfVm {
         let operation = self
             .begin_operation_inner(false, OPERATION_WAIT_TIMEOUT, std::panic::Location::caller())
             .map_err(E::from)?;
+        let gate_own = crate::diagnostics_counters::rank_hold_gate_own();
         // Validation and capability-return marking run inside the same
         // catch_unwind as `body`: either can panic (an invariant check in
         // `validate_hvf_completion`, or `mark_capability_returned`'s own
@@ -3298,6 +3565,7 @@ impl HvfVm {
         let body_panicked = result.is_err();
         let exact_capability_returned = operation.frame.direct_capability_returned.get();
         let finish = operation.finish(body_panicked);
+        drop(gate_own);
         match result {
             Ok(result) => {
                 self.finish_capability_operation(result, finish, exact_capability_returned)
@@ -3319,9 +3587,11 @@ impl HvfVm {
         let operation = self
             .begin_operation_inner(cleanup, wait_timeout, std::panic::Location::caller())
             .map_err(E::from)?;
+        let gate_own = crate::diagnostics_counters::rank_hold_gate_own();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&operation)));
         let body_panicked = result.is_err();
         let finish = operation.finish(body_panicked);
+        drop(gate_own);
         match result {
             Ok(result) => self.finish_operation(result, finish),
             Err(payload) => self.resume_operation_panic(payload, finish),
@@ -3342,9 +3612,11 @@ impl HvfVm {
         let operation = self
             .begin_operation_inner(cleanup, wait_timeout, std::panic::Location::caller())
             .map_err(E::from)?;
+        let gate_own = crate::diagnostics_counters::rank_hold_gate_own();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&operation)));
         let body_panicked = result.is_err();
         let finish = operation.finish_observed(body_panicked, on_published_panic_latched);
+        drop(gate_own);
         match result {
             Ok(result) => self.finish_operation(result, finish),
             Err(payload) => self.resume_operation_panic(payload, finish),
@@ -3564,7 +3836,9 @@ impl HvfVm {
         operation.mark_hvf_published()?;
         handle_state.store(VCPU_HANDLE_CLOSING, Ordering::Release);
         drop(ownership);
-        Ok(unsafe { litebox_hvf_vcpu_destroy(identifier) })
+        Ok(crate::diagnostics_counters::rank_host_call(|| unsafe {
+            litebox_hvf_vcpu_destroy(identifier)
+        }))
     }
 
     pub(crate) fn poison(&self) {
@@ -3689,10 +3963,13 @@ impl HvfVm {
                         owner: reservation.owner,
                         handle_state: Arc::clone(&reservation.handle_state),
                         live: true,
+                        // Version 0 is never a real version, so the first check always scans.
+                        ownership_memo: AtomicU64::new(0),
                         installs_since_run: 0,
                         last_run_raw_ticks: 0,
                         last_run_installs_before: 0,
                         resident: HvfResidentRegisters::new(),
+                        armed_vtimer_cval: 0,
                         not_send: PhantomData,
                     };
                     creation_guard.disarm();
@@ -3832,6 +4109,10 @@ impl HvfVm {
             owner: pending.owner,
             handle_state: pending.handle_state,
         });
+        // CLASS C: every structural change to `active` bumps the version mirror, so a vCPU's
+        // cached membership verdict (`HvfVcpu::ownership_memo`) can never outlive the table it
+        // was computed from.
+        self.bump_vcpu_ownership_version();
         drop(ownership);
         Ok((identifier, exit_area, guard))
     }
@@ -3914,7 +4195,9 @@ impl HvfVm {
         }
 
         handle_state.store(VCPU_HANDLE_CLOSING, Ordering::Release);
-        let cleanup = unsafe { litebox_hvf_vcpu_destroy(identifier) };
+        let cleanup = crate::diagnostics_counters::rank_host_call(|| unsafe {
+            litebox_hvf_vcpu_destroy(identifier)
+        });
         if succeeded(cleanup) {
             if let Some(index) = pending_index {
                 let record = ownership.pending.remove(index);
@@ -3926,6 +4209,7 @@ impl HvfVm {
                 record
                     .handle_state
                     .store(VCPU_HANDLE_CLOSED, Ordering::Release);
+                self.bump_vcpu_ownership_version();
             }
             return;
         }
@@ -3976,6 +4260,9 @@ impl HvfVm {
                 && record.owner == owner
                 && Arc::ptr_eq(&record.handle_state, handle_state))
         });
+        // CLASS C: unconditional -- a `retain` may or may not have removed a row, and an extra
+        // bump only costs one re-scan of a table this thread already has locked.
+        self.bump_vcpu_ownership_version();
         if let Some(cleanup_code) = cleanup_code {
             handle_state.store(VCPU_HANDLE_RETRY_QUEUED, Ordering::Release);
             if let Some(index) = quarantine_index {
@@ -4029,6 +4316,8 @@ impl HvfVm {
                 && record.owner == owner
                 && Arc::ptr_eq(&record.handle_state, handle_state))
         });
+        // CLASS C: unconditional (see `record_vcpu_cleanup`).
+        self.bump_vcpu_ownership_version();
         handle_state.store(VCPU_HANDLE_RETRY_QUEUED, Ordering::Release);
         if !already_quarantined {
             ownership.quarantined.push(HvfQuarantinedVcpu {
@@ -4218,7 +4507,9 @@ impl HvfVm {
                 ownership.pending[index]
                     .handle_state
                     .store(VCPU_HANDLE_CLOSING, Ordering::Release);
-                let result = unsafe { litebox_hvf_vcpu_destroy(identifier) };
+                let result = crate::diagnostics_counters::rank_host_call(|| unsafe {
+                    litebox_hvf_vcpu_destroy(identifier)
+                });
                 if succeeded(result) {
                     let record = ownership.pending.remove(index);
                     record
@@ -4257,8 +4548,9 @@ impl HvfVm {
                 ownership.quarantined[index]
                     .handle_state
                     .store(VCPU_HANDLE_CLOSING, Ordering::Release);
-                let result =
-                    unsafe { litebox_hvf_vcpu_destroy(ownership.quarantined[index].identifier) };
+                let result = crate::diagnostics_counters::rank_host_call(|| unsafe {
+                    litebox_hvf_vcpu_destroy(ownership.quarantined[index].identifier)
+                });
                 if succeeded(result) {
                     let record = ownership.quarantined.remove(index);
                     record
@@ -4299,8 +4591,9 @@ impl HvfVm {
                 ownership.active[index]
                     .handle_state
                     .store(VCPU_HANDLE_CLOSING, Ordering::Release);
-                let result =
-                    unsafe { litebox_hvf_vcpu_destroy(ownership.active[index].identifier) };
+                let result = crate::diagnostics_counters::rank_host_call(|| unsafe {
+                    litebox_hvf_vcpu_destroy(ownership.active[index].identifier)
+                });
                 if succeeded(result) {
                     let record = ownership.active.remove(index);
                     record
@@ -4317,6 +4610,8 @@ impl HvfVm {
                         .store(VCPU_HANDLE_RETRY_QUEUED, Ordering::Release);
                 }
             }
+            // CLASS C: unconditional -- the sweep may have removed rows from `active`.
+            self.bump_vcpu_ownership_version();
             match first_failure {
                 Some(error) => Err(error),
                 None => Ok(released),
@@ -4439,14 +4734,14 @@ impl HvfVm {
                         mapping_error = Some(error);
                         break;
                     }
-                    let result = unsafe {
+                    let result = crate::diagnostics_counters::rank_host_call(|| unsafe {
                         litebox_hvf_vm_map(
                             host_address as *mut c_void,
                             fragment.ipa,
                             fragment.length,
                             permissions.0,
                         )
-                    };
+                    });
                     if !succeeded(result) {
                         mapping_error = Some(HvfError::Call {
                             operation: "hv_vm_map",
@@ -4570,7 +4865,9 @@ impl HvfVm {
                     None => error,
                 });
             }
-            let result = unsafe { litebox_hvf_vm_unmap(fragment.ipa, fragment.length) };
+            let result = crate::diagnostics_counters::rank_host_call(|| unsafe {
+                litebox_hvf_vm_unmap(fragment.ipa, fragment.length)
+            });
             if succeeded(result) {
                 fragment.state = HvfMappingFragmentState::Absent;
                 fragment.last_unmap_error = None;
@@ -5247,14 +5544,16 @@ const VCPU_HANDLE_RETRY_QUEUED: u8 = 3;
 
 struct HvfVcpuControl {
     state: AtomicU8,
-    sdk_call: Mutex<()>,
+    /// CLASS A: ranked ([`crate::diagnostics_counters::RANK_SDK_CALL`]); every SDK entry point
+    /// that mutates a vCPU's handle state takes it, below `vcpu_ownership`.
+    sdk_call: RankedMutex<()>,
 }
 
 impl HvfVcpuControl {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(VCPU_HANDLE_LIVE),
-            sdk_call: Mutex::new(()),
+            sdk_call: RankedMutex::new((), crate::diagnostics_counters::RANK_SDK_CALL),
         }
     }
 
@@ -5548,8 +5847,9 @@ impl HvfMapping<'_> {
                 return Err(HvfError::MappingNotLive);
             }
             operation.mark_published()?;
-            let result =
-                unsafe { litebox_hvf_vm_protect(self.ipa, self.host_range.len(), permissions.0) };
+            let result = crate::diagnostics_counters::rank_host_call(|| unsafe {
+                litebox_hvf_vm_protect(self.ipa, self.host_range.len(), permissions.0)
+            });
             if !succeeded(result) {
                 record.lifecycle = HvfMappingLifecycle::Quarantined;
                 record.permissions_unknown = true;
@@ -5607,7 +5907,9 @@ impl HvfMapping<'_> {
                 return Err(HvfError::MappingNotLive);
             }
             operation.mark_published()?;
-            let result = unsafe { litebox_hvf_vm_unmap(self.ipa + 1, self.host_range.len()) };
+            let result = crate::diagnostics_counters::rank_host_call(|| unsafe {
+                litebox_hvf_vm_unmap(self.ipa + 1, self.host_range.len())
+            });
             record.lifecycle = HvfMappingLifecycle::Quarantined;
             record
                 .handle_state
@@ -5881,11 +6183,17 @@ pub(crate) struct HvfVcpu {
     owner: std::thread::ThreadId,
     handle_state: Arc<HvfVcpuControl>,
     live: bool,
+    /// CLASS C memo of the `vcpu_ownership` membership verdict; see [`Self::require_owner_live`].
+    ownership_memo: AtomicU64,
     installs_since_run: u32,
     last_run_raw_ticks: u64,
     last_run_installs_before: u32,
     /// FXR resident-register cache; see [`HvfResidentRegisters`].
     resident: HvfResidentRegisters,
+    /// RUNWALL FC2: the guest-counter deadline this vCPU's virtual timer is currently armed with,
+    /// 0 when it is not armed. The slice is armed once and re-armed when that deadline is a whole
+    /// slice behind, instead of on every run; see [`HvfVcpu::vtimer_arm_due`].
+    armed_vtimer_cval: u64,
     not_send: PhantomData<Rc<()>>,
 }
 
@@ -5936,17 +6244,42 @@ impl HvfVcpu {
                 identifier: self.identifier,
             });
         }
-        let ownership = self
-            .vm
-            .vcpu_ownership
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if ownership.active.iter().any(|record| {
+        // CLASS C: this membership lookup reads a VM-global mutex to validate ONE vCPU's own
+        // record -- measured at ~10.8k acquisitions/s on the desktop (~4.5 per guest run), every
+        // one of them contending with every other lane's vCPU bookkeeping for a table whose
+        // structural changes are rare (vCPU create/destroy only; a lane migration moves address
+        // spaces, not ownership rows). Memoize it per vCPU against `vcpu_ownership_version`, which
+        // every structural change to `active` bumps *under the same lock*: if the version is
+        // unchanged, the cached verdict is still exact, because the predicate reads only immutable
+        // record fields (identifier, generation, owner, handle_state identity). A bump is
+        // conservative -- it can only cost a re-scan, never a stale verdict -- and
+        // `self.live` / `handle_state` are re-read lock-free first, exactly as
+        // `HvfRunScope::require_live` already does.
+        let version = self.vm.vcpu_ownership_version.load(Ordering::Acquire);
+        let memo = self.ownership_memo.load(Ordering::Relaxed);
+        if crate::diagnostics_counters::vcpu_ownership_memo_version(memo) == version {
+            crate::diagnostics_counters::record_vcpu_ownership_memo();
+            if crate::diagnostics_counters::vcpu_ownership_memo_live(memo) {
+                return Ok(());
+            }
+            return Err(HvfError::VcpuNotLive);
+        }
+        let ownership = crate::diagnostics_counters::lock_vcpu_ownership(&self.vm.vcpu_ownership);
+        let live = ownership.active.iter().any(|record| {
             record.identifier == self.identifier
                 && record.generation == self.generation
                 && record.owner == self.owner
                 && Arc::ptr_eq(&record.handle_state, &self.handle_state)
-        }) {
+        });
+        // Read the version *under* the lock: no other thread can bump it while we hold it, so the
+        // memo we store is exact for the scan we just did.
+        let scanned_at = self.vm.vcpu_ownership_version.load(Ordering::Acquire);
+        self.ownership_memo.store(
+            crate::diagnostics_counters::vcpu_ownership_memo(scanned_at, live),
+            Ordering::Relaxed,
+        );
+        drop(ownership);
+        if live {
             Ok(())
         } else {
             Err(HvfError::VcpuNotLive)
@@ -5960,12 +6293,17 @@ impl HvfVcpu {
     ) -> Result<T, HvfError> {
         let vm = self.vm;
         let operation = vm.begin_existing_vcpu_operation(std::panic::Location::caller())?;
+        // The existing-vCPU frame is the hottest gate path in the crate (~14 acquisitions per
+        // syscall, per FACTS), so it registers too: a FIFO join or a wait by a thread holding
+        // *only* this frame was invisible while only the exclusive wrappers registered.
+        let gate_own = crate::diagnostics_counters::rank_hold_gate_own();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.require_owner_live()?;
             body(self, &operation)
         }));
         let body_panicked = result.is_err();
         let finish = operation.finish(body_panicked);
+        drop(gate_own);
         match result {
             Ok(result) => vm.finish_operation(result, finish),
             Err(payload) => vm.resume_operation_panic(payload, finish),
@@ -5980,12 +6318,51 @@ impl HvfVcpu {
     ) -> Result<T, HvfError> {
         let vm = self.vm;
         let operation = vm.begin_existing_vcpu_operation(std::panic::Location::caller())?;
+        let gate_own = crate::diagnostics_counters::rank_hold_gate_own();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.require_owner_live()?;
             body(self, &operation)
         }));
         let body_panicked = result.is_err();
         let finish = operation.finish_observed(body_panicked, on_published_panic_latched);
+        drop(gate_own);
+        match result {
+            Ok(result) => vm.finish_operation(result, finish),
+            Err(payload) => vm.resume_operation_panic(payload, finish),
+        }
+    }
+
+    /// T2d: ONE existing-vCPU operation around a whole run (arm + install + `hv_vcpu_run` +
+    /// execution-time read + exit read). B1-B6 once, O1 once, M1 lazily before the first mutating
+    /// HVF call (see [`HvfRunScope`]) and F once -- ten gate mutex acquisitions per run become
+    /// three. The body's own refusals are returned unchanged; a panic, a poison or an abandon is
+    /// handled exactly as [`Self::with_existing_operation`] handles it.
+    #[track_caller]
+    pub(crate) fn with_run_scope<T, E: HvfOperationError>(
+        &mut self,
+        body: impl FnOnce(&mut HvfRunScope<'_, '_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let vm = self.vm;
+        let operation = vm
+            .begin_existing_vcpu_operation(std::panic::Location::caller())
+            .map_err(E::from)?;
+        // One existing-vCPU frame for the whole run (arm + install + run + read + exit read),
+        // registered like the others: this is the frame every `hv_vcpu_run` happens inside.
+        let scope_gate_own = crate::diagnostics_counters::rank_hold_gate_own();
+        let mut scope = HvfRunScope {
+            vcpu: self,
+            publication: HvfRunPublication {
+                operation: &operation,
+                published: Cell::new(false),
+            },
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scope.vcpu.require_owner_live().map_err(E::from)?;
+            body(&mut scope)
+        }));
+        let body_panicked = result.is_err();
+        let finish = operation.finish(body_panicked);
+        drop(scope_gate_own);
         match result {
             Ok(result) => vm.finish_operation(result, finish),
             Err(payload) => vm.resume_operation_panic(payload, finish),
@@ -6129,28 +6506,36 @@ impl HvfVcpu {
         &mut self,
     ) -> Result<HvfArchitecturalState, HvfError> {
         self.with_existing_operation(|vcpu, operation| {
-            let mut state = HvfArchitecturalState::default();
-            let result =
-                unsafe { litebox_hvf_vcpu_get_arch_state(vcpu.identifier, &raw mut state) };
-            if !succeeded(result) {
-                let trigger = HvfError::Call {
-                    operation: "hv_vcpu_get_reg/FP/sys_reg",
-                    code: result,
-                };
-                return Err(vcpu.quarantine(operation, trigger));
-            }
-            if !state.has_valid_header() {
-                return Err(vcpu.quarantine(operation, HvfError::InvalidArchitectureState));
-            }
-            vcpu.resident.read(&state, install_mask::SCALAR);
-            vcpu.resident.fp_unsaved = false;
-            vcpu.resident.verify_fp = state_verify_enabled().then(|| HvfGuestFp::of(&state));
-            crate::diagnostics_counters::record_resident(
-                crate::diagnostics_counters::RESIDENT_FULL_READS,
-                1,
-            );
-            Ok(state)
+            Self::read_full_state_in_operation(vcpu, operation)
         })
+    }
+
+    /// The body of [`HvfVcpu::architectural_state_unclassified`] / [`HvfRunScope::architectural_
+    /// state_unclassified`].
+    fn read_full_state_in_operation(
+        vcpu: &mut HvfVcpu,
+        operation: &impl HvfPublicationCapability,
+    ) -> Result<HvfArchitecturalState, HvfError> {
+        let mut state = HvfArchitecturalState::default();
+        let result = unsafe { litebox_hvf_vcpu_get_arch_state(vcpu.identifier, &raw mut state) };
+        if !succeeded(result) {
+            let trigger = HvfError::Call {
+                operation: "hv_vcpu_get_reg/FP/sys_reg",
+                code: result,
+            };
+            return Err(vcpu.quarantine(operation, trigger));
+        }
+        if !state.has_valid_header() {
+            return Err(vcpu.quarantine(operation, HvfError::InvalidArchitectureState));
+        }
+        vcpu.resident.read(&state, install_mask::SCALAR);
+        vcpu.resident.fp_unsaved = false;
+        vcpu.resident.verify_fp = state_verify_enabled().then(|| HvfGuestFp::of(&state));
+        crate::diagnostics_counters::record_resident(
+            crate::diagnostics_counters::RESIDENT_FULL_READS,
+            1,
+        );
+        Ok(state)
     }
 
     /// The full 74-register install of `state` (the synchronization trip's scratch state and every
@@ -6164,46 +6549,54 @@ impl HvfVcpu {
         context: HvfPstateContext,
     ) -> Result<(), HvfError> {
         self.with_existing_operation(|vcpu, operation| {
-            if !state.has_valid_header() {
-                return Err(HvfError::InvalidArchitectureState);
-            }
-            state.validate_install(context)?;
-            if vcpu.resident.fp_unsaved {
-                return Err(HvfError::ResidentFpUnsaved);
-            }
-            operation.mark_published()?;
-            let verify = state_verify_enabled();
-            let mut readback = HvfArchitecturalState::default();
-            let result = if verify {
-                unsafe { litebox_hvf_vcpu_set_arch_state(vcpu.identifier, state, &raw mut readback) }
-            } else {
-                unsafe {
-                    litebox_hvf_vcpu_install_arch_state(vcpu.identifier, state, install_mask::ALL)
-                }
-            };
-            if !succeeded(result) {
-                let trigger = HvfError::Call {
-                    operation: "hv_vcpu_set_reg/FP/sys_reg",
-                    code: result,
-                };
-                return Err(vcpu.quarantine(operation, trigger));
-            }
-            if verify {
-                let exact = readback == *state;
-                crate::diagnostics_counters::record_resident_verify(exact);
-                if !exact {
-                    return Err(vcpu.quarantine(operation, HvfError::ArchitectureStateReadback));
-                }
-            }
-            vcpu.resident.installed(state, install_mask::SCALAR);
-            vcpu.resident.verify_fp = verify.then(|| HvfGuestFp::of(state));
-            vcpu.installs_since_run = vcpu.installs_since_run.saturating_add(1);
-            crate::diagnostics_counters::record_resident(
-                crate::diagnostics_counters::RESIDENT_INSTALLS_FULL_STATE,
-                1,
-            );
-            Ok(())
+            Self::install_full_state_in_operation(vcpu, operation, state, context)
         })
+    }
+
+    /// The body of [`HvfVcpu::set_architectural_state`] / [`HvfRunScope::set_architectural_state`].
+    fn install_full_state_in_operation(
+        vcpu: &mut HvfVcpu,
+        operation: &impl HvfPublicationCapability,
+        state: &HvfArchitecturalState,
+        context: HvfPstateContext,
+    ) -> Result<(), HvfError> {
+        if !state.has_valid_header() {
+            return Err(HvfError::InvalidArchitectureState);
+        }
+        state.validate_install(context)?;
+        if vcpu.resident.fp_unsaved {
+            return Err(HvfError::ResidentFpUnsaved);
+        }
+        operation.mark_hvf_published()?;
+        let verify = state_verify_enabled();
+        let mut readback = HvfArchitecturalState::default();
+        let result = if verify {
+            unsafe { litebox_hvf_vcpu_set_arch_state(vcpu.identifier, state, &raw mut readback) }
+        } else {
+            unsafe { litebox_hvf_vcpu_install_arch_state(vcpu.identifier, state, install_mask::ALL) }
+        };
+        if !succeeded(result) {
+            let trigger = HvfError::Call {
+                operation: "hv_vcpu_set_reg/FP/sys_reg",
+                code: result,
+            };
+            return Err(vcpu.quarantine(operation, trigger));
+        }
+        if verify {
+            let exact = readback == *state;
+            crate::diagnostics_counters::record_resident_verify(exact);
+            if !exact {
+                return Err(vcpu.quarantine(operation, HvfError::ArchitectureStateReadback));
+            }
+        }
+        vcpu.resident.installed(state, install_mask::SCALAR);
+        vcpu.resident.verify_fp = verify.then(|| HvfGuestFp::of(state));
+        vcpu.installs_since_run = vcpu.installs_since_run.saturating_add(1);
+        crate::diagnostics_counters::record_resident(
+            crate::diagnostics_counters::RESIDENT_INSTALLS_FULL_STATE,
+            1,
+        );
+        Ok(())
     }
 
     /// Declares the vCPU's unsaved SIMD/FP file dead: the caller either holds a newer copy that
@@ -6221,11 +6614,16 @@ impl HvfVcpu {
     /// registers are returned to the zeroed pre-FXR shape on every exit that changed them), and
     /// the SIMD file iff `fp` is [`HvfFpInstall::Install`]. Release and verify mode install the
     /// same set, so verify-mode evidence covers the release path. `vtimer_cval` arms the
-    /// run's time slice in the same entry point and operation (exactly [`Self::arm_vtimer`]), so
-    /// a run's whole per-run install is one admission. Nothing to install, no arm and no
-    /// verification due: no SDK call and no operation admission at all.
-    pub(crate) fn install_guest_state(
-        &mut self,
+    /// run's time slice in the same entry point (exactly `arm_vtimer`), so a run's whole per-run
+    /// install is one SDK entry point.
+    ///
+    /// T2d: it runs inside a caller-supplied operation -- a [`HvfRunScope`] on the run path -- and
+    /// publishes that operation at its first mutating HVF call (the arm or the install) and never
+    /// again, so a validation refusal here leaves the frame unpublished exactly as before. Nothing
+    /// to install, no arm and no verification due: no SDK call at all.
+    fn install_resident_state_in_operation(
+        vcpu: &mut HvfVcpu,
+        operation: &impl HvfPublicationCapability,
         desired: &HvfArchitecturalState,
         context: HvfPstateContext,
         fp: HvfFpInstall,
@@ -6235,7 +6633,7 @@ impl HvfVcpu {
             return Err(HvfError::InvalidArchitectureState);
         }
         desired.validate_install(context)?;
-        if !self.live {
+        if !vcpu.live {
             return Err(HvfError::VcpuNotLive);
         }
         // Review fix-up (FXR-c1): the compared set is [`install_mask::SCALAR`] in *both* modes.
@@ -6247,19 +6645,59 @@ impl HvfVcpu {
         // host takes FAR_EL1 only from the fresh 39-get exit read), but "dead between exits" was an
         // unwitnessed assumption, and it meant the 3.35M-readback / 0-mismatch verify result did
         // NOT witness the release install mask. Comparing them in release mode makes release
-        // install exactly what verify installs, so that evidence transfers. The extra cost is a
-        // host-side compare over five more registers, plus one `hv_vcpu_set_sys_reg` each for
-        // SPSR/ELR/ESR/FAR_EL1 on exits that changed them -- measured, see the FXR witness.
+        // install exactly what verify installs, so that evidence transfers. RUNWALL FC2 later
+        // narrowed the *compared* set for EL0 entries only (see `compared` below): they are dead
+        // between exits precisely because an EL0 entry's next exception entry rewrites them, and
+        // the cost the FXR witness measured (a host-side compare over five more registers plus
+        // one `hv_vcpu_set_sys_reg` each for SPSR/ELR/ESR/FAR_EL1 on exits that changed them) is
+        // not only host-side -- each of those writes also costs the following `hv_vcpu_run`.
+        // Verify mode still compares the whole scalar file, so the FXR evidence still covers every
+        // register an EL1 entry installs.
         let verify = state_verify_enabled();
-        let compared = install_mask::SCALAR;
-        let known = self.resident.known;
+        // RUNWALL FC2: on an EL0 entry (`UserEl0t`) the five [`install_mask::DEAD_EL1`] registers
+        // are architecturally dead, so re-zeroing them is not compared -- they are still installed
+        // whenever they are not `known` yet, through the `SCALAR & !known` term below. Exception
+        // entry rewrites SPSR_EL1/ELR_EL1/ESR_EL1 before the monitor's first instruction and the
+        // monitor never uses SP_EL1 (no stack access anywhere in `hvf_monitor.S`), so nothing reads
+        // what a previous exit left there; hardware supplies the values the monitor and the 39-get
+        // exit read actually consume.
+        //
+        // FAR_EL1 is the exception and is handled at the platform boundary instead of here.
+        // Review fix-up (RUNWALL FC2): hardware updates FAR_EL1 only on EC 0x20/0x21/0x24/0x25, so
+        // on an SVC and every other non-abort class a skipped FAR_EL1 still holds the previous
+        // abort's address, and a run entered the monitor with a stale fault address. Adding it back
+        // to `compared` (one `hv_vcpu_set_sys_reg` on the runs that follow an abort exit) was
+        // MEASURED, not assumed, and it costs far more than the single write should: raw
+        // `hv_vcpu_run` p50 in cg2 loaded (4 workers, pages=16) went 1583/1625 ns -> 1875 ns on
+        // two independent builds of each side (5+5 interleaved, twice) and the mean 2300-2365 ->
+        // 2620 ns, while single mode moved by one 24 MHz tick. So the stale value is instead
+        // zeroed where it is consumed: `ExceptionInfo::fault_address` is 0 for every non-abort
+        // class in `hvf_backend.rs`, which is the only unguarded reader (`classify_wx_fault` and
+        // `try_resolve_cow_fault` are already `is_abort`-gated, and `litebox_shim_linux` zeroed it
+        // for non-aborts already). If an EL0-path reader of FAR_EL1 ever appears that is not
+        // `is_abort`-gated, `compared` here must gain `install_mask::FAR_EL1` again -- the file
+        // remembers the cost.
+        //
+        // A host-only probe (`.gm/syscall-bench/runwall/fc2shape.c`, [w2] vs [w3]) measures three
+        // per-run `hv_vcpu_set_sys_reg` calls as +167 ns of the next `hv_vcpu_run` (against +42 ns
+        // for three GPR sets, [w1], and +0 ns for one, [w3]): HVF re-materializes the
+        // system-register trap frame on the following entry. An EL1 entry (`MonitorEl1h`, the
+        // resume and synchronization shapes) is different: there the monitor's own `eret`
+        // consumes ELR_EL1/SPSR_EL1, so those runs keep the full `SCALAR` comparison, and so
+        // does verify mode, whose evidence is about the whole scalar file.
+        let compared = if verify || context != HvfPstateContext::UserEl0t {
+            install_mask::SCALAR
+        } else {
+            install_mask::INTEGER
+        };
+        let known = vcpu.resident.known;
         let mut mask = (install_mask::SCALAR & !known)
-            | self
+            | vcpu
                 .resident
                 .shadow
                 .scalar_differences(desired, compared & known);
         if fp == HvfFpInstall::Install {
-            if self.resident.fp_unsaved {
+            if vcpu.resident.fp_unsaved {
                 return Err(HvfError::ResidentFpUnsaved);
             }
             mask |= install_mask::SIMD;
@@ -6270,10 +6708,10 @@ impl HvfVcpu {
             full: mask & thread_state == thread_state,
         };
         let sample = !verify && {
-            self.resident.installs_until_sample =
-                self.resident.installs_until_sample.saturating_sub(1);
-            if self.resident.installs_until_sample == 0 {
-                self.resident.installs_until_sample = RESIDENT_SAMPLE_INTERVAL;
+            vcpu.resident.installs_until_sample =
+                vcpu.resident.installs_until_sample.saturating_sub(1);
+            if vcpu.resident.installs_until_sample == 0 {
+                vcpu.resident.installs_until_sample = RESIDENT_SAMPLE_INTERVAL;
                 true
             } else {
                 false
@@ -6283,99 +6721,97 @@ impl HvfVcpu {
         if mask == 0 && vtimer_cval.is_none() && !verify && !sample {
             return Ok(report);
         }
-        self.with_existing_operation(|vcpu, operation| {
-            if mask != 0 || vtimer_cval.is_some() {
-                operation.mark_published()?;
-                let result = match vtimer_cval {
-                    Some(cval) => unsafe {
-                        litebox_hvf_vcpu_arm_and_install_arch_state(
-                            vcpu.identifier,
-                            desired,
-                            mask,
-                            cval,
-                        )
-                    },
-                    None => unsafe {
-                        litebox_hvf_vcpu_install_arch_state(vcpu.identifier, desired, mask)
-                    },
+        if mask != 0 || vtimer_cval.is_some() {
+            operation.mark_hvf_published()?;
+            let result = match vtimer_cval {
+                Some(cval) => unsafe {
+                    litebox_hvf_vcpu_arm_and_install_arch_state(
+                        vcpu.identifier,
+                        desired,
+                        mask,
+                        cval,
+                    )
+                },
+                None => unsafe {
+                    litebox_hvf_vcpu_install_arch_state(vcpu.identifier, desired, mask)
+                },
+            };
+            if !succeeded(result) {
+                let trigger = HvfError::Call {
+                    operation: "hv_vcpu_set_reg/FP/sys_reg (resident install)",
+                    code: result,
                 };
-                if !succeeded(result) {
-                    let trigger = HvfError::Call {
-                        operation: "hv_vcpu_set_reg/FP/sys_reg (resident install)",
-                        code: result,
-                    };
-                    return Err(vcpu.quarantine(operation, trigger));
-                }
-                vcpu.resident.installed(desired, mask);
-                if mask & install_mask::SIMD != 0 {
-                    vcpu.resident.verify_fp = verify.then(|| HvfGuestFp::of(desired));
-                }
+                return Err(vcpu.quarantine(operation, trigger));
             }
-            if verify || sample {
-                let mut readback = HvfArchitecturalState::default();
-                let result =
-                    unsafe { litebox_hvf_vcpu_get_arch_state(vcpu.identifier, &raw mut readback) };
-                if !succeeded(result) {
-                    let trigger = HvfError::Call {
-                        operation: "hv_vcpu_get_reg/FP/sys_reg (resident verify)",
-                        code: result,
-                    };
-                    return Err(vcpu.quarantine(operation, trigger));
-                }
-                let scalar_mismatch = vcpu
-                    .resident
-                    .shadow
-                    .scalar_differences(&readback, vcpu.resident.known)
-                    | desired.scalar_differences(&readback, compared);
-                let expected_fp = if mask & install_mask::SIMD != 0 {
-                    Some(HvfGuestFp::of(desired))
-                } else {
-                    vcpu.resident.verify_fp
+            vcpu.resident.installed(desired, mask);
+            if mask & install_mask::SIMD != 0 {
+                vcpu.resident.verify_fp = verify.then(|| HvfGuestFp::of(desired));
+            }
+        }
+        if verify || sample {
+            let mut readback = HvfArchitecturalState::default();
+            let result =
+                unsafe { litebox_hvf_vcpu_get_arch_state(vcpu.identifier, &raw mut readback) };
+            if !succeeded(result) {
+                let trigger = HvfError::Call {
+                    operation: "hv_vcpu_get_reg/FP/sys_reg (resident verify)",
+                    code: result,
                 };
-                let fp_mismatch = expected_fp.is_some_and(|fp| fp != HvfGuestFp::of(&readback));
-                let exact = scalar_mismatch == 0 && !fp_mismatch;
-                if verify {
-                    crate::diagnostics_counters::record_resident_verify(exact);
-                    if !exact {
-                        litebox_util_log::error!(
-                            scalar_mismatch:? = scalar_mismatch, fp_mismatch:? = fp_mismatch,
-                            install_mask:? = mask;
-                            "HVF resident-register verify: the vCPU does not hold the installed state"
-                        );
-                        return Err(vcpu.quarantine(operation, HvfError::ArchitectureStateReadback));
-                    }
-                } else {
-                    crate::diagnostics_counters::record_resident_sampled(exact);
-                    if !exact {
-                        // A cache bug, never expected: say so loudly, then restore the whole
-                        // scalar file (and the SIMD file when this install set it) from the
-                        // authoritative desired state so the next run cannot build on it.
-                        litebox_util_log::error!(
-                            scalar_mismatch:? = scalar_mismatch, fp_mismatch:? = fp_mismatch,
-                            install_mask:? = mask;
-                            "HVF resident-register sampled verify: cache and vCPU disagree; reinstalling"
-                        );
-                        let repair = install_mask::SCALAR | (mask & install_mask::SIMD);
-                        operation.mark_published()?;
-                        let result = unsafe {
-                            litebox_hvf_vcpu_install_arch_state(vcpu.identifier, desired, repair)
+                return Err(vcpu.quarantine(operation, trigger));
+            }
+            let scalar_mismatch = vcpu
+                .resident
+                .shadow
+                .scalar_differences(&readback, vcpu.resident.known)
+                | desired.scalar_differences(&readback, compared);
+            let expected_fp = if mask & install_mask::SIMD != 0 {
+                Some(HvfGuestFp::of(desired))
+            } else {
+                vcpu.resident.verify_fp
+            };
+            let fp_mismatch = expected_fp.is_some_and(|fp| fp != HvfGuestFp::of(&readback));
+            let exact = scalar_mismatch == 0 && !fp_mismatch;
+            if verify {
+                crate::diagnostics_counters::record_resident_verify(exact);
+                if !exact {
+                    litebox_util_log::error!(
+                        scalar_mismatch:? = scalar_mismatch, fp_mismatch:? = fp_mismatch,
+                        install_mask:? = mask;
+                        "HVF resident-register verify: the vCPU does not hold the installed state"
+                    );
+                    return Err(vcpu.quarantine(operation, HvfError::ArchitectureStateReadback));
+                }
+            } else {
+                crate::diagnostics_counters::record_resident_sampled(exact);
+                if !exact {
+                    // A cache bug, never expected: say so loudly, then restore the whole
+                    // scalar file (and the SIMD file when this install set it) from the
+                    // authoritative desired state so the next run cannot build on it.
+                    litebox_util_log::error!(
+                        scalar_mismatch:? = scalar_mismatch, fp_mismatch:? = fp_mismatch,
+                        install_mask:? = mask;
+                        "HVF resident-register sampled verify: cache and vCPU disagree; reinstalling"
+                    );
+                    let repair = install_mask::SCALAR | (mask & install_mask::SIMD);
+                    operation.mark_hvf_published()?;
+                    let result = unsafe {
+                        litebox_hvf_vcpu_install_arch_state(vcpu.identifier, desired, repair)
+                    };
+                    if !succeeded(result) {
+                        let trigger = HvfError::Call {
+                            operation: "hv_vcpu_set_reg/FP/sys_reg (resident repair)",
+                            code: result,
                         };
-                        if !succeeded(result) {
-                            let trigger = HvfError::Call {
-                                operation: "hv_vcpu_set_reg/FP/sys_reg (resident repair)",
-                                code: result,
-                            };
-                            return Err(vcpu.quarantine(operation, trigger));
-                        }
-                        vcpu.resident.installed(desired, repair);
+                        return Err(vcpu.quarantine(operation, trigger));
                     }
+                    vcpu.resident.installed(desired, repair);
                 }
             }
-            if report.full {
-                vcpu.installs_since_run = vcpu.installs_since_run.saturating_add(1);
-            }
-            Ok(report)
-        })
+        }
+        if report.full {
+            vcpu.installs_since_run = vcpu.installs_since_run.saturating_add(1);
+        }
+        Ok(report)
     }
 
     /// FXR exit read: the 39 registers [`install_mask::EXIT_READ`] names -- X0..X30, SP_EL0, PC,
@@ -6383,41 +6819,43 @@ impl HvfVcpu {
     /// vCPU, unsaved: the returned state's Q/FPCR/FPSR are zero and must not be read (the caller
     /// materializes them with [`Self::read_guest_fp`] when a path needs them); its SP_EL1 is the
     /// cache's known value.
-    pub(crate) fn read_guest_exit_state(&mut self) -> Result<HvfArchitecturalState, HvfError> {
-        self.with_existing_operation(|vcpu, operation| {
-            let mut state = HvfArchitecturalState::default();
-            if vcpu.resident.known & install_mask::SP_EL1 != 0 {
-                state.sp_el1 = vcpu.resident.shadow.sp_el1;
-            }
-            let result =
-                unsafe { litebox_hvf_vcpu_read_exit_state(vcpu.identifier, &raw mut state) };
+    ///
+    /// T2d: on the run path this executes inside the run's single [`HvfRunScope`]; see
+    /// [`HvfRunScope::read_guest_exit_state`].
+    fn read_exit_state_in_operation(
+        vcpu: &mut HvfVcpu,
+        operation: &impl HvfPublicationCapability,
+    ) -> Result<HvfArchitecturalState, HvfError> {
+        let mut state = HvfArchitecturalState::default();
+        if vcpu.resident.known & install_mask::SP_EL1 != 0 {
+            state.sp_el1 = vcpu.resident.shadow.sp_el1;
+        }
+        let result = unsafe { litebox_hvf_vcpu_read_exit_state(vcpu.identifier, &raw mut state) };
+        if !succeeded(result) {
+            let trigger = HvfError::Call {
+                operation: "hv_vcpu_get_reg/sys_reg (exit read)",
+                code: result,
+            };
+            return Err(vcpu.quarantine(operation, trigger));
+        }
+        vcpu.resident.read(&state, install_mask::EXIT_READ);
+        if state_verify_enabled() {
+            let mut simd = HvfArchitecturalState::default();
+            let result = unsafe { litebox_hvf_vcpu_get_simd_state(vcpu.identifier, &raw mut simd) };
             if !succeeded(result) {
                 let trigger = HvfError::Call {
-                    operation: "hv_vcpu_get_reg/sys_reg (exit read)",
+                    operation: "hv_vcpu_get_simd_fp_reg (verify capture)",
                     code: result,
                 };
                 return Err(vcpu.quarantine(operation, trigger));
             }
-            vcpu.resident.read(&state, install_mask::EXIT_READ);
-            if state_verify_enabled() {
-                let mut simd = HvfArchitecturalState::default();
-                let result =
-                    unsafe { litebox_hvf_vcpu_get_simd_state(vcpu.identifier, &raw mut simd) };
-                if !succeeded(result) {
-                    let trigger = HvfError::Call {
-                        operation: "hv_vcpu_get_simd_fp_reg (verify capture)",
-                        code: result,
-                    };
-                    return Err(vcpu.quarantine(operation, trigger));
-                }
-                vcpu.resident.verify_fp = Some(HvfGuestFp::of(&simd));
-            }
-            crate::diagnostics_counters::record_resident(
-                crate::diagnostics_counters::RESIDENT_EXIT_READS,
-                1,
-            );
-            Ok(state)
-        })
+            vcpu.resident.verify_fp = Some(HvfGuestFp::of(&simd));
+        }
+        crate::diagnostics_counters::record_resident(
+            crate::diagnostics_counters::RESIDENT_EXIT_READS,
+            1,
+        );
+        Ok(state)
     }
 
     /// FXR lazy SIMD read (34 gets): the SIMD/FP file as the vCPU holds it. Afterwards the vCPU's
@@ -6563,29 +7001,101 @@ impl HvfVcpu {
         })
     }
 
+    /// One guest time slice in guest-counter ticks: `TIME_SLICE` (10 ms) at
+    /// `TIMER_TICKS_PER_SECOND`, the same pair `time_slice_deadline` converts. The vtimer re-arm
+    /// rule needs the slice length, not the deadline, so it is a constant here.
+    pub(crate) const VTIMER_SLICE_TICKS: u64 = 240_000;
+
+    /// RUNWALL FC2: whether `cval`, this run's slice deadline, still has to be written into the
+    /// virtual timer.
+    ///
+    /// The arm is two `hv_vcpu_set_sys_reg` calls (CNTV_CVAL_EL0, CNTV_CTL_EL0) plus an unmask.
+    /// A host-only probe (`.gm/syscall-bench/runwall/fc2shape.c`) measures those writes as +167 ns
+    /// of the NEXT `hv_vcpu_run`'s wall time -- HVF re-materializes the timer and the rest of the
+    /// system-register trap frame on the following entry -- while an already-armed timer costs
+    /// nothing: shape [w5] (3 GPR sets + 3 sys-reg sets + arm per run) is 958 ns p50 against
+    /// [w7] (the same install, timer armed once) at 791 ns and [s0] (no writes at all) at 750 ns.
+    /// So: arm when nothing is armed, which covers every run following a `VtimerActivated` exit
+    /// because [`HvfVcpu::run_in_operation`] clears the field there, and re-arm once the armed
+    /// deadline is a whole slice behind, which also recovers a timer something else masked without
+    /// firing. One arm per slice instead of one per run; the run still has a deadline no older
+    /// than one slice at all times.
+    ///
+    /// This is a pure predicate: it decides, it does not record. Review fix-up (RUNWALL FC2): the
+    /// first cut wrote `armed_vtimer_cval` here, at the top of `execute_attached` and *before*
+    /// `reconcile_fp` / `begin_running` / the install, so any refusal between here and the actual
+    /// `hv_vcpu_set_sys_reg` left the field claiming a deadline hardware does not hold. The caller
+    /// records it with [`HvfVcpu::mark_vtimer_armed`] once the arm has issued.
+    pub(crate) fn vtimer_arm_due(&self, cval: u64) -> bool {
+        let armed = self.armed_vtimer_cval;
+        if armed == 0 || cval.wrapping_sub(armed) >= Self::VTIMER_SLICE_TICKS {
+            true
+        } else {
+            crate::diagnostics_counters::record_resident(
+                crate::diagnostics_counters::RESIDENT_VTIMER_ARM_SKIPS,
+                1,
+            );
+            false
+        }
+    }
+
+    /// RUNWALL FC2: records that `cval` has just been written into this vCPU's virtual timer, so
+    /// [`HvfVcpu::vtimer_arm_due`] can skip re-arming it for the rest of the slice. Called only
+    /// after the arm has issued (see that method's comment for why the predicate cannot do it).
+    /// [`HvfVcpu::run_in_operation`] clears the field again on a `VtimerActivated` exit.
+    pub(crate) fn mark_vtimer_armed(&mut self, cval: u64) {
+        self.armed_vtimer_cval = cval;
+        crate::diagnostics_counters::record_resident(
+            crate::diagnostics_counters::RESIDENT_VTIMER_ARMS,
+            1,
+        );
+    }
+
+    /// BCORE-3: forgets the armed deadline. Used after a synchronization monitor trip, whose own
+    /// `suppress_internal_interrupts` / `restore_internal_side_state` pair can leave
+    /// `CNTV_CVAL_EL0` in the past (the timer fired and auto-masked inside the trip), so the next
+    /// run has to arm a fresh deadline instead of trusting the cached one.
+    pub(crate) fn clear_vtimer_armed(&mut self) {
+        self.armed_vtimer_cval = 0;
+    }
+
     pub(crate) fn run(&mut self) -> Result<HvfVcpuExit, HvfError> {
         self.last_run_installs_before = core::mem::take(&mut self.installs_since_run);
         self.last_run_raw_ticks = 0;
-        self.with_existing_operation(|vcpu, operation| {
-            let mut exit = HvfExitPayload::default();
-            operation.mark_published()?;
-            // FXR: from here the guest owns every register it (or exception entry) can write.
-            vcpu.resident.ran();
-            let raw_start = crate::diagnostics_counters::ticks();
-            let result = unsafe {
-                litebox_hvf_vcpu_run(vcpu.identifier, vcpu.exit_area.as_ptr(), &raw mut exit)
-            };
-            vcpu.last_run_raw_ticks = crate::diagnostics_counters::ticks().wrapping_sub(raw_start);
-            if succeeded(result) {
-                Ok(exit.decode())
-            } else {
-                let trigger = HvfError::Call {
-                    operation: "hv_vcpu_run",
-                    code: result,
-                };
-                Err(vcpu.quarantine(operation, trigger))
+        self.with_existing_operation(|vcpu, operation| Self::run_in_operation(vcpu, operation))
+    }
+
+    /// The body of [`HvfVcpu::run`] / [`HvfRunScope::run`]: publishes, then the raw
+    /// `litebox_hvf_vcpu_run`, timed into `HvfVcpu::last_run_raw_ticks`.
+    fn run_in_operation(
+        vcpu: &mut HvfVcpu,
+        operation: &impl HvfPublicationCapability,
+    ) -> Result<HvfVcpuExit, HvfError> {
+        let mut exit = HvfExitPayload::default();
+        operation.mark_hvf_published()?;
+        // FXR: from here the guest owns every register it (or exception entry) can write.
+        vcpu.resident.ran();
+        let raw_start = crate::diagnostics_counters::ticks();
+        let result = crate::diagnostics_counters::rank_host_call(|| unsafe {
+            litebox_hvf_vcpu_run(vcpu.identifier, vcpu.exit_area.as_ptr(), &raw mut exit)
+        });
+        vcpu.last_run_raw_ticks = crate::diagnostics_counters::ticks().wrapping_sub(raw_start);
+        if succeeded(result) {
+            let exit = exit.decode();
+            // RUNWALL FC2: the timer fired, so HVF masked it; the next slice has to be armed
+            // again. Recorded here rather than at the four `VtimerActivated` dispatch arms so
+            // every path (including the diagnostic probes) sees the same state.
+            if matches!(exit, HvfVcpuExit::VtimerActivated) {
+                vcpu.armed_vtimer_cval = 0;
             }
-        })
+            Ok(exit)
+        } else {
+            let trigger = HvfError::Call {
+                operation: "hv_vcpu_run",
+                code: result,
+            };
+            Err(vcpu.quarantine(operation, trigger))
+        }
     }
 
     pub(crate) fn quarantine_rejected_exit(mut self) -> Result<(), HvfError> {
@@ -6667,23 +7177,24 @@ impl HvfVcpu {
         })
     }
 
-    /// Arms the virtual timer as a one-shot deadline (`CNTV_CVAL_EL0 = cval`,
-    /// `CNTV_CTL_EL0.ENABLE`, SDK mask cleared) so the next run exits with
-    /// `VtimerActivated` no later than `cval` on the guest's counter.
-    pub(crate) fn arm_vtimer(&mut self, cval: u64) -> Result<(), HvfError> {
-        self.with_existing_operation(|vcpu, operation| {
-            operation.mark_published()?;
-            let result = unsafe { litebox_hvf_vcpu_arm_vtimer(vcpu.identifier, cval) };
-            if succeeded(result) {
-                Ok(())
-            } else {
-                let trigger = HvfError::Call {
-                    operation: "hv_vcpu_arm_vtimer",
-                    code: result,
-                };
-                Err(vcpu.quarantine(operation, trigger))
-            }
-        })
+    /// Arms the virtual timer as a one-shot deadline inside a [`HvfRunScope`] (T2d: a run's arm,
+    /// install, run and reads share one existing-vCPU operation).
+    fn arm_vtimer_in_operation(
+        vcpu: &mut HvfVcpu,
+        operation: &impl HvfPublicationCapability,
+        cval: u64,
+    ) -> Result<(), HvfError> {
+        operation.mark_hvf_published()?;
+        let result = unsafe { litebox_hvf_vcpu_arm_vtimer(vcpu.identifier, cval) };
+        if succeeded(result) {
+            Ok(())
+        } else {
+            let trigger = HvfError::Call {
+                operation: "hv_vcpu_arm_vtimer",
+                code: result,
+            };
+            Err(vcpu.quarantine(operation, trigger))
+        }
     }
 
     pub(crate) fn vtimer_mask(&mut self) -> Result<bool, HvfError> {
@@ -6741,18 +7252,26 @@ impl HvfVcpu {
 
     pub(crate) fn execution_time(&mut self) -> Result<u64, HvfError> {
         self.with_existing_operation(|vcpu, operation| {
-            let mut time = 0;
-            let result = unsafe { litebox_hvf_vcpu_get_exec_time(vcpu.identifier, &raw mut time) };
-            if succeeded(result) {
-                Ok(time)
-            } else {
-                let trigger = HvfError::Call {
-                    operation: "hv_vcpu_get_exec_time",
-                    code: result,
-                };
-                Err(vcpu.quarantine(operation, trigger))
-            }
+            Self::read_exec_time_in_operation(vcpu, operation)
         })
+    }
+
+    /// The body of [`HvfVcpu::execution_time`] / [`HvfRunScope::execution_time`].
+    fn read_exec_time_in_operation(
+        vcpu: &mut HvfVcpu,
+        operation: &impl HvfPublicationCapability,
+    ) -> Result<u64, HvfError> {
+        let mut time = 0;
+        let result = unsafe { litebox_hvf_vcpu_get_exec_time(vcpu.identifier, &raw mut time) };
+        if succeeded(result) {
+            Ok(time)
+        } else {
+            let trigger = HvfError::Call {
+                operation: "hv_vcpu_get_exec_time",
+                code: result,
+            };
+            Err(vcpu.quarantine(operation, trigger))
+        }
     }
 
     pub(crate) fn program_stage_one(

@@ -1341,26 +1341,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
     }
 }
 
-/// A datagram message with source address information
-#[derive(Clone)]
-struct DatagramMessage {
+/// A datagram message with source address information.
+///
+/// `rights` is the `SCM_RIGHTS` payload, carried exactly the way the stream
+/// path's `Message` carries it: the single `recv` that consumes the message takes
+/// it out (see [`UnixDatagram::recvfrom`]), so a message nobody ever receives --
+/// or a queue dropped when the last socket holding it closes -- just releases
+/// those open file descriptions, never leaks or double-installs them. The type is
+/// deliberately not `Clone`: duplicating a message would duplicate its fds.
+struct DatagramMessage<Platform: ShimPlatform, FS: ShimFS> {
     data: Vec<u8>,
-    // TODO: add SCM_RIGHTS
+    rights: Vec<TransferredFd<Platform, FS>>,
     source: UnixSocketAddr,
     /// The sender's credentials, captured when the datagram was queued (see
     /// `Message::credentials`).
     credentials: Ucred,
 }
 
-impl<Platform: ShimPlatform> WriteEnd<Platform, DatagramMessage> {
-    fn try_write(&self, msg: DatagramMessage) -> Result<(), (DatagramMessage, Errno)> {
+impl<Platform: ShimPlatform, FS: ShimFS> WriteEnd<Platform, DatagramMessage<Platform, FS>> {
+    fn try_write(
+        &self,
+        msg: DatagramMessage<Platform, FS>,
+    ) -> Result<(), (DatagramMessage<Platform, FS>, Errno)> {
         self.try_write_one(msg)
     }
     fn write(
         &self,
         cx: &WaitContext<'_, Platform>,
         timeout: Option<Duration>,
-        msg: DatagramMessage,
+        msg: DatagramMessage<Platform, FS>,
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
         let mut msg = Some(msg);
@@ -1384,7 +1393,7 @@ impl<Platform: ShimPlatform> WriteEnd<Platform, DatagramMessage> {
             .map_err(Errno::from)
     }
 }
-impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
+impl<Platform: ShimPlatform, FS: ShimFS> ReadEnd<Platform, DatagramMessage<Platform, FS>> {
     /// Attempts to read a single datagram message without blocking.
     ///
     /// Reads exactly one message, preserving message boundaries. If the buffer
@@ -1395,7 +1404,7 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
         &self,
         buf: &mut [u8],
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<(usize, Ucred), TryOpError<Errno>> {
+    ) -> Result<(usize, Vec<TransferredFd<Platform, FS>>, Ucred), TryOpError<Errno>> {
         let is_self_shutdown = self.is_shutdown();
         self.peek_and_consume_one(|msg| {
             let copy_len = buf.len().min(msg.data.len());
@@ -1403,8 +1412,18 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
             if let Some(source_addr) = source_addr.as_deref_mut() {
                 *source_addr = Some(msg.source.clone());
             }
-            // Always consume the entire message to preserve boundaries.
-            Ok((true, (msg.data.len(), msg.credentials)))
+            // Always consume the entire message to preserve boundaries, and take
+            // its descriptors with it -- they belong to this one receive, so a
+            // later peek of the same (already gone) message cannot install them
+            // a second time.
+            Ok((
+                true,
+                (
+                    msg.data.len(),
+                    core::mem::take(&mut msg.rights),
+                    msg.credentials,
+                ),
+            ))
         })
         .map_err(|e| match e {
             Errno::EAGAIN => TryOpError::TryAgain,
@@ -1428,10 +1447,13 @@ struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
     addr: Option<BoundDatagramAddr<Platform, FS>>,
     /// The read end of the local socket's channel for receiving messages.
     /// Set when the socket is bound via `bind` or `new_pair`.
-    recv_channel: Option<ReadEnd<Platform, DatagramMessage>>,
+    recv_channel: Option<ReadEnd<Platform, DatagramMessage<Platform, FS>>>,
     /// The write end of the connected peer socket for sending messages.
     /// Set when the socket is connected via `connect` or `new_pair`.
-    connected_send_channel: Option<(WriteEnd<Platform, DatagramMessage>, UnixSocketAddr)>,
+    connected_send_channel: Option<(
+        WriteEnd<Platform, DatagramMessage<Platform, FS>>,
+        UnixSocketAddr,
+    )>,
     read_shutdown: bool,
     write_shutdown: bool,
     pollee: Arc<Pollee<Platform>>,
@@ -1571,7 +1593,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         &self,
         task: &Task<Platform, FS>,
         addr: UnixSocketAddr,
-    ) -> Result<WriteEnd<Platform, DatagramMessage>, Errno> {
+    ) -> Result<WriteEnd<Platform, DatagramMessage<Platform, FS>>, Errno> {
         let guard = task.global.unix_addr_table.read();
         let Some(key) = addr.to_key() else {
             return Err(Errno::EINVAL);
@@ -1610,7 +1632,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         buf: &mut [u8],
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
-    ) -> Result<(usize, Ucred), Errno> {
+    ) -> Result<(usize, Vec<TransferredFd<Platform, FS>>, Ucred), Errno> {
         let res = cx
             .with_timeout(timeout)
             .wait_on_events(
@@ -1652,6 +1674,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         credentials: Ucred,
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
+        rights: Vec<TransferredFd<Platform, FS>>,
     ) -> Result<usize, Errno> {
         let source = self.get_local_addr();
         let connected_send_channel = {
@@ -1677,6 +1700,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             timeout,
             DatagramMessage {
                 data: buf.to_vec(),
+                rights,
                 source,
                 credentials,
             },
@@ -1891,12 +1915,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 is_nonblocking,
                 addr,
             ),
-            UnixSocketInner::Datagram(datagram) => {
-                if !rights.is_empty() {
-                    return Err(Errno::EOPNOTSUPP);
-                }
-                datagram.sendto(task, timeout, buf, credentials, is_nonblocking, addr)
-            }
+            UnixSocketInner::Datagram(datagram) => datagram.sendto(
+                task,
+                timeout,
+                buf,
+                credentials,
+                is_nonblocking,
+                addr,
+                rights,
+            ),
         }
     }
 
@@ -1935,9 +1962,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             }
             UnixSocketInner::Datagram(datagram) => datagram
                 .recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
-                .map(|(size, credentials)| RecvResult {
+                .map(|(size, rights, credentials)| RecvResult {
                     size,
-                    rights: Vec::new(),
+                    rights,
                     credentials: pass_cred.then_some(credentials),
                 }),
         };
@@ -2201,7 +2228,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> IOPollable for UnixSocket<Platform, FS>
 pub(crate) struct UnixEntry<Platform: ShimPlatform, FS: ShimFS>(UnixEntryInner<Platform, FS>);
 enum UnixEntryInner<Platform: ShimPlatform, FS: ShimFS> {
     Stream(Arc<Backlog<Platform, FS>>),
-    Datagram(WriteEnd<Platform, DatagramMessage>),
+    Datagram(WriteEnd<Platform, DatagramMessage<Platform, FS>>),
     /// A placeholder claimed by `bind()` (autobind, explicit path, or
     /// explicit abstract) before the socket has gone on to `listen()` or
     /// (for datagram sockets) finished its atomic bind. Nothing can lookup

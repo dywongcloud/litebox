@@ -2297,7 +2297,18 @@ pub enum PrctlArg {
         len: usize,
         arg: usize,
     },
-    CapBSetRead(usize),
+    /// Every `prctl` that touches the capability surface, in one variant.
+    ///
+    /// LiteBox grants no capabilities at all, so the whole family is answered by one
+    /// rule in the shim rather than one arm per constant: a *read* of capability state
+    /// reports "none held", and a request that would *grant* a capability is `EPERM`,
+    /// exactly as Linux answers a caller without `CAP_SETPCAP`.
+    ///
+    /// None of these is an isolation primitive -- no capability here restricts anything
+    /// a process can do -- so reporting "no capabilities held" never claims a boundary
+    /// LiteBox does not enforce. That is what separates this family from the
+    /// enforcement families (Landlock, mount namespaces), which answer `ENOSYS`.
+    Capability(CapabilityPrctl),
     SetNoNewPrivs,
     GetNoNewPrivs,
     /// `PR_SET_KEEPCAPS`: whether the permitted capability set is cleared on
@@ -2317,6 +2328,31 @@ pub enum PrctlArg {
     SetChildSubreaper(bool),
     /// `PR_GET_CHILD_SUBREAPER`: writes back `0`/`1` through the pointer.
     GetChildSubreaper(UserPtrMut<i32>),
+}
+
+/// One `prctl` that reads or writes the capability surface; see
+/// [`PrctlArg::Capability`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum CapabilityPrctl {
+    /// `PR_CAPBSET_READ`: is `cap` in the calling thread's bounding set?
+    CapBSetRead(usize),
+    /// `PR_CAPBSET_DROP`: remove `cap` from the bounding set.
+    CapBSetDrop(usize),
+    /// `PR_GET_SECUREBITS`.
+    GetSecureBits,
+    /// `PR_SET_SECUREBITS`: `0` (clear every secure bit) is a no-op LiteBox can
+    /// honour -- every bit is already clear -- while any other value would set a
+    /// bit, which needs `CAP_SETPCAP`.
+    SetSecureBits(u64),
+    /// `PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET`.
+    AmbientIsSet(usize),
+    /// `PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE`.
+    AmbientRaise(usize),
+    /// `PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER`.
+    AmbientLower(usize),
+    /// `PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL`.
+    AmbientClearAll,
 }
 
 #[repr(i32)]
@@ -2621,6 +2657,29 @@ pub enum SyscallRequest {
         addr: usize,
         len: usize,
         flags: usize,
+    },
+    /// `close_range(2)`: close (or mark close-on-exec) every open descriptor in
+    /// `[first, last]`. LiteBox owns the whole descriptor table, so closing a
+    /// range is a fully real operation -- the descriptors really are gone when
+    /// this returns -- which is why it is implemented rather than refused.
+    /// `flags` is `CLOSE_RANGE_CLOEXEC` (4) or 0; `CLOSE_RANGE_UNSHARE` (2) is
+    /// not accepted, see `Task::sys_close_range`.
+    CloseRange {
+        first: u32,
+        last: u32,
+        flags: u32,
+    },
+    /// `get_mempolicy(2)`: read the NUMA policy of the calling task (or, with
+    /// `MPOL_F_ADDR`, of the mapping at `addr`). LiteBox has a single
+    /// undifferentiated memory space, so the only truthful answer is
+    /// `MPOL_DEFAULT` with an empty node mask -- see `sys_get_mempolicy` for why
+    /// that is a real answer and not a stub.
+    GetMempolicy {
+        mode: UserPtrMut<i32>,
+        nodemask: UserPtrMut<u64>,
+        maxnode: usize,
+        addr: usize,
+        flags: u32,
     },
     Mmap {
         addr: usize,
@@ -3879,9 +3938,58 @@ impl SyscallRequest {
                                 arg: ctx.sys_req_arg(4),
                             },
                         },
-                        PrctlOption::CapBSetRead => SyscallRequest::Prctl {
-                            args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
+                        // The capability family, decoded by one rule: LiteBox holds no
+                        // capabilities, so reading reports "none" and granting is refused.
+                        // -- `PR_GET_SECUREBITS`: Linux ignores the trailing arguments (see
+                        //    `GetDumpable` above, where an over-eager `EINVAL` reads as "no
+                        //    securebits support" and trips the caller's CHECK).
+                        PrctlOption::GetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::Capability(CapabilityPrctl::GetSecureBits),
                         },
+                        PrctlOption::SetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::Capability(CapabilityPrctl::SetSecureBits(
+                                ctx.sys_req_arg(1),
+                            )),
+                        },
+                        PrctlOption::CapBSetRead => SyscallRequest::Prctl {
+                            args: PrctlArg::Capability(CapabilityPrctl::CapBSetRead(
+                                ctx.sys_req_arg(1),
+                            )),
+                        },
+                        PrctlOption::CapBSetDrop => SyscallRequest::Prctl {
+                            args: PrctlArg::Capability(CapabilityPrctl::CapBSetDrop(
+                                ctx.sys_req_arg(1),
+                            )),
+                        },
+                        // `PR_CAP_AMBIENT`: `arg2` selects the sub-operation and `arg3` the
+                        // capability; Linux rejects a non-zero `arg4`/`arg5` for every
+                        // sub-operation.
+                        PrctlOption::CapAmbient => {
+                            let op: usize = ctx.sys_req_arg(1);
+                            let cap: usize = ctx.sys_req_arg(2);
+                            let trailing_zero = (3..5).all(|index| {
+                                ctx.sys_req_arg::<usize>(index) == 0
+                            });
+                            if !trailing_zero {
+                                return Err(unsupported_einval(format_args!(
+                                    "prctl(PR_CAP_AMBIENT, {op}, {cap}) with trailing arguments"
+                                )));
+                            }
+                            let ambient = match op {
+                                1 => CapabilityPrctl::AmbientIsSet(cap),
+                                2 => CapabilityPrctl::AmbientRaise(cap),
+                                3 => CapabilityPrctl::AmbientLower(cap),
+                                4 => CapabilityPrctl::AmbientClearAll,
+                                _ => {
+                                    return Err(unsupported_einval(format_args!(
+                                        "prctl(PR_CAP_AMBIENT, op = {op})"
+                                    )));
+                                }
+                            };
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::Capability(ambient),
+                            }
+                        }
                         PrctlOption::SetNoNewPrivs
                             if ctx.sys_req_arg::<usize>(1) == 1
                                 && (2..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
@@ -4176,6 +4284,44 @@ impl SyscallRequest {
                 addr,
                 data
             }),
+            Sysno::close_range => sys_req!(CloseRange { first, last, flags }),
+            Sysno::get_mempolicy => sys_req!(GetMempolicy {
+                mode:*,
+                nodemask:*,
+                maxnode,
+                addr,
+                flags,
+            }),
+            // Filesystem-access *enforcement* -- the one class of sandbox syscall that
+            // must never be faked. `landlock_restrict_self` returning 0 is a promise that
+            // later opens outside the ruleset fail; LiteBox has no such enforcement layer
+            // (its isolation is the LiteBox layer itself, not the guest's own sandbox), so
+            // succeeding here would hand the guest a boundary that does not exist.
+            // `ENOSYS` is both honest and what a kernel built without
+            // `CONFIG_SECURITY_LANDLOCK` answers; callers probe for it and fall back.
+            // The `pidfd_*` family: an fd whose whole contract is "pollable, readable when
+            // the process it names exits". LiteBox has no descriptor type backed by a
+            // process-exit notification, and an fd that *looks* like a pidfd but never
+            // reports readiness is worse than none: a caller that polls it blocks forever
+            // on a process that may already be gone, which is exactly the failure
+            // `ENOSYS` (what a pre-5.3 kernel answers) lets the caller fall back from.
+            // Unlike Landlock this is not an enforcement primitive, so refusing it costs
+            // no isolation -- it only costs the caller its preferred exit-notification
+            // mechanism.
+            sysno @ (Sysno::pidfd_open | Sysno::pidfd_send_signal | Sysno::pidfd_getfd) => {
+                log_unsupported(format_args!(
+                    "{sysno:?}: no process-exit-notification descriptor type -> ENOSYS"
+                ));
+                return Err(errno::Errno::ENOSYS);
+            }
+            sysno @ (Sysno::landlock_create_ruleset
+            | Sysno::landlock_add_rule
+            | Sysno::landlock_restrict_self) => {
+                log_unsupported(format_args!(
+                    "{sysno:?}: filesystem-access enforcement LiteBox does not implement -> ENOSYS"
+                ));
+                return Err(errno::Errno::ENOSYS);
+            }
             // Noisy unsupported syscalls.
             Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);

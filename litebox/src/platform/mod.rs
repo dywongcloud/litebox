@@ -40,6 +40,32 @@ pub enum SeccompMediationCapability {
     Complete,
 }
 
+/// Where a guest thread that is already runnable was held on its way back to guest execution.
+///
+/// These are the blocking points the runnable-not-running guard of PRD row
+/// `hvf-guest-runnable-not-running-guard-and-class-fix` (step G) names: every one of them is
+/// reached *after* the thread became runnable (woken, timed out, syscall served, slice expired)
+/// and *before* it executes guest code again, so time spent in one of them is invisible to every
+/// existing per-syscall counter. Reported through [`Provider::note_rbnr_wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RunnableWaitKind {
+    /// The host kernel's own wake latency: from the wake issued for this thread to the host
+    /// thread actually resuming from the blocking primitive (`W1` of the inventory).
+    HostWake = 0,
+    /// Parked while a sibling `fork` in this process holds the fork gate closed (`W2`).
+    ForkGate = 1,
+    /// Handing a shared address space to a waiter that wants it: quiesce, copy out, wait,
+    /// copy back (`W3`).
+    AddressSpaceHandOff = 2,
+    /// Waiting to take the shared address space back before touching guest memory (`W4`).
+    AddressSpaceAcquire = 3,
+    /// The pre-guest-re-entry `ptrace` stop rendezvous (`W5`).
+    PtraceRendezvous = 4,
+    /// Writing a delivered signal's frame into guest memory before guest re-entry (`W6`).
+    SignalFrame = 5,
+}
+
 /// A provider of a platform upon which LiteBox can execute.
 ///
 /// Ideally, a [`Provider`] is zero-sized, and only exists to provide access to functionality
@@ -56,6 +82,40 @@ pub trait Provider:
     /// instance.
     fn seccomp_mediation_capability(&self) -> SeccompMediationCapability {
         SeccompMediationCapability::Incomplete
+    }
+
+    /// Reports one blocking point the calling guest thread passed through between becoming
+    /// runnable and running guest code again, for the platform's runnable-not-running (RBNR)
+    /// accounting -- see [`RunnableWaitKind`] and PRD row
+    /// `hvf-guest-runnable-not-running-guard-and-class-fix`.
+    ///
+    /// Called only on paths that actually waited (each caller brackets its own slow branch), so
+    /// this is never on the ordinary syscall hot path. The default does nothing: a platform with
+    /// no RBNR readout simply declines to account for these.
+    fn note_rbnr_wait(&self, kind: RunnableWaitKind, ns: u64) {
+        let _ = (kind, ns);
+    }
+
+    /// Reports one input event's inject-to-drain latency in nanoseconds: the time between the
+    /// injector handing an evdev event to [`crate::fs::devices::InputRegistry`] and the read that
+    /// drained it. The class-level guard for the desktop input consumers; a platform that
+    /// publishes an RBNR readout also rate-limits a warning for the ones over its threshold.
+    /// The default does nothing.
+    fn note_input_consume_ns(&self, ns: u64) {
+        let _ = ns;
+    }
+
+    /// Publishes the calling guest thread's identity -- its pid and its `comm` -- so the
+    /// platform's per-space RBNR readout can name the process a stalled space belongs to.
+    /// Called once per guest re-entry.
+    ///
+    /// `comm` is passed as the `Cell` that holds it, not as a copied slice: the receiver is the
+    /// only side that needs the 16 bytes, and it needs them only when its own readout is on, so
+    /// this lets a platform that declines to account for RBNR pay nothing for the call. A
+    /// platform that does account reads `comm` here and keeps the pair in thread-local storage,
+    /// comparing before storing. The default does nothing and never reads it.
+    fn note_task_identity(&self, pid: i32, comm: &core::cell::Cell<[u8; 16]>) {
+        let _ = (pid, comm);
     }
 }
 
@@ -93,6 +153,21 @@ pub trait ThreadProvider: RawPointerProvider {
     ///
     /// [`EnterShim`]: crate::shim::EnterShim
     fn current_thread(&self) -> Self::ThreadHandle;
+
+    /// BCORE-5: releases whatever platform-specific execution resource the CALLING thread
+    /// owns, before it leaves the shim's thread teardown. The default is a no-op; a platform
+    /// whose threads hold an exclusive execution resource (the macOS HVF backend's bound
+    /// vCPU, which only its creator thread may destroy) overrides it, so the resource is gone
+    /// before any address space it is registered in can be destroyed.
+    ///
+    /// The caller must not assume the resource is gone the moment this returns: this runs from
+    /// every `Task::drop`, including a task this thread only *created* (a failed
+    /// `spawn_thread` drops the new task on the spawning thread), which may happen while the
+    /// calling thread is in the middle of dispatching its own guest exit. An implementation
+    /// may therefore defer the release to the calling thread's next safe point -- which is
+    /// still before that thread can leave its run loop, and so still before any address space
+    /// it is registered in can be destroyed.
+    fn release_thread_execution_resources(&self) {}
 
     /// Interrupt the given thread from running guest code.
     ///
@@ -220,6 +295,40 @@ pub trait RawMutexProvider {
         Self: crate::sync::RawSyncPrimitivesProvider + Sized,
     {
     }
+
+    /// Classifies the calling thread for the descriptor-table guard (NETFIX section 5.3).
+    ///
+    /// [`crate::LiteBox::descriptor_table`] and `descriptor_table_mut` report every acquisition
+    /// through this: a platform that runs the network worker on a known thread answers
+    /// [`DescriptorTableAccess::NetworkWorker`] there, so a regression that makes the worker take
+    /// the process-global table again is counted (and trapped in debug builds) instead of
+    /// silently stalling every guest `open`/`close`/`dup`/`fork` behind a per-poll walk. The
+    /// default (`Ordinary`) costs nothing on platforms without such a thread.
+    fn descriptor_table_access(&self) -> DescriptorTableAccess {
+        DescriptorTableAccess::Ordinary
+    }
+
+    /// Runs `f` as the network worker's one sanctioned descriptor-table access (the queued-close
+    /// drain, taken only when a removal is certain): inside it the guard counts the acquisition as
+    /// sanctioned instead of as a violation. The default just runs `f`.
+    fn with_sanctioned_descriptor_table_access<R>(&self, f: impl FnOnce() -> R) -> R
+    where
+        Self: Sized,
+    {
+        f()
+    }
+}
+
+/// How the calling thread relates to the network worker, for the descriptor-table guard (see
+/// [`RawMutexProvider::descriptor_table_access`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescriptorTableAccess {
+    /// Any thread that is not the network worker.
+    Ordinary,
+    /// The network worker, outside its sanctioned scope: a violation.
+    NetworkWorker,
+    /// The network worker inside [`RawMutexProvider::with_sanctioned_descriptor_table_access`].
+    NetworkWorkerSanctioned,
 }
 
 /// A raw mutex/lock API; expected to roughly match (or even be implemented using) a Linux futex.
@@ -311,6 +420,37 @@ pub trait IPInterfaceProvider {
     fn has_external_interface(&self) -> bool {
         true
     }
+
+    /// Block the calling thread -- the runner's network worker -- until there may be network
+    /// work: a wake posted through [`Self::notify_network_worker`], a packet (or host-side flow
+    /// readiness) that may be receivable through [`Self::receive_ip_packet`], or `timeout`.
+    ///
+    /// The default answers [`NetworkWait::Unsupported`] without blocking, and the runner then
+    /// keeps its bounded legacy sleep, so a platform that implements neither method behaves
+    /// exactly as before.
+    fn wait_for_network_activity(&self, timeout: Option<core::time::Duration>) -> NetworkWait {
+        let _ = timeout;
+        NetworkWait::Unsupported
+    }
+
+    /// Post a wake for a thread parked in [`Self::wait_for_network_activity`]. Must be callable
+    /// from any thread with any lock held and must be cheap (at most one system call); a wake
+    /// posted while the worker is not parked must make its next park return at once. The
+    /// default does nothing.
+    fn notify_network_worker(&self) {}
+}
+
+/// What ended a [`IPInterfaceProvider::wait_for_network_activity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkWait {
+    /// The platform has no wake mechanism; the caller must fall back to a bounded sleep.
+    Unsupported,
+    /// A wake was posted through [`IPInterfaceProvider::notify_network_worker`].
+    Woken,
+    /// A device or host-side flow became readable.
+    PacketReady,
+    /// The timeout elapsed with neither.
+    TimedOut,
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].

@@ -8,10 +8,13 @@ use core::ops::{BitOr, BitOrAssign, Deref, DerefMut, Range};
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::HvfCompletionCapability;
-use crate::diagnostics_counters::TimedMutex;
+use crate::diagnostics_counters::{
+    GR_COUNTERS, GR_PLAN_RETRY_BOUND, GR_REPLAN_BOUND, GrSite, RankedGuard, RankedMutex, TimedMutex,
+    gr_check_plan_enabled, gr_invariants_enabled, gr_note_time, gr_time_start,
+};
 use crate::hvf_vcpu::{
     HvfOwnerSynchronizationProof, HvfSynchronizationRequest, HvfVcpuLaneParticipantCapability,
     HvfVcpuLaneRegistration, hvf_vcpu_lane_is_live,
@@ -19,7 +22,7 @@ use crate::hvf_vcpu::{
 
 use crate::hvf::{
     HvfError, HvfMapPermissions, HvfMapping, HvfSdkResidualReport, HvfStageOneRegisterReport,
-    HvfVm, HvfVmOperation, process_hvf_vm,
+    HvfVm, HvfVmOperation, HvfVmSharedOperation, process_hvf_vm,
 };
 use crate::hvf_backing::{
     CallbackOutcome, HVF_HOST_PAGE_SIZE, HvfHostBacking, HvfHostBackingError, HvfHostBackingReport,
@@ -233,17 +236,22 @@ pub(crate) struct FileOriginTable {
     pub(crate) pages: usize,
 }
 
-/// Process-global registry of file origins keyed by slice identity. Its mutex is the innermost
-/// lock of this module: taken briefly inside a space's state-locked commit closures for the two
-/// reference counters, and alone (no `HvfMemory` lock held) by the acquire and drain paths --
-/// never across an origin-space operation, which takes the manager's own locks.
+/// Process-global registry of file origins keyed by slice identity.
+///
+/// CLASS A: it used to be documented as "the innermost lock of this module", which is exactly
+/// why it needs a rank rather than a prose exemption: it is taken inside a space's `state`-locked
+/// commit closures for the two reference counters, i.e. strictly above `acknowledgements` in the
+/// commit order, and `hvf_backend` waits on `changed` while holding it. It therefore ranks
+/// [`RANK_FILE_ORIGINS`] and its table is a [`RankedMutex`]; the condvar wait is noted with
+/// [`rank_note_blocking_wait`] so a park under it is a named violation instead of an invisible
+/// one. It is never held across an origin-space operation, which takes the manager's own locks.
 pub(crate) struct FileOriginRegistry {
-    pub(crate) table: Mutex<FileOriginTable>,
+    pub(crate) table: RankedMutex<FileOriginTable>,
     pub(crate) changed: std::sync::Condvar,
 }
 
 impl FileOriginRegistry {
-    pub(crate) fn lock(&self) -> MutexGuard<'_, FileOriginTable> {
+    pub(crate) fn lock(&self) -> RankedGuard<'_, FileOriginTable> {
         self.table
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -252,7 +260,10 @@ impl FileOriginRegistry {
 
 pub(crate) static FILE_ORIGINS: std::sync::LazyLock<FileOriginRegistry> =
     std::sync::LazyLock::new(|| FileOriginRegistry {
-        table: Mutex::new(FileOriginTable::default()),
+        table: RankedMutex::new(
+            FileOriginTable::default(),
+            crate::diagnostics_counters::RANK_FILE_ORIGINS,
+        ),
         changed: std::sync::Condvar::new(),
     });
 
@@ -410,6 +421,13 @@ pub(crate) fn file_cow_count(counter: &std::sync::atomic::AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
+/// `file_cow_count` by more than one: one call can install several pages (T1f-b F1's
+/// fault-around), and the counters that count pages rather than calls have to stay comparable
+/// with the page gauges they sit next to.
+pub(crate) fn file_cow_count_by(counter: &std::sync::atomic::AtomicU64, delta: u64) {
+    counter.fetch_add(delta, Ordering::Relaxed);
+}
+
 fn file_cow_gauge_add(counter: &std::sync::atomic::AtomicU64, delta: isize) {
     if delta >= 0 {
         counter.fetch_add(delta as u64, Ordering::Relaxed);
@@ -499,6 +517,10 @@ const DESCRIPTOR_NOT_GLOBAL: u64 = 1 << 11;
 const DESCRIPTOR_PXN: u64 = 1 << 53;
 const DESCRIPTOR_UXN: u64 = 1 << 54;
 const DESCRIPTOR_OUTPUT_MASK: u64 = 0x0000_ffff_ffff_c000;
+
+/// CLASS C: the most retirement tickets one batched pump admission may acknowledge. Bounds how
+/// long a pass holds the VM-global gate; see [`HvfAddressSpace::pump_retirements_once`].
+const PUMP_TICKETS_PER_ADMISSION: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HvfAddressSpaceId(u64);
@@ -842,6 +864,10 @@ pub enum HvfMemoryError {
         destroy_abandoned: bool,
         poisoned: bool,
     },
+    /// CLASS R: the plan this act was decided from no longer describes `cell.state` -- a mutation
+    /// of the domain completed after the plan was taken. Re-plan; never act on it. (`&'static str`
+    /// rather than `GrSite` so the public error type does not name a crate-private one.)
+    PlanStale { site: &'static str },
     ResourceLimit {
         resource: &'static str,
         requested: usize,
@@ -854,6 +880,13 @@ pub enum HvfMemoryError {
     Finalization {
         trigger: Box<HvfMemoryError>,
         cleanup: Box<HvfMemoryError>,
+    },
+    /// A migration's departure half failed AND unwinding its freshly registered arrival half
+    /// failed: the same lane now has two live registrations, so the failure is reported as a pair
+    /// instead of as an ordinary (single-registration) failed migration.
+    MigrationUnwindFailed {
+        departure: Box<HvfMemoryError>,
+        unwind: Box<HvfMemoryError>,
     },
     IpaExhausted(usize),
     IpaOwnership,
@@ -923,6 +956,9 @@ impl HvfMemoryError {
             Self::Finalization { trigger, cleanup } => {
                 trigger.published_before_failure() || cleanup.published_before_failure()
             }
+            Self::MigrationUnwindFailed { departure, unwind } => {
+                departure.published_before_failure() || unwind.published_before_failure()
+            }
             Self::Hvf(error) => error.published_before_failure(),
             _ => false,
         }
@@ -984,6 +1020,10 @@ impl fmt::Display for HvfMemoryError {
                 range.start, range.end
             ),
             Self::ClaimStale => write!(f, "the logical GVA claim is stale or foreign"),
+            Self::PlanStale { site } => write!(
+                f,
+                "the memory-subsystem plan taken at {site} is stale: re-plan, do not act"
+            ),
             Self::RangeOutsideClaim(range) => write!(
                 f,
                 "range {:#x}..{:#x} is outside the logical GVA claim",
@@ -1116,6 +1156,11 @@ impl fmt::Display for HvfMemoryError {
             Self::Finalization { trigger, cleanup } => write!(
                 f,
                 "compact HVF operation failed ({trigger}); cleanup also failed ({cleanup})"
+            ),
+            Self::MigrationUnwindFailed { departure, unwind } => write!(
+                f,
+                "lane migration departure failed ({departure}); unwinding the arrival registration \
+                 also failed ({unwind}) -- this lane has two live registrations"
             ),
             Self::IpaExhausted(pages) => {
                 write!(f, "compact IPA aperture cannot allocate {pages} pages")
@@ -1717,6 +1762,16 @@ impl HvfVcpuParticipant {
         self.id
     }
 
+    /// T1b (hvf-kick-only-lanes-in-mutated-space): the address space this participant is
+    /// registered in. A lane mirrors it into `LaneGeneration::space_tag` so a mutation can kick
+    /// only the lanes that are participants of the space it just mutated, instead of every lane
+    /// in the VM. `address_space` is immutable for the life of the record (it is set at
+    /// registration and a move between spaces mints a new record), so this is exact, never a
+    /// snapshot of something that already changed.
+    pub const fn address_space(&self) -> HvfAddressSpaceId {
+        self.address_space
+    }
+
     pub const fn lane_generation(&self) -> u64 {
         self.lane_generation
     }
@@ -1770,6 +1825,13 @@ impl HvfVcpuRunAttachment {
 
     pub const fn requires_synchronization(&self) -> bool {
         self.requires_synchronization
+    }
+
+    /// T2d: whether [`HvfAddressSpace::attach_submitted_vcpu`] already submitted this lease, so
+    /// [`HvfVcpuLaneHandle::execute`] only submits the ones [`HvfAddressSpace::attach_vcpu`] hands
+    /// out (witnesses, `synchronize`, `shootdown`).
+    pub fn is_submitted(&self) -> bool {
+        self.lease_state.load(Ordering::Acquire) == ATTACHMENT_SUBMITTED
     }
 
     pub fn synchronization_request(&self) -> HvfSynchronizationRequest {
@@ -4330,6 +4392,21 @@ impl BackingRegistry {
         Ok(*epoch)
     }
 
+    /// GSIGSEGV2 diagnostic: the stage-two authority counters a backing page currently carries,
+    /// in order: guest writers, guest executors, host writers, and whether the page's own host
+    /// storage is still hidden-writable. `None` when the page indexes no live record.
+    fn stage_two_counters(&self, page: BackingPage) -> Option<(usize, usize, usize, bool)> {
+        let index = self.page_index(page).ok()?;
+        let record = self.records.get(&page.identity)?;
+        let authorities = record.authorities.get(index).copied()?;
+        Some((
+            authorities.stage_two_writers,
+            authorities.stage_two_executors,
+            authorities.host_writers,
+            authorities.hidden_writable,
+        ))
+    }
+
     fn sharing(&self, identity: HvfBackingIdentity) -> Result<HvfSharing, HvfMemoryError> {
         self.records
             .get(&identity)
@@ -4720,8 +4797,8 @@ struct SharedWriterPage {
 
 struct SharedWriterSettlement<'a> {
     vm: &'static HvfVm,
-    backings: MutexGuard<'a, BackingRegistry>,
-    acknowledgements: MutexGuard<'a, Acknowledgements>,
+    backings: RankedGuard<'a, BackingRegistry>,
+    acknowledgements: RankedGuard<'a, Acknowledgements>,
     pages: Vec<SharedWriterPage>,
     epoch: HvfWriteEpoch,
     callback_started: Cell<bool>,
@@ -4733,8 +4810,8 @@ struct SharedWriterSettlement<'a> {
 impl<'a> SharedWriterSettlement<'a> {
     fn new(
         vm: &'static HvfVm,
-        backings: MutexGuard<'a, BackingRegistry>,
-        mut acknowledgements: MutexGuard<'a, Acknowledgements>,
+        backings: RankedGuard<'a, BackingRegistry>,
+        mut acknowledgements: RankedGuard<'a, Acknowledgements>,
         pages: Vec<SharedWriterPage>,
         epoch: HvfWriteEpoch,
     ) -> Result<Self, HvfMemoryError> {
@@ -5079,6 +5156,332 @@ struct SelfDivergedGeneration {
     from_window_retirement: bool,
 }
 
+// ---------------------------------------------------------------------------
+// CLASS R -- the versioned-plan primitive
+// ---------------------------------------------------------------------------
+
+/// A read of one memory-subsystem state domain, stamped with that domain's mutation counter as of
+/// the instant the data was read.
+///
+/// `Versioned` has no public data field and only two ways in ([`HvfAddressSpace::plan_locked`],
+/// [`HvfAddressSpace::plan_lockless`] -- both of them through the one function that applies the
+/// ordering rule -- and [`Self::stamped`] for a read that owns its own lock acquisition). The only
+/// way to spend one is [`HvfAddressSpace::check_plan`] (directly, or through [`Self::validated`] /
+/// [`HvfAddressSpace::settle_gate`]). Rust cannot make "must call `check_plan`" a compile error;
+/// this makes the unvalidated read impossible to write silently, because the one way to reach the
+/// data without a check says so in its own name.
+pub struct Versioned<T> {
+    value: T,
+    generation: u64,
+    site: GrSite,
+}
+
+impl<T> Versioned<T> {
+    /// Module-private on purpose (see the struct's own doc comment). `generation` MUST be the
+    /// domain's counter as of the data read -- never as of some later point, which is the whole
+    /// defect this type exists to make unrepresentable.
+    fn new(value: T, generation: u64, site: GrSite) -> Self {
+        Self {
+            value,
+            generation,
+            site,
+        }
+    }
+
+    /// For a read routine that owns its own `cell.state` acquisition -- one that must RELEASE and
+    /// re-take `state` to avoid waiting for a contended `arenas` while holding it
+    /// ([`HvfAddressSpace::host_access_plan`] and [`HvfAddressSpace::page_writable_now`], both of
+    /// which retry the whole locked section). `generation` MUST be read while that routine still
+    /// holds `state`, immediately before it hands the data back: the same instant
+    /// [`HvfAddressSpace::plan_locked`] reads it at, and the only instant that names the state the
+    /// data describes. Two callers, both named in `steps/GR2/inventory.md`.
+    pub(crate) fn stamped(value: T, generation: u64, site: GrSite) -> Self {
+        let plan = Self::new(value, generation, site);
+        GR_COUNTERS.plan_calls[site.index()].fetch_add(1, Ordering::Relaxed);
+        plan
+    }
+
+    /// The plan's data, once the domain has agreed the plan is still current. `Err` means a
+    /// mutation of the domain completed after this plan was taken: re-plan, do not act.
+    pub(crate) fn validated(&self, space: &HvfAddressSpace) -> Result<&T, HvfMemoryError> {
+        space.check_plan(self)?;
+        Ok(&self.value)
+    }
+
+    /// The plan's data WITHOUT re-validating it. Every call site must say why that is sound
+    /// (typically: the act re-checks its own precondition under its own lock), and the name says
+    /// what is being skipped at every one of them.
+    pub(crate) fn into_value_unvalidated(self) -> T {
+        self.value
+    }
+}
+
+impl HvfAddressSpace {
+    /// CLASS R: the ONE place the version-read ORDER is expressed, and the ONE place a plan is
+    /// accepted or re-taken.
+    ///
+    /// **read generation -> read data -> re-read generation -> act on a match, retry on a
+    /// mismatch.** `sample` performs one attempt and returns
+    /// `(data, generation_before_the_read, generation_after_the_read)`. Equal means no mutation of
+    /// this domain completed anywhere inside the window the two reads bracket -- a window that
+    /// contains the data read -- so the generation is a valid stamp for that data. Unequal means
+    /// one did: the pair is re-taken, bounded by [`GR_PLAN_RETRY_BOUND`].
+    ///
+    /// A stamp taken AFTER the data it describes can name a generation a later mutation already
+    /// reached, which is exactly how `check_plan` comes to accept a plan whose data predates that
+    /// mutation. The ancestor-side divergence gate
+    /// [`crate::hvf_backend::HvfBackend::diverge_fork_write_protected_pages`] shipped that shape
+    /// once: its empty fast path read the counter unlocked, after the hint the plan was describing,
+    /// so a `fork_write_protect_range` that landed in between left an empty plan that `check_plan`
+    /// still accepted -- and the divergence that has to precede a permission change was skipped.
+    ///
+    /// On exhaustion the last read is handed back stamped with the generation it was TAKEN at,
+    /// never the later one, so `check_plan` still judges it rather than accepting data that
+    /// predates a mutation already visible here.
+    fn plan_from<T>(&self, site: GrSite, mut sample: impl FnMut() -> (T, u64, u64)) -> Versioned<T> {
+        let started = gr_time_start();
+        let mut retries = 0u32;
+        let result = loop {
+            let (value, before, after) = sample();
+            if before == after {
+                break Versioned::new(value, before, site);
+            }
+            retries += 1;
+            GR_COUNTERS.plan_retries[site.index()].fetch_add(1, Ordering::Relaxed);
+            if retries >= GR_PLAN_RETRY_BOUND {
+                break Versioned::new(value, before, site);
+            }
+        };
+        GR_COUNTERS.plan_calls[site.index()].fetch_add(1, Ordering::Relaxed);
+        gr_note_time(site, started);
+        result
+    }
+
+    /// A plan over this space's `cell.state` whose data read needs the domain's own lock and
+    /// nothing else: the generation is read INSIDE one hold of that lock, immediately before the
+    /// data and again immediately after it.
+    ///
+    /// Sampling inside the hold is what makes the stamp both sound and cheap. It is sound because
+    /// the domain can only be mutated through a `&mut` borrow of this same mutex, so no mutation
+    /// can complete anywhere between the two reads and they can never disagree. It is cheap
+    /// because the window the two reads bracket is the data read itself, not the lock
+    /// ACQUISITION: bracketing from outside (a generation read before `lock()` and another after
+    /// the guard drops) puts a possibly long contended wait inside the window, which is how the
+    /// previous pass of this step came to stamp `host_access_plan` stale 33 % of the time -- the
+    /// re-plans then cost the desktop ~4.5x idle CPU. This is also the site the previous pass
+    /// fixed in the opposite direction (a stamp read once, at the FIRST acquisition, before the
+    /// body released `state` to wait for `arenas`): that stamp names a state the data may predate,
+    /// which is the unsound shape again.
+    /// (`&AddressSpaceState` is this module's own type, so this stays module-private: every plan
+    /// over `cell.state` is taken inside this file.)
+    fn plan_locked<T>(
+        &self,
+        site: GrSite,
+        mut read: impl FnMut(&AddressSpaceState) -> T,
+    ) -> Versioned<T> {
+        self.plan_from(site, || {
+            let state = self
+                .cell
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = self.cell.state.generation();
+            let value = read(&state);
+            let after = self.cell.state.generation();
+            (value, before, after)
+        })
+    }
+
+    /// A plan whose data is read with NO lock -- the one-way `AddressSpaceCell` hint fast paths
+    /// (`fork_write_protected_hint`). Two generation reads, one on each side of the data read, are
+    /// what give a lock-free read a stamp it can be judged against at all: a mutation that
+    /// completes between the two loads makes the pair mismatch and the read is re-taken rather
+    /// than answered from a torn pair. This is the shape the D2 site was missing.
+    pub(crate) fn plan_lockless<T>(&self, site: GrSite, mut read: impl FnMut() -> T) -> Versioned<T> {
+        self.plan_from(site, || {
+            let before = self.cell.state.generation();
+            let value = read();
+            let after = self.cell.state.generation();
+            (value, before, after)
+        })
+    }
+
+    /// This domain's mutation counter, for a caller that already holds `cell.state` and must stamp
+    /// its own read (see [`Versioned::stamped`]).
+    pub(crate) fn state_generation(&self) -> u64 {
+        self.cell.state.generation()
+    }
+
+    /// Re-validates `plan` under the domain's own lock: `Ok` when no mutation of `cell.state` has
+    /// completed since the plan was taken, `Err(HvfMemoryError::PlanStale)` when one has. This is
+    /// the act's ORACLE, not a lock: [`Self::plan_locked`]'s and this call's acquisitions are
+    /// separate, so the check-then-act window is narrowed to one unlock/relock pair and measured
+    /// (`hvf_gr.plan_stale`), never closed. The safety of what remains rests on each act
+    /// re-checking its own precondition under its own locks, which `steps/GR2/inventory.md` states
+    /// per site rather than assuming.
+    ///
+    /// It is a RE-PLAN TRIGGER ONLY. Nothing in this step refuses, skips or changes an act because
+    /// a plan was stale -- the previous pass of this step added a refusal on that basis and
+    /// regressed correctness (`grs2 stress` `iov_wrong_data` canaries 0 -> 223-684), so a stale
+    /// verdict is spent the same way a lost race is spent here: take the plan again.
+    pub(crate) fn check_plan<T>(&self, plan: &Versioned<T>) -> Result<(), HvfMemoryError> {
+        let site = plan.site;
+        if !gr_check_plan_enabled(site) {
+            return Ok(());
+        }
+        let started = gr_time_start();
+        GR_COUNTERS.plan_checks[site.index()].fetch_add(1, Ordering::Relaxed);
+        let generation = {
+            let _state = self
+                .cell
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.cell.state.generation()
+        };
+        gr_note_time(site, started);
+        if generation != plan.generation {
+            GR_COUNTERS.plan_stale[site.index()].fetch_add(1, Ordering::Relaxed);
+            return Err(HvfMemoryError::PlanStale { site: site.name() });
+        }
+        Ok(())
+    }
+
+    /// A gate whose answer decides an act: re-take the plan until `check_plan` accepts it, or
+    /// until `GR_REPLAN_BOUND` is spent. Returns the answer to act on and whether the domain
+    /// agreed with it, so the caller can be honest about the difference. Exhausting the bound is
+    /// counted (`hvf_gr.plan_bound_exhausted`) because it IS an act on a plan known to be stale --
+    /// a space that never stops mutating still has to make progress.
+    pub(crate) fn settle_gate<T>(
+        &self,
+        site: GrSite,
+        mut take: impl FnMut() -> Versioned<T>,
+    ) -> (T, bool) {
+        for _ in 0..GR_REPLAN_BOUND {
+            let plan = take();
+            if plan.validated(self).is_ok() {
+                return (plan.into_value_unvalidated(), true);
+            }
+        }
+        GR_COUNTERS.plan_bound_exhausted[site.index()].fetch_add(1, Ordering::Relaxed);
+        (take().into_value_unvalidated(), false)
+    }
+
+    /// The invariant checker: two properties of a STEADY state, sampled (at most
+    /// [`Self::INVARIANT_SAMPLE_PAGES`] pages per range, counted as `invariant_pages_checked` of
+    /// `invariant_pages_span`, so a "0 violations" figure carries its coverage):
+    ///
+    /// * a page is held by at most ONE of {own claim, lineage alias, promoted shadow, file alias}
+    ///   -- with the two legitimate claim+redirect combinations counted apart
+    ///   (`exempt_claim_promoted`, `exempt_claim_file_alias`). A file WINDOW is a range record, not
+    ///   a page-level holder, so it is not one of the terms; its co-occurrence with a redirect is
+    ///   counted apart (`exempt_window_redirect`);
+    /// * no page carries WRITE and EXECUTE at once (W^X).
+    ///
+    /// This is NOT a class guard and its own doc comment says so: none of the historical class-R
+    /// bugs would trip it, because they were check-then-act races over TIME, not contradictions a
+    /// steady state could show. On unconditionally in a debug build, on demand in release
+    /// (`LITEBOX_HVF_GR_CHECK=1`).
+    const INVARIANT_SAMPLE_PAGES: usize = 16;
+
+    pub(crate) fn check_invariants_range(&self, range: &Range<usize>, site: GrSite) {
+        if !gr_invariants_enabled() {
+            return;
+        }
+        // Reported after the guard is gone: `describe_page` takes `cell.state` itself, and this
+        // domain's mutex is not reentrant.
+        let mut found: Vec<(usize, u32)> = Vec::new();
+        {
+            let state = self
+                .cell
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pages: Vec<usize> = page_addresses(range).collect();
+            if pages.is_empty() {
+                return;
+            }
+            GR_COUNTERS
+                .invariant_pages_span
+                .fetch_add(pages.len() as u64, Ordering::Relaxed);
+            let step = pages.len().div_ceil(Self::INVARIANT_SAMPLE_PAGES);
+            for page in pages.iter().copied().step_by(step) {
+                GR_COUNTERS.invariant_checks.fetch_add(1, Ordering::Relaxed);
+                GR_COUNTERS
+                    .invariant_pages_checked
+                    .fetch_add(1, Ordering::Relaxed);
+                let claim = state
+                    .claims
+                    .values()
+                    .find(|claim| claim.range.start <= page && page < claim.range.end)
+                    .and_then(|claim| claim.pages.get(&page));
+                // `file_windows` is a RANGE record, not a page-level holder: a window names a span
+                // of the address space whose untouched pages read through the origin, and a page
+                // inside that span that has since been aliased, promoted or claimed is still inside
+                // it. Counting it as a holder produced 6,680 "violations" on one desktop arm, every
+                // one of them the same page (`file_alias` + `file_window`) -- a false positive, not
+                // a class-R escape. The co-occurrence is counted apart instead
+                // (`exempt_window_redirect`).
+                let windowed = file_window_at_locked(&state.file_windows, page).is_some();
+                let mut holders = u32::from(claim.is_some())
+                    + u32::from(state.aliases.contains_key(&page))
+                    + u32::from(state.promoted.contains_key(&page))
+                    + u32::from(state.file_aliases.contains_key(&page));
+                if windowed && holders > 0 {
+                    GR_COUNTERS
+                        .exempt_window_redirect
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                // D4: the two combinations that are legitimate and therefore exempted, measured
+                // apart so a "0 violations" bound never rests silently on an exemption.
+                if claim.is_some() && state.promoted.contains_key(&page) {
+                    GR_COUNTERS.exempt_claim_promoted.fetch_add(1, Ordering::Relaxed);
+                    holders -= 1;
+                }
+                if claim.is_some() && state.file_aliases.contains_key(&page) {
+                    GR_COUNTERS
+                        .exempt_claim_file_alias
+                        .fetch_add(1, Ordering::Relaxed);
+                    holders -= 1;
+                }
+                if holders > 1 {
+                    GR_COUNTERS
+                        .invariant_violations
+                        .fetch_add(1, Ordering::Relaxed);
+                    GR_COUNTERS
+                        .violation_multi_redirect
+                        .fetch_add(1, Ordering::Relaxed);
+                    if claim.is_some() && state.aliases.contains_key(&page) {
+                        GR_COUNTERS
+                            .violation_claim_alias
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    found.push((page, holders));
+                }
+                if let Some(page_state) = claim
+                    && page_state.permissions.contains(HvfGuestPermissions::WRITE)
+                    && page_state
+                        .permissions
+                        .contains(HvfGuestPermissions::EXECUTE)
+                {
+                    GR_COUNTERS
+                        .invariant_violations
+                        .fetch_add(1, Ordering::Relaxed);
+                    GR_COUNTERS.violation_wx.fetch_add(1, Ordering::Relaxed);
+                    found.push((page, holders));
+                }
+            }
+        }
+        for (page, holders) in found {
+            litebox_util_log::warn!(
+                page:? = page, holders:? = holders, site:? = site.name(),
+                state:% = self.describe_page(page);
+                "HVF class-R invariant violated"
+            );
+        }
+    }
+}
+
 struct AddressSpaceCell {
     id: HvfAddressSpaceId,
     asid: HvfAsid,
@@ -5127,13 +5530,24 @@ struct AddressSpaceCell {
     /// desktop soak, max 244 ms). Same instant-of-read semantics as the locked test it replaces:
     /// a window installed right after either read is found by the access's fault retry.
     file_windows_len: AtomicUsize,
+    /// CLASS C: this space's retirement-ledger row count (every row, deferred or not), mirrored
+    /// by [`HvfMemory::commit_retirement`] / [`HvfAddressSpace::acknowledge_retirement_in`] under
+    /// the ledger lock. A superset of the pumpable set, so a zero proves nothing is pumpable and
+    /// the per-exit opportunistic check needs neither the process-global `acknowledgements`
+    /// mutex nor its two full ledger scans (measured 176 us per call on the desktop, contention
+    /// shared with every mutator's ledger critical section). Cross-checked in debug against the
+    /// real row count in [`HvfAddressSpace::pending_retirements`].
+    retirement_rows: AtomicUsize,
     /// A [`TimedMutex`]: contended waits and long holds are attributed to their holder (T1h,
     /// hvf-t1g-remainder-multisecond-service-guest-memory-access-convoy).
     state: TimedMutex<AddressSpaceState>,
     /// Serializes ledger-backed retirement pump passes for this address space.
     /// Deferred custody itself lives in `Acknowledgements::retirements`, so
     /// parking a post-commit ticket cannot allocate or lose it.
-    retirement_pump: Mutex<()>,
+    /// CLASS A: ranked BELOW the operation gate (T1g). A gate owner takes it inside the
+    /// admission, never the other way round, so no thread can ever hold it while waiting for
+    /// the gate.
+    retirement_pump: RankedMutex<()>,
 }
 
 impl AddressSpaceCell {
@@ -6035,14 +6449,18 @@ pub struct HvfMemory {
     regime: HvfTranslationRegime,
     synchronization_root: SynchronizationRoot,
     _monitor_mapping: HvfMapping<'static>,
-    spaces: Mutex<HashMap<HvfAddressSpaceId, Arc<AddressSpaceCell>>>,
-    arenas: Mutex<Arenas>,
-    backings: Mutex<BackingRegistry>,
-    acknowledgements: Mutex<Acknowledgements>,
+    /// CLASS A: every lock below declares a rank in the global order
+    /// ([`crate::diagnostics_counters::RANK_SPACES`] and up) and joins the calling thread's held
+    /// set, so a thread that blocks on one of them while holding another is counted (release) and
+    /// asserted (debug) at its call site.
+    spaces: RankedMutex<HashMap<HvfAddressSpaceId, Arc<AddressSpaceCell>>>,
+    arenas: RankedMutex<Arenas>,
+    backings: RankedMutex<BackingRegistry>,
+    acknowledgements: RankedMutex<Acknowledgements>,
     /// Caller-named shared backing objects ([`HvfSharedBackingKey::identity`])
     /// to the pinned registry object that holds their pages. Always locked
     /// after `backings`, never before.
-    shared_backings: Mutex<HashMap<usize, HvfBackingIdentity>>,
+    shared_backings: RankedMutex<HashMap<usize, HvfBackingIdentity>>,
 }
 
 impl fmt::Debug for HvfMemory {
@@ -6297,11 +6715,14 @@ impl HvfMemory {
                 regime,
                 synchronization_root,
                 _monitor_mapping: monitor_mapping,
-                spaces: Mutex::new(HashMap::new()),
-                arenas: Mutex::new(arenas),
-                backings: Mutex::new(BackingRegistry::new(max_physical_pages)),
-                acknowledgements: Mutex::new(acknowledgements),
-                shared_backings: Mutex::new(HashMap::new()),
+                spaces: RankedMutex::new(HashMap::new(), crate::diagnostics_counters::RANK_SPACES),
+                arenas: RankedMutex::new(arenas, crate::diagnostics_counters::RANK_ARENAS),
+                backings: RankedMutex::new(
+                    BackingRegistry::new(max_physical_pages),
+                    crate::diagnostics_counters::RANK_BACKINGS,
+                ),
+                acknowledgements: RankedMutex::new(acknowledgements, crate::diagnostics_counters::RANK_ACKS),
+                shared_backings: RankedMutex::new(HashMap::new(), crate::diagnostics_counters::RANK_SHARED_BACKINGS),
             })
         })
     }
@@ -6618,6 +7039,7 @@ impl HvfMemory {
                 fork_write_protected_hint: AtomicBool::new(false),
                 file_alias_hint: AtomicBool::new(false),
                 file_windows_len: AtomicUsize::new(0),
+                retirement_rows: AtomicUsize::new(0),
                 state: TimedMutex::new(
                     AddressSpaceState {
                         live: false,
@@ -6641,8 +7063,9 @@ impl HvfMemory {
                         fork_write_protected: HashMap::new(),
                     },
                     id.value(),
+                    crate::diagnostics_counters::RANK_CELL_STATE,
                 ),
-                retirement_pump: Mutex::new(()),
+                retirement_pump: RankedMutex::new((), crate::diagnostics_counters::RANK_PUMP),
             });
             let root = match create_monitor_root(self.vm, &mut arenas, self.limits.max_table_pages)
             {
@@ -6669,9 +7092,13 @@ impl HvfMemory {
             }
             operation.mark_published()?;
             {
+                // CLASS A: this cell's `Arc` is not in `spaces` yet, so no other thread can reach
+                // its `state`; taking it while `spaces` and `arenas` are still held is the reverse
+                // of the usual order but cannot deadlock. `lock_unpublished` is how the code says
+                // that, instead of bending the rank.
                 let mut state = cell
                     .state
-                    .lock()
+                    .lock_unpublished()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.root = root;
                 state.live = true;
@@ -6833,11 +7260,20 @@ impl HvfMemory {
         })
     }
 
+    /// Commits one retirement row. `cell` (rather than a bare id) so the row can also be counted
+    /// in the space's own lock-free mirror, [`AddressSpaceCell::retirement_rows`]: the per-exit
+    /// opportunistic pump check reads that mirror instead of taking the process-global
+    /// `acknowledgements` mutex and scanning the ledger twice (CLASS C,
+    /// `hvf-exclusive-gate-saturation-shrink`).
+    /// T1f-a: `#[track_caller]` only -- every commit is attributed to its call site (which also
+    /// covers the mutations minted inside this file that never reach the backend's
+    /// `settle_mutation`), counted in `t1f.root_generation_sites`.
+    #[track_caller]
     fn commit_retirement(
         &self,
         acknowledgements: &mut Acknowledgements,
         reservation: RetirementReservation,
-        address_space: HvfAddressSpaceId,
+        cell: &AddressSpaceCell,
         generation: HvfRootGeneration,
         tlbi_generation: HvfTlbiGeneration,
         participants: RetirementParticipants,
@@ -6848,6 +7284,7 @@ impl HvfMemory {
     ) -> HvfRetirementTicket {
         let mut id = reservation.id;
         let custody = RetirementCustodyCell::new();
+        let address_space = cell.id;
         let retired = RetiredGeneration {
             address_space,
             generation,
@@ -6878,6 +7315,11 @@ impl HvfMemory {
             }
         }
         acknowledgements.note_row_added(address_space);
+        cell.retirement_rows.fetch_add(1, Ordering::Release);
+        crate::diagnostics_counters::record_root_generation(
+            core::panic::Location::caller(),
+            address_space,
+        );
         HvfRetirementTicket::mint(self.manager, address_space, id, generation, custody)
     }
 
@@ -7545,6 +7987,34 @@ impl HvfMemory {
     }
 }
 
+/// CLASS C: the publication surface a participant-record mutation actually needs of the VM
+/// operation gate -- `require_live` before the mutation and `mark_published` at it. Both the
+/// exclusive (`HvfVmOperation`) and the counting shared (`HvfVmSharedOperation`) admission
+/// provide it, so one body serves both classes and the class is chosen at the wrapper
+/// (see [`Self::register_vcpu_participant`] vs [`Self::register_vcpu_participant_shared`]).
+trait ParticipantPublishScope {
+    fn require_live(&self) -> Result<(), HvfError>;
+    fn mark_published(&self) -> Result<(), HvfError>;
+}
+
+impl ParticipantPublishScope for HvfVmOperation<'_> {
+    fn require_live(&self) -> Result<(), HvfError> {
+        HvfVmOperation::require_live(self)
+    }
+    fn mark_published(&self) -> Result<(), HvfError> {
+        HvfVmOperation::mark_published(self)
+    }
+}
+
+impl ParticipantPublishScope for HvfVmSharedOperation<'_> {
+    fn require_live(&self) -> Result<(), HvfError> {
+        HvfVmSharedOperation::require_live(self)
+    }
+    fn mark_published(&self) -> Result<(), HvfError> {
+        HvfVmSharedOperation::mark_published(self)
+    }
+}
+
 impl HvfAddressSpace {
     pub fn id(&self) -> HvfAddressSpaceId {
         self.cell.id
@@ -7989,7 +8459,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 generation,
                 tlbi_generation,
                 participants,
@@ -8008,6 +8478,16 @@ impl HvfAddressSpace {
         self.pump_retirements().map(|_| ())
     }
 
+    /// CLASS R: **N-by-construction**, and the reason is recorded here so it survives the next
+    /// refactor (this accessor was absent from the first pass's inventory entirely). Its one
+    /// caller runs from `HvfBackend::new`, immediately after `install_trampoline` and before any
+    /// lane, vCPU, view or guest thread exists, on `default_space`, about a page the same function
+    /// mapped and protected two statements earlier -- so there is no concurrent mutator of this
+    /// domain at all and a generation stamp here could never fire. Afterwards the two properties
+    /// the write depends on are held by other means: the page is never unmapped (`default_space`
+    /// outlives every guest) and it is never made EXECUTE, which this accessor itself refuses --
+    /// exactly the one transition that would retract the storage's host WRITE.
+    ///
     /// The host address of the physical page backing this space's own claim at `gva`: the
     /// backing's storage mapping itself, which stays host-writable whatever the guest's
     /// permission is (the permanent mirror alias at `gva`, by contrast, follows the guest's
@@ -8113,14 +8593,9 @@ impl HvfAddressSpace {
     /// `hvf_backend.rs`'s fault classifier uses to decide between installing a fresh alias (not
     /// yet aliased at all) and promoting an existing one (a write against an already-aliased
     /// page).
-    pub fn is_cow_aliased(&self, gva: usize) -> bool {
+    pub fn is_cow_aliased(&self, gva: usize) -> Versioned<bool> {
         let page = gva & !(PAGE_SIZE - 1);
-        let state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.aliases.contains_key(&page)
+        self.plan_locked(GrSite::IsCowAliased, |state| state.aliases.contains_key(&page))
     }
 
     /// Whether `self` currently holds ANY COW read-alias installed by
@@ -8149,17 +8624,22 @@ impl HvfAddressSpace {
     /// by-far-common "never fork-write-protected" path: one relaxed load of
     /// `fork_write_protected_hint`, no lock, no hashmap touch -- mirrors
     /// [`Self::resolve_host_redirect`]'s own identical hint-then-lock shape.
-    pub fn is_fork_write_protected(&self, gva: usize) -> bool {
-        if !self.cell.fork_write_protected_hint.load(Ordering::Relaxed) {
-            return false;
-        }
+    pub fn is_fork_write_protected(&self, gva: usize) -> Versioned<bool> {
         let page = gva & !(PAGE_SIZE - 1);
-        let state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.fork_write_protected.contains_key(&page)
+        // The hint fast path stays (one relaxed load): `plan_lockless` reads the generation BEFORE
+        // it and again after, so a protection that lands in between makes the pair mismatch and
+        // the read is re-taken rather than answered from a torn pair.
+        self.plan_lockless(GrSite::IsForkWriteProtected, || {
+            if !self.cell.fork_write_protected_hint.load(Ordering::Relaxed) {
+                return false;
+            }
+            let state = self
+                .cell
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.fork_write_protected.contains_key(&page)
+        })
     }
 
     /// Whether this space was created as a direct fork child (its [`AddressSpaceCell::fork_origin`]
@@ -8249,12 +8729,12 @@ impl HvfAddressSpace {
     /// the same answers as those per-page calls at the instant of the lock: a SNAPSHOT, valid
     /// only until the space next changes -- `HvfBackend::prepare_guest_access` acts on each one
     /// only within the round that took it (see its `revalidated_rounds`).
-    pub fn host_access_plan(&self, range: &Range<usize>) -> Vec<HostAccessEntry> {
+    pub fn host_access_plan(&self, range: &Range<usize>) -> Versioned<Vec<HostAccessEntry>> {
         let mut tries = 1;
         loop {
             let block = tries >= Self::ARENAS_UNDER_STATE_TRIES;
-            if let Some(plan) = self.host_access_plan_attempt(range, block) {
-                return plan;
+            if let Some((plan, generation)) = self.host_access_plan_attempt(range, block) {
+                return Versioned::stamped(plan, generation, GrSite::HostAccessPlan);
             }
             tries += 1;
         }
@@ -8266,7 +8746,7 @@ impl HvfAddressSpace {
         &self,
         range: &Range<usize>,
         block: bool,
-    ) -> Option<Vec<HostAccessEntry>> {
+    ) -> Option<(Vec<HostAccessEntry>, u64)> {
         let start = range.start & !(PAGE_SIZE - 1);
         let end = range.end.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let span = start..end;
@@ -8284,7 +8764,7 @@ impl HvfAddressSpace {
             })
             .collect();
         if plan.is_empty() {
-            return Some(plan);
+            return Some((plan, self.state_generation()));
         }
         for claim in state.claims.values() {
             if claim.range.start >= end || start >= claim.range.end {
@@ -8340,8 +8820,13 @@ impl HvfAddressSpace {
                     .is_none_or(|record| record.gva != page);
                 plan[index].alias_state = HostAliasState::Alias { relocated };
             }
+            let generation = self.state_generation();
+            drop(arenas);
+            return Some((plan, generation));
         }
-        Some(plan)
+        let generation = self.state_generation();
+        drop(state);
+        Some((plan, generation))
     }
 
     /// How many times a host-side lookup that needs `arenas` under `state` releases `state` to
@@ -8361,7 +8846,7 @@ impl HvfAddressSpace {
         block: bool,
     ) -> Option<(
         crate::diagnostics_counters::TimedGuard<'s, AddressSpaceState>,
-        MutexGuard<'s, Arenas>,
+        RankedGuard<'s, Arenas>,
     )> {
         if block {
             let arenas = self
@@ -8439,7 +8924,15 @@ impl HvfAddressSpace {
     /// an ancestor's own permission over `range` (a guest `mprotect`, a W^X-toggle flip), which
     /// must diverge each such page first so the protection is never silently undone or its
     /// pre-fault content lost to a live descendant.
-    pub fn fork_write_protected_pages_in(&self, range: &Range<usize>) -> Vec<usize> {
+    pub fn fork_write_protected_pages_in(&self, range: &Range<usize>) -> Versioned<Vec<usize>> {
+        // CLASS R (D2): THIS is the site that shipped the unsound shape. Its empty fast path was
+        // stamped with a generation read UNLOCKED and AFTER the lock-free hint it describes, so a
+        // `fork_write_protect_range` landing in between left an empty plan `check_plan` still
+        // ACCEPTED -- and the divergence that has to precede a permission change was skipped.
+        // The whole body now sits inside `plan_lockless`, which reads the generation before the
+        // data and again after it and re-takes the pair on a mismatch -- the two reads a LOCK-FREE
+        // fast path needs, since the hint load is not protected by anything.
+        self.plan_lockless(GrSite::ForkWriteProtectedPagesIn, || {
         if !self.cell.fork_write_protected_hint.load(Ordering::Relaxed) {
             return Vec::new();
         }
@@ -8465,8 +8958,9 @@ impl HvfAddressSpace {
                 .filter(|page| (start..end).contains(page))
                 .collect()
         };
-        pages.sort_unstable();
-        pages
+            pages.sort_unstable();
+            pages
+        })
     }
 
     /// This space's own current self-divergence epoch (see
@@ -9171,7 +9665,7 @@ impl HvfAddressSpace {
         &self,
     ) -> (
         crate::diagnostics_counters::TimedGuard<'_, AddressSpaceState>,
-        MutexGuard<'_, Arenas>,
+        RankedGuard<'_, Arenas>,
     ) {
         let mut tries = 1;
         loop {
@@ -9195,7 +9689,7 @@ impl HvfAddressSpace {
     /// protection the faulting translation still carried (every divergence re-checks and drops
     /// the protection inside its own commit, so the siblings that faulted on the same protection
     /// find nothing left to diverge -- T1h fix-up), and resuming re-attaches onto the current root.
-    pub fn page_writable_now(&self, gva: usize) -> bool {
+    pub fn page_writable_now(&self, gva: usize) -> Versioned<bool> {
         let page = gva & !(PAGE_SIZE - 1);
         let writable = |state: &AddressSpaceState, at: usize| {
             state
@@ -9209,7 +9703,14 @@ impl HvfAddressSpace {
                 })
         };
         let mut tries = 1;
-        loop {
+        // CLASS R: the guest is RESUMED on this answer, so the act cannot re-check anything
+        // afterwards -- it has to be a plan the domain still agrees with. Like
+        // [`Self::host_access_plan`] this routine releases `state` to wait for a contended
+        // `arenas` and starts its locked section over, so it stamps itself
+        // ([`Versioned::stamped`]) at the instant the answer is produced, while `state` is still
+        // held -- neither before the loop (which would name a state the data may predate) nor
+        // after it (which would put every release inside the stamp's window).
+        let (answer, generation) = loop {
             let block = tries >= Self::ARENAS_UNDER_STATE_TRIES;
             let state = self
                 .cell
@@ -9217,32 +9718,118 @@ impl HvfAddressSpace {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !state.live || state.fork_write_protected.contains_key(&page) {
-                return false;
+                break (false, self.state_generation());
             }
             let Some(record) = state.promoted.get(&page).copied() else {
-                return writable(&state, page);
+                break (writable(&state, page), self.state_generation());
             };
             let Some((state, arenas)) = self.arenas_under_state(state, block) else {
                 tries += 1;
                 continue;
             };
             let Some(shadow_gva) = arenas.slots.records.get(&record.slot).map(|slot| slot.gva) else {
-                return false;
+                break (false, self.state_generation());
             };
+            let answer = writable(&state, shadow_gva);
+            let generation = self.state_generation();
             drop(arenas);
-            return writable(&state, shadow_gva);
-        }
+            break (answer, generation);
+        };
+        Versioned::stamped(answer, generation, GrSite::PageWritableNow)
     }
 
-    /// Whether this space still holds any fork-COW retention a reap could release: a preserved
-    /// self-diverged generation or a `retired_mirrored_pages` stash entry. One state lock.
-    pub fn has_fork_cow_retention(&self) -> bool {
+    /// The repair target for a page this space owns but cannot currently execute against: the
+    /// permissions [`Self::permissions`]-shaped state says `page` should carry, when the hardware
+    /// disagrees with it and no fault arm can explain why.
+    ///
+    /// Returns `Some` only for a page that is genuinely this space's own -- a live claim covering
+    /// it, holding its own private backing, with no COW/file alias and no promotion of its own
+    /// (every one of those has a fault arm of its own) -- whose stage-2 translation is either
+    /// absent entirely or installed at an authority that is not the one its own recorded
+    /// permissions ask for. `None` for anything else.
+    ///
+    /// `fork_write_protected` is deliberately NOT a disqualifier: a page that is fork-time
+    /// write-protected AND has lost its translation is exactly the dead end
+    /// [`Self::atomically_diverge_claimed_page`] refuses
+    /// ("source page has no backing to preserve" / no mapping), so the caller repairs it by
+    /// reinstalling the protection's own read-only target instead, after which the ordinary
+    /// self-divergence arm works again.
+    pub fn own_page_repair_target(&self, gva: usize) -> Option<HvfGuestPermissions> {
+        let page = gva & !(PAGE_SIZE - 1);
         let state = self
             .cell
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !state.self_diverged.is_empty() || !state.retired_mirrored_pages.is_empty()
+        if !state.live
+            || state.aliases.contains_key(&page)
+            || state.promoted.contains_key(&page)
+            || state.retired_mirrored_pages.contains_key(&page)
+        {
+            return None;
+        }
+        let protected = state.fork_write_protected.get(&page).copied();
+        let claim = state
+            .claims
+            .values()
+            .find(|claim| claim.range.start <= page && page < claim.range.end)?;
+        let page_state = claim.pages.get(&page)?;
+        if page_state.sharing != HvfSharing::Private || page_state.backing.is_none() {
+            return None;
+        }
+        match protected {
+            // A fork-time write-protected page is legitimately installed read-only while its own
+            // claim still records WRITE, so there the hardware ALREADY agrees: returning `None`
+            // is what keeps this from "repairing" the ordinary protected state over and over,
+            // which would turn the existing bounded, loud failure into an unbounded resume loop.
+            // (That case is also `HvfBackend::try_resolve_cow_fault`'s own self-divergence arm,
+            // which runs before this repair is ever reached.)
+            Some(_) => {
+                let target =
+                    HvfGuestPermissions(page_state.permissions.0 & !HvfGuestPermissions::WRITE.0);
+                if target == HvfGuestPermissions::NONE {
+                    return None;
+                }
+                let installed = page_state.mapping.as_ref().map(|mapping| mapping.authority);
+                if installed == Some(StageTwoAuthority::for_permissions(target)) {
+                    return None;
+                }
+                Some(target)
+            }
+            // Not protected: the recorded permission IS what the hardware must carry. The
+            // measured failure (see `HvfBackend::try_repair_own_page`) is a write permission
+            // fault against a page whose own claim already records READ|WRITE with a live
+            // mapping and no protection -- i.e. the stage-2 authority has fallen out of step
+            // with the claim, after a self-divergence or protect whose stage-2 rewrite never
+            // landed. Reinstalling the claim's own permission is therefore always the right
+            // target, and the caller bounds how often.
+            None => {
+                if page_state.permissions == HvfGuestPermissions::NONE {
+                    return None;
+                }
+                Some(page_state.permissions)
+            }
+        }
+    }
+
+    /// Whether this space still holds any fork-COW retention a reap could release: a preserved
+    /// self-diverged generation or a `retired_mirrored_pages` stash entry. One state lock.
+    pub fn has_fork_cow_retention(&self) -> Versioned<bool> {
+        self.plan_locked(GrSite::HasForkCowRetention, |state| {
+            !state.self_diverged.is_empty() || !state.retired_mirrored_pages.is_empty()
+        })
+    }
+
+    /// [`Self::has_fork_cow_retention`] settled through [`Self::settle_gate`] for its three ACTING
+    /// callers, each of which gates a mutation (a reap, or a whole `destroy`) on this answer after
+    /// the accessor's own lock release -- and the reap itself blocks (VM operation gate, unmap,
+    /// retirement pump). A stale `true` costs one reap that finds nothing; a stale `false` skips a
+    /// reap whose retention then outlives the space, i.e. it leaks exactly the live-data pages
+    /// `hvf-fork-cow-retention-exhausts-live-data-pages` exists to reclaim (measured live before
+    /// that fix: 8 GiB in under four minutes of Chromium desktop use).
+    pub fn has_fork_cow_retention_checked(&self) -> bool {
+        self.settle_gate(GrSite::HasForkCowRetention, || self.has_fork_cow_retention())
+            .0
     }
 
     /// FIX (hvf-fork-cow-retention-exhausts-live-data-pages): drains up to `limit` preserved
@@ -9884,7 +10471,7 @@ impl HvfAddressSpace {
                 let retirement = self.memory.commit_retirement(
                     &mut acknowledgements,
                     reservation,
-                    self.cell.id,
+                    &self.cell,
                     generation,
                     tlbi_generation,
                     participants,
@@ -10054,7 +10641,7 @@ impl HvfAddressSpace {
         // in one space), so any live claim -- or claim-derived stash -- `source` holds there now
         // is a later mapping the descendant must not see: only a promotion or a parked
         // generation can supply lineage content for it, everything else resolves to the origin.
-        let window_page = self.file_window_at(page).is_some();
+        let window_page = self.file_window_at(page).into_value_unvalidated().is_some();
         let (slot, source_permissions, ipa_start, anchor_gva) = {
             let source_state = source
                 .cell
@@ -10358,7 +10945,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 generation,
                 tlbi_generation,
                 participants,
@@ -10393,25 +10980,21 @@ impl HvfAddressSpace {
 
     /// Whether `gva`'s page holds a COW read alias of either kind (lineage or file origin): the
     /// "already installed by a concurrent fault on the same page" resume test.
-    pub fn is_any_aliased(&self, gva: usize) -> bool {
+    pub fn is_any_aliased(&self, gva: usize) -> Versioned<bool> {
         let page = gva & !(PAGE_SIZE - 1);
-        let state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.aliases.contains_key(&page) || state.file_aliases.contains_key(&page)
+        // The one gate of `try_resolve_cow_fault` whose act is a RESUME, so it cannot re-check
+        // anything afterwards: it has to be settled, like its two neighbours.
+        self.plan_locked(GrSite::IsAnyAliased, |state| {
+            state.aliases.contains_key(&page) || state.file_aliases.contains_key(&page)
+        })
     }
 
     /// Whether `gva`'s page currently holds a file alias.
-    pub fn is_file_aliased(&self, gva: usize) -> bool {
+    pub fn is_file_aliased(&self, gva: usize) -> Versioned<bool> {
         let page = gva & !(PAGE_SIZE - 1);
-        self.cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .file_aliases
-            .contains_key(&page)
+        self.plan_locked(GrSite::IsFileAliased, |state| {
+            state.file_aliases.contains_key(&page)
+        })
     }
 
     /// Whether this space holds any file window record at all. Lock-free: see
@@ -10421,14 +11004,11 @@ impl HvfAddressSpace {
     }
 
     /// The window record covering `gva`'s page, if any.
-    pub(crate) fn file_window_at(&self, gva: usize) -> Option<FileWindow> {
+    pub(crate) fn file_window_at(&self, gva: usize) -> Versioned<Option<FileWindow>> {
         let page = gva & !(PAGE_SIZE - 1);
-        let state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        file_window_at_locked(&state.file_windows, page)
+        self.plan_locked(GrSite::FileWindowAt, |state| {
+            file_window_at_locked(&state.file_windows, page)
+        })
     }
 
     /// Every window record of this space, in address order. Diagnostic and clone source.
@@ -10633,6 +11213,56 @@ impl HvfAddressSpace {
         gva: usize,
         execute: bool,
     ) -> Result<HvfRangeMutation, HvfMemoryError> {
+        self.install_file_alias_around(origin, gva, |_| execute, 1)
+    }
+
+    /// Installs read-only stage-1 aliases for `gva`'s page **and up to `max_pages - 1` following
+    /// pages of the same window** in ONE stage-1 rewrite and ONE retirement -- T1f-b F1, the
+    /// fault-around this step's attribution asked for: 63 % of the idle desktop's guest faults
+    /// are file-window faults and 83 % of those land within 4 pages of this space's own previous
+    /// fault (`t1f.fault_arms.file_alias.adjacent`), so one mutation can absorb several faults
+    /// instead of one each. `max_pages == 1` is exactly [`Self::install_file_alias`].
+    ///
+    /// `execute` is asked per page because a W^X toggle region can cover some pages of a window
+    /// and not others; a page whose answer differs from the faulting page's is simply not part of
+    /// the run, so every installed page gets precisely the descriptor a fault on it would have
+    /// produced.
+    ///
+    /// Invariants: an alias is never writable (asserted), so W^X is untouched; the pages share
+    /// the faulting page's origin pages (no copies, no new data); a neighbour that is claimed,
+    /// aliased, promoted, outside the window, or covered by a different window record is skipped
+    /// rather than failed; and the faulting page's own failure is still the whole call's failure,
+    /// unchanged from the single-page path.
+    ///
+    /// Two deliberate differences from the pre-fault-around `install_file_alias` that hold on the
+    /// shipped default (`max_pages == 1`) too, so they are stated rather than left to look
+    /// accidental:
+    ///
+    /// * **It allocates.** The old `install_file_alias` allocated nothing; this builds `prepared`,
+    ///   `usable`, `updates`, `installable` and `views` (five `Vec`s) on every file-window fault,
+    ///   one element each at one page per fault. The idle desktop faults ~78/s, so the cost is
+    ///   unmeasurable there, but it is a real change on the shipped hot path and it is *unmeasured*
+    ///   rather than refuted (cg2's getpid stayed inside run-to-run spread, which this protocol
+    ///   cannot resolve below roughly 30 %).
+    /// * **A page's fork-write-protection entry is now dropped after the install commits**, not
+    ///   before the arenas lock. Every fallible step between (slot retain, candidate root,
+    ///   retirement reservation) used to leave the entry removed while installing nothing, so a
+    ///   failed install could silently clear protection the next store depended on; with `max_pages
+    ///   > 1` that window widens to the whole neighbour run. This is a state-machine change on the
+    ///   shipped path, and a strict improvement.
+    ///
+    /// Lock order, checked so nobody "fixes" it into an inversion: the per-page `execute` closure
+    /// is called both outside and inside the exclusive VM operation while `cell.state` and
+    /// `arenas` are held, and it takes `wx_toggle.state`. Every other holder of that lock
+    /// (`classify_wx_fault`, `commit_wx_flip_host`, both in `hvf_backend.rs`) drops it before any
+    /// mutation, so taking it here cannot produce an ABBA cycle today.
+    pub(crate) fn install_file_alias_around(
+        &self,
+        origin: &HvfAddressSpace,
+        gva: usize,
+        execute: impl Fn(usize) -> bool,
+        max_pages: usize,
+    ) -> Result<HvfRangeMutation, HvfMemoryError> {
         if !std::ptr::eq(self.memory, origin.memory) {
             return Err(HvfMemoryError::WrongMemoryManager);
         }
@@ -10643,30 +11273,66 @@ impl HvfAddressSpace {
         self.cell.regime.validate_range(&range)?;
         let window = self
             .file_window_at(page)
+            .into_value_unvalidated()
             .ok_or_else(|| HvfMemoryError::RangeUnmapped(range.clone()))?;
         if window.perms == HvfGuestPermissions::NONE {
             return Err(HvfMemoryError::Witness(
                 "file window page has no permissions to alias",
             ));
         }
-        let origin_page = window.origin_page(page);
-        let (slot, origin_permissions, ipa_start, origin_backing) =
-            Self::origin_page_state(origin, origin_page)?;
-        if !origin_permissions.contains(HvfGuestPermissions::READ) {
-            return Err(HvfMemoryError::Witness("file origin page is not readable"));
+        // -- outside the operation: resolve the run of pages ----------------------------------
+        // The faulting page first; then each following page of the SAME window while it resolves
+        // to a readable origin page and wants the same execute bit. A page that fails to resolve
+        // ends the run (it is not this fault's business -- it will fault on its own if the guest
+        // touches it), except when it is the faulting page itself, whose failure is this call's
+        // failure exactly as it was before fault-around existed.
+        let mut prepared: Vec<(usize, usize, HostSlotToken, u64, Option<BackingPage>)> = Vec::new();
+        let mut cursor = page;
+        while prepared.len() < max_pages.max(1) {
+            let origin_page = window.origin_page(cursor);
+            let resolved = match Self::origin_page_state(origin, origin_page) {
+                Ok((slot, permissions, ipa_start, backing)) => {
+                    match (permissions.contains(HvfGuestPermissions::READ), ipa_start) {
+                        (true, Some(ipa_start)) => Some((slot, ipa_start, backing)),
+                        _ => None,
+                    }
+                }
+                Err(_) => None,
+            };
+            let Some((slot, ipa_start, backing)) = resolved else {
+                if prepared.is_empty() {
+                    return Err(match Self::origin_page_state(origin, origin_page) {
+                        Ok((_, _, None, _)) => HvfMemoryError::Witness(
+                            "file origin page has no stage-two mapping",
+                        ),
+                        Ok(_) => HvfMemoryError::Witness("file origin page is not readable"),
+                        Err(error) => error,
+                    });
+                }
+                break;
+            };
+            if execute(cursor) != execute(page) {
+                break;
+            }
+            prepared.push((cursor, origin_page, slot, ipa_start, backing));
+            let Some(next) = cursor.checked_add(PAGE_SIZE) else {
+                break;
+            };
+            if next >= window.end || self.cell.regime.validate_range(&(next..next + PAGE_SIZE)).is_err()
+            {
+                break;
+            }
+            cursor = next;
         }
-        let Some(ipa_start) = ipa_start else {
-            return Err(HvfMemoryError::Witness(
-                "file origin page has no stage-two mapping",
-            ));
-        };
-        let alias_permissions = if execute {
-            HvfGuestPermissions::READ | HvfGuestPermissions::EXECUTE
-        } else {
-            HvfGuestPermissions::READ
-        };
-        debug_assert!(!alias_permissions.contains(HvfGuestPermissions::WRITE));
+        let last = prepared
+            .last()
+            .map(|(page, _, _, _, _)| *page)
+            .unwrap_or(page);
+        self.cell
+            .regime
+            .validate_range(&(page..last.saturating_add(PAGE_SIZE)))?;
 
+        let mut installed_page_count = 0usize;
         let installed = self.memory.vm.with_operation(|operation| {
             let mut state = self
                 .cell
@@ -10677,48 +11343,100 @@ impl HvfAddressSpace {
                 return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
             }
             self.require_mutable(&state)?;
-            ensure_claim_gap(&state.claims, &range)?;
-            if state.aliases.contains_key(&page)
-                || state.promoted.contains_key(&page)
-                || state.file_aliases.contains_key(&page)
-            {
-                return Err(HvfMemoryError::AddressOverlap(range.clone()));
-            }
-            // Commit-time re-resolution: the window this alias was resolved against must still
-            // be the one covering `page`.
-            if !file_window_at_locked(&state.file_windows, page).is_some_and(|current| {
-                current.key == window.key && current.origin_gva == window.origin_gva
-            }) {
-                return Err(HvfMemoryError::Witness(
-                    "file window changed under the alias install",
-                ));
+            // -- under the lock: which of the prepared pages can still be installed -----------
+            let mut usable: Vec<(usize, usize, HostSlotToken, u64, Option<BackingPage>)> = Vec::new();
+            for (index, entry) in prepared.iter().enumerate() {
+                let (candidate, _, _, _, _) = *entry;
+                let candidate_range = candidate..candidate.saturating_add(PAGE_SIZE);
+                let blocked = ensure_claim_gap(&state.claims, &candidate_range).is_err()
+                    || state.aliases.contains_key(&candidate)
+                    || state.promoted.contains_key(&candidate)
+                    || state.file_aliases.contains_key(&candidate)
+                    || !file_window_at_locked(&state.file_windows, candidate).is_some_and(|current| {
+                        current.key == window.key && current.origin_gva == window.origin_gva
+                    });
+                if !blocked {
+                    usable.push(*entry);
+                    continue;
+                }
+                if index == 0 {
+                    // The faulting page: today's failure, unchanged (`AddressOverlap` means a
+                    // concurrent fault won and the caller resumes).
+                    return Err(if state.aliases.contains_key(&candidate)
+                        || state.promoted.contains_key(&candidate)
+                        || state.file_aliases.contains_key(&candidate)
+                        || ensure_claim_gap(&state.claims, &candidate_range).is_err()
+                    {
+                        HvfMemoryError::AddressOverlap(candidate_range)
+                    } else {
+                        HvfMemoryError::Witness("file window changed under the alias install")
+                    });
+                }
+                break;
             }
             state
                 .file_aliases
-                .try_reserve(1)
+                .try_reserve(usable.len())
                 .map_err(|_| HvfMemoryError::MetadataAllocation("file alias ownership"))?;
-            // A page re-established from the origin carries no fork-time write-protection: an
-            // entry left by an earlier incarnation at this address would route its first store
-            // to the self-divergence path, which has no claim to diverge.
-            state.fork_write_protected.remove(&page);
             let mut arenas = self
                 .memory
                 .arenas
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let record = arenas
-                .slots
-                .records
-                .get(&slot)
-                .ok_or(HvfMemoryError::IpaOwnership)?;
-            if record.gva != origin_page || !record.mirrored || record.gva < FILE_ORIGIN_GVA_BASE {
+            let mut retained: Vec<HostSlotToken> = Vec::new();
+            let mut updates: Vec<(usize, u64)> = Vec::new();
+            let mut installable: Vec<(usize, HostSlotToken, Option<BackingPage>)> = Vec::new();
+            for (index, (candidate, origin_page, slot, ipa_start, backing)) in
+                usable.iter().enumerate()
+            {
+                let alias_permissions = if execute(*candidate) {
+                    HvfGuestPermissions::READ | HvfGuestPermissions::EXECUTE
+                } else {
+                    HvfGuestPermissions::READ
+                };
+                debug_assert!(!alias_permissions.contains(HvfGuestPermissions::WRITE));
+                let source_ok = arenas
+                    .slots
+                    .records
+                    .get(slot)
+                    .is_some_and(|record| {
+                        record.gva == *origin_page
+                            && record.mirrored
+                            && record.gva >= FILE_ORIGIN_GVA_BASE
+                    });
+                if !source_ok {
+                    if index == 0 {
+                        return Err(HvfMemoryError::Witness(
+                            "file alias source slot is not a live origin slot",
+                        ));
+                    }
+                    break;
+                }
+                match arenas.slots.retain(*slot) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        if index == 0 {
+                            return Err(error);
+                        }
+                        break;
+                    }
+                }
+                retained.push(*slot);
+                updates.push((*candidate, alias_permissions.stage_one_descriptor(*ipa_start)));
+                installable.push((*candidate, *slot, *backing));
+            }
+            if updates.is_empty() {
                 return Err(HvfMemoryError::Witness(
-                    "file alias source slot is not a live origin slot",
+                    "file window page could not be aliased",
                 ));
             }
-            arenas.slots.retain(slot)?;
-            let descriptor = alias_permissions.stage_one_descriptor(ipa_start);
-            let updates = [(page, descriptor)];
+            let cleanup_slots = |arenas: &mut Arenas, retained: &[HostSlotToken]| {
+                let mut result = Ok(());
+                for slot in retained {
+                    result = result.and(arenas.slots.release(*slot).map(|_| ()));
+                }
+                result
+            };
             let candidate = match build_candidate_root(
                 self.memory.vm,
                 &mut arenas,
@@ -10728,28 +11446,38 @@ impl HvfAddressSpace {
             ) {
                 Ok(root) => root,
                 Err(error) => {
-                    let cleanup = arenas.slots.release(slot).map(|_| ());
+                    let cleanup = cleanup_slots(&mut arenas, &retained);
                     return Err(HvfMemoryError::with_cleanup(error, cleanup));
                 }
             };
-            // The page's host view (best effort; `arenas` then `backings`, the order every
+            // The pages' host views (best effort; `arenas` then `backings`, the order every
             // transaction here takes them in).
-            let view = {
+            let views: Vec<(usize, FilePageView)> = {
                 let backings = self
                     .memory
                     .backings
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                origin_backing.and_then(|backing| {
-                    install_file_page_view(&backings, page, backing)
-                        .map_err(|error| {
-                            litebox_util_log::debug!(
-                                page:? = page, error:% = error;
-                                "HVF file COW: host view of the origin page could not be installed"
-                            );
-                        })
-                        .ok()
-                })
+                installable
+                    .iter()
+                    .filter_map(|(candidate, _, backing)| {
+                        let backing = (*backing)?;
+                        install_file_page_view(&backings, *candidate, backing)
+                            .map_err(|error| {
+                                litebox_util_log::debug!(
+                                    page:? = candidate, error:% = error;
+                                    "HVF file COW: host view of the origin page could not be installed"
+                                );
+                            })
+                            .ok()
+                            .map(|view| (*candidate, view))
+                    })
+                    .collect()
+            };
+            let cleanup_views = |views: Vec<(usize, FilePageView)>| {
+                for (_, view) in views {
+                    drop_file_page_view(view);
+                }
             };
             let mut acknowledgements = self
                 .memory
@@ -10777,12 +11505,10 @@ impl HvfAddressSpace {
                 match metadata {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        if let Some(view) = view {
-                            drop_file_page_view(view);
-                        }
+                        cleanup_views(views);
                         let root_cleanup =
                             cleanup_candidate_root(self.memory.vm, &mut arenas, candidate);
-                        let slot_cleanup = arenas.slots.release(slot).map(|_| ());
+                        let slot_cleanup = cleanup_slots(&mut arenas, &retained);
                         return Err(HvfMemoryError::with_cleanup(
                             error,
                             root_cleanup.and(slot_cleanup),
@@ -10798,12 +11524,10 @@ impl HvfAddressSpace {
             ) {
                 Ok(reservation) => reservation,
                 Err(error) => {
-                    if let Some(view) = view {
-                        drop_file_page_view(view);
-                    }
+                    cleanup_views(views);
                     let root_cleanup =
                         cleanup_candidate_root(self.memory.vm, &mut arenas, candidate);
-                    let slot_cleanup = arenas.slots.release(slot).map(|_| ());
+                    let slot_cleanup = cleanup_slots(&mut arenas, &retained);
                     return Err(HvfMemoryError::with_cleanup(
                         error,
                         root_cleanup.and(slot_cleanup),
@@ -10814,7 +11538,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 generation,
                 tlbi_generation,
                 participants,
@@ -10826,13 +11550,23 @@ impl HvfAddressSpace {
             install_root(&mut state, &arenas.tables, candidate);
             state.root_generation = generation;
             state.pending_tlbi_generation = tlbi_generation;
-            state.file_aliases.insert(page, slot);
-            if let Some(view) = view {
-                if let Some(stale) = state.file_views.insert(page, view) {
+            let installed_pages = installable.len() as isize;
+            installed_page_count = installable.len();
+            for (candidate, slot, _) in &installable {
+                state.file_aliases.insert(*candidate, *slot);
+            }
+            for (candidate, view) in views {
+                if let Some(stale) = state.file_views.insert(candidate, view) {
                     drop_file_page_view(stale);
                 }
             }
-            file_origin_adjust(window.key, 0, 1);
+            file_origin_adjust(window.key, 0, installed_pages);
+            // A page re-established from the origin carries no fork-time write-protection: an
+            // entry left by an earlier incarnation at this address would route its first store
+            // to the self-divergence path, which has no claim to diverge.
+            for (candidate, _, _, _, _) in &usable {
+                state.fork_write_protected.remove(candidate);
+            }
             Ok(HvfRangeMutation {
                 retirement,
                 root_generation: generation,
@@ -10842,7 +11576,12 @@ impl HvfAddressSpace {
         })?;
         self.cell.file_alias_hint.store(true, Ordering::Relaxed);
         ANY_HOST_REDIRECT_EVER.store(true, Ordering::Relaxed);
-        file_cow_count(&FILE_COW_COUNTERS.alias_installs);
+        // Pages installed, not calls made: with `max_pages > 1` one call installs several pages,
+        // and this counter must stay comparable with `file_alias_pages_live` (which
+        // `file_origin_adjust` moves by the same `installed_pages`) and with
+        // `state.file_aliases.len()`. On the shipped default (`max_pages == 1`) the two are the
+        // same number, so this changes nothing the shipped tree reports.
+        file_cow_count_by(&FILE_COW_COUNTERS.alias_installs, installed_page_count as u64);
         Ok(installed)
     }
 
@@ -11295,6 +12034,7 @@ impl HvfAddressSpace {
         self.cell.regime.validate_range(&range)?;
         let window = self
             .file_window_at(page)
+            .into_value_unvalidated()
             .ok_or_else(|| HvfMemoryError::RangeUnmapped(range.clone()))?;
         let (_, _, _, backing) = Self::origin_page_state(origin, window.origin_page(page))?;
         let backing = backing.ok_or(HvfMemoryError::Witness(
@@ -11429,7 +12169,7 @@ impl HvfAddressSpace {
         // Resolved BEFORE the `source` state lock, exactly as in `install_cow_read_alias` (see its
         // own comments, including the window-page rule).
         let branch_epoch = self.branch_epoch_against(source.cell.id);
-        let window_page = self.file_window_at(page).is_some();
+        let window_page = self.file_window_at(page).into_value_unvalidated().is_some();
         let (permissions, stashed_backing, shared_backing) = {
             let source_state = source
                 .cell
@@ -11895,6 +12635,18 @@ impl HvfAddressSpace {
                 &updates,
                 self.memory.limits.max_table_pages,
             )?;
+            // CLASS A: `backings` ranks BELOW `acknowledgements` (the order `report` and every
+            // other site take them in), so it is taken before the ledger lock rather than inside
+            // its critical section. Only taken when this promotion actually has a window page to
+            // retarget, so a promotion without one pays nothing.
+            let retarget = shadow_backing
+                .filter(|_| file_window_at_locked(&state.file_windows, page).is_some());
+            let backings = retarget.map(|_| {
+                self.memory
+                    .backings
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
             let mut acknowledgements = self
                 .memory
                 .acknowledgements
@@ -11943,7 +12695,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 generation,
                 tlbi_generation,
                 participants,
@@ -11967,23 +12719,18 @@ impl HvfAddressSpace {
             };
             // A promoted window page's host view now shows the shadow (installed here for a
             // page promoted straight from the origin by a host write); best effort.
-            if file_window_at_locked(&state.file_windows, page).is_some()
-                && let Some(backing) = shadow_backing
+            if let Some(backing) = retarget
+                && let Some(backings) = &backings
             {
-                let backings = self
-                    .memory
-                    .backings
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match state.file_views.remove(&page) {
-                    Some(view) => match retarget_file_page_view(&view, &backings, backing) {
+                    Some(view) => match retarget_file_page_view(&view, backings, backing) {
                         Ok(()) => {
                             state.file_views.insert(page, view);
                         }
                         Err(_) => drop_file_page_view(view),
                     },
                     None => {
-                        if let Ok(view) = install_file_page_view(&backings, page, backing) {
+                        if let Ok(view) = install_file_page_view(backings, page, backing) {
                             state.file_views.insert(page, view);
                         }
                     }
@@ -12132,7 +12879,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 generation,
                 tlbi_generation,
                 participants,
@@ -12362,12 +13109,8 @@ impl HvfAddressSpace {
     }
 
     /// How this space holds each page of `range`, in address order.
-    pub fn page_kinds(&self, range: &Range<usize>) -> Vec<(usize, PageKind)> {
-        let state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pub fn page_kinds(&self, range: &Range<usize>) -> Versioned<Vec<(usize, PageKind)>> {
+        self.plan_locked(GrSite::PageKinds, |state| {
         let mut kinds: Vec<(usize, PageKind)> = page_addresses(range)
             .map(|page| (page, PageKind::Missing))
             .collect();
@@ -12403,17 +13146,15 @@ impl HvfAddressSpace {
             }
         }
         kinds
+        })
     }
 
     /// Whether any page of `range` is held here only as a COW read alias (either kind), a
     /// promoted redirect, or an untouched file window page -- everything a plain
     /// `protect_range` over own claims cannot see.
-    pub fn has_cow_pages_in(&self, range: &Range<usize>) -> bool {
-        let state = self
-            .cell
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pub fn has_cow_pages_in(&self, range: &Range<usize>) -> Versioned<bool> {
+        // Which act `protect_view_range` runs is decided on this answer.
+        self.plan_locked(GrSite::HasCowPagesIn, |state| {
         if state.aliases.is_empty()
             && state.promoted.is_empty()
             && state.file_aliases.is_empty()
@@ -12429,13 +13170,14 @@ impl HvfAddressSpace {
                 map.keys().any(|page| range.contains(page))
             }
         }
-        hit(range, pages, &state.aliases)
-            || hit(range, pages, &state.promoted)
-            || hit(range, pages, &state.file_aliases)
-            || state
-                .file_windows
-                .iter()
-                .any(|window| window.start < range.end && range.start < window.end)
+            hit(range, pages, &state.aliases)
+                || hit(range, pages, &state.promoted)
+                || hit(range, pages, &state.file_aliases)
+                || state
+                    .file_windows
+                    .iter()
+                    .any(|window| window.start < range.end && range.start < window.end)
+        })
     }
 
     /// Whether a descendant's lineage lookup against this space would find content for `gva`'s
@@ -12505,6 +13247,85 @@ impl HvfAddressSpace {
                 );
             }
             None => out.push_str(" claim=none"),
+        }
+        // GSIGSEGV2: everything above is BOOKKEEPING. A repeated write permission fault whose
+        // bookkeeping reads healthy has to be attributed against what the hardware actually
+        // walks, so print the live stage-one leaf descriptor straight out of `state.root`, the
+        // stage-two authority this space's own mapping records, and the backing's own stage-two
+        // authority counters (the W^X invariant that can pin a backing read-only).
+        {
+            let own = state
+                .claims
+                .values()
+                .find(|claim| claim.range.start <= page && page < claim.range.end)
+                .and_then(|claim| claim.pages.get(&page));
+            let _ = write!(
+                out,
+                " root={} tlbi={} participants={}",
+                state.root_generation.value(),
+                state.pending_tlbi_generation.value(),
+                state.participants.len()
+            );
+            match self
+                .memory
+                .arenas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tables
+                .walk(state.root, page)
+            {
+                Ok((ipa, descriptor)) => {
+                    let ap = (descriptor >> 6) & 0b11;
+                    let ap_text = match ap {
+                        0b01 => "RW",
+                        0b11 => "RO",
+                        0b10 => "EL1RO",
+                        _ => "EL0NONE",
+                    };
+                    let _ = write!(
+                        out,
+                        " s1(desc={descriptor:#x} ap={ap_text} uxn={} ipa={ipa:#x})",
+                        (descriptor >> 54) & 1
+                    );
+                }
+                Err(_) => out.push_str(" s1(walk_failed)"),
+            }
+            if let Some(own) = own {
+                let _ = write!(
+                    out,
+                    " map(authority={} ipa={:#x})",
+                    match own.mapping.as_ref().map(|mapping| mapping.authority) {
+                        Some(StageTwoAuthority::Writer) => "Writer",
+                        Some(StageTwoAuthority::Executor) => "Executor",
+                        Some(StageTwoAuthority::ReadOnly) => "ReadOnly",
+                        None => "none",
+                    },
+                    own.mapping.as_ref().map_or(0, |mapping| mapping.ipa.start)
+                );
+                if let Some(backing) = own.backing {
+                    let counters = self
+                        .memory
+                        .backings
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .stage_two_counters(backing);
+                    match counters {
+                        Some((writers, executors, host_writers, hidden_writable)) => {
+                            let _ = write!(
+                                out,
+                                " bk(w={writers} x={executors} host_w={host_writers} hidden_w={hidden_writable})"
+                            );
+                        }
+                        None => out.push_str(" bk(unknown)"),
+                    }
+                }
+            }
+            let writable_now = !state.fork_write_protected.contains_key(&page)
+                && own.is_some_and(|own| {
+                    own.permissions.contains(HvfGuestPermissions::WRITE)
+                        && own.mapping.is_some()
+                });
+            let _ = write!(out, " writable_now={}", writable_now);
         }
         if let Some(&slot) = state.aliases.get(&page) {
             let relocated = self
@@ -12770,6 +13591,7 @@ impl HvfAddressSpace {
             HostAliasState::Other => {
                 let kind = self
                     .page_kinds(&range)
+                    .into_value_unvalidated()
                     .first()
                     .map(|(_, kind)| *kind)
                     .unwrap_or(PageKind::Missing);
@@ -12855,7 +13677,7 @@ impl HvfAddressSpace {
         }
     }
 
-    /// Tries each ledger-backed deferred retirement once and returns how many
+/// Tries each ledger-backed deferred retirement once and returns how many
     /// were released. Tickets whose participants still owe a synchronization
     /// remain marked; tickets already acknowledged elsewhere disappear with
     /// their ledger record. Snapshot allocation failure also leaves every
@@ -12874,25 +13696,32 @@ impl HvfAddressSpace {
         result
     }
 
-    /// One pump pass, in the shape it always had: the space's `retirement_pump` mutex serializes
-    /// its passes, the pass mints its tickets under `acknowledgements`, and every ticket gets its
-    /// OWN cleanup admission in the gate FIFO -- exactly the one `acknowledge_retirement` gives it,
-    /// so the panic/poison scope stays per ticket (an outermost admission starts with
-    /// `admission_published` clear; a nested one inherits its caller's, as a nested
-    /// `acknowledge_retirement` does) and the release stays ordered before the pumping thread's
-    /// next mutation. The precheck, under `acknowledgements` alone, skips the mutex entirely
-    /// when nothing is releasable.
+/// One pump pass. The pass mints its tickets under `acknowledgements` and acknowledges them in
+    /// chunks, one batched cleanup admission per chunk (`PUMP_TICKETS_PER_ADMISSION`), so the
+    /// panic/poison scope stays per ticket while the gate FIFO sees one admission per chunk
+    /// instead of one per ticket. The precheck, under `acknowledgements` alone, skips the whole
+    /// pass when nothing is releasable.
     ///
-    /// The one change (hvf-retirement-pump-exclusive-gate-lock-order-inversion): a caller that
-    /// already owns the exclusive gate never waits for the mutex. Its holder may be a pass of this
-    /// space waiting in the gate FIFO for that very owner (`HvfBackend::remap_shared_pages`
-    /// settles into this pump inside its `with_operation`), which stalled each of the holder's
-    /// tickets for the whole `OPERATION_WAIT_TIMEOUT`. The owner instead releases this space's
-    /// releasable tickets under nested admissions without the mutex -- the gate it holds already
-    /// serializes it against every other pass, and the waiting holder later finds those tickets
-    /// released. Everyone else still waits for the mutex, so a space keeps one pass in the gate
-    /// FIFO rather than one per pumping thread, and every release stays synchronous with the thread
-    /// that pumps. Both alternatives measured worse on the desktop
+    /// What the space's `retirement_pump` mutex is for, exactly (corrected 2026-09-29, step GA
+    /// fix-up -- the previous text claimed it still serialized competing passes; it does not):
+    /// it is taken INSIDE the admission, below the gate in the global rank order. Every caller
+    /// reaches it from inside an admission, i.e. while it owns the gate, so
+    /// `lock_pump_unless_gate_owner` always takes its non-blocking branch and the mutex is
+    /// uncontended there by construction. It is therefore NOT a contention fast path and it does
+    /// NOT serialize one pass in the FIFO per pumping thread -- the gate does that, one admission
+    /// per chunk. The mutex is load-bearing as a **re-entrancy guard** and nothing else: a pass
+    /// reached from inside another pass's admission (a nested pump) finds it held and skips
+    /// instead of recursing into a second pass over the same space.
+    ///
+    /// It was taken OUTSIDE the admission before step GA. That is T1g's shape -- a thread holding
+    /// the mutex while its tickets wait in the gate FIFO for up to `OPERATION_WAIT_TIMEOUT` each
+    /// (and the holder can be waiting for the very owner that needs those tickets:
+    /// `HvfBackend::remap_shared_pages` settles into this pump inside its `with_operation`) -- and
+    /// it is the one instance the rank checker still found under the 8-thread concurrency stress.
+    /// Moving it inside is what makes T1g's per-site `try_lock` bypass unnecessary: the rank
+    /// order, not the bypass, is now what forbids the shape.
+    ///
+    /// Both alternatives to this order measured worse on the desktop
     /// (hvf-opportunistic-retirement-pump-breaks-wx-authority-ordering): non-waiting passes with a
     /// background drainer failed a guest `mprotect` after publishing ("has conflicting write and
     /// execute authority"), and gate-first per-ticket passes (no mutex) had higher handoff and
@@ -12903,10 +13732,7 @@ impl HvfAddressSpace {
             counters::record_pump_precheck_skip();
             return Ok(0);
         }
-        let _pump = counters::lock_pump_unless_gate_owner(&self.cell.retirement_pump, || {
-            self.memory.vm.current_thread_owns_exclusive_operation()
-        });
-        let tickets = match self.pumpable_tickets() {
+        let mut tickets = match self.pumpable_tickets() {
             Ok(tickets) => tickets,
             Err(error) => {
                 // Snapshot allocation failure: every marker stays for a later pass.
@@ -12919,47 +13745,104 @@ impl HvfAddressSpace {
             counters::record_pump_empty_pass();
             return Ok(0);
         }
-        let mut admissions = 0usize;
+        // CLASS C batching: ONE cleanup admission for the whole pass instead of one per ticket
+        // (measured ~1232 exclusive admissions per second on the desktop, each one queueing
+        // behind every other process's mutation). The per-ticket scope is preserved exactly:
+        //   * every ticket still calls `operation.mark_published()` at its own publish point, so
+        //     a ticket that has not published cannot mark the pass published, and a ticket's
+        //     failure is tagged `after_publication` only if THAT ticket published
+        //     (`acknowledge_retirement_in`'s own `published` cell);
+        //   * a panic anywhere in a ticket's body unwinds out of the single admission, whose
+        //     `finish` sees `body_panicked` and requests poison when the admission published --
+        //     the same outcome today's per-ticket admission gives (both resume the unwind), and
+        //     no later ticket runs after it;
+        //   * an ordinary `Err` is recorded as `first_error` and the pass goes on, exactly as
+        //     today.
+        // So a later item can never poison the VM because an earlier one published: publication
+        // is per ticket, and the admission's published flag is the OR of the tickets that ran.
+        let mut first_error = None;
+        let mut ran = false;
         let mut tried = 0usize;
         let mut released = 0usize;
-        let mut first_error = None;
-        for mut ticket in tickets {
+        // CLASS C fix-up: the batch is bounded. A pass averages ~1.05 tickets, so batching almost
+        // never shares an admission -- but the tail does, and an unbounded batch turned a short
+        // per-ticket hold into a single 37-42 ms hold of the VM-global gate (measured `hold_max`
+        // 8-16 ms before this step), which is what made the pump SITE's own wait go up
+        // 0.131/0.161/0.144 -> 0.209/0.182/0.197 thread-s/wall-s. The bound is per ADMISSION, not
+        // per pass: a pass chunks its tickets and takes one admission per chunk, so one
+        // `pump_retirements` call still drains everything it collected (the contract
+        // `deferred_retirements_pumped` in the mirrored-view witness relies on) while no single
+        // admission can hold the gate for more than `PUMP_TICKETS_PER_ADMISSION` items.
+        // Step GC A/B knob: `LITEBOX_HVF_CLASSC=0` chunks the pass into one ticket per admission,
+        // which is the pre-step shape (one exclusive admission per retirement ticket).
+        let tickets_per_admission = if crate::diagnostics_counters::class_c_enabled() {
+            PUMP_TICKETS_PER_ADMISSION
+        } else {
+            1
+        };
+        for chunk in tickets.chunks_mut(tickets_per_admission) {
             let requested = counters::ticks();
-            let ran = Cell::new(false);
-            let outcome = self.memory.vm.with_cleanup_operation(|operation| {
-                ran.set(true);
-                let admitted_at = counters::record_pump_admission(requested);
-                let outcome = self
-                    .acknowledge_retirement_in(operation, &mut ticket)
-                    .map(|_| ());
-                counters::record_pump_ticket_hold(admitted_at);
-                outcome
+            let mut chunk_tried = 0usize;
+            let mut chunk_released = 0usize;
+            let outcome = self.memory.vm.with_batched_cleanup_operation(|operation| {
+                // CLASS A: the space's `retirement_pump` mutex is taken INSIDE the admission,
+                // below the gate in the global rank order, and never the other way round. The
+                // gate already serializes passes against every other thread, so the mutex is
+                // uncontended here; taking it outside is the shape T1g inverted (a thread holding
+                // the mutex while its tickets wait in the gate FIFO, up to
+                // `OPERATION_WAIT_TIMEOUT` each), and it is what the rank checker still flagged
+                // under the 8-thread concurrency stress. `lock_pump_unless_gate_owner` stays as
+                // the belt-and-braces path: on any contention it skips instead of waiting, and
+                // the caller is by construction the gate owner here.
+                let _pump = counters::lock_pump_unless_gate_owner(&self.cell.retirement_pump, || {
+                    self.memory.vm.current_thread_owns_exclusive_operation()
+                });
+                ran = true;
+                let admitted_at = counters::record_pump_batch_admission(requested);
+                for ticket in chunk.iter_mut() {
+                    chunk_tried += 1;
+                    let before = counters::ticks();
+                    match self.acknowledge_retirement_in(operation, ticket).map(|_| ()) {
+                        Ok(()) => chunk_released += 1,
+                        Err(
+                            HvfMemoryError::RetirementParticipantsPending { .. }
+                            | HvfMemoryError::RetirementStale,
+                        ) => {}
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    counters::record_pump_ticket_hold(before);
+                }
+                counters::record_pump_batch_tickets(chunk_tried);
+                counters::record_pump_batch_hold(admitted_at);
+                Ok::<(), HvfMemoryError>(())
             });
-            if !ran.get() {
+            tried += chunk_tried;
+            released += chunk_released;
+            if !ran {
                 // The admission itself failed (gate state, `OperationWaitTimeout`): nothing ran,
                 // and the rest of the pass stays parked instead of waiting again per ticket.
-                counters::record_pump_admission_failure(admissions == 0);
+                counters::record_pump_admission_failure(true);
                 if let Err(error) = outcome {
-                    first_error.get_or_insert(error);
+                    return Err(error);
                 }
                 break;
             }
-            admissions += 1;
-            tried += 1;
-            match outcome {
-                Ok(()) => released += 1,
-                Err(
-                    HvfMemoryError::RetirementParticipantsPending { .. }
-                    | HvfMemoryError::RetirementStale,
-                ) => {}
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
+            if let Err(error) = outcome {
+                // The admission itself finished poisoned/abandoned: surface it the way a
+                // per-ticket admission's `finish_operation` used to.
+                counters::record_pump_admission_failure(false);
+                first_error.get_or_insert(error);
+                break;
             }
         }
-        if admissions != 0 {
-            counters::record_pump_pass(tried, released);
+        if !ran {
+            // No chunk ever got an admission and nothing was released: every marker stays for a
+            // later pass.
+            return Ok(0);
         }
+        counters::record_pump_pass(tried, released);
         match first_error {
             Some(error) => Err(error),
             None => Ok(released),
@@ -13002,6 +13885,15 @@ impl HvfAddressSpace {
     /// under `acknowledgements` alone -- no admission, no pump mutex -- so a pump with nothing
     /// to release never touches the operation gate.
     fn has_pumpable_retirement(&self) -> bool {
+        // CLASS C: no row for this space at all (the per-space mirror) means nothing can be
+        // pumpable, without touching the process-global ledger.
+        // Step GC A/B knob: `LITEBOX_HVF_CLASSC=0` ignores the mirror, so the check takes the
+        // ledger on every call -- the pre-step shape.
+        if crate::diagnostics_counters::class_c_enabled()
+            && self.cell.retirement_rows.load(Ordering::Acquire) == 0
+        {
+            return false;
+        }
         crate::diagnostics_counters::lock_timed(
             &self.memory.acknowledgements,
             crate::diagnostics_counters::STAT_ACK_LOCK_CONTENDED,
@@ -13021,6 +13913,15 @@ impl HvfAddressSpace {
             );
             let count = acknowledgements.deferred_count(self.cell.id);
             debug_assert_eq!(count, acknowledgements.recount_deferred(self.cell.id));
+            // CLASS C: the mirror is a superset of the deferred set, so it can only be >= the
+            // real count; an equal-or-greater mismatch would mean a row was added or removed
+            // without the mirror (a missed site).
+            debug_assert!(
+                usize::from(self.cell.retirement_rows.load(Ordering::Acquire)) >= count,
+                "retirement row mirror undercounts: mirror={} rows_for_space={}",
+                self.cell.retirement_rows.load(Ordering::Acquire),
+                acknowledgements.rows_for_space(self.cell.id),
+            );
             count
         };
         crate::diagnostics_counters::record_pending(started);
@@ -13038,6 +13939,16 @@ impl HvfAddressSpace {
     /// opportunistic pass: the next exit of any thread of the space looks again, and every
     /// mutator's own settle/shootdown pump is unchanged.
     pub fn pending_retirements_if_uncontended(&self) -> Option<usize> {
+        // CLASS C: the per-space row mirror decides first. Zero rows for this space means no
+        // deferred row can exist, so the ledger lock and its two full scans are skipped
+        // entirely -- the common case on a desktop (measured 176 us per call against a
+        // contended ledger, at one call per guest exit). A nonzero hint costs exactly what
+        // today's check costs.
+        if self.cell.retirement_rows.load(Ordering::Acquire) == 0 {
+            crate::diagnostics_counters::record_retirement_hint(false);
+            return Some(0);
+        }
+        crate::diagnostics_counters::record_retirement_hint(true);
         let started = crate::diagnostics_counters::ticks();
         let acknowledgements = match self.memory.acknowledgements.try_lock() {
             Ok(acknowledgements) => acknowledgements,
@@ -13342,7 +14253,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 state.root_generation,
                 state.pending_tlbi_generation,
                 participants,
@@ -13386,80 +14297,117 @@ impl HvfAddressSpace {
         Ok(())
     }
 
+    fn register_participant_in(
+        &self,
+        operation: &impl ParticipantPublishScope,
+        registration: HvfVcpuLaneRegistration,
+    ) -> Result<HvfVcpuParticipant, HvfMemoryError> {
+        if self.cell.attachment_abandoned.load(Ordering::Acquire) {
+            return Err(HvfMemoryError::AttachmentAbandoned(self.cell.id));
+        }
+        let mut state = self
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.live {
+            return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
+        }
+        admit_resource(
+            "vCPU participants",
+            state.participants.len(),
+            1,
+            MAX_PARTICIPANTS_PER_ADDRESS_SPACE,
+        )?;
+        state
+            .participants
+            .try_reserve(1)
+            .map_err(|_| HvfMemoryError::MetadataAllocation("vCPU participants"))?;
+        let mut arenas = self
+            .memory
+            .arenas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = HvfVcpuParticipantId(take_counter(&mut arenas.next_participant)?);
+        if state.participants.contains_key(&id) {
+            return Err(HvfMemoryError::IpaOwnership);
+        }
+        operation.require_live()?;
+        if !registration.is_live() {
+            return Err(HvfMemoryError::ParticipantLaneUnavailable(
+                registration.generation,
+            ));
+        }
+        let capability_state = Arc::new(AtomicU8::new(PARTICIPANT_LIVE));
+        operation.mark_published()?;
+        state.participants.insert(
+            id,
+            ParticipantRecord {
+                lane_generation: registration.generation,
+                lane_lifecycle: Arc::clone(&registration.lifecycle),
+                owner_stopped: Arc::clone(&registration.owner_stopped),
+                capability_state: Arc::clone(&capability_state),
+                attachment_state: None,
+                last_root_generation: HvfRootGeneration(0),
+                last_executable_generation: HvfExecutableGeneration(0),
+                last_tlbi_generation: HvfTlbiGeneration(0),
+                in_flight: 0,
+            },
+        );
+        Ok(HvfVcpuParticipant {
+            manager: self.memory.manager,
+            address_space: self.cell.id,
+            id,
+            lane_generation: registration.generation,
+            lane_lifecycle: registration.lifecycle,
+            owner_stopped: registration.owner_stopped,
+            capability_state,
+        })
+    }
+
+    /// Registers a lane's vCPU participant under a TRUE EXCLUSIVE admission: lane creation's
+    /// first registration and every caller that needs to run while the VM is poison-requested.
     pub fn register_vcpu_participant(
         &self,
         capability: HvfVcpuLaneParticipantCapability,
     ) -> Result<HvfVcpuParticipant, HvfMemoryError> {
         let lane_generation = capability.generation();
         match capability.with_live_registration(|registration: HvfVcpuLaneRegistration| {
-            self.memory.vm.with_operation(|operation| {
-                if self.cell.attachment_abandoned.load(Ordering::Acquire) {
-                    return Err(HvfMemoryError::AttachmentAbandoned(self.cell.id));
-                }
-                let mut state = self
-                    .cell
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !state.live {
-                    return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
-                }
-                admit_resource(
-                    "vCPU participants",
-                    state.participants.len(),
-                    1,
-                    MAX_PARTICIPANTS_PER_ADDRESS_SPACE,
-                )?;
-                state
-                    .participants
-                    .try_reserve(1)
-                    .map_err(|_| HvfMemoryError::MetadataAllocation("vCPU participants"))?;
-                let mut arenas = self
-                    .memory
-                    .arenas
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let id = HvfVcpuParticipantId(take_counter(&mut arenas.next_participant)?);
-                if state.participants.contains_key(&id) {
-                    return Err(HvfMemoryError::IpaOwnership);
-                }
-                operation.require_live()?;
-                if !registration.is_live() {
-                    return Err(HvfMemoryError::ParticipantLaneUnavailable(
-                        registration.generation,
-                    ));
-                }
-                let capability_state = Arc::new(AtomicU8::new(PARTICIPANT_LIVE));
-                operation.mark_published()?;
-                state.participants.insert(
-                    id,
-                    ParticipantRecord {
-                        lane_generation: registration.generation,
-                        lane_lifecycle: Arc::clone(&registration.lifecycle),
-                        owner_stopped: Arc::clone(&registration.owner_stopped),
-                        capability_state: Arc::clone(&capability_state),
-                        attachment_state: None,
-                        last_root_generation: HvfRootGeneration(0),
-                        last_executable_generation: HvfExecutableGeneration(0),
-                        last_tlbi_generation: HvfTlbiGeneration(0),
-                        in_flight: 0,
-                    },
-                );
-                Ok(HvfVcpuParticipant {
-                    manager: self.memory.manager,
-                    address_space: self.cell.id,
-                    id,
-                    lane_generation: registration.generation,
-                    lane_lifecycle: registration.lifecycle,
-                    owner_stopped: registration.owner_stopped,
-                    capability_state,
-                })
+            self.memory
+                .vm
+                .with_operation(|operation| self.register_participant_in(operation, registration))
+        }) {
+            Ok(result) => result,
+            Err(_) => Err(HvfMemoryError::ParticipantLaneUnavailable(lane_generation)),
+        }
+    }
+
+    /// CLASS C: the same registration under a COUNTING SHARED admission
+    /// (`hvf-exclusive-gate-saturation-shrink`). A migration only adds one record to
+    /// `state.participants` (one map insert under `cell.state`) and takes one participant id from
+    /// `arenas.next_participant`; both are already serialized against every mutator of this space
+    /// by those two locks, because a mutation takes its required-participant snapshot and commits
+    /// its retirement inside ONE `cell.state` + `acknowledgements` critical section. The
+    /// exclusive gate therefore added nothing but a wait behind every other process's mutation:
+    /// measured 5.1 ms mean admission wait during the desktop drive and ~14 ms while typing and
+    /// idle, 4.31 thread-seconds per wall-second of waiters. A shared admission is refused while
+    /// the VM is poisoned or poison-requested, and a poisoned VM runs nothing -- so a refused
+    /// migration costs nothing a successful one would have delivered.
+    fn register_vcpu_participant_shared(
+        &self,
+        capability: HvfVcpuLaneParticipantCapability,
+    ) -> Result<HvfVcpuParticipant, HvfMemoryError> {
+        let lane_generation = capability.generation();
+        match capability.with_live_registration(|registration: HvfVcpuLaneRegistration| {
+            self.memory.vm.with_shared_operation(|operation| {
+                self.register_participant_in(operation, registration)
             })
         }) {
             Ok(result) => result,
             Err(_) => Err(HvfMemoryError::ParticipantLaneUnavailable(lane_generation)),
         }
     }
+
 
     pub fn deregister_vcpu_participant(
         &self,
@@ -13496,6 +14444,58 @@ impl HvfAddressSpace {
         departing: bool,
     ) -> Result<(), HvfMemoryError> {
         self.memory.vm.with_cleanup_operation(|operation| {
+            self.deregister_participant_in(operation, participant, departing)
+        })
+    }
+
+    /// CLASS C: the departing deregistration of a migration under a COUNTING SHARED admission
+    /// ([`Self::register_vcpu_participant_shared`]'s counterpart). It removes one record from
+    /// `state.participants` under `cell.state` and, when `departing`, acknowledges this
+    /// participant in every retirement row of the space under `acknowledgements` -- the same two
+    /// locks a mutator holds across its required-participant snapshot and its retirement commit,
+    /// so the removal linearizes either before that snapshot (the participant is then not
+    /// required) or after the commit (it is required, and this call acknowledges it). That is
+    /// exactly the property the exclusive gate was providing, so the gate only added a wait.
+    /// Lane teardown keeps [`Self::deregister_vcpu_participant`]'s cleanup-class admission, which
+    /// must succeed while the VM is poisoned.
+    fn deregister_vcpu_participant_shared(
+        &self,
+        participant: &mut HvfVcpuParticipant,
+    ) -> Result<(), HvfMemoryError> {
+        match self.memory.vm.with_shared_operation(|operation| {
+            self.deregister_participant_in(operation, participant, true)
+        }) {
+            Ok(()) => Ok(()),
+            // CLASS C narrow-window repair: a counting shared admission is refused once the VM is
+            // poison-*requested*, poisoned or abandoned (`begin_shared_operation` /
+            // `HvfVmSharedOperation::require_live`), while the cleanup-class admission this half of
+            // the migration used before this step was admitted in exactly that window
+            // (`begin_operation_inner` admits `cleanup`, and `HvfVmOperation::require_live` only
+            // rejects non-cleanup). Fall back to the cleanup class instead of failing: on a
+            // *refusal* no body ran (and the body's own `mark_published` failure happens before
+            // any mutation), so nothing is applied twice, and the departure half keeps succeeding
+            // in the window this step newly opened -- which is what makes
+            // [`Self::migrate_vcpu_participant`]'s "never two live registrations" invariant
+            // reachable rather than best-effort. Every other error is a real precondition failure
+            // and is returned unchanged.
+            Err(HvfMemoryError::Hvf(HvfError::Poisoned | HvfError::OperationAbandoned)) => {
+                crate::diagnostics_counters::add_stat(
+                    crate::diagnostics_counters::STAT_MIGRATION_DEPART_FALLBACK,
+                    1,
+                );
+                self.deregister_vcpu_participant_inner(participant, true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn deregister_participant_in(
+        &self,
+        operation: &impl ParticipantPublishScope,
+        participant: &mut HvfVcpuParticipant,
+        departing: bool,
+    ) -> Result<(), HvfMemoryError> {
+        {
             self.validate_participant_capability(participant)?;
             let mut state = self
                 .cell
@@ -13554,7 +14554,7 @@ impl HvfAddressSpace {
                 .capability_state
                 .store(PARTICIPANT_RELEASED, Ordering::Release);
             Ok(())
-        })
+        }
     }
 
     /// Moves a vCPU participant from `source`'s address space to `self` by
@@ -13570,27 +14570,51 @@ impl HvfAddressSpace {
     /// migration is legal exactly when a fresh `attach_vcpu` on `self` would
     /// also be legal.
     ///
-    /// If registration in `self` fails, `old` is returned completely
-    /// untouched -- still validly registered in `source` -- so a failed
-    /// migration never leaves a lane attached to neither space. If
+    /// If registration in `self` fails, `old` is dropped with its capability
+    /// marked `PARTICIPANT_ABANDONED` (the `?` below does not hand it back to
+    /// the caller) and its record stays in `source`'s `state.participants`
+    /// until [`Self::recover_stopped_vcpu_participants`] removes it -- so the
+    /// lane is still attached to `source`, never to neither space.
     /// registration succeeds but deregistering `old` from `source` then
     /// fails, the freshly registered participant in `self` is unwound with a
-    /// best-effort deregistration before the error is returned, so a failed
-    /// migration never leaves two live registrations open for the same
-    /// lane.
+    /// deregistration before the error is returned.
+    ///
+    /// That unwind is no longer discarded (CLASS C fix-up): if it fails too, the
+    /// lane is left with two live registrations and the error reports BOTH
+    /// halves instead of only the departure's, so the caller can never mistake a
+    /// double-registration for an ordinary failed migration.
     pub fn migrate_vcpu_participant(
         &self,
         source: &HvfAddressSpace,
         mut old: HvfVcpuParticipant,
         capability: HvfVcpuLaneParticipantCapability,
     ) -> Result<HvfVcpuParticipant, HvfMemoryError> {
-        let mut new = self.register_vcpu_participant(capability)?;
-        match source.deregister_vcpu_participant_inner(&mut old, true) {
+        // CLASS C: both halves of a migration run under counting shared admissions -- two
+        // exclusive admissions per migration, each queueing behind every other process's
+        // mutation, was 0.86 / 0.26 / 4.31 thread-s per wall-s of waiters at idle / typing /
+        // drive and 12.9 ms mean (max 3.78 s) per migration.
+        // Step GC A/B knob: `LITEBOX_HVF_CLASSC=0` registers under the TRUE EXCLUSIVE operation
+        // again, which is what a migration did before this step.
+        let mut new = if crate::diagnostics_counters::class_c_enabled() {
+            self.register_vcpu_participant_shared(capability)?
+        } else {
+            self.register_vcpu_participant(capability)?
+        };
+        match source.deregister_vcpu_participant_shared(&mut old) {
             Ok(()) => Ok(new),
-            Err(err) => {
-                let _ = self.deregister_vcpu_participant(&mut new);
-                Err(err)
-            }
+            Err(departure) => match self.deregister_vcpu_participant(&mut new) {
+                Ok(()) => Err(departure),
+                Err(unwind) => {
+                    crate::diagnostics_counters::add_stat(
+                        crate::diagnostics_counters::STAT_MIGRATION_UNWIND_FAILED,
+                        1,
+                    );
+                    Err(HvfMemoryError::MigrationUnwindFailed {
+                        departure: Box::new(departure),
+                        unwind: Box::new(unwind),
+                    })
+                }
+            },
         }
     }
 
@@ -13618,88 +14642,101 @@ impl HvfAddressSpace {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !state.live {
-                return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
-            }
-            let mut receipts = Vec::new();
-            receipts
-                .try_reserve_exact(state.participants.len())
-                .map_err(|_| HvfMemoryError::MetadataAllocation("participant recovery"))?;
-            let mut released_in_flight = 0usize;
-            for (&id, record) in &state.participants {
-                let attachment_abandoned = record
-                    .attachment_state
-                    .as_ref()
-                    .is_some_and(|lease| lease.load(Ordering::Acquire) == ATTACHMENT_ABANDONED);
-                let handle_stopped = record.capability_state.load(Ordering::Acquire)
-                    == PARTICIPANT_ABANDONED
-                    && record.owner_stopped.load(Ordering::Acquire);
-                if !attachment_abandoned && !handle_stopped {
-                    continue;
-                }
-                if handle_stopped {
-                    match (record.in_flight, record.attachment_state.as_ref()) {
-                        (0, None) => {}
-                        (1, Some(_)) if attachment_abandoned => {}
-                        _ => return Err(HvfMemoryError::ParticipantBusy(id)),
-                    }
-                }
-                released_in_flight = released_in_flight
-                    .checked_add(record.in_flight)
-                    .ok_or(HvfMemoryError::IpaOwnership)?;
-                receipts.push(HvfParticipantRecoveryReceipt {
-                    participant: id,
-                    released_in_flight: record.in_flight,
-                    removed: handle_stopped,
-                });
-            }
-            let next_in_flight = state
-                .in_flight
-                .checked_sub(released_in_flight)
-                .ok_or(HvfMemoryError::IpaOwnership)?;
-            let clear_attachment_abandoned =
-                next_in_flight == 0 && self.cell.attachment_abandoned.load(Ordering::Acquire);
-            let mut acknowledgements = self
-                .memory
-                .acknowledgements
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !receipts.is_empty() || clear_attachment_abandoned {
-                operation.mark_published()?;
-            }
-            for receipt in &receipts {
-                let id = receipt.participant;
-                if receipt.removed {
-                    let record = state
-                        .participants
-                        .remove(&id)
-                        .ok_or(HvfMemoryError::ParticipantStale(id))?;
-                    for retired in acknowledgements.retirements.values_mut().filter(|retired| {
-                        retired.address_space == self.cell.id
-                            && retired.required_participants.contains(&id)
-                    }) {
-                        retired.acknowledged_participants.insert(id);
-                    }
-                    record
-                        .capability_state
-                        .store(PARTICIPANT_RECOVERED, Ordering::Release);
-                } else {
-                    let record = state
-                        .participants
-                        .get_mut(&id)
-                        .ok_or(HvfMemoryError::ParticipantStale(id))?;
-                    record.in_flight = 0;
-                    record.attachment_state = None;
-                }
-            }
-            state.in_flight = next_in_flight;
-            if state.in_flight == 0 {
-                self.cell
-                    .attachment_abandoned
-                    .store(false, Ordering::Release);
-            }
-            Ok(receipts)
+            self.recover_stopped_participants_locked(&mut state, operation)
         })
+    }
+
+    /// The body of [`Self::recover_stopped_vcpu_participants`], for a caller that already holds
+    /// the space's state lock (and therefore cannot take the cleanup operation again).
+    ///
+    /// BCORE2-FX: [`Self::begin_destroy`] calls this too, so the sweep is a property of the
+    /// destroy path rather than of whichever teardown happened to remember to call it.
+    fn recover_stopped_participants_locked(
+        &self,
+        state: &mut AddressSpaceState,
+        operation: &HvfVmOperation<'_>,
+    ) -> Result<Vec<HvfParticipantRecoveryReceipt>, HvfMemoryError> {
+        if !state.live {
+            return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
+        }
+        let mut receipts = Vec::new();
+        receipts
+            .try_reserve_exact(state.participants.len())
+            .map_err(|_| HvfMemoryError::MetadataAllocation("participant recovery"))?;
+        let mut released_in_flight = 0usize;
+        for (&id, record) in &state.participants {
+            let attachment_abandoned = record
+                .attachment_state
+                .as_ref()
+                .is_some_and(|lease| lease.load(Ordering::Acquire) == ATTACHMENT_ABANDONED);
+            let handle_stopped = record.capability_state.load(Ordering::Acquire)
+                == PARTICIPANT_ABANDONED
+                && record.owner_stopped.load(Ordering::Acquire);
+            if !attachment_abandoned && !handle_stopped {
+                continue;
+            }
+            if handle_stopped {
+                match (record.in_flight, record.attachment_state.as_ref()) {
+                    (0, None) => {}
+                    (1, Some(_)) if attachment_abandoned => {}
+                    _ => return Err(HvfMemoryError::ParticipantBusy(id)),
+                }
+            }
+            released_in_flight = released_in_flight
+                .checked_add(record.in_flight)
+                .ok_or(HvfMemoryError::IpaOwnership)?;
+            receipts.push(HvfParticipantRecoveryReceipt {
+                participant: id,
+                released_in_flight: record.in_flight,
+                removed: handle_stopped,
+            });
+        }
+        let next_in_flight = state
+            .in_flight
+            .checked_sub(released_in_flight)
+            .ok_or(HvfMemoryError::IpaOwnership)?;
+        let clear_attachment_abandoned =
+            next_in_flight == 0 && self.cell.attachment_abandoned.load(Ordering::Acquire);
+        let mut acknowledgements = self
+            .memory
+            .acknowledgements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !receipts.is_empty() || clear_attachment_abandoned {
+            operation.mark_published()?;
+        }
+        for receipt in &receipts {
+            let id = receipt.participant;
+            if receipt.removed {
+                let record = state
+                    .participants
+                    .remove(&id)
+                    .ok_or(HvfMemoryError::ParticipantStale(id))?;
+                for retired in acknowledgements.retirements.values_mut().filter(|retired| {
+                    retired.address_space == self.cell.id
+                        && retired.required_participants.contains(&id)
+                }) {
+                    retired.acknowledged_participants.insert(id);
+                }
+                record
+                    .capability_state
+                    .store(PARTICIPANT_RECOVERED, Ordering::Release);
+            } else {
+                let record = state
+                    .participants
+                    .get_mut(&id)
+                    .ok_or(HvfMemoryError::ParticipantStale(id))?;
+                record.in_flight = 0;
+                record.attachment_state = None;
+            }
+        }
+        state.in_flight = next_in_flight;
+        if state.in_flight == 0 {
+            self.cell
+                .attachment_abandoned
+                .store(false, Ordering::Release);
+        }
+        Ok(receipts)
     }
 
     pub fn attach_vcpu(
@@ -13764,6 +14801,113 @@ impl HvfAddressSpace {
                 },
                 requires_synchronization,
                 lease_state: Arc::new(AtomicU8::new(ATTACHMENT_ALLOCATED)),
+            })
+        })
+    }
+
+    /// T2d: [`Self::attach_vcpu`] and [`Self::submit`] in ONE shared operation -- the per-run
+    /// handshake was two operations and seven gate mutex acquisitions per syscall; it is now one
+    /// and four. The lease is created already [`ATTACHMENT_SUBMITTED`] (so no compare-exchange can
+    /// fail), the snapshot is built inside the same critical section that validates it (so
+    /// `submit`'s "generations changed since attach" and address-space-identity tests are vacuous
+    /// -- their races no longer exist), and every check still runs in `submit`'s order: all
+    /// validation first, then `require_live`, then the lease, then `mark_published`, then the
+    /// three mutations (`record.in_flight`, `record.attachment_state`, `state.in_flight`).
+    ///
+    /// A mutation landing just after this operation now requires this participant, `in_flight`
+    /// having been raised ~0.2 us earlier -- the same protocol state as a mutation during today's
+    /// run. Callers that need an [`ATTACHMENT_ALLOCATED`] lease (the witnesses, `synchronize`
+    /// and `shootdown`) keep using [`Self::attach_vcpu`].
+    pub fn attach_submitted_vcpu(
+        &self,
+        participant: &HvfVcpuParticipant,
+    ) -> Result<HvfVcpuRunAttachment, HvfMemoryError> {
+        self.memory.vm.with_shared_operation(|operation| {
+            self.validate_participant_capability(participant)?;
+            if self.cell.attachment_abandoned.load(Ordering::Acquire) {
+                return Err(HvfMemoryError::AttachmentAbandoned(self.cell.id));
+            }
+            let mut state = self
+                .cell
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.live {
+                return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
+            }
+            let requires_synchronization = {
+                let record = state
+                    .participants
+                    .get(&participant.id)
+                    .ok_or(HvfMemoryError::ParticipantStale(participant.id))?;
+                if record.lane_generation != participant.lane_generation
+                    || !Arc::ptr_eq(&record.lane_lifecycle, &participant.lane_lifecycle)
+                    || !Arc::ptr_eq(&record.owner_stopped, &participant.owner_stopped)
+                    || !Arc::ptr_eq(&record.capability_state, &participant.capability_state)
+                {
+                    return Err(HvfMemoryError::ParticipantLaneMismatch {
+                        participant: participant.id,
+                        expected: record.lane_generation,
+                        actual: participant.lane_generation,
+                    });
+                }
+                if !hvf_vcpu_lane_is_live(&record.lane_lifecycle, &record.owner_stopped) {
+                    return Err(HvfMemoryError::ParticipantLaneUnavailable(
+                        record.lane_generation,
+                    ));
+                }
+                // `submit`'s checks, on the same record the snapshot below is built from.
+                if record.capability_state.load(Ordering::Acquire) != PARTICIPANT_LIVE {
+                    return Err(HvfMemoryError::ParticipantStale(participant.id));
+                }
+                if !hvf_vcpu_lane_is_live(&record.lane_lifecycle, &record.owner_stopped) {
+                    return Err(HvfMemoryError::ParticipantLaneUnavailable(
+                        record.lane_generation,
+                    ));
+                }
+                if record.in_flight != 0 || record.attachment_state.is_some() {
+                    return Err(HvfMemoryError::ParticipantBusy(participant.id));
+                }
+                record.last_root_generation < state.root_generation
+                    || record.last_executable_generation < state.executable_generation
+                    || record.last_tlbi_generation < state.pending_tlbi_generation
+            };
+            let (root_ipa, synchronization_root_ipa) =
+                root_and_synchronization_ipas(self.memory, &mut state)?;
+            let in_flight = state
+                .in_flight
+                .checked_add(1)
+                .ok_or(HvfMemoryError::IpaOwnership)?;
+            let expected_ttbr0 = (u64::from(self.cell.asid.value) << 48) | root_ipa;
+            operation.require_live()?;
+            // Every fallible step precedes the first mutation, so a failure here cannot strand a
+            // lease in SUBMITTED with no ledger row behind it.
+            let lease_state = Arc::new(AtomicU8::new(ATTACHMENT_SUBMITTED));
+            let record = state
+                .participants
+                .get_mut(&participant.id)
+                .ok_or(HvfMemoryError::ParticipantStale(participant.id))?;
+            operation.mark_published()?;
+            record.in_flight = 1;
+            record.attachment_state = Some(Arc::clone(&lease_state));
+            state.in_flight = in_flight;
+            Ok(HvfVcpuRunAttachment {
+                memory: self.memory,
+                cell: Arc::clone(&self.cell),
+                participant: participant.id,
+                lane_generation: participant.lane_generation,
+                snapshot: HvfVcpuMemorySnapshot {
+                    address_space_id: self.cell.id,
+                    asid: self.cell.asid,
+                    regime: self.cell.regime,
+                    synchronization_ttbr0_el1: synchronization_root_ipa,
+                    ttbr0_el1: expected_ttbr0,
+                    root_generation: state.root_generation,
+                    executable_generation: state.executable_generation,
+                    pending_tlbi_generation: state.pending_tlbi_generation,
+                },
+                requires_synchronization,
+                lease_state,
             })
         })
     }
@@ -14365,7 +15509,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 generation,
                 tlbi_generation,
                 participants,
@@ -14977,7 +16121,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 generation,
                 tlbi_generation,
                 participants,
@@ -15407,7 +16551,7 @@ impl HvfAddressSpace {
             let retirement = self.memory.commit_retirement(
                 &mut acknowledgements,
                 reservation,
-                self.cell.id,
+                &self.cell,
                 generation,
                 tlbi_generation,
                 participants,
@@ -15791,6 +16935,39 @@ impl HvfAddressSpace {
     /// Locks only `state` and `arenas` (never `backings`/`acknowledgements`, only touched by
     /// `coalesced_ledger`/`usage_locked`), and preserves `report`'s exact same
     /// `live`/`require_live` staleness gating.
+    /// CLASS C read-class counterpart to [`Self::vcpu_snapshot`]: the three generation counters
+    /// [`HvfBackend::view_was_stale`] compares, and nothing else.
+    ///
+    /// Takes **no** VM operation. Every field it reads is written only under `cell.state` (the
+    /// same lock that serializes every mutation of this space), so the value is exactly what an
+    /// exclusive read would return; the exclusive gate added nothing but a wait behind every
+    /// other process's mutation (measured 0.33 / 0.18 / 0.66 thread-seconds per wall-second of
+    /// waiters at idle / typing / drive, ~595 calls/s). [`Self::vcpu_snapshot`] keeps its own
+    /// admission for its other callers (startup and witnesses), which need the full
+    /// [`HvfVcpuMemorySnapshot`].
+    ///
+    /// Marked read-class for the CLASS C guard: the body cannot mutate `cell.state` (it holds an
+    /// immutable `TimedGuard`), and `TimedGuard::deref_mut` traps in debug / counts in release
+    /// if a future edit breaks that.
+    pub fn generation_snapshot(
+        &self,
+    ) -> Result<(HvfRootGeneration, HvfExecutableGeneration, HvfTlbiGeneration), HvfMemoryError> {
+        let _read = crate::diagnostics_counters::enter_read_class();
+        let state = self
+            .cell
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.live {
+            return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
+        }
+        Ok((
+            state.root_generation,
+            state.executable_generation,
+            state.pending_tlbi_generation,
+        ))
+    }
+
     pub fn vcpu_snapshot(&self) -> Result<HvfVcpuMemorySnapshot, HvfMemoryError> {
         self.memory.vm.with_operation(|operation| {
             let state = self
@@ -15922,6 +17099,9 @@ impl HvfAddressSpace {
             let retired = acknowledgements
                 .remove_retirement(ticket.id)
                 .ok_or(HvfMemoryError::RetirementStale)?;
+            self.cell
+                .retirement_rows
+                .fetch_sub(1, Ordering::Release);
             ticket.live = false;
             let mut released_data_pages = 0;
             let mut released_backing_references = 0;
@@ -16114,6 +17294,7 @@ impl HvfAddressSpace {
                 fork_write_protected_hint: AtomicBool::new(false),
                 file_alias_hint: AtomicBool::new(false),
                 file_windows_len: AtomicUsize::new(0),
+                retirement_rows: AtomicUsize::new(0),
                 state: TimedMutex::new(
                     AddressSpaceState {
                         live: false,
@@ -16137,8 +17318,9 @@ impl HvfAddressSpace {
                         fork_write_protected: HashMap::new(),
                     },
                     id.value(),
+                    crate::diagnostics_counters::RANK_CELL_STATE,
                 ),
-                retirement_pump: Mutex::new(()),
+                retirement_pump: RankedMutex::new((), crate::diagnostics_counters::RANK_PUMP),
             });
             let mut private_sources = Vec::new();
             if private_sources
@@ -16379,9 +17561,14 @@ impl HvfAddressSpace {
             }
             operation.mark_published()?;
             {
+                // CLASS A: same unpublished-cell case as [`Self::create_address_space_with`] --
+                // this cell's `Arc` is not in `spaces` yet (the insert is a few lines below), so
+                // no other thread can reach its `state` and taking it while `spaces`, `arenas`,
+                // `backings` and `acknowledgements` are still held cannot deadlock. Found by the
+                // rank checker in the `--hvf-memory` witness (fork path).
                 let mut state = cell
                     .state
-                    .lock()
+                    .lock_unpublished()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.live = true;
                 state.root = candidate;
@@ -16516,6 +17703,25 @@ impl HvfAddressSpace {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !state.live || state.destroy_pending {
                 return Err(HvfMemoryError::AddressSpaceDestroyed(self.cell.id));
+            }
+            // BCORE2-FX: sweep records that can no longer make progress on their own before
+            // deciding this space is busy.
+            //
+            // A participant handle that is dropped without being deregistered leaves its record
+            // in `state.participants` (the handle's own destructor only marks the capability
+            // `PARTICIPANT_ABANDONED`), and nothing but `recover_stopped_vcpu_participants`
+            // ever removes it -- a function only two call sites used to reach. One stranded
+            // record therefore made this space undestroyable for the life of the process, and
+            // kept its stage-2 pages charged against the live-data budget for just as long.
+            // Sweeping here rather than at each teardown fixes the whole class at the one point
+            // where the consequence is felt: any record that is abandoned on a stopped owner,
+            // from whichever source, no longer pins a space. Best effort -- a recovery that
+            // refuses must not turn a destroy into a different error.
+            if let Err(error) = self.recover_stopped_participants_locked(&mut state, operation) {
+                litebox_util_log::debug!(
+                    error:% = error, address_space:? = self.cell.id;
+                    "HVF address space: stranded-participant sweep refused during destroy"
+                );
             }
             self.require_quiescent(&state)?;
             if !state.participants.is_empty() {
@@ -16845,9 +18051,17 @@ impl HvfAddressSpace {
         if self.participant_count() == 0 {
             let _ = self.pump_retirements();
         }
+        let space_id = self.cell.id;
         let mut ticket = self.begin_destroy()?;
         match self.finish_destroy(&mut ticket) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Diagnostics only: hand this space's per-space counter row back to the free pool.
+                // A claimed tag used to be permanent, so the 320-slot table saturated after the
+                // first 320 address spaces that ever existed and every later space silently lost
+                // its per-space readout (a desktop drive mints hundreds).
+                crate::diagnostics_counters::space_slot_release(space_id);
+                Ok(())
+            }
             Err(error) if ticket.lifecycle.load(Ordering::Acquire) == DESTROY_TICKET_LIVE => {
                 self.rollback_destroy(&mut ticket)?;
                 Err(error)
@@ -16857,8 +18071,11 @@ impl HvfAddressSpace {
     }
 }
 
-static PROCESS_HVF_MEMORY_CREATE_RESIDUAL: Mutex<Option<HvfMemoryCreateResidual>> =
-    Mutex::new(None);
+/// Ranked (step GA fix-up): these two slots are only ever locked inside a mutation body, i.e.
+/// after `rank_hold_gate_own()`, so they rank above the gate; blocking on one of them holds the
+/// operation for up to `OPERATION_WAIT_TIMEOUT` (T1g's shape) and is now checked.
+static PROCESS_HVF_MEMORY_CREATE_RESIDUAL: RankedMutex<Option<HvfMemoryCreateResidual>> =
+    RankedMutex::new(None, crate::diagnostics_counters::RANK_CREATE_RESIDUAL);
 static PROCESS_HVF_MEMORY: OnceLock<Result<HvfMemory, HvfMemoryError>> = OnceLock::new();
 
 fn retry_hvf_memory_create_residual() -> Result<(), HvfMemoryError> {
@@ -21327,7 +22544,8 @@ struct MirrorPlanResidual {
     committed: bool,
 }
 
-static PROCESS_MIRROR_PLAN_RESIDUAL: Mutex<Option<MirrorPlanResidual>> = Mutex::new(None);
+static PROCESS_MIRROR_PLAN_RESIDUAL: RankedMutex<Option<MirrorPlanResidual>> =
+    RankedMutex::new(None, crate::diagnostics_counters::RANK_MIRROR_RESIDUAL);
 
 impl MirrorPlan {
     fn commit(&mut self) {

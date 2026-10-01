@@ -74,7 +74,7 @@
 //! Linux, not merely this shim's own limitation).
 
 use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
-use litebox::platform::{ArchSpecificRegister, RawMutex as _};
+use litebox::platform::{ArchSpecificRegister, Instant as _, RawMutex as _};
 use litebox::sync::Mutex;
 use litebox_common_linux::PtRegs;
 use litebox_common_linux::errno::Errno;
@@ -969,6 +969,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// stop rendezvous if a tracer has requested one, applying any tracer register mutation on
     /// resume. No-op (a single atomic load) when untraced or not currently stop-requested.
     pub(crate) fn ptrace_rendezvous(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        // Step G: an untraced thread reaches here on every guest re-entry and the rendezvous
+        // below is a single atomic load for it, so the runnable-not-running clock reads sit
+        // behind the stop-request check rather than in front of it (W5).
+        if !self.thread_remote().ptrace.is_stop_requested() {
+            self.plain_ptrace_rendezvous(ctx);
+            return;
+        }
+        let started = self.global.platform.now();
+        self.plain_ptrace_rendezvous(ctx);
+        if let Some(elapsed) = self.global.platform.now().checked_duration_since(&started)
+            && elapsed >= core::time::Duration::from_micros(1)
+        {
+            self.global.platform.note_rbnr_wait(
+                litebox::platform::RunnableWaitKind::PtraceRendezvous,
+                u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            );
+        }
+    }
+
+    fn plain_ptrace_rendezvous(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let tpidr_el0 = self
             .global
             .platform

@@ -308,6 +308,30 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => false,
         }
     }
+
+    /// NETFIX: attach this channel to its `Network`'s wake path as registry entry `key`, so the
+    /// guest's ring operations queue the socket for the worker (see `net::wake`).
+    pub(super) fn attach_wake(
+        &self,
+        hook: &alloc::sync::Arc<super::wake::NetWakeHook<Platform>>,
+        key: super::wake::RegistryKey,
+    ) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.inner.wake.attach(hook, key),
+            NetworkProxy::Datagram(channel) => channel.inner.wake.attach(hook, key),
+            NetworkProxy::Raw => {}
+        }
+    }
+
+    /// NETFIX: the worker is about to service this channel's socket; clear its queued flag first
+    /// (clear-then-drain, see `net::wake`).
+    pub(super) fn clear_wake(&self) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.inner.wake.clear(),
+            NetworkProxy::Datagram(channel) => channel.inner.wake.clear(),
+            NetworkProxy::Raw => {}
+        }
+    }
 }
 
 /// A channel for stream (TCP) socket communication.
@@ -353,6 +377,9 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 
     /// Event notification
     pollee: Pollee<Platform>,
+
+    /// NETFIX: how this channel tells the network worker it has work (see `net::wake`).
+    wake: super::wake::ChannelWake<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Platform> {
@@ -380,6 +407,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             socket_error: SocketAsyncErrorState::new(),
 
             pollee: Pollee::new(),
+
+            wake: super::wake::ChannelWake::new(),
         }
     }
 
@@ -436,6 +465,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
 
         let mut rx_cons = self.inner.rx_cons.lock();
+        // NETFIX: the worker leaves bytes in smoltcp only when this ring is full, so a read that
+        // frees space in a full ring is the moment the worker has more to move.
+        let was_full = rx_cons.is_full();
         let n = if flags.contains(super::ReceiveFlags::PEEK) {
             // `MSG_PEEK`: copy out without consuming, so the next read sees the same bytes.
             let (first, second) = rx_cons.as_slices();
@@ -453,6 +485,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         } else {
             rx_cons.pop_slice(buf)
         };
+        let consumed = !flags.contains(super::ReceiveFlags::PEEK) && n > 0;
+        let now_empty = rx_cons.is_empty();
 
         if let Some(source_addr) = source_addr {
             // TCP is connection-oriented, so no need to provide a source address
@@ -462,6 +496,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         // Update available count (a peek leaves the bytes, and the count, in place)
         if !flags.contains(super::ReceiveFlags::PEEK) {
             self.inner.rx_available.fetch_sub(n, Ordering::Release);
+        }
+        drop(rx_cons);
+
+        // NETFIX: queue the socket for the worker when this read changed what it can do: it
+        // freed a full ring (smoltcp may hold more), or it emptied the ring after the peer's FIN
+        // (the worker signals end-of-file only once the ring is empty).
+        if consumed && (was_full || (now_empty && self.inner.peer_fin.load(Ordering::Acquire))) {
+            self.inner.wake.mark();
         }
 
         if n > 0 {
@@ -496,10 +538,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
         let mut tx_prod = self.inner.tx_prod.lock();
         let n = tx_prod.push_slice(buf);
+        drop(tx_prod);
 
         if n > 0 {
             // Update available count
             self.inner.tx_available.fetch_sub(n, Ordering::Release);
+            // NETFIX: bytes for the worker to move into smoltcp; pushed before the mark, so the
+            // worker's clear-then-drain sees them (see `net::wake`).
+            self.inner.wake.mark();
             Ok(n)
         } else {
             Err(ChannelWriteError::BufferFull)
@@ -811,6 +857,9 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
 
     /// Event notification
     pollee: Pollee<Platform>,
+
+    /// NETFIX: how this channel tells the network worker it has work (see `net::wake`).
+    wake: super::wake::ChannelWake<Platform>,
 }
 
 /// Maximum number of datagrams in queue
@@ -840,6 +889,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
             socket_error: SocketAsyncErrorState::new(),
 
             pollee: Pollee::new(),
+
+            wake: super::wake::ChannelWake::new(),
         }
     }
 }
@@ -882,6 +933,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, ChannelReadError> {
         let mut rx_cons = self.inner.rx_cons.lock();
+        // NETFIX: the worker leaves datagrams in smoltcp only when this queue is full.
+        let was_full = rx_cons.is_full();
 
         if let Some(msg) = rx_cons.try_pop() {
             let DatagramMessage { data, addr } = msg;
@@ -893,6 +946,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
                 buf[..to_copy].copy_from_slice(&data[..to_copy]);
             }
             self.inner.rx_count.fetch_sub(1, Ordering::Release);
+            drop(rx_cons);
+            if was_full {
+                self.inner.wake.mark();
+            }
             Ok(data.len())
         } else {
             Ok(0)
@@ -923,6 +980,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         match tx_prod.try_push(msg) {
             Ok(()) => {
                 self.inner.tx_space.fetch_sub(1, Ordering::Release);
+                drop(tx_prod);
+                // NETFIX: a datagram for the worker to hand to smoltcp (see `net::wake`).
+                self.inner.wake.mark();
                 Ok(size)
             }
             Err(_) => Err(ChannelWriteError::BufferFull),

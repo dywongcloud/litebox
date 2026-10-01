@@ -164,6 +164,10 @@ pub(crate) struct NatEngine {
     udp_flows: HashMap<FlowKey, UdpFlow>,
     /// smoltcp timestamps are relative; this anchors them to host time.
     zero_time: std::time::Instant,
+    /// NETFIX: the network worker's doorbell. Every host socket the engine creates is also
+    /// watched there (edge-triggered), and a finished dial rings it, so host-side readiness
+    /// wakes a parked worker instead of waiting for its next timer.
+    doorbell: Option<&'static crate::net_doorbell::NetDoorbell>,
 }
 
 impl NatEngine {
@@ -173,7 +177,10 @@ impl NatEngine {
     /// the `Config::new` / `Interface::new` / `add_default_ipv4_route`
     /// sequence litebox's `Network::new` uses, with a /32 plus `any_ip` in
     /// place of the guest's /24.
-    pub(crate) fn new(gateway_ip: core::net::Ipv4Addr) -> Self {
+    pub(crate) fn new(
+        gateway_ip: core::net::Ipv4Addr,
+        doorbell: Option<&'static crate::net_doorbell::NetDoorbell>,
+    ) -> Self {
         let mut device = NatDevice {
             ingress: Mutex::new(VecDeque::new()),
             egress: Mutex::new(VecDeque::new()),
@@ -211,6 +218,7 @@ impl NatEngine {
             tcp_host_fds: HashMap::new(),
             udp_flows: HashMap::new(),
             zero_time: std::time::Instant::now(),
+            doorbell,
         }
     }
 
@@ -294,7 +302,13 @@ impl NatEngine {
                     litebox_util_log::debug!(dst:% = dst, dst_port:% = key.dst_port; "nat: flow table full; dropping guest datagram");
                     return;
                 }
-                udp::relay_from_guest(&mut self.udp_flows, key, ip.src_addr(), datagram.payload());
+                udp::relay_from_guest(
+                    &mut self.udp_flows,
+                    key,
+                    ip.src_addr(),
+                    datagram.payload(),
+                    self.doorbell,
+                );
             }
             _ => litebox_util_log::debug!(
                 dst:% = ip.dst_addr(), protocol:? = ip.next_header();
